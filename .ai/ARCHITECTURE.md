@@ -377,6 +377,10 @@ set**. Everything after that is materialization.
 
 - No Raft: the partition owner group-commits each batch to object storage (MemWAL or
   a log object) with conditional-write fencing, and acks after the PUT succeeds.
+- **Create-only fencing (spike B1):** on Hetzner, `If-None-Match: *` create is atomic
+  but `If-Match` replace fails spuriously. Each batch is therefore a new immutable
+  object (`log/p{partition}/{offset:020}`) claimed by creating it; leases are
+  `lease/p{partition}/{epoch}` objects; nothing is ever updated in place.
 - Nodes become stateless: no NVMe, no replica sets, no consensus code — the simplest
   scale-to-zero.
 - Costs: commits take 10–100 ms instead of about 1 ms; request limits cap frequency
@@ -604,7 +608,7 @@ Worked through, with experiments, exit criteria and fallbacks, in
 | MemWAL writer API availability | **Risk** | Not in Lance 2.0.0; option A depends on it | Spike step 0; fall back to B |
 | Atomic commit with `_meta` | Unknown | Crash-safe apply depends on it | Kill mid-apply in the spike |
 | Offset guard inside a Lance commit | Unknown | Prevents stale-applier reverts | Race test in the spike |
-| Object-store conditional writes (Hetzner) | **Blocker** | Lance commits depend on compare-and-swap | Verify first |
+| Object-store conditional writes (Hetzner) | ☑ Resolved (B1) | Create-only is atomic (Lance's commit path works); `If-Match` replace is broken | Design rule: create-only objects; open issue B1a (three gateways reject the key) |
 | openraft 0.9 vs 0.10 | Decision | API churn vs features | Prototype on one, pin it |
 | One Raft group per replica set | Decision | One leader carries all of the set's appends and replication | Benchmark leader throughput; multi-Raft only if it saturates |
 | Commit mode per tier | Decision | Raft (~1 ms, NVMe replica sets) vs object-store commit (10–100 ms, stateless nodes) | Choose per tier; both behind the log trait |
