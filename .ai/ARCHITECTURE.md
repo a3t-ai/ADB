@@ -596,6 +596,9 @@ and sequencer constraints, which need plaintext. So:
 
 ## 19. Open questions and risks
 
+Worked through, with experiments, exit criteria and fallbacks, in
+[`RISK_BURNDOWN.md`](RISK_BURNDOWN.md).
+
 | Item | Type | Why it matters | Next step |
 |---|---|---|---|
 | MemWAL writer API availability | **Risk** | Not in Lance 2.0.0; option A depends on it | Spike step 0; fall back to B |
