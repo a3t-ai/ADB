@@ -387,6 +387,23 @@ impl Value {
     }
 }
 
+impl From<&serde_json::Value> for Value {
+    /// JSON → AQL value. Objects have no AQL literal form and become their JSON text.
+    fn from(json: &serde_json::Value) -> Self {
+        match json {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => match n.as_i64() {
+                Some(i) => Self::Int(i),
+                None => n.as_f64().map_or(Self::Null, Self::Float),
+            },
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Array(a) => Self::Array(a.iter().map(Self::from).collect()),
+            serde_json::Value::Object(_) => Self::String(json.to_string()),
+        }
+    }
+}
+
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
         Self::String(s.to_string())

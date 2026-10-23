@@ -52,13 +52,41 @@ impl Executor {
         Ok(result)
     }
 
+    /// Execute an AQL query string with request-level variables (`{name}` / `$name`),
+    /// as sent by `POST /query` with `"variables": {...}`.
+    pub async fn execute_with_vars(
+        &self,
+        query: &str,
+        variables: &HashMap<String, serde_json::Value>,
+    ) -> ExecutorResult<QueryResult> {
+        let start = Instant::now();
+        let stmt = parse(query).map_err(|e| ExecutorError::Parse(e.to_string()))?;
+        let plan = self.planner.plan(&stmt)?;
+        let bindings: HashMap<String, Value> =
+            variables.iter().map(|(k, v)| (k.clone(), Value::from(v))).collect();
+        let mut result = self.execute_plan_with(&plan, bindings).await?;
+        result.metadata.execution_time_ms = start.elapsed().as_millis() as u64;
+        Ok(result)
+    }
+
     /// Execute a pre-planned query
     pub async fn execute_plan(&self, plan: &ExecutionPlan) -> ExecutorResult<QueryResult> {
+        self.execute_plan_with(plan, HashMap::new()).await
+    }
+
+    /// Execute a pre-planned query with initial variable bindings
+    async fn execute_plan_with(
+        &self,
+        plan: &ExecutionPlan,
+        bindings: HashMap<String, Value>,
+    ) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
 
         let result = match plan {
-            ExecutionPlan::Single(step) => self.execute_step(step).await?,
-            ExecutionPlan::Pipeline(pipeline) => self.execute_pipeline(pipeline).await?,
+            ExecutionPlan::Single(step) => {
+                self.execute_step(&self.bind_variables_in_step(step, &bindings)).await?
+            }
+            ExecutionPlan::Pipeline(pipeline) => self.execute_pipeline(pipeline, bindings).await?,
             ExecutionPlan::Reflect(reflect) => self.execute_reflect(reflect).await?,
             ExecutionPlan::FanOut(fanout) => self.execute_fanout(fanout).await?,
         };
@@ -89,10 +117,13 @@ impl Executor {
     }
 
     /// Execute a pipeline
-    async fn execute_pipeline(&self, pipeline: &PipelinePlan) -> ExecutorResult<QueryResult> {
+    async fn execute_pipeline(
+        &self,
+        pipeline: &PipelinePlan,
+        mut var_bindings: HashMap<String, Value>,
+    ) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
         let mut step_results = Vec::new();
-        let mut var_bindings: HashMap<String, Value> = HashMap::new();
 
         for (i, stage) in pipeline.stages.iter().enumerate() {
             // Bind variables in the stage's predicate from previous results
@@ -224,40 +255,22 @@ impl Executor {
 
         match fanout.operation {
             Operation::Recall => {
-                // Fan-out RECALL across all memory types
+                // Fan-out RECALL across all memory types; one merged record list (each
+                // record keeps its memory_type), as AQL's FROM ALL and ClawDB return it.
                 let mut all_records = Vec::new();
-                let mut source_results = Vec::new();
-
                 for mem_type in MemoryType::all() {
                     let records = self
                         .adb
                         .recall_with_modifiers(*mem_type, &fanout.predicate, &fanout.modifiers)
                         .await?;
-
-                    source_results.push(SourceResult {
-                        memory_type: format!("{:?}", mem_type),
-                        records: records.clone(),
-                    });
                     all_records.extend(records);
                 }
 
-                // Apply limit to merged results if specified
                 if let Some(limit) = fanout.modifiers.limit {
                     all_records.truncate(limit);
                 }
 
-                // Return as Reflect-style multi-source result for visibility
-                Ok(QueryResult {
-                    success: true,
-                    data: ResultSet::Reflect {
-                        sources: source_results,
-                        links: Vec::new(),
-                    },
-                    metadata: crate::result::ResultMetadata {
-                        execution_time_ms: start.elapsed().as_millis() as u64,
-                        ..Default::default()
-                    },
-                })
+                Ok(QueryResult::records(all_records, start.elapsed().as_millis() as u64))
             }
             Operation::Forget => {
                 // Fan-out FORGET across all memory types
@@ -951,13 +964,16 @@ mod tests {
         // Store data
         executor
             .adb
-            .store(MemoryType::Working, "task-1", json!({"name": "Test Task"}))
+            .store(MemoryType::Procedural, "task-1", json!({"name": "Test Task"}))
             .await
             .unwrap();
 
+        // AQL v0.5 §19: LOOKUP is not valid on WORKING memory
+        assert!(executor.execute(r#"LOOKUP FROM WORKING KEY id = "task-1""#).await.is_err());
+
         // Execute lookup by key
         let result = executor
-            .execute(r#"LOOKUP FROM WORKING KEY id = "task-1""#)
+            .execute(r#"LOOKUP FROM PROCEDURAL KEY id = "task-1""#)
             .await
             .unwrap();
 
@@ -1057,7 +1073,7 @@ mod tests {
 
         // Execute pipeline
         let result = executor
-            .execute(r#"PIPELINE test_pipe SCAN FROM WORKING | SCAN FROM WORKING LIMIT 1"#)
+            .execute(r#"PIPELINE test_pipe TIMEOUT 50ms SCAN FROM WORKING | SCAN FROM WORKING LIMIT 1"#)
             .await
             .unwrap();
 

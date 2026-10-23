@@ -1,11 +1,242 @@
-//! ADB Server - Main Agent Database Instance
+//! ADB HTTP server — a drop-in replacement for ClawDB's server (`clawdb-server`).
 //!
-//! Provides the main `Adb` struct that orchestrates all backends
-//! and provides a unified interface for agent memory operations.
+//! A3T reaches agent memory through these endpoints today, so they keep ClawDB's
+//! paths and wire format:
 //!
-//! Note: The core Adb and AdbConfig types are now in adb-backends.
-//! This crate re-exports them for convenience and will contain
-//! HTTP/gRPC server implementations.
+//! | Endpoint | Purpose |
+//! |---|---|
+//! | `GET /health` | `{status, version}` |
+//! | `POST /query` | `{"query": AQL, "variables"?: {…}}` → `{success, data, error, execution_time_ms}` |
+//! | `GET /stats` | `{success, data: {working: n, …}}` |
+//! | `POST /mcp` | MCP over streamable HTTP (JSON responses) |
+//! | `GET /mcp/sse`, `POST /mcp/message?sessionId=…` | MCP over HTTP+SSE (no `sessionId`: reply in the body) |
 
-// Re-export from adb-backends for backward compatibility
-pub use adb_backends::{Adb, AdbConfig};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use adb_executor::Engine;
+use adb_mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
+use adb_mcp::McpServer;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use futures::Stream;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tower_http::cors::{Any, CorsLayer};
+
+/// Shared state: the engine and the MCP handler over it.
+#[derive(Clone)]
+pub struct AppState {
+    engine: Arc<dyn Engine>,
+    mcp: McpServer,
+    sessions: Sessions,
+}
+
+impl AppState {
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
+        Self { mcp: McpServer::new(Arc::clone(&engine)), engine, sessions: Sessions::default() }
+    }
+}
+
+/// The full router.
+pub fn router(engine: Arc<dyn Engine>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/query", post(query))
+        .route("/stats", get(stats))
+        .route("/mcp", post(mcp_post).get(mcp_get))
+        .route("/mcp/sse", get(mcp_sse))
+        .route("/mcp/message", post(mcp_message))
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        .with_state(AppState::new(engine))
+}
+
+/// Bind and serve until the process ends.
+pub async fn serve(addr: SocketAddr, engine: Arc<dyn Engine>) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("ADB listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, router(engine)).await
+}
+
+// ---------------------------------------------------------------- REST
+
+#[derive(Serialize)]
+struct Health {
+    status: &'static str,
+    version: &'static str,
+}
+
+async fn health() -> Json<Health> {
+    Json(Health { status: "ok", version: env!("CARGO_PKG_VERSION") })
+}
+
+#[derive(Deserialize)]
+struct QueryRequest {
+    query: String,
+    #[serde(default)]
+    variables: Option<HashMap<String, Value>>,
+}
+
+#[derive(Serialize)]
+struct QueryResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_time_ms: Option<u64>,
+}
+
+/// `POST /query` — ClawDB's shape: `data` is the whole wire `QueryResult`.
+async fn query(State(s): State<AppState>, Json(req): Json<QueryRequest>) -> (StatusCode, Json<QueryResponse>) {
+    let start = Instant::now();
+    let result = s.engine.query(&req.query, req.variables.as_ref()).await;
+    let ms = Some(start.elapsed().as_millis() as u64);
+    match result {
+        Ok(wire) => {
+            let success = wire.get("success").and_then(Value::as_bool).unwrap_or(true);
+            let error = wire.get("error").and_then(Value::as_str).map(String::from);
+            (StatusCode::OK, Json(QueryResponse { success, data: Some(wire), error, execution_time_ms: ms }))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(QueryResponse { success: false, data: None, error: Some(e), execution_time_ms: ms }),
+        ),
+    }
+}
+
+/// `GET /stats` — `{success, data: {working: n, episodic: n, …}}`.
+async fn stats(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    match s.engine.stats().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(QueryResponse { success: true, data: Some(data), error: None, execution_time_ms: None }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(QueryResponse { success: false, data: None, error: Some(e), execution_time_ms: None }),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------- MCP: streamable HTTP
+
+/// `POST /mcp` — one JSON-RPC message (or a batch) in, JSON out; notifications → 202.
+async fn mcp_post(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
+    match body {
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if let Some(r) = handle_value(&s.mcp, item).await {
+                    out.push(r);
+                }
+            }
+            if out.is_empty() {
+                StatusCode::ACCEPTED.into_response()
+            } else {
+                Json(out).into_response()
+            }
+        }
+        item => match handle_value(&s.mcp, item).await {
+            Some(r) => Json(r).into_response(),
+            None => StatusCode::ACCEPTED.into_response(),
+        },
+    }
+}
+
+/// `GET /mcp` — no server-initiated stream on the streamable transport (yet).
+async fn mcp_get() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+async fn handle_value(mcp: &McpServer, v: Value) -> Option<JsonRpcResponse> {
+    match serde_json::from_value::<JsonRpcRequest>(v) {
+        Ok(req) => mcp.handle(req).await,
+        Err(e) => Some(JsonRpcResponse::error(None, -32600, format!("Invalid request: {e}"))),
+    }
+}
+
+// ---------------------------------------------------------------- MCP: HTTP+SSE
+
+/// Open SSE sessions: session id → sender of serialized JSON-RPC responses.
+#[derive(Clone, Default)]
+struct Sessions(Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>);
+
+impl Sessions {
+    fn open(&self) -> (String, mpsc::UnboundedReceiver<String>) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.0.lock().unwrap().insert(id.clone(), tx);
+        (id, rx)
+    }
+    fn send(&self, id: &str, msg: String) -> bool {
+        self.0.lock().unwrap().get(id).map(|tx| tx.send(msg).is_ok()).unwrap_or(false)
+    }
+    fn close(&self, id: &str) {
+        self.0.lock().unwrap().remove(id);
+    }
+}
+
+/// Removes the session when the SSE stream is dropped (client disconnected).
+struct SessionGuard {
+    sessions: Sessions,
+    id: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.sessions.close(&self.id);
+        tracing::debug!("MCP SSE session closed: {}", self.id);
+    }
+}
+
+/// `GET /mcp/sse` — first event `endpoint` = where to POST messages; then one
+/// `message` event per JSON-RPC response.
+async fn mcp_sse(State(s): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (id, rx) = s.sessions.open();
+    tracing::info!("MCP SSE session opened: {id}");
+    let endpoint = format!("/mcp/message?sessionId={id}");
+    let guard = SessionGuard { sessions: s.sessions.clone(), id };
+    let stream = futures::stream::unfold((Some(endpoint), rx, guard), |(endpoint, mut rx, guard)| async move {
+        if let Some(e) = endpoint {
+            return Some((Ok(Event::default().event("endpoint").data(e)), (None, rx, guard)));
+        }
+        let msg = rx.recv().await?;
+        Some((Ok(Event::default().event("message").data(msg)), (None, rx, guard)))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+#[derive(Deserialize)]
+struct MessageQuery {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+/// `POST /mcp/message?sessionId=…` — 202, the response goes out on the session's SSE stream.
+/// Without `sessionId` it answers in the body like `POST /mcp`: FlowR's `call:mcp` maps a
+/// `/mcp/sse` resource URL to `/mcp/message` and posts there without opening a stream.
+async fn mcp_message(State(s): State<AppState>, Query(q): Query<MessageQuery>, Json(body): Json<Value>) -> Response {
+    let Some(session_id) = q.session_id else {
+        return mcp_post(State(s), Json(body)).await;
+    };
+    if !s.sessions.0.lock().unwrap().contains_key(&session_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(resp) = handle_value(&s.mcp, body).await {
+        let text = serde_json::to_string(&resp).unwrap_or_default();
+        if !s.sessions.send(&session_id, text) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    StatusCode::ACCEPTED.into_response()
+}

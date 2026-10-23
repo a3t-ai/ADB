@@ -32,7 +32,7 @@ pub struct ProcedureNode {
     /// Severity level
     pub severity: String,
     /// Confidence score (0.0 - 1.0)
-    pub confidence: f32,
+    pub confidence: f64,
     /// Source of this procedure (manual, learned, etc.)
     pub source: String,
     /// Number of successful applications
@@ -97,7 +97,7 @@ impl ProcedureNode {
     fn update_confidence(&mut self) {
         let total = self.success_count + self.failure_count;
         if total > 0 {
-            self.confidence = self.success_count as f32 / total as f32;
+            self.confidence = self.success_count as f64 / total as f64;
         }
     }
 
@@ -318,7 +318,7 @@ impl Backend for ProceduralBackend {
             proc.source = source.to_string();
         }
         if let Some(confidence) = data["confidence"].as_f64() {
-            proc.confidence = confidence as f32;
+            proc.confidence = confidence;
         }
 
         // Read success_count and failure_count from input
@@ -507,7 +507,7 @@ impl Backend for ProceduralBackend {
                     proc.source = source.to_string();
                 }
                 if let Some(confidence) = data["confidence"].as_f64() {
-                    proc.confidence = confidence as f32;
+                    proc.confidence = confidence;
                 }
 
                 // Handle steps - support both array and string formats

@@ -746,11 +746,11 @@ mod tests {
         let results = backend
             .lookup(
                 &Predicate::Where {
-                    conditions: vec![Condition {
-                        field: "category".to_string(),
-                        operator: Operator::Eq,
-                        value: Value::String("a".to_string()),
-                    }],
+                    conditions: vec![Condition::new(
+                        "category",
+                        Operator::Eq,
+                        Value::String("a".to_string()),
+                    )],
                 },
                 &Modifiers::default(),
             )

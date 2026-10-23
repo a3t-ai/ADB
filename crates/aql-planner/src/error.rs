@@ -35,4 +35,8 @@ pub enum PlanError {
     /// Type mismatch
     #[error("Type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
+
+    /// Statement parses but the engine does not implement it yet
+    #[error("{0} is not implemented yet")]
+    NotImplemented(&'static str),
 }

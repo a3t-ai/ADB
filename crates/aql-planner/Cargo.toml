@@ -7,7 +7,7 @@ description = "AQL query planner - routes queries to backends"
 
 [dependencies]
 adb-core = { path = "../adb-core" }
-aql-parser = { path = "../aql-parser" }
+aql-parser.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 serde.workspace = true

@@ -58,6 +58,14 @@ impl Planner {
             Statement::Update(u) => Ok(ExecutionPlan::Single(self.plan_update(u)?)),
             Statement::Forget(f) => self.plan_forget(f),
             Statement::Link(l) => Ok(ExecutionPlan::Single(self.plan_link(l)?)),
+            // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
+            Statement::Subscribe(_)
+            | Statement::Unsubscribe(_)
+            | Statement::Ack(_)
+            | Statement::Publish(_) => Err(PlanError::NotImplemented("Subscriptions (SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH)")),
+            Statement::Watch(_) | Statement::Unwatch(_) => {
+                Err(PlanError::NotImplemented("Continuous queries (WATCH / UNWATCH)"))
+            }
         }
     }
 
@@ -573,14 +581,18 @@ mod tests {
 
     #[test]
     fn test_plan_lookup() {
-        let stmt = parse(r#"LOOKUP FROM WORKING KEY id = "task-1""#).unwrap();
         let planner = Planner::new();
+        // AQL v0.5 §19: LOOKUP is not valid on WORKING memory
+        let working = parse(r#"LOOKUP FROM WORKING KEY id = "task-1""#).unwrap();
+        assert!(planner.plan(&working).is_err());
+
+        let stmt = parse(r#"LOOKUP FROM PROCEDURAL KEY id = "oom-fix""#).unwrap();
         let plan = planner.plan(&stmt).unwrap();
 
         match plan {
             ExecutionPlan::Single(step) => {
                 assert_eq!(step.operation, Operation::Lookup);
-                assert_eq!(step.memory_type, CoreMemoryType::Working);
+                assert_eq!(step.memory_type, CoreMemoryType::Procedural);
             }
             _ => panic!("Expected single step plan"),
         }

@@ -3,23 +3,21 @@ name = "adb-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ADB server - main database instance"
+description = "ADB HTTP server: ClawDB-compatible REST API and MCP (streamable HTTP + SSE)"
 
 [dependencies]
-adb-core = { path = "../adb-core" }
-adb-backends = { path = "../adb-backends" }
-aql-parser = { path = "../aql-parser" }
-aql-planner = { path = "../aql-planner" }
+adb-executor = { path = "../adb-executor" }
+adb-mcp = { path = "../adb-mcp" }
 tokio.workspace = true
-async-trait.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
-uuid.workspace = true
-chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

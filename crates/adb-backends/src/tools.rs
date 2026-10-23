@@ -33,7 +33,7 @@ pub struct ToolRecord {
     /// Tool category (e.g., "file", "network", "database")
     pub category: String,
     /// Dynamic ranking score (0.0 - 1.0)
-    pub ranking: f32,
+    pub ranking: f64,
     /// Number of times this tool has been called
     pub call_count: u64,
     /// Last time this tool was called
@@ -87,7 +87,7 @@ impl ToolRecord {
     pub fn update_ranking(&mut self, success_signal: f32, decay: f32) {
         let decay = decay.clamp(0.0, 1.0);
         let signal = success_signal.clamp(0.0, 1.0);
-        self.ranking = (self.ranking * decay + signal * (1.0 - decay)).clamp(0.0, 1.0);
+        self.ranking = (self.ranking * decay as f64 + signal as f64 * (1.0 - decay as f64)).clamp(0.0, 1.0);
         self.call_count += 1;
         self.last_called = Some(Utc::now());
     }
@@ -219,7 +219,7 @@ impl Backend for ToolsBackend {
 
         // Set initial ranking if provided
         if let Some(ranking) = data["ranking"].as_f64() {
-            tool.ranking = ranking as f32;
+            tool.ranking = ranking;
         }
 
         // Set relevance scores if provided
@@ -329,12 +329,12 @@ impl Backend for ToolsBackend {
         // Sort by ranking (descending) with relevance adjustment
         matches.sort_by(|a, b| {
             let score_a = if let Some(tt) = task_type {
-                a.ranking * 0.7 + a.relevance_for(tt) * 0.3
+                a.ranking * 0.7 + a.relevance_for(tt) as f64 * 0.3
             } else {
                 a.ranking
             };
             let score_b = if let Some(tt) = task_type {
-                b.ranking * 0.7 + b.relevance_for(tt) * 0.3
+                b.ranking * 0.7 + b.relevance_for(tt) as f64 * 0.3
             } else {
                 b.ranking
             };
@@ -398,7 +398,7 @@ impl Backend for ToolsBackend {
                     tool.category = cat.to_string();
                 }
                 if let Some(ranking) = data["ranking"].as_f64() {
-                    tool.ranking = ranking as f32;
+                    tool.ranking = ranking;
                 }
                 if let Some(schema) = data.get("schema") {
                     tool.schema = schema.clone();
@@ -437,7 +437,7 @@ mod tests {
             json!({"type": "object"}),
             "test",
         );
-        tool.ranking = ranking;
+        tool.ranking = ranking as f64;
         tool
     }
 

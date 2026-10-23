@@ -1,26 +1,20 @@
-//! ADB CLI - Command line interface for Agent Database
+//! `adb` — the ADB command-line interface.
 //!
-//! Runs the ADB MCP server for integration with Claude Code and other MCP clients.
+//! - `adb serve` — MCP over stdio (Claude Code, Claude Desktop)
+//! - `adb serve --http [--host 0.0.0.0] [--port 3000]` — REST + MCP over HTTP/SSE,
+//!   a drop-in for ClawDB's server (A3T); `adb serve-http` is the same
+//! - `adb query "<AQL>"` — run one statement and print the JSON result
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use adb_backends::Adb;
-use adb_executor::Executor;
-use adb_mcp::server::McpServer;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
+use adb_executor::{Engine, LocalEngine};
+use adb_mcp::McpServer;
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
-#[command(name = "adb")]
-#[command(about = "Agent Database - Memory system for AI agents", long_about = None)]
+#[command(name = "adb", version, about = "Agent Database — memory for AI agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -28,136 +22,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the MCP server on stdio (default)
-    Serve,
-    /// Run the HTTP server
-    ServeHttp {
-        /// Port to listen on
-        #[arg(short, long, default_value = "3000")]
+    /// Run the MCP server on stdio (default), or the HTTP server with --http
+    Serve {
+        /// Serve REST + MCP over HTTP instead of MCP on stdio
+        #[arg(long)]
+        http: bool,
+        #[arg(long, default_value = "0.0.0.0")]
+        host: IpAddr,
+        #[arg(short, long, default_value_t = 3000)]
         port: u16,
     },
-    /// Execute an AQL query
+    /// Run the HTTP server (same as `serve --http`)
+    ServeHttp {
+        #[arg(long, default_value = "0.0.0.0")]
+        host: IpAddr,
+        #[arg(short, long, default_value_t = 3000)]
+        port: u16,
+    },
+    /// Execute one AQL statement and print the result as JSON
     Query {
-        /// The AQL query to execute
+        /// The AQL statement
         query: String,
     },
-}
-
-#[derive(Clone)]
-struct AppState {
-    executor: Arc<Executor>,
-}
-
-#[derive(Deserialize)]
-struct QueryRequest {
-    query: String,
-}
-
-#[derive(Serialize)]
-struct QueryResponse {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Commands::Serve { http: false, host: [0, 0, 0, 0].into(), port: 3000 });
 
-    // Initialize tracing - for MCP serve mode, write to stderr without colors
-    let is_serve = matches!(cli.command, None | Some(Commands::Serve));
-
+    // Logs always go to stderr: stdout carries MCP messages in stdio mode.
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    if is_serve { "warn".into() } else { "adb=info".into() }
-                }),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_ansi(!is_serve)  // Disable ANSI colors for MCP
-                .with_writer(std::io::stderr)  // Write to stderr, not stdout
-        )
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "adb=info,adb_server=info".into()))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .init();
 
-    match cli.command.unwrap_or(Commands::Serve) {
-        Commands::Serve => {
-            eprintln!("Starting ADB MCP server on stdio");
-            let adb = Arc::new(Adb::new());
-            let server = McpServer::new(adb);
-            server.run_stdio().await?;
+    let engine: Arc<dyn Engine> = Arc::new(LocalEngine::default());
+
+    match command {
+        Commands::Serve { http: false, .. } => {
+            tracing::info!("ADB MCP server on stdio");
+            McpServer::new(engine).run_stdio().await?;
         }
-        Commands::ServeHttp { port } => {
-            eprintln!("Starting ADB HTTP server on port {}", port);
-            let adb = Arc::new(Adb::new());
-            let executor = Arc::new(Executor::new(adb));
-            let state = AppState { executor };
-
-            let cors = CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any);
-
-            let app = Router::new()
-                .route("/health", get(health_check))
-                .route("/query", post(execute_query))
-                .layer(cors)
-                .with_state(state);
-
-            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-            eprintln!("ADB HTTP server listening on http://0.0.0.0:{}", port);
-            axum::serve(listener, app).await?;
+        Commands::Serve { http: true, host, port } | Commands::ServeHttp { host, port } => {
+            adb_server::serve(SocketAddr::new(host, port), engine).await?;
         }
-        Commands::Query { query } => {
-            let adb = Arc::new(Adb::new());
-            let executor = Executor::new(adb);
-            match executor.execute(&query).await {
-                Ok(result) => {
-                    let json = serde_json::to_string_pretty(&result)?;
-                    println!("{}", json);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        Commands::Query { query } => match engine.query(&query, None).await {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
-        }
+        },
     }
-
     Ok(())
-}
-
-async fn health_check() -> &'static str {
-    "OK"
-}
-
-async fn execute_query(
-    State(state): State<AppState>,
-    Json(payload): Json<QueryRequest>,
-) -> (StatusCode, Json<QueryResponse>) {
-    match state.executor.execute(&payload.query).await {
-        Ok(result) => {
-            let json_result = serde_json::to_value(&result).unwrap_or_default();
-            (
-                StatusCode::OK,
-                Json(QueryResponse {
-                    success: true,
-                    result: Some(json_result),
-                    error: None,
-                }),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(QueryResponse {
-                success: false,
-                result: None,
-                error: Some(e.to_string()),
-            }),
-        ),
-    }
 }

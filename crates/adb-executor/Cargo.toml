@@ -9,7 +9,7 @@ description = "ADB query executor"
 adb-core = { path = "../adb-core" }
 adb-backends = { path = "../adb-backends" }
 aql-planner = { path = "../aql-planner" }
-aql-parser = { path = "../aql-parser" }
+aql-parser.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -20,4 +20,3 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
-adb-mcp = { path = "../adb-mcp" }

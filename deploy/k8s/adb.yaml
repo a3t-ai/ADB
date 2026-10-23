@@ -1,0 +1,67 @@
+# ADB single node for A3T (vc-dev, namespace a3t). Stage A: in-memory engine, so a pod
+# restart empties it.
+#
+#   kubectl apply -f adb.yaml
+#   # A3T resource a3t/agent-memory-mcp → url: http://adb.a3t.svc.cluster.local:3000/mcp/sse
+#
+# New image: flowr-system/deploy.sh release adb && deploy.sh roll adb <tag>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adb
+  namespace: a3t
+  labels:
+    app: adb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adb
+  template:
+    metadata:
+      labels:
+        app: adb
+    spec:
+      imagePullSecrets:
+        - name: registry-credentials
+      containers:
+        - name: adb
+          image: ghcr.io/srirammails/adb:2026-10-23
+          args: ["adb", "serve-http", "--host", "0.0.0.0", "--port", "3000"]
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: RUST_LOG
+              value: info
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adb
+  namespace: a3t
+  labels:
+    app: adb
+spec:
+  selector:
+    app: adb
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
