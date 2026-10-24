@@ -8,6 +8,8 @@
  *
  *   # spawn both (temp data dirs, free ports):
  *   node tests/flowr-integration.mjs --adb target/release/adb --flowr <flowr-ce binary>
+ *   # stage C gate: ADB durable; it is SIGKILLed mid-conversation and restarted:
+ *   node tests/flowr-integration.mjs --adb target/release/adb --adb-data-dir /tmp/adb-data --flowr <flowr-ce binary>
  *   # or against running servers (containers, compose):
  *   node tests/flowr-integration.mjs --adb-url http://localhost:3000 --flowr-url http://localhost:3002
  *
@@ -133,10 +135,13 @@ const callTool = (tool, toolArgs) => run({ test_type: 'mcp_call', tool, argument
 try {
   // ---------------------------------------------------------------- start
   let adbUrl = args['adb-url'];
+  let adbChild, adbArgv;
   if (!adbUrl) {
     const port = await freePort();
     adbUrl = `http://127.0.0.1:${port}`;
-    start(args.adb, ['serve', '--http', '--host', '127.0.0.1', '--port', String(port)], {}, 'adb');
+    adbArgv = ['serve', '--http', '--host', '127.0.0.1', '--port', String(port)];
+    if (args['adb-data-dir']) adbArgv = ['--data-dir', args['adb-data-dir'], ...adbArgv];
+    adbChild = start(args.adb, adbArgv, {}, 'adb');
   }
   flowrUrl = args['flowr-url'];
   if (!flowrUrl) {
@@ -217,6 +222,25 @@ try {
     body: JSON.stringify({ query: 'RECALL FROM SEMANTIC WHERE key = "acme-renewal"' }),
   })).json();
   check('ADB /query sees FlowR’s write (ClawDbMemory shape)', q.success && q.data?.data?.records?.[0]?.data?.content === 'Acme renews on 1 Nov', JSON.stringify(q));
+
+  // ---------------------------------------------------------------- stage C: ADB crashes mid-conversation
+  if (args['adb-data-dir'] && adbChild) {
+    r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'STORE INTO WORKING (conversation = "c-42", turn = 3, topic = "renewal")' });
+    check('conversation turn stored in WORKING', !r.isError && flowOutput(r.text)?.data?.type === 'stored', r.text);
+
+    const exited = new Promise(res => adbChild.once('exit', res));
+    adbChild.kill('SIGKILL');
+    await exited;
+    adbChild = start(args.adb, adbArgv, {}, 'adb (restarted)');
+    await waitHealthy(adbUrl, 'ADB after SIGKILL');
+
+    r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'RECALL FROM WORKING WHERE conversation = "c-42"' });
+    check('WORKING memory survives an ADB crash (call:adb)', flowOutput(r.text)?.data?.records?.[0]?.data?.turn === 3, r.text);
+    r = await callTool('recall', { contains: 'renews' });
+    check('facts survive the crash too (MCP recall)', flowOutput(r.text)?.data?.records?.[0]?.data?.key === 'acme-renewal', r.text);
+    r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'RECALL FROM WORKING WHERE name = "alice"' });
+    check('earlier call:adb writes survive', flowOutput(r.text)?.data?.records?.[0]?.data?.score === 95, r.text);
+  }
 } catch (e) {
   check('session', false, e.stack);
 } finally {
