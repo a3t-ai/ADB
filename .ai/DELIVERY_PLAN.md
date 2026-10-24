@@ -40,10 +40,10 @@ M2 can overlap the end of M1, and M3 can start as soon as M1's log trait is stab
 |---|---|---|
 | Dependency upgrade — ✅ *24 Oct (K5 closed)* | One Arrow 58 / DataFusion / object_store across the workspace; Lance `=12.0.0`; Rust stable; `protoc` in Dockerfile and docs | K5 |
 | AQL from one source | ✅ Done 9 Oct: ADB depends on the AQL repo's `aql-parser` (git), local override in `.cargo/config.toml`; push AQL so Docker and fresh clones build | K9 |
-| Crate skeletons | `adb-log`, `adb-sequencer`, `adb-store` (and empty `adb-cluster`, `adb-cq`, `adb-gateway`); move `clawdb`'s Lance code toward `adb-store` | §16 |
-| Core types | In `adb-core`: log record, typed effects (`PutEntity`, `PutFact`, `PutEdge`, `PutEpisode`, `SupersedeFact`, `Delete`, `Forget`, `RegisterSub`, …), offsets, epochs, partition id | §9, §11.7 |
-| Schema write-up (D3) | Concrete Arrow schema per `kind` (incl. `event`, `sub`, `cq`, `_meta`), nullability, plaintext vs encrypted `value` fields, one platform embedding model and dimension, re-embedding procedure | D3 |
-| Temporal write-up (D2) | Supersede-by-default for SEMANTIC / PROCEDURAL, overwrite for WORKING / TOOLS; `valid_from` / `valid_to` / `superseded_by`; TTL; how `UPDATE`, `FORGET`, `WINDOW` map | D2 |
+| Crate skeletons — ✅ *24 Oct* | `adb-log`, `adb-sequencer`, `adb-store` (and empty `adb-cluster`, `adb-cq`, `adb-gateway`); move `clawdb`'s Lance code toward `adb-store` | §16 |
+| Core types — ✅ *24 Oct* | In `adb-core`: log record, typed effects (`PutEntity`, `PutFact`, `PutEdge`, `PutEpisode`, `SupersedeFact`, `Delete`, `Forget`, `RegisterSub`, …), offsets, epochs, partition id | §9, §11.7 |
+| Schema write-up (D3) — ✅ *24 Oct* | Concrete Arrow schema per `kind` (incl. `event`, `sub`, `cq`, `_meta`), nullability, plaintext vs encrypted `value` fields, one platform embedding model and dimension, re-embedding procedure | D3 |
+| Temporal write-up (D2) — ✅ *24 Oct* | Supersede-by-default for SEMANTIC / PROCEDURAL, overwrite for WORKING / TOOLS; `valid_from` / `valid_to` / `superseded_by`; TTL; how `UPDATE`, `FORGET`, `WINDOW` map | D2 |
 | CI | Build + tests on stable, `cargo deny` licences, AQL conformance runner against ADB, spike crash tests (S1, S2, R11, R12) ported as integration tests | B4, K3 |
 | Lance bug | File the MemWAL replay report (`lancebug.md`) | K7 |
 

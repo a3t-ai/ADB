@@ -1,0 +1,15 @@
+[package]
+name = "adb-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB partition log: the Log trait and implementations (ARCHITECTURE.md §9, §11, §16)"
+
+[dependencies]
+adb-core.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

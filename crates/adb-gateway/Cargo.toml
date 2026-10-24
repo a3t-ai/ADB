@@ -1,0 +1,8 @@
+[package]
+name = "adb-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB Client streams, delivery buffers, acks, catch-up, routing to owners (ARCHITECTURE.md §11.7; stage E, M4)"
+
+[dependencies]

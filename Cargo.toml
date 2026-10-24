@@ -8,6 +8,11 @@ members = [
     "crates/adb-server",
     "crates/adb-mcp",
     "crates/adb-store",
+    "crates/adb-log",
+    "crates/adb-sequencer",
+    "crates/adb-cluster",
+    "crates/adb-cq",
+    "crates/adb-gateway",
     "adb-cli",
 ]
 
@@ -41,6 +46,10 @@ petgraph = "0.6"
 
 # Vector search
 usearch = "2.8"
+
+# Log records: f16 embeddings (S9), ULID ids (D3 S1)
+half = { version = "2", features = ["serde"] }
+ulid = { version = "1", features = ["serde"] }
 
 # Arrow/DataFusion/Lance: one version line across the workspace, set by Lance
 # (pinned exactly: MemWAL option A, ARCHITECTURE.md §9.2). Lance 12 needs

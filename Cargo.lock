@@ -39,17 +39,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "adb-cluster"
+version = "0.1.0"
+
+[[package]]
 name = "adb-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "half",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "ulid",
  "uuid",
 ]
+
+[[package]]
+name = "adb-cq"
+version = "0.1.0"
 
 [[package]]
 name = "adb-executor"
@@ -69,6 +79,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "adb-gateway"
+version = "0.1.0"
+
+[[package]]
+name = "adb-log"
+version = "0.1.0"
+dependencies = [
+ "adb-core",
+ "async-trait",
+ "parking_lot",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "adb-mcp"
 version = "0.1.0"
 dependencies = [
@@ -82,6 +107,16 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "adb-sequencer"
+version = "0.1.0"
+dependencies = [
+ "adb-core",
+ "adb-log",
+ "chrono",
+ "tokio",
 ]
 
 [[package]]
@@ -3233,6 +3268,7 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "num-traits",
+ "serde",
  "zerocopy",
 ]
 
@@ -3817,15 +3853,6 @@ name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
@@ -5950,7 +5977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -5969,7 +5996,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7916,6 +7943,17 @@ name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.5",
+ "serde",
+ "web-time",
+]
 
 [[package]]
 name = "unicase"

@@ -1,0 +1,8 @@
+[package]
+name = "adb-cq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB Continuous queries: result state, update strategies, read-set capture, debounce (ARCHITECTURE.md §11.7; M2)"
+
+[dependencies]

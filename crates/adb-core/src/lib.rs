@@ -6,9 +6,11 @@
 //! - Link/ontology types
 //! - Error types
 //! - Scope and namespace handling
+//! - Log records and effects (`log`)
 
 pub mod error;
 pub mod link;
+pub mod log;
 pub mod memory;
 pub mod predicate;
 pub mod scope;

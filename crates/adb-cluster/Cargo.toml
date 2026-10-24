@@ -1,0 +1,8 @@
+[package]
+name = "adb-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB Control-plane client: routing map, leases, owner claims, hibernation and scheduled wakes (ARCHITECTURE.md §8, §14.1; M4)"
+
+[dependencies]
