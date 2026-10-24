@@ -7,6 +7,7 @@ members = [
     "crates/adb-executor",
     "crates/adb-server",
     "crates/adb-mcp",
+    "crates/adb-store",
     "adb-cli",
 ]
 
@@ -16,7 +17,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["ADB Contributors"]
 repository = "https://github.com/adb/adb"
-rust-version = "1.75"
+rust-version = "1.91"
 
 [workspace.dependencies]
 # Async runtime
@@ -29,7 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Time
-chrono = { version = "=0.4.38", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 
 # Concurrent data structures
 dashmap = "5.5"
@@ -41,10 +42,16 @@ petgraph = "0.6"
 # Vector search
 usearch = "2.8"
 
-# Arrow/DataFusion (analytics)
-arrow = { version = "51", features = ["prettyprint"] }
-datafusion = "37"
-parquet = "51"
+# Arrow/DataFusion/Lance: one version line across the workspace, set by Lance
+# (pinned exactly: MemWAL option A, ARCHITECTURE.md §9.2). Lance 12 needs
+# Rust >= 1.91 and protoc at build time.
+arrow = { version = "58", features = ["prettyprint"] }
+arrow-array = "58"
+arrow-schema = "58"
+datafusion = "54"
+parquet = "58"
+object_store = "0.14"
+lance = "=12.0.0"
 
 # Parsing
 pest = "2.7"

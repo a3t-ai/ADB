@@ -1,0 +1,16 @@
+[package]
+name = "adb-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB storage: Lance tables and the MemWAL applier (ARCHITECTURE.md §9, §16)"
+
+[dependencies]
+lance.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
+futures.workspace = true
