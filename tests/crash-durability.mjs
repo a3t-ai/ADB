@@ -32,7 +32,8 @@ const freePort = () => new Promise(res => {
 });
 
 async function waitHealthy(url) {
-  for (let i = 0; i < 600; i++) {
+  // Replay grows with the log: a debug build replays ~10k records/s, so allow 5 minutes.
+  for (let i = 0; i < 6000; i++) {
     try { if ((await fetch(`${url}/health`)).ok) return; } catch {}
     await new Promise(r => setTimeout(r, 50));
   }

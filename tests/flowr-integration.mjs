@@ -169,6 +169,11 @@ try {
   const tools = (flowOutput(r.text) ?? []).map(t => t.name);
   check('tools/list through FlowR', ['aql_query', 'remember', 'recall', 'store_memory', 'get_stats'].every(t => tools.includes(t)), r.text);
 
+  // FlowR's own discovery tool (A3T's Permissions tab, the chat LLM) must ask ADB too.
+  r = await flowr('list_mcp_tools', { namespace: 'a3t', name: 'agent-memory-mcp' });
+  let listed; try { listed = JSON.parse(r.text); } catch {}
+  check('list_mcp_tools discovers ADB tools from an …/mcp/sse resource', !r.isError && ['aql_query', 'remember', 'recall'].every(t => listed?.tools?.includes(t)), r.text);
+
   r = await callTool('remember', { content: 'Acme renews on 1 Nov', key: 'acme-renewal', fields: { account: 'acme' } });
   check('remember a fact', !r.isError && flowOutput(r.text)?.data?.type === 'stored', r.text);
 
