@@ -6,8 +6,10 @@ pub mod engine;
 mod error;
 mod executor;
 mod result;
+pub mod writes;
 
 pub use error::{ExecutorError, ExecutorResult};
 pub use executor::Executor;
 pub use engine::{Engine, LocalEngine};
 pub use result::{QueryResult, ResultSet};
+pub use writes::{DirectWrites, DurableWrites, ReplayStats, Writes};

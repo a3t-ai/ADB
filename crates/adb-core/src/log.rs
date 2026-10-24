@@ -104,6 +104,30 @@ pub enum Memory {
     Episodic,
 }
 
+impl From<crate::MemoryType> for Memory {
+    fn from(t: crate::MemoryType) -> Self {
+        match t {
+            crate::MemoryType::Working => Memory::Working,
+            crate::MemoryType::Tools => Memory::Tools,
+            crate::MemoryType::Procedural => Memory::Procedural,
+            crate::MemoryType::Semantic => Memory::Semantic,
+            crate::MemoryType::Episodic => Memory::Episodic,
+        }
+    }
+}
+
+impl From<Memory> for crate::MemoryType {
+    fn from(m: Memory) -> Self {
+        match m {
+            Memory::Working => crate::MemoryType::Working,
+            Memory::Tools => crate::MemoryType::Tools,
+            Memory::Procedural => crate::MemoryType::Procedural,
+            Memory::Semantic => crate::MemoryType::Semantic,
+            Memory::Episodic => crate::MemoryType::Episodic,
+        }
+    }
+}
+
 /// Row shape (D3 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +151,26 @@ pub enum Visibility {
     Private,
     Shared,
     Cluster,
+}
+
+impl From<crate::Scope> for Visibility {
+    fn from(s: crate::Scope) -> Self {
+        match s {
+            crate::Scope::Private => Visibility::Private,
+            crate::Scope::Shared => Visibility::Shared,
+            crate::Scope::Cluster => Visibility::Cluster,
+        }
+    }
+}
+
+impl From<Visibility> for crate::Scope {
+    fn from(v: Visibility) -> Self {
+        match v {
+            Visibility::Private => crate::Scope::Private,
+            Visibility::Shared => crate::Scope::Shared,
+            Visibility::Cluster => crate::Scope::Cluster,
+        }
+    }
 }
 
 /// Who wrote a row, and in which transaction.
@@ -194,15 +238,17 @@ pub enum Effect {
     /// `UPDATE` on SEMANTIC / PROCEDURAL: close `old` and add `new` in one step.
     Supersede { old: RecordId, new: NewRow },
     /// `UPDATE` on EPISODIC / WORKING / TOOLS: merge `fields` into the row in place.
+    /// (Stage C also patches SEMANTIC / PROCEDURAL; `Supersede` arrives with stage D.)
     Patch {
+        memory: Memory,
         id: RecordId,
         fields: serde_json::Map<String, serde_json::Value>,
         version: u32,
     },
     /// `FORGET`: tombstone every version of the lineage and its edges (D2 §5).
-    Forget { lineage_id: RecordId },
+    Forget { memory: Memory, lineage_id: RecordId },
     /// TTL expiry, committed by the owner's timer (D2 §4).
-    Expire { lineage_id: RecordId },
+    Expire { memory: Memory, lineage_id: RecordId },
     /// `SUBSCRIBE` / `WATCH` registration (`kind = sub | cq` row).
     Register(NewRow),
     /// Batched cursor advance for a subscription.
@@ -283,7 +329,7 @@ mod tests {
             effects: vec![
                 Effect::Supersede { old, new },
                 Effect::UpdateSubCursor { sub_id: ids.next(ts), cursor: LogOffset(41) },
-                Effect::Expire { lineage_id: ids.next(ts) },
+                Effect::Expire { memory: Memory::Working, lineage_id: ids.next(ts) },
             ],
         };
         let json = serde_json::to_string(&record).unwrap();

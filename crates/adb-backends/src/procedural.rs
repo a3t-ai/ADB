@@ -45,6 +45,9 @@ pub struct ProcedureNode {
     pub metadata: serde_json::Value,
     /// Version number (incremented on update)
     pub version: u64,
+    /// When the procedure was stored (kept out of the payload, which predates it)
+    #[serde(skip, default = "adb_core::time::now")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ProcedureNode {
@@ -66,6 +69,7 @@ impl ProcedureNode {
             variables: HashMap::new(),
             metadata: serde_json::Value::Null,
             version: 1,
+            created_at: adb_core::time::now(),
         }
     }
 
@@ -73,6 +77,9 @@ impl ProcedureNode {
     pub fn to_memory_record(&self, scope: Scope) -> MemoryRecord {
         let mut metadata = Metadata::new(scope);
         metadata.version = self.version;
+        // The stored time, not the time of the read.
+        metadata.created_at = self.created_at;
+        metadata.accessed_at = self.created_at;
         MemoryRecord {
             id: self.pattern_id.clone(),
             memory_type: MemoryType::Procedural,

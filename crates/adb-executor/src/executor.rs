@@ -14,11 +14,14 @@ use aql_planner::{ExecutionPlan, FanOutPlan, Operation, PipelinePlan, PipelineSt
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::result::{QueryResult, ResultSet, SourceResult};
+use crate::writes::{DirectWrites, Writes};
 
 /// The query executor
 pub struct Executor {
     /// The ADB instance
     adb: Arc<Adb>,
+    /// Where writes go: straight to `adb`, or through the log (stage C)
+    writes: Arc<dyn Writes>,
     /// The planner
     planner: Planner,
 }
@@ -26,8 +29,15 @@ pub struct Executor {
 impl Executor {
     /// Create a new executor
     pub fn new(adb: Arc<Adb>) -> Self {
+        let writes = Arc::new(DirectWrites(Arc::clone(&adb)));
+        Self::with_writes(adb, writes)
+    }
+
+    /// An executor whose writes go through `writes` (e.g. [`crate::writes::DurableWrites`]).
+    pub fn with_writes(adb: Arc<Adb>, writes: Arc<dyn Writes>) -> Self {
         Self {
             adb,
+            writes,
             planner: Planner::new(),
         }
     }
@@ -277,7 +287,7 @@ impl Executor {
                 let mut total_count = 0u64;
 
                 for mem_type in MemoryType::all() {
-                    let count = self.adb.forget(*mem_type, &fanout.predicate).await?;
+                    let count = self.writes.forget(*mem_type, &fanout.predicate).await?;
                     total_count += count;
                 }
 
@@ -290,7 +300,7 @@ impl Executor {
                 if let Some(data) = &fanout.data {
                     for mem_type in MemoryType::all() {
                         let count = self
-                            .adb
+                            .writes
                             .update(*mem_type, &fanout.predicate, data.clone())
                             .await?;
                         total_count += count;
@@ -696,8 +706,8 @@ impl Executor {
             .map(std::time::Duration::from_millis);
 
         let record = self
-            .adb
-            .store_with_options(step.memory_type, key, payload, scope, namespace, ttl)
+            .writes
+            .store(step.memory_type, key, payload, scope, namespace, ttl)
             .await?;
 
         Ok(QueryResult::stored(
@@ -716,7 +726,7 @@ impl Executor {
             .clone();
 
         let count = self
-            .adb
+            .writes
             .update(step.memory_type, &step.predicate, data)
             .await?;
 
@@ -726,7 +736,7 @@ impl Executor {
     async fn execute_forget(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
 
-        let count = self.adb.forget(step.memory_type, &step.predicate).await?;
+        let count = self.writes.forget(step.memory_type, &step.predicate).await?;
 
         Ok(QueryResult::count(count, start.elapsed().as_millis() as u64))
     }
@@ -797,7 +807,7 @@ impl Executor {
         let mut link_count = 0u64;
         for source in &source_records {
             for target in &target_records {
-                self.adb
+                self.writes
                     .link(step.memory_type, &source.id, to_type, &target.id, link_type, weight)
                     .await?;
                 link_count += 1;

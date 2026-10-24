@@ -94,13 +94,34 @@ impl<L: Log> Sequencer<L> {
     where
         F: FnOnce(&mut Txn<'_>) -> Vec<Effect>,
     {
-        if let Some(id) = &txn_id {
-            if let Some(offset) = self.seen.get(id) {
-                return Ok(*offset);
-            }
+        if let Some(offset) = txn_id.as_ref().and_then(|id| self.seen.get(id)) {
+            return Ok(*offset);
         }
-        let commit_ts = self.clock.tick((self.wall)());
+        let commit_ts = self.begin();
         let effects = build(&mut Txn { commit_ts, ids: &mut self.ids });
+        self.append(commit_ts, txn_id, effects).await
+    }
+
+    /// Two-phase commit for writes that must read state at their commit time first
+    /// (an `UPDATE` resolving its targets): `begin` fixes the commit timestamp, the
+    /// caller prepares effects as of that time, then [`Sequencer::append`] logs them.
+    /// The caller holds the sequencer throughout, so no other write interleaves.
+    pub fn begin(&mut self) -> CommitTs {
+        self.clock.tick((self.wall)())
+    }
+
+    /// A new id carrying `at` (a timestamp from [`Sequencer::begin`]).
+    pub fn new_id(&mut self, at: CommitTs) -> RecordId {
+        self.ids.next(at)
+    }
+
+    /// Whether `txn_id` already committed, and at which offset.
+    pub fn committed(&self, txn_id: &str) -> Option<LogOffset> {
+        self.seen.get(txn_id).copied()
+    }
+
+    /// Log a prepared transaction at `commit_ts`. Resolves once it is durable.
+    pub async fn append(&mut self, commit_ts: CommitTs, txn_id: Option<String>, effects: Vec<Effect>) -> LogResult<LogOffset> {
         let record = LogRecord {
             partition: self.log.partition(),
             offset: self.log.last_offset().next(),
@@ -114,6 +135,11 @@ impl<L: Log> Sequencer<L> {
             self.seen.insert(id, offset);
         }
         Ok(offset)
+    }
+
+    /// Resume after replay: the clock continues after the last committed timestamp.
+    pub fn resume_after(&mut self, last: CommitTs) {
+        self.clock = CommitClock::after(last);
     }
 }
 
@@ -135,7 +161,7 @@ mod tests {
     }
 
     fn forget(txn: &mut Txn<'_>) -> Vec<Effect> {
-        vec![Effect::Forget { lineage_id: txn.new_id() }]
+        vec![Effect::Forget { memory: adb_core::log::Memory::Working, lineage_id: txn.new_id() }]
     }
 
     #[tokio::test]

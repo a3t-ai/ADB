@@ -4,6 +4,10 @@
 //! - `adb serve --http [--host 0.0.0.0] [--port 3000]` — REST + MCP over HTTP/SSE,
 //!   a drop-in for ClawDB's server (A3T); `adb serve-http` is the same
 //! - `adb query "<AQL>"` — run one statement and print the JSON result
+//!
+//! With `--data-dir <dir>` (or `ADB_DATA_DIR`) every write goes to a write-ahead log
+//! in that directory first and is replayed on start, so memory survives restarts.
+//! Without it ADB keeps memory in RAM only, as before.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -16,6 +20,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Parser)]
 #[command(name = "adb", version, about = "Agent Database — memory for AI agents")]
 struct Cli {
+    /// Keep memory durable in this directory (write-ahead log, replayed on start)
+    #[arg(long, global = true, env = "ADB_DATA_DIR")]
+    data_dir: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -57,15 +64,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .init();
 
-    let engine: Arc<dyn Engine> = Arc::new(LocalEngine::default());
+    let engine: Arc<dyn Engine> = match &cli.data_dir {
+        Some(dir) => {
+            let (engine, replayed) = LocalEngine::durable(dir).await?;
+            tracing::info!(
+                dir = %dir.display(),
+                records = replayed.records,
+                last_offset = replayed.last_offset.0,
+                "ADB durable: replayed the write-ahead log"
+            );
+            Arc::new(engine)
+        }
+        None => {
+            tracing::info!("ADB in memory only (no --data-dir): memory is lost on restart");
+            Arc::new(LocalEngine::default())
+        }
+    };
 
     match command {
         Commands::Serve { http: false, .. } => {
             tracing::info!("ADB MCP server on stdio");
-            McpServer::new(engine).run_stdio().await?;
+            let mcp = McpServer::new(engine);
+            tokio::select! {
+                r = mcp.run_stdio() => r?,
+                s = shutdown_signal() => tracing::info!(signal = s, "ADB shutting down"),
+            }
         }
         Commands::Serve { http: true, host, port } | Commands::ServeHttp { host, port } => {
-            adb_server::serve(SocketAddr::new(host, port), engine).await?;
+            tokio::select! {
+                r = adb_server::serve(SocketAddr::new(host, port), engine) => r?,
+                // Acknowledged writes are already durable (acked after fsync); returning
+                // drops the engine, which drains and syncs the log.
+                s = shutdown_signal() => tracing::info!(signal = s, "ADB shutting down"),
+            }
         }
         Commands::Query { query } => match engine.query(&query, None).await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
@@ -76,4 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     }
     Ok(())
+}
+
+/// SIGTERM (Kubernetes stopping the pod) or Ctrl-C.
+async fn shutdown_signal() -> &'static str {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+    }
 }

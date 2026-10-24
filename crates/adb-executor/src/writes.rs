@@ -1,0 +1,369 @@
+//! Where the executor's writes go (DELIVERY_PLAN.md stage C).
+//!
+//! - [`DirectWrites`] — straight to the in-memory backends (no log): tests and the
+//!   in-memory server.
+//! - [`DurableWrites`] — log first: each write is resolved into effects
+//!   (`adb_core::log::Effect`) at its commit timestamp, appended to the partition log
+//!   through the sequencer, and applied only after the log made it durable. On open,
+//!   [`replay`] rebuilds the backends from the log.
+//!
+//! Applying always runs under `adb_core::time::at(commit_ts)`, so a write applied
+//! live and the same write replayed after a restart produce the same records (same
+//! ids, `created_at`, TTL start, expiry checks; D2_TEMPORAL.md T2).
+//!
+//! Stage C limits: one partition (`PartitionId(0)`); `UPDATE` patches every memory
+//! type in place (D2's supersede for SEMANTIC / PROCEDURAL comes with the Lance
+//! store, stage D); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per
+//! memory type.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use adb_backends::Adb;
+use adb_core::log::{
+    CommitTs, Effect, Kind, LogOffset, Memory, NewRow, PartitionId, Provenance, RecordId, RowData, Visibility,
+};
+use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Predicate, Scope};
+use adb_log::{Log, LogError};
+use adb_sequencer::Sequencer;
+use async_trait::async_trait;
+use tokio::sync::Mutex;
+
+/// The partition every stage C write goes to (placement arrives with M3).
+pub const SINGLE_PARTITION: PartitionId = PartitionId(0);
+/// Tenant and named scope for stage C rows (D3 S6 default).
+const TENANT: &str = "default";
+const DEFAULT_SCOPE: &str = "tenant:default";
+
+/// The executor's write operations.
+#[async_trait]
+pub trait Writes: Send + Sync {
+    async fn store(
+        &self,
+        memory_type: MemoryType,
+        key: &str,
+        payload: serde_json::Value,
+        scope: Scope,
+        namespace: Option<&str>,
+        ttl: Option<Duration>,
+    ) -> AdbResult<MemoryRecord>;
+
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64>;
+
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64>;
+
+    async fn link(
+        &self,
+        from_type: MemoryType,
+        from_id: &str,
+        to_type: MemoryType,
+        to_id: &str,
+        link_type: &str,
+        weight: f32,
+    ) -> AdbResult<Link>;
+}
+
+/// Writes straight to the backends.
+pub struct DirectWrites(pub Arc<Adb>);
+
+#[async_trait]
+impl Writes for DirectWrites {
+    async fn store(
+        &self,
+        memory_type: MemoryType,
+        key: &str,
+        payload: serde_json::Value,
+        scope: Scope,
+        namespace: Option<&str>,
+        ttl: Option<Duration>,
+    ) -> AdbResult<MemoryRecord> {
+        self.0.store_with_options(memory_type, key, payload, scope, namespace, ttl).await
+    }
+
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64> {
+        self.0.update(memory_type, predicate, data).await
+    }
+
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64> {
+        self.0.forget(memory_type, predicate).await
+    }
+
+    async fn link(
+        &self,
+        from_type: MemoryType,
+        from_id: &str,
+        to_type: MemoryType,
+        to_id: &str,
+        link_type: &str,
+        weight: f32,
+    ) -> AdbResult<Link> {
+        self.0.link(from_type, from_id, to_type, to_id, link_type, weight).await
+    }
+}
+
+fn log_err(e: LogError) -> AdbError {
+    AdbError::Internal(format!("log: {e}"))
+}
+
+fn kind_of(memory: MemoryType) -> Kind {
+    match memory {
+        MemoryType::Episodic => Kind::Episode,
+        MemoryType::Tools => Kind::Tool,
+        _ => Kind::Entity,
+    }
+}
+
+fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
+    RowData {
+        tenant_id: TENANT.into(),
+        scope: DEFAULT_SCOPE.into(),
+        visibility: Visibility::Private,
+        namespace: None,
+        memory: memory.into(),
+        kind,
+        key: value.get("key").and_then(|v| v.as_str()).map(String::from),
+        subject_id: None,
+        predicate: None,
+        object_id: None,
+        link_type: None,
+        weight: None,
+        text: value.get("content").and_then(|v| v.as_str()).map(String::from),
+        value,
+        sealed: None,
+        embedding: None,
+        ttl_at: None,
+        provenance: Provenance::default(),
+    }
+}
+
+/// Writes through the log.
+pub struct DurableWrites<L: Log> {
+    adb: Arc<Adb>,
+    seq: Mutex<Sequencer<L>>,
+}
+
+impl<L: Log + 'static> DurableWrites<L> {
+    /// Replay `log` into `adb`, then accept new writes on top of it.
+    pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>) -> AdbResult<(Self, ReplayStats)> {
+        let stats = replay(&adb, seq.log()).await?;
+        if let Some(last) = stats.last_commit_ts {
+            seq.resume_after(last);
+        }
+        Ok((Self { adb, seq: Mutex::new(seq) }, stats))
+    }
+
+    /// The last durable offset (tests and metrics).
+    pub async fn durable_offset(&self) -> LogOffset {
+        self.seq.lock().await.log().durable_offset()
+    }
+}
+
+#[async_trait]
+impl<L: Log + 'static> Writes for DurableWrites<L> {
+    async fn store(
+        &self,
+        memory_type: MemoryType,
+        key: &str,
+        payload: serde_json::Value,
+        scope: Scope,
+        namespace: Option<&str>,
+        ttl: Option<Duration>,
+    ) -> AdbResult<MemoryRecord> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let id = RecordId(Adb::store_id(memory_type, key, &payload));
+        let mut data = row(memory_type, kind_of(memory_type), payload);
+        data.visibility = scope.into();
+        data.namespace = namespace.map(String::from);
+        data.ttl_at = ttl.map(|d| CommitTs(ts.0 + d.as_micros() as i64));
+        let new = NewRow { id: id.clone(), lineage_id: id, version: 1, data };
+        let effect = match memory_type {
+            MemoryType::Episodic => Effect::PutEpisode(new),
+            MemoryType::Tools => Effect::PutTool(new),
+            _ => Effect::PutEntity(new),
+        };
+        seq.append(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        apply(&self.adb, ts, &effect).await?.ok_or_else(|| AdbError::Internal("store produced no record".into()))
+    }
+
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let ids = time::at(ts.to_datetime(), self.adb.update_targets(memory_type, predicate)).await?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let fields = match &data {
+            serde_json::Value::Object(map) => map.clone(),
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("value".into(), other.clone());
+                m
+            }
+        };
+        let effects: Vec<Effect> = ids
+            .iter()
+            .map(|id| Effect::Patch { memory: memory_type.into(), id: RecordId(id.clone()), fields: fields.clone(), version: 0 })
+            .collect();
+        seq.append(ts, None, effects).await.map_err(log_err)?;
+        // Apply exactly what was logged, so live and replayed updates agree.
+        time::at(ts.to_datetime(), self.adb.update_ids(memory_type, &ids, serde_json::Value::Object(fields))).await
+    }
+
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let ids = time::at(ts.to_datetime(), self.adb.forget_targets(memory_type, predicate)).await?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let effects: Vec<Effect> =
+            ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
+        seq.append(ts, None, effects.clone()).await.map_err(log_err)?;
+        let mut removed = 0;
+        for effect in &effects {
+            removed += apply_count(&self.adb, ts, effect).await?;
+        }
+        Ok(removed)
+    }
+
+    async fn link(
+        &self,
+        from_type: MemoryType,
+        from_id: &str,
+        to_type: MemoryType,
+        to_id: &str,
+        link_type: &str,
+        weight: f32,
+    ) -> AdbResult<Link> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let id = seq.new_id(ts);
+        let to: Memory = to_type.into();
+        let mut data = row(from_type, Kind::Edge, serde_json::json!({ "to_memory": to }));
+        data.key = None;
+        data.text = None;
+        data.subject_id = Some(from_id.into());
+        data.predicate = Some("link".into());
+        data.object_id = Some(to_id.into());
+        data.link_type = Some(link_type.into());
+        data.weight = Some(weight);
+        let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
+        seq.append(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        apply_link(&self.adb, ts, &effect).await
+    }
+}
+
+/// What a replay did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ReplayStats {
+    pub records: u64,
+    pub effects: u64,
+    pub last_offset: LogOffset,
+    pub last_commit_ts: Option<CommitTs>,
+}
+
+/// Rebuild `adb` from every record in `log`, in order.
+pub async fn replay<L: Log>(adb: &Adb, log: &L) -> AdbResult<ReplayStats> {
+    let mut stats = ReplayStats::default();
+    let mut from = LogOffset(1);
+    loop {
+        let batch = log.read(from, 1024).await.map_err(log_err)?;
+        let Some(last) = batch.last().map(|r| r.offset) else { break };
+        for record in &batch {
+            for effect in &record.effects {
+                match effect {
+                    Effect::PutEdge(_) => {
+                        apply_link(adb, record.commit_ts, effect).await?;
+                    }
+                    _ => {
+                        apply_count(adb, record.commit_ts, effect).await?;
+                    }
+                }
+                stats.effects += 1;
+            }
+            stats.records += 1;
+            stats.last_commit_ts = Some(record.commit_ts);
+        }
+        stats.last_offset = last;
+        from = last.next();
+    }
+    Ok(stats)
+}
+
+/// Apply one effect at its commit time; returns the stored record for `Put*`.
+async fn apply(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Option<MemoryRecord>> {
+    time::at(ts.to_datetime(), async {
+        match effect {
+            Effect::PutEntity(r) | Effect::PutEpisode(r) | Effect::PutTool(r) | Effect::PutFact(r) => {
+                let ttl = r.data.ttl_at.map(|at| Duration::from_micros((at.0 - ts.0).max(0) as u64));
+                let record = adb
+                    .store_with_options(
+                        r.data.memory.into(),
+                        &r.id.0,
+                        r.data.value.clone(),
+                        r.data.visibility.into(),
+                        r.data.namespace.as_deref(),
+                        ttl,
+                    )
+                    .await?;
+                Ok(Some(record))
+            }
+            _ => {
+                apply_count_now(adb, effect).await?;
+                Ok(None)
+            }
+        }
+    })
+    .await
+}
+
+async fn apply_count(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<u64> {
+    match effect {
+        Effect::PutEntity(_) | Effect::PutEpisode(_) | Effect::PutTool(_) | Effect::PutFact(_) => {
+            apply(adb, ts, effect).await.map(|r| r.is_some() as u64)
+        }
+        _ => time::at(ts.to_datetime(), apply_count_now(adb, effect)).await,
+    }
+}
+
+/// Non-`Put` effects; the clock is already fixed by the caller.
+async fn apply_count_now(adb: &Adb, effect: &Effect) -> AdbResult<u64> {
+    match effect {
+        Effect::Patch { memory, id, fields, .. } => {
+            adb.update_ids((*memory).into(), &[id.0.clone()], serde_json::Value::Object(fields.clone())).await
+        }
+        Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
+            adb.forget_ids((*memory).into(), &[lineage_id.0.clone()]).await
+        }
+        // Subscriptions, events and supersede arrive with stages D and E.
+        _ => Ok(0),
+    }
+}
+
+async fn apply_link(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Link> {
+    let Effect::PutEdge(r) = effect else {
+        return Err(AdbError::Internal("apply_link needs PutEdge".into()));
+    };
+    let to: Memory = r
+        .data
+        .value
+        .get("to_memory")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?;
+    let d = &r.data;
+    time::at(
+        ts.to_datetime(),
+        adb.link_with_id(
+            &r.id.0,
+            d.memory.into(),
+            d.subject_id.as_deref().unwrap_or_default(),
+            to.into(),
+            d.object_id.as_deref().unwrap_or_default(),
+            d.link_type.as_deref().unwrap_or_default(),
+            d.weight.unwrap_or(1.0),
+        ),
+    )
+    .await
+}

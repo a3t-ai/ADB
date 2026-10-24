@@ -42,6 +42,9 @@ pub struct ToolRecord {
     pub relevance_scores: HashMap<String, f32>,
     /// Additional metadata
     pub metadata: serde_json::Value,
+    /// When the tool was stored (kept out of the payload, which predates it)
+    #[serde(skip, default = "adb_core::time::now")]
+    pub created_at: DateTime<Utc>,
 }
 
 impl ToolRecord {
@@ -64,6 +67,7 @@ impl ToolRecord {
             last_called: None,
             relevance_scores: HashMap::new(),
             metadata: serde_json::Value::Null,
+            created_at: adb_core::time::now(),
         }
     }
 
@@ -73,7 +77,13 @@ impl ToolRecord {
             id: self.tool_id.clone(),
             memory_type: MemoryType::Tools,
             data: serde_json::to_value(self).unwrap_or_default(),
-            metadata: Metadata::new(scope),
+            metadata: {
+                // The stored time, not the time of the read.
+                let mut m = Metadata::new(scope);
+                m.created_at = self.created_at;
+                m.accessed_at = self.created_at;
+                m
+            },
         }
     }
 

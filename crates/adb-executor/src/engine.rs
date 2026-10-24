@@ -13,6 +13,11 @@ use adb_core::{MemoryRecord, MemoryType};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
+use adb_core::log::Epoch;
+use adb_log::{LocalWal, WalConfig};
+use adb_sequencer::Sequencer;
+
+use crate::writes::{DurableWrites, ReplayStats, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
 
 /// What every API surface needs from the database.
@@ -37,6 +42,20 @@ impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
         Self { adb, executor }
+    }
+}
+
+impl LocalEngine {
+    /// A durable engine: replays the write-ahead log in `dir`, then logs every write
+    /// there before applying it (stage C). Returns what the replay found.
+    pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
+        let dir = dir.into();
+        let adb = Arc::new(Adb::new());
+        let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
+        let seq = Sequencer::new(wal, Epoch(1));
+        let (writes, stats) = DurableWrites::open(Arc::clone(&adb), seq).await.map_err(|e| e.to_string())?;
+        let executor = Executor::with_writes(Arc::clone(&adb), Arc::new(writes));
+        Ok((Self { adb, executor }, stats))
     }
 }
 

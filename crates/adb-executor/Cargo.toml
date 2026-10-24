@@ -9,6 +9,8 @@ description = "ADB query executor"
 adb-core = { path = "../adb-core" }
 adb-backends = { path = "../adb-backends" }
 aql-planner = { path = "../aql-planner" }
+adb-log = { path = "../adb-log" }
+adb-sequencer = { path = "../adb-sequencer" }
 aql-parser.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
@@ -19,4 +21,5 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }

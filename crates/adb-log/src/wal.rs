@@ -432,7 +432,7 @@ mod tests {
             epoch: Epoch(1),
             commit_ts: ts,
             txn_id: Some(format!("txn-{offset}")),
-            effects: vec![Effect::Forget { lineage_id: RecordId(format!("01K8LINEAGE{offset:015}")) }],
+            effects: vec![Effect::Forget { memory: adb_core::log::Memory::Working, lineage_id: RecordId(format!("01K8LINEAGE{offset:015}")) }],
         }
     }
 

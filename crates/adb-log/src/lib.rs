@@ -146,7 +146,7 @@ mod tests {
             epoch: Epoch(epoch),
             commit_ts: CommitTs(offset as i64),
             txn_id: None,
-            effects: vec![Effect::Forget { lineage_id: ids.next(CommitTs(offset as i64)) }],
+            effects: vec![Effect::Forget { memory: adb_core::log::Memory::Working, lineage_id: ids.next(CommitTs(offset as i64)) }],
         }
     }
 
