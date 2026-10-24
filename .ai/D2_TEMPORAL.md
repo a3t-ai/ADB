@@ -1,7 +1,8 @@
 # D2 — Temporal model
 
 > **Status:** agreed 24 Oct 2026 (decisions T1–T8 as recommended) · @Sriram
-> **Closes:** `RISK_BURNDOWN.md` D2.
+> **Closes:** `RISK_BURNDOWN.md` D2. *Amended 24 Oct: expiry commits an `Expire` effect
+> (§4), matching `SUBSCRIPTIONS_CQ_SPEC.md`.*
 > **Builds on:** the 9 Oct decision (facts supersede by default; WORKING and TOOLS
 > overwrite; transaction time from the log; "as of" queries deferred),
 > `ARCHITECTURE.md` §5 (AQL mapping), §7 (table layout), §9 (write path), §11.7
@@ -98,11 +99,16 @@ is current when all hold:
 - **Physical removal:** WORKING's in-memory map sweeps expired entries; Lance rows are
   dropped by compaction (D5). Expired data is removed by the same path as `FORGET`
   but on the compaction schedule, not the forget SLA, and log payloads are not
-  crypto-shredded (TTL is housekeeping, not an erasure request).
-- **Expiry is not a write**: it needs no log record, so replay is unaffected. Timers
-  in the owner's timer wheel turn `ttl_at` and `valid_to` boundaries into
-  notifications for subscriptions and continuous queries (§11.7), and into scheduled
-  wakes for hibernated partitions (§14.1).
+  crypto-shredded (TTL is housekeeping, not an erasure request). The `Expire`
+  effect below marks the row for that compaction.
+- **Expiry is also logged**, after the fact: when the owner's timer wheel reaches a
+  `ttl_at`, it commits an `Expire(lineage)` effect through the log, so every
+  subscriber and continuous query sees the expiry at one offset
+  (`SUBSCRIPTIONS_CQ_SPEC.md`, temporal events). Reads don't wait for it: they hide
+  the row from `ttl_at` on. A hibernated partition with a pending `ttl_at` registers a
+  scheduled wake (§14.1), so the `Expire` lands when it wakes. Replay applies the
+  logged `Expire` like any effect, so tables stay identical. `volatile` WORKING
+  entries expire in memory only.
 
 ## 5. FORGET
 
@@ -133,7 +139,7 @@ These are the effect types B4 adds to `adb-core`.
 | `UPDATE INTO EPISODIC / WORKING / TOOLS` | per match: `PatchRecord(id, fields, version + 1)` |
 | `FORGET` | per matched lineage: `Forget(lineage_id)` (tombstones all versions and edges) |
 | `LINK` | `PutEdge` between lineage ids |
-| TTL expiry | none (read filter + timers) |
+| TTL expiry (owner timer) | `Expire(lineage_id)`; reads already hide the row from `ttl_at` |
 
 `UPDATE` validates against the current view at its read offset (OCC read set, §9): if
 the matched lineage was superseded or forgotten before commit, the transaction
