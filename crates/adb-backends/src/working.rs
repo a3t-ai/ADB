@@ -284,52 +284,39 @@ impl Backend for WorkingBackend {
         self.lookup(predicate, modifiers).await
     }
 
-    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64> {
-        let mut count = 0u64;
-
-        // For ALL predicate, clear everything
+    async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
         if matches!(predicate, Predicate::All) {
-            count = self.store.len() as u64;
-            self.store.clear();
-            return Ok(count);
+            return Ok(self.store.iter().map(|r| r.key().clone()).collect());
         }
-
-        // Otherwise, find and remove matching records
-        let to_remove: Vec<String> = self
+        Ok(self
             .store
             .iter()
             .filter(|r| self.matches_predicate(r.value(), predicate))
             .map(|r| r.key().clone())
-            .collect();
-
-        for key in to_remove {
-            if self.store.remove(&key).is_some() {
-                count += 1;
-            }
-        }
-
-        Ok(count)
+            .collect())
     }
 
-    async fn update(
-        &self,
-        predicate: &Predicate,
-        data: serde_json::Value,
-    ) -> AdbResult<u64> {
-        let mut count = 0u64;
+    async fn forget_ids(&self, ids: &[String]) -> AdbResult<u64> {
+        Ok(ids.iter().filter(|key| self.store.remove(*key).is_some()).count() as u64)
+    }
 
+    async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
         // Find matching records (excluding already expired ones)
-        let keys: Vec<String> = self
+        Ok(self
             .store
             .iter()
             .filter(|r| !r.value().is_expired()) // Skip expired records
             .filter(|r| self.matches_predicate(r.value(), predicate))
             .map(|r| r.key().clone())
-            .collect();
+            .collect())
+    }
+
+    async fn update_ids(&self, ids: &[String], data: serde_json::Value) -> AdbResult<u64> {
+        let mut count = 0u64;
 
         // Update each record with race condition protection
-        for key in keys {
-            if let Some(mut entry) = self.store.get_mut(&key) {
+        for key in ids {
+            if let Some(mut entry) = self.store.get_mut(key) {
                 // Double-check expiration under lock to handle race with TTL reaper
                 if entry.is_expired() {
                     continue; // Skip expired record (TTL may have expired between collect and update)

@@ -147,6 +147,19 @@ impl LinkStore {
     }
 
     /// Get link type statistics
+    /// Store a fully built link (its id included), e.g. when replaying a logged `LINK`.
+    pub fn insert_link(&self, link: Link) -> Link {
+        // Add to primary storage
+        self.by_id.insert(link.id.clone(), link.clone());
+
+        // Add to indexes
+        self.index_link(&link);
+
+        self.link_count.fetch_add(1, Ordering::SeqCst);
+
+        link
+    }
+
     pub fn type_stats(&self) -> HashMap<String, usize> {
         self.by_type
             .iter()
@@ -178,16 +191,7 @@ impl LinkStoreOps for LinkStore {
         weight: f32,
     ) -> AdbResult<Link> {
         let link = Link::new(from_type, from_id, to_type, to_id, link_type, weight);
-
-        // Add to primary storage
-        self.by_id.insert(link.id.clone(), link.clone());
-
-        // Add to indexes
-        self.index_link(&link);
-
-        self.link_count.fetch_add(1, Ordering::SeqCst);
-
-        Ok(link)
+        Ok(self.insert_link(link))
     }
 
     async fn get_links_from(

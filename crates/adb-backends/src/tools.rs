@@ -352,41 +352,39 @@ impl Backend for ToolsBackend {
         Ok(results)
     }
 
-    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64> {
-        let mut tools = self.tools.write();
-        let initial_count = tools.len();
-
+    async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
         // Find tools to remove
-        let to_remove: Vec<String> = tools
+        Ok(self
+            .tools
+            .read()
             .values()
             .filter(|t| self.matches_predicate(t, predicate))
             .map(|t| t.tool_id.clone())
-            .collect();
-
-        for id in &to_remove {
-            tools.remove(id);
-        }
-
-        Ok((initial_count - tools.len()) as u64)
+            .collect())
     }
 
-    async fn update(
-        &self,
-        predicate: &Predicate,
-        data: serde_json::Value,
-    ) -> AdbResult<u64> {
+    async fn forget_ids(&self, ids: &[String]) -> AdbResult<u64> {
+        let mut tools = self.tools.write();
+        Ok(ids.iter().filter(|id| tools.remove(*id).is_some()).count() as u64)
+    }
+
+    async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        // Find matching tools
+        Ok(self
+            .tools
+            .read()
+            .values()
+            .filter(|t| self.matches_predicate(t, predicate))
+            .map(|t| t.tool_id.clone())
+            .collect())
+    }
+
+    async fn update_ids(&self, ids: &[String], data: serde_json::Value) -> AdbResult<u64> {
         let mut tools = self.tools.write();
         let mut count = 0u64;
 
-        // Find matching tools
-        let ids: Vec<String> = tools
-            .values()
-            .filter(|t| self.matches_predicate(t, predicate))
-            .map(|t| t.tool_id.clone())
-            .collect();
-
         for id in ids {
-            if let Some(tool) = tools.get_mut(&id) {
+            if let Some(tool) = tools.get_mut(id) {
                 // Update fields from data
                 if let Some(name) = data["name"].as_str() {
                     tool.name = name.to_string();

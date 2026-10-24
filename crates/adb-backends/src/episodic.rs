@@ -471,19 +471,24 @@ impl Backend for EpisodicBackend {
         self.lookup(predicate, modifiers).await
     }
 
-    async fn update(&self, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64> {
-        let mut records = self.records.write();
-        let mut count = 0;
-
-        // Collect keys to update (can't modify while iterating)
-        let keys_to_update: Vec<(i64, String)> = records
+    async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        Ok(self
+            .records
+            .read()
             .iter()
             .filter(|(_, r)| self.matches_predicate(r, predicate))
-            .map(|(k, _)| k.clone())
-            .collect();
+            .map(|((_, id), _)| id.clone())
+            .collect())
+    }
 
-        for key in keys_to_update {
-            if let Some(record) = records.get_mut(&key) {
+    async fn update_ids(&self, ids: &[String], data: serde_json::Value) -> AdbResult<u64> {
+        let mut records = self.records.write();
+        let id_index = self.id_index.read();
+        let mut count = 0;
+
+        for id in ids {
+            let Some(&ts) = id_index.get(id) else { continue };
+            if let Some(record) = records.get_mut(&(ts, id.clone())) {
                 // Merge data into existing record
                 if let (Some(existing), Some(updates)) =
                     (record.data.as_object_mut(), data.as_object())
@@ -503,22 +508,27 @@ impl Backend for EpisodicBackend {
         Ok(count)
     }
 
-    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64> {
-        let mut records = self.records.write();
-        let mut id_index = self.id_index.write();
-
-        let keys_to_remove: Vec<(i64, String)> = records
+    async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        Ok(self
+            .records
+            .read()
             .iter()
             .filter(|(_, r)| self.matches_predicate(r, predicate))
-            .map(|(k, _)| k.clone())
-            .collect();
+            .map(|((_, id), _)| id.clone())
+            .collect())
+    }
 
-        for (ts, id) in &keys_to_remove {
-            records.remove(&(*ts, id.clone()));
-            id_index.remove(id);
+    async fn forget_ids(&self, ids: &[String]) -> AdbResult<u64> {
+        let mut records = self.records.write();
+        let mut id_index = self.id_index.write();
+        let mut count = 0u64;
+        for id in ids {
+            if let Some(ts) = id_index.remove(id) {
+                records.remove(&(ts, id.clone()));
+                count += 1;
+            }
         }
-
-        Ok(keys_to_remove.len() as u64)
+        Ok(count)
     }
 
     async fn clear(&self) -> AdbResult<()> {

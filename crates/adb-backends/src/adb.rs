@@ -243,6 +243,85 @@ impl Adb {
     }
 
     // =========================================================================
+    // Writes by id (stage C: resolve a predicate, log the ids, apply exactly those)
+    // =========================================================================
+
+    /// Ids `update` would change in `memory_type`.
+    pub async fn update_targets(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        match memory_type {
+            MemoryType::Working => self.working.update_targets(predicate).await,
+            MemoryType::Tools => self.tools.update_targets(predicate).await,
+            MemoryType::Procedural => self.procedural.update_targets(predicate).await,
+            MemoryType::Semantic => self.semantic.update_targets(predicate).await,
+            MemoryType::Episodic => self.episodic.update_targets(predicate).await,
+        }
+    }
+
+    /// Apply an update's data to these ids.
+    pub async fn update_ids(&self, memory_type: MemoryType, ids: &[String], data: serde_json::Value) -> AdbResult<u64> {
+        match memory_type {
+            MemoryType::Working => self.working.update_ids(ids, data).await,
+            MemoryType::Tools => self.tools.update_ids(ids, data).await,
+            MemoryType::Procedural => self.procedural.update_ids(ids, data).await,
+            MemoryType::Semantic => self.semantic.update_ids(ids, data).await,
+            MemoryType::Episodic => self.episodic.update_ids(ids, data).await,
+        }
+    }
+
+    /// Ids `forget` would remove from `memory_type`.
+    pub async fn forget_targets(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        match memory_type {
+            MemoryType::Working => self.working.forget_targets(predicate).await,
+            MemoryType::Tools => self.tools.forget_targets(predicate).await,
+            MemoryType::Procedural => self.procedural.forget_targets(predicate).await,
+            MemoryType::Semantic => self.semantic.forget_targets(predicate).await,
+            MemoryType::Episodic => self.episodic.forget_targets(predicate).await,
+        }
+    }
+
+    /// Remove these ids from `memory_type`.
+    pub async fn forget_ids(&self, memory_type: MemoryType, ids: &[String]) -> AdbResult<u64> {
+        match memory_type {
+            MemoryType::Working => self.working.forget_ids(ids).await,
+            MemoryType::Tools => self.tools.forget_ids(ids).await,
+            MemoryType::Procedural => self.procedural.forget_ids(ids).await,
+            MemoryType::Semantic => self.semantic.forget_ids(ids).await,
+            MemoryType::Episodic => self.episodic.forget_ids(ids).await,
+        }
+    }
+
+    /// The id `store` gives a record: TOOLS and PROCEDURAL take `tool_id` /
+    /// `pattern_id` from the payload when present, every type falls back to `key`.
+    pub fn store_id(memory_type: MemoryType, key: &str, payload: &serde_json::Value) -> String {
+        let field = match memory_type {
+            MemoryType::Tools => Some("tool_id"),
+            MemoryType::Procedural => Some("pattern_id"),
+            _ => None,
+        };
+        field
+            .and_then(|f| payload.get(f))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| key.to_string())
+    }
+
+    /// `link` with a given link id (replaying a logged `LINK`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_with_id(
+        &self,
+        id: &str,
+        from_type: MemoryType,
+        from_id: &str,
+        to_type: MemoryType,
+        to_id: &str,
+        link_type: &str,
+        weight: f32,
+    ) -> AdbResult<Link> {
+        let link = Link::with_id(id, from_type, from_id, to_type, to_id, link_type, weight);
+        Ok(self.links.insert_link(link))
+    }
+
+    // =========================================================================
     // Link Operations (Ontology)
     // =========================================================================
 

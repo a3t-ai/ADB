@@ -444,56 +444,53 @@ impl Backend for ProceduralBackend {
         self.lookup(predicate, modifiers).await
     }
 
-    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64> {
-        let mut graph = self.graph.write();
-        let mut index = self.index.write();
-
+    async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        let graph = self.graph.read();
         // Find nodes to remove
-        let to_remove: Vec<(String, NodeIndex)> = index
+        Ok(self
+            .index
+            .read()
             .iter()
             .filter(|(_, &idx)| self.matches_predicate(&graph[idx], predicate))
-            .map(|(id, &idx)| (id.clone(), idx))
-            .collect();
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
 
-        let count = to_remove.len() as u64;
-
-        // Remove from graph (in reverse order to maintain indices)
-        let mut indices: Vec<NodeIndex> = to_remove.iter().map(|(_, idx)| *idx).collect();
-        indices.sort_by(|a, b| b.index().cmp(&a.index()));
-
-        for (id, _) in &to_remove {
-            index.remove(id);
-        }
-
-        for idx in indices {
+    async fn forget_ids(&self, ids: &[String]) -> AdbResult<u64> {
+        let mut graph = self.graph.write();
+        let mut index = self.index.write();
+        let mut count = 0u64;
+        for id in ids {
+            let Some(idx) = index.remove(id) else { continue };
             graph.remove_node(idx);
+            // petgraph moves the last node into the freed slot: repoint its id.
+            if let Some(moved) = graph.node_weight(idx) {
+                index.insert(moved.pattern_id.clone(), idx);
+            }
+            count += 1;
         }
-
-        // Note: After removal, node indices may be invalidated
-        // In a production system, we'd need to rebuild the index
-        // For now, this is acceptable for the test cases
-
         Ok(count)
     }
 
-    async fn update(
-        &self,
-        predicate: &Predicate,
-        data: serde_json::Value,
-    ) -> AdbResult<u64> {
+    async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        let graph = self.graph.read();
+        // Find matching nodes
+        Ok(self
+            .index
+            .read()
+            .iter()
+            .filter(|(_, &idx)| self.matches_predicate(&graph[idx], predicate))
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
+
+    async fn update_ids(&self, ids: &[String], data: serde_json::Value) -> AdbResult<u64> {
         let mut graph = self.graph.write();
         let index = self.index.read();
         let mut count = 0u64;
 
-        // Find matching nodes
-        let ids: Vec<String> = index
-            .iter()
-            .filter(|(_, &idx)| self.matches_predicate(&graph[idx], predicate))
-            .map(|(id, _)| id.clone())
-            .collect();
-
         for id in ids {
-            if let Some(&idx) = index.get(&id) {
+            if let Some(&idx) = index.get(id) {
                 let proc = &mut graph[idx];
 
                 // Update fields

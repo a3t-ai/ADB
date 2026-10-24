@@ -356,16 +356,22 @@ impl Backend for SemanticBackend {
         }
     }
 
-    async fn update(
-        &self,
-        predicate: &Predicate,
-        data: serde_json::Value,
-    ) -> AdbResult<u64> {
+    async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        Ok(self
+            .records
+            .read()
+            .iter()
+            .filter(|(_, r)| self.matches_predicate(r, predicate))
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+
+    async fn update_ids(&self, ids: &[String], data: serde_json::Value) -> AdbResult<u64> {
         let mut records = self.records.write();
         let mut count = 0;
 
-        for record in records.values_mut() {
-            if self.matches_predicate(record, predicate) {
+        for id in ids {
+            if let Some(record) = records.get_mut(id) {
                 // Merge data into existing record
                 if let (Some(existing), Some(updates)) = (record.data.as_object_mut(), data.as_object()) {
                     for (key, value) in updates {
@@ -383,20 +389,29 @@ impl Backend for SemanticBackend {
         Ok(count)
     }
 
-    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64> {
+    async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        Ok(self
+            .records
+            .read()
+            .iter()
+            .filter(|(_, r)| self.matches_predicate(r, predicate))
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+
+    async fn forget_ids(&self, ids: &[String]) -> AdbResult<u64> {
         let mut records = self.records.write();
         let mut embeddings = self.embeddings.write();
         let mut id_to_key = self.id_to_key.write();
         let mut key_to_id = self.key_to_id.write();
         let index = self.index.read();
+        let mut count = 0u64;
 
-        let keys_to_remove: Vec<String> = records
-            .iter()
-            .filter(|(_, r)| self.matches_predicate(r, predicate))
-            .map(|(k, _)| k.clone())
-            .collect();
-
-        for key in &keys_to_remove {
+        for key in ids {
+            if !records.contains_key(key) {
+                continue;
+            }
+            count += 1;
             records.remove(key);
             embeddings.remove(key);
 
@@ -406,7 +421,7 @@ impl Backend for SemanticBackend {
             }
         }
 
-        Ok(keys_to_remove.len() as u64)
+        Ok(count)
     }
 
     async fn clear(&self) -> AdbResult<()> {

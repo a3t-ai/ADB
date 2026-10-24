@@ -143,7 +143,10 @@ pub trait Backend: Send + Sync {
 
     /// Delete records matching predicate
     /// Returns the number of records deleted
-    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64>;
+    async fn forget(&self, predicate: &Predicate) -> AdbResult<u64> {
+        let ids = self.forget_targets(predicate).await?;
+        self.forget_ids(&ids).await
+    }
 
     /// Update records matching predicate
     /// Returns the number of records updated
@@ -151,7 +154,24 @@ pub trait Backend: Send + Sync {
         &self,
         predicate: &Predicate,
         data: serde_json::Value,
-    ) -> AdbResult<u64>;
+    ) -> AdbResult<u64> {
+        let ids = self.update_targets(predicate).await?;
+        self.update_ids(&ids, data).await
+    }
+
+    /// Ids of the records `update` would change. Split from applying so a durable
+    /// engine can resolve a predicate, log the ids, then apply exactly those (stage C).
+    async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>>;
+
+    /// Apply `update`'s change to these ids; returns how many changed. Ids that are
+    /// gone (or, for WORKING, expired) are skipped.
+    async fn update_ids(&self, ids: &[String], data: serde_json::Value) -> AdbResult<u64>;
+
+    /// Ids of the records `forget` would remove.
+    async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>>;
+
+    /// Remove these ids; returns how many were removed.
+    async fn forget_ids(&self, ids: &[String]) -> AdbResult<u64>;
 
     /// Full scan (Working memory only)
     /// Returns all records, optionally filtered by window
