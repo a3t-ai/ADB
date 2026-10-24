@@ -10,6 +10,10 @@ adb-core.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+rmp-serde.workspace = true
+crc32fast.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile.workspace = true

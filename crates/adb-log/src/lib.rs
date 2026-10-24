@@ -4,7 +4,7 @@
 //! materialized view of the log. One trait, several implementations:
 //!
 //! - [`MemLog`] — in memory, for tests and the in-process engine (here).
-//! - Local WAL — segment files, `fdatasync`, group commit (stage C).
+//! - [`wal::LocalWal`] — segment files on local disk, `fdatasync`, group commit.
 //! - openraft replicated log (M3) and object-store commit (§11.5), behind the same
 //!   trait.
 
@@ -12,7 +12,10 @@ use adb_core::log::{Epoch, LogOffset, LogRecord, PartitionId};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-#[derive(Debug, thiserror::Error, PartialEq)]
+pub mod wal;
+pub use wal::{LocalWal, WalConfig};
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum LogError {
     #[error("record offset {got:?} out of order: expected {expected:?}")]
     OutOfOrder { expected: LogOffset, got: LogOffset },
