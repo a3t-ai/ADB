@@ -1,10 +1,14 @@
-# ADB single node for A3T (vc-dev, namespace a3t). Stage A: in-memory engine, so a pod
-# restart empties it.
+# ADB single node for A3T (vc-dev, namespace a3t). Stage C: durable — every write goes
+# to a write-ahead log on the node (/data/a3t-dev/adb, like FlowR's /data/a3t-dev/*)
+# and is replayed on start, so memory survives pod restarts and crashes.
 #
 #   kubectl apply -f adb.yaml
 #   # A3T resource a3t/agent-memory-mcp → url: http://adb.a3t.svc.cluster.local:3000/mcp/sse
 #
 # New image: flowr-system/deploy.sh release adb && deploy.sh roll adb <tag>
+#
+# One writer per log: `Recreate`, never a rolling update (the old pod must stop before
+# the new one opens the log; ADB also refuses a log another process holds).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,6 +18,8 @@ metadata:
     app: adb
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: adb
@@ -24,9 +30,11 @@ spec:
     spec:
       imagePullSecrets:
         - name: registry-credentials
+      # ADB exits at once on SIGTERM (acknowledged writes are already synced).
+      terminationGracePeriodSeconds: 15
       containers:
         - name: adb
-          image: ghcr.io/srirammails/adb:2026-10-23
+          image: ghcr.io/srirammails/adb:2026-10-24-c
           args: ["adb", "serve-http", "--host", "0.0.0.0", "--port", "3000"]
           ports:
             - name: http
@@ -34,6 +42,18 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: ADB_DATA_DIR
+              value: /data/adb
+          volumeMounts:
+            - name: adb-data
+              mountPath: /data/adb
+          # Replaying a long log takes time before /health answers.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /health
@@ -50,6 +70,11 @@ spec:
               memory: 128Mi
             limits:
               memory: 1Gi
+      volumes:
+        - name: adb-data
+          hostPath:
+            path: /data/a3t-dev/adb
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
