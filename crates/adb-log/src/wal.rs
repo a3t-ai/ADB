@@ -13,6 +13,9 @@
 //!   frame. A bad frame in an older segment is corruption and fails the open.
 //! - **Retention:** `purge_below` deletes whole segments below an offset; the active
 //!   segment is never deleted.
+//! - **One writer:** `open` takes an exclusive lock on `LOCK` in the directory for the
+//!   log's lifetime; a second process (e.g. a new pod during a rolling update) fails
+//!   to open instead of corrupting the segments.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -86,6 +89,8 @@ pub struct LocalWal {
     state: Arc<Mutex<State>>,
     jobs: Option<mpsc::Sender<Job>>,
     writer: Option<JoinHandle<()>>,
+    /// Held open (and exclusively locked) while the log is open.
+    _lock: File,
 }
 
 impl std::fmt::Debug for LocalWal {
@@ -145,6 +150,14 @@ impl LocalWal {
     /// Open (or create) the log in `config.dir`, recovering from a crash if needed.
     pub fn open(partition: PartitionId, config: WalConfig) -> LogResult<Self> {
         fs::create_dir_all(&config.dir).map_err(io)?;
+        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("LOCK")).map_err(io)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LogError::Io(format!("{} is in use by another ADB process", config.dir.display())));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
+        }
         let mut segments: Vec<u64> = fs::read_dir(&config.dir)
             .map_err(io)?
             .filter_map(|e| e.ok())
@@ -227,7 +240,7 @@ impl LocalWal {
                 .map_err(io)?
         };
 
-        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer) })
+        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), _lock: lock })
     }
 
     /// Number of `fdatasync` calls so far.
@@ -579,6 +592,16 @@ mod tests {
         })
         .await;
         out.into_iter().map(|o| o.unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_second_opener_is_refused_until_the_first_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = open(dir.path(), 1 << 20);
+        let second = LocalWal::open(PartitionId(5), WalConfig::new(dir.path()));
+        assert!(matches!(second, Err(LogError::Io(ref m)) if m.contains("in use")), "{second:?}");
+        drop(first);
+        assert!(LocalWal::open(PartitionId(5), WalConfig::new(dir.path())).is_ok());
     }
 
     #[tokio::test]
