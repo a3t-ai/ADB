@@ -55,7 +55,7 @@ impl Link {
         link_type: impl Into<String>,
         weight: f32,
     ) -> Self {
-        let now = Utc::now();
+        let now = crate::time::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             from_type,
@@ -79,7 +79,7 @@ impl Link {
         link_type: impl Into<String>,
         weight: f32,
     ) -> Self {
-        let now = Utc::now();
+        let now = crate::time::now();
         Self {
             id: id.into(),
             from_type,
@@ -99,13 +99,13 @@ impl Link {
         let decay = decay.clamp(0.0, 1.0);
         let signal = signal.clamp(0.0, 1.0);
         self.weight = (self.weight * decay + signal * (1.0 - decay)).clamp(0.0, 1.0);
-        self.updated_at = Utc::now();
+        self.updated_at = crate::time::now();
     }
 
     /// Set weight directly
     pub fn set_weight(&mut self, weight: f32) {
         self.weight = weight.clamp(0.0, 1.0);
-        self.updated_at = Utc::now();
+        self.updated_at = crate::time::now();
     }
 
     /// Check if this link is from a specific record

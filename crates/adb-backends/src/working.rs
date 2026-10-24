@@ -6,7 +6,6 @@
 //! Latency target: < 1ms
 
 use async_trait::async_trait;
-use chrono::Utc;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -178,7 +177,7 @@ impl WorkingBackend {
                 }
             }
             Window::LastDuration { duration } => {
-                let cutoff = Utc::now() - chrono::Duration::from_std(*duration).unwrap_or_default();
+                let cutoff = adb_core::time::now() - chrono::Duration::from_std(*duration).unwrap_or_default();
                 records
                     .into_iter()
                     .filter(|r| r.metadata.created_at > cutoff)

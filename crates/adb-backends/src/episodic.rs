@@ -11,7 +11,6 @@ use arrow::array::{ArrayRef, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use chrono::Utc;
 use datafusion::prelude::*;
 use parking_lot::RwLock;
 
@@ -46,7 +45,7 @@ impl EpisodicBackend {
     /// Get records within a time window
     pub fn get_window(&self, window: &Window) -> Vec<MemoryRecord> {
         let records = self.records.read();
-        let now = Utc::now();
+        let now = adb_core::time::now();
 
         match window {
             Window::LastN { count } => {
@@ -293,7 +292,7 @@ impl EpisodicBackend {
 
     /// Filter records by window
     fn filter_by_window(&self, records: &[MemoryRecord], window: &Window) -> Vec<MemoryRecord> {
-        let now = Utc::now();
+        let now = adb_core::time::now();
 
         match window {
             Window::LastN { count } => {

@@ -14,6 +14,6 @@ uuid.workspace = true
 async-trait.workspace = true
 half.workspace = true
 ulid.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -10,6 +10,7 @@ adb-core = { path = "../adb-core" }
 aql-parser.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+ulid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

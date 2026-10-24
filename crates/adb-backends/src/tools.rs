@@ -89,7 +89,7 @@ impl ToolRecord {
         let signal = success_signal.clamp(0.0, 1.0);
         self.ranking = (self.ranking * decay as f64 + signal as f64 * (1.0 - decay as f64)).clamp(0.0, 1.0);
         self.call_count += 1;
-        self.last_called = Some(Utc::now());
+        self.last_called = Some(adb_core::time::now());
     }
 
     /// Set relevance score for a task type

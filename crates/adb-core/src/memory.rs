@@ -122,7 +122,7 @@ pub struct Metadata {
 impl Metadata {
     /// Create new metadata with current timestamp
     pub fn new(scope: Scope) -> Self {
-        let now = Utc::now();
+        let now = crate::time::now();
         Self {
             created_at: now,
             accessed_at: now,
@@ -151,7 +151,7 @@ impl Metadata {
     pub fn is_expired(&self) -> bool {
         if let Some(ttl) = self.ttl {
             let expires_at = self.created_at + chrono::Duration::from_std(ttl).unwrap_or_default();
-            Utc::now() > expires_at
+            crate::time::now() > expires_at
         } else {
             false
         }
@@ -159,7 +159,7 @@ impl Metadata {
 
     /// Update accessed_at to now
     pub fn touch(&mut self) {
-        self.accessed_at = Utc::now();
+        self.accessed_at = crate::time::now();
     }
 
     /// Increment version

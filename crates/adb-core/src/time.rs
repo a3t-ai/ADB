@@ -5,6 +5,24 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
+tokio::task_local! {
+    static CLOCK: DateTime<Utc>;
+}
+
+/// The current time for the write path. Inside [`at`], this is the transaction's
+/// commit timestamp, so applying a logged write (live or on replay) sees the time it
+/// committed at (D2_TEMPORAL.md T2); elsewhere it is the wall clock.
+pub fn now() -> DateTime<Utc> {
+    CLOCK.try_with(|t| *t).unwrap_or_else(|_| Utc::now())
+}
+
+/// Run `fut` with [`now`] fixed at `t`.
+pub async fn at<F: std::future::Future>(t: DateTime<Utc>, fut: F) -> F::Output {
+    CLOCK.scope(t, fut).await
+}
+
 /// Time-to-live specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ttl(#[serde(with = "duration_serde")] Duration);
@@ -155,6 +173,19 @@ mod duration_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clock_is_fixed_inside_at_and_across_awaits() {
+        let t = chrono::DateTime::parse_from_rfc3339("2026-10-24T10:00:00Z").unwrap().with_timezone(&Utc);
+        let seen = at(t, async {
+            let a = now();
+            tokio::task::yield_now().await;
+            (a, now())
+        })
+        .await;
+        assert_eq!(seen, (t, t));
+        assert_ne!(now(), t); // outside `at`: the wall clock
+    }
 
     #[test]
     fn test_parse_duration() {

@@ -242,7 +242,7 @@ impl Planner {
             .iter()
             .find(|f| f.field == "key" || f.field == "id")
             .map(|f| value_to_string(&f.value))
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(|| ulid::Ulid::new().to_string()); // D3 S1
 
         // Convert payload to JSON
         let payload = assignments_to_json(&stmt.payload);
