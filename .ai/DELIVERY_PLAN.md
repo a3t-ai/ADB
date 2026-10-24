@@ -149,6 +149,7 @@ URL, and every stage below is tested through the same path A3T uses.
 | **D. Store (option A)** | `adb-store` MemWAL applier, D3 schema, D2 supersede, persisted links; executor moved off `adb-backends` (then deleted) | Conformance 116/116 on the new engine; ported R11/R12 crash tests; **A3T: agent recalls facts and links across restarts; superseded facts hidden** |
 | **E. Subscriptions** | `SUBSCRIBE` / `PUBLISH` / `ACK` with in-process gateway; MCP notifications | Two subscribers see identical sequences; **A3T: two FlowR instances receive the same topic events** |
 | **F. FlowR wiring** | Port `call:clawdb` handler to `swf_runtime::TaskHandler`; `ClawDbMemory` adapter against ADB; local dev packaging | **A3T end to end: a flow with `call:a3t:agent` stores and recalls memory through ADB** |
+| **G. Platform tables** (after D; can run alongside E/F) | Second table family on the log/sequencer/store (ARCHITECTURE §15.1): `create_table` / `insert` / `query` / `update` / `delete` / `list_tables` with `call:lancedb` semantics; Arrow Flight surface; FlowR `adb` platform-table backend chosen by resource type (CE / local dev keep embedded LanceDB). Starts with a wire spike: HTTP + JSON vs gRPC + protobuf vs Flight on A3T-shaped queries | **A3T on hosted ADB: the A3T flows (agents, canvases, templates, audit) run unchanged against ADB platform tables; data survives ADB restarts** |
 
 ### MCP server for testing with an LLM or the A3T chat agent
 

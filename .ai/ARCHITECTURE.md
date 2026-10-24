@@ -1,7 +1,7 @@
 # ADB (Agent Database) — Architecture
 
-> **Version:** 1.4 — subscriptions and continuous queries ([`SUBSCRIPTIONS_CQ_SPEC.md`](SUBSCRIPTIONS_CQ_SPEC.md), §11.7) on top of v1.3 (spike results to 7 Oct and the architecture review). Changes listed in §20.
-> **Date:** 9 Oct 2026 · @Sriram
+> **Version:** 1.5 — platform tables for hosted A3T (§15.1) on top of v1.4 (subscriptions and continuous queries, [`SUBSCRIPTIONS_CQ_SPEC.md`](SUBSCRIPTIONS_CQ_SPEC.md), §11.7). Changes listed in §20.
+> **Date:** 24 Oct 2026 (v1.4: 9 Oct) · @Sriram
 > **Language:** AQL v0.5 (spec and reference implementation in the AQL repo)
 > **Supersedes:** `archive/ARCHITECTURE_v0.1_in_memory.md` (in-memory engine),
 > `archive/adb_lance_persistence.md` v0.2 (cache + write-behind draft), the 5 Oct cluster
@@ -58,7 +58,9 @@ The same engine runs as the cluster (production), as a single-node local dev bui
 - Cross-partition ACID by default (sagas/outbox first; 2PC only if a real use case
   appears).
 - Postgres-scale relational workloads. The hosted control plane uses its own
-  Postgres. FlowR's control-plane data is out of scope for v1 (§15).
+  Postgres. A3T's platform data in the hosted service is a goal (platform tables,
+  §15.1), but only the CRUD subset FlowR already uses; local dev and CE keep the
+  embedded LanceDB.
 
 ## 4. Design principles
 
@@ -829,9 +831,35 @@ and sequencer constraints, which need plaintext. So:
   shared state and pub/sub for live sessions. **Pub/sub is answered by ADB
   subscriptions (§11.7):** each FlowR instance subscribes to the scopes or topics it
   follows and sees every change in one order, with no FlowR-to-FlowR coordination.
-  Open: whether FlowR's run-state notifications use topics directly. Whether the rest of FlowR's state
-  becomes a second ADB table family on the same log/sequencer engine is an open
-  decision (§19), taken after the single-node milestone.
+  Open: whether FlowR's run-state notifications use topics directly. The rest of
+  FlowR's state becomes a second table family on the same engine (§15.1, decided
+  24 Oct).
+
+### 15.1 Platform tables (hosted A3T)
+
+**Goal (decided 24 Oct 2026):** in the hosted service, A3T's platform data (agents,
+canvases, templates, deployments, audit) moves from the LanceDB embedded in each FlowR
+process (`A3T_DB_PATH`, `call:lancedb`) into ADB, so clustered and hibernating FlowR
+instances share one durable copy. **Local dev and CE keep the embedded LanceDB**; the
+FlowR resource type picks the backend, so A3T's flows don't change.
+
+- **Contract:** the six operations A3T's flows use today through `call:lancedb`
+  (69 steps): `create_table`, `insert`, `query` (SQL filter + limit), `update`
+  (filter + set), `delete` (filter), `list_tables`, with the same semantics.
+- **Engine:** a second table family next to the memory tables, on the same log,
+  sequencer and Lance store (§9). Each platform table has its own schema; writes go
+  through the log like memory writes; no AQL memory semantics (no supersede,
+  forget or links).
+- **Wire:** native, not HTTP. **Arrow Flight** (on gRPC) for platform tables: Lance
+  stores Arrow and FlowR's LanceDB handler already holds Arrow record batches, so
+  batches cross without conversion, and large results and bulk inserts stream.
+  Plain gRPC (AQL `proto/`) stays for AQL calls and subscription streams. In-cluster
+  round trips are similar for all three (HTTP keep-alive measured 0.16 ms); Flight's
+  gain is on large results and bulk writes. Any network option is slower per call
+  than the embedded LanceDB; the gain is shared, durable state.
+- **Prerequisites:** the durable engine (log, sequencer, store); a protocol spike
+  (HTTP + JSON vs gRPC + protobuf vs Flight on A3T-shaped queries) settles the wire
+  with numbers.
 
 ## 16. Crate plan
 
@@ -915,7 +943,7 @@ Worked through, with experiments, exit criteria and fallbacks, in
 | Hetzner 750 req/s per bucket | Risk | Caps writes, reads and table opens per bucket (S7: ~45 opens/s) | Many buckets per cluster; writes only at seals (§9.2); cache manifests (§10.1) |
 | Encryption vs search (§14.3) | Decision | Plaintext needed for FTS/constraints | Split rule adopted; S12: SSE-C per table only → per-tenant at-rest keys in the dedicated tier |
 | Cross-partition operations | Decision | Shared scopes on other partitions | Sagas/outbox first; 2PC only on demand |
-| FlowR state as an ADB table family | Decision | Basis for FlowR cluster mode | Decide after single-node milestone |
+| FlowR state as an ADB table family | ☑ Decided (24 Oct) | Basis for FlowR cluster mode | Platform tables for hosted A3T (§15.1); local dev and CE keep embedded LanceDB. Next: wire-protocol spike |
 | **ADB licence** | ☑ Decided (9 Oct) | SaaS-only; the dev build ships under the **same business support licence as FlowR** | Add the LICENSE text once FlowR's exists (FlowR's `Cargo.toml` still says Apache-2.0; no LICENSE file in either repo); align `Cargo.toml` and README; drop "ADB-CE" |
 | **Node hibernation vs PLP dedicated servers** | Risk, deferred | Dedicated servers are billed monthly, so releasing them saves nothing; a woken set is a fresh bootstrap (§14.1) | Start hibernated mode as partition hibernation on an always-on pool (§14.1); revisit with pricing
 | **Wake throughput per bucket** | Risk | ~14 requests per open, ~45 opens/s per bucket (S7); a mass wake is bucket-bound | Spread over ~20 buckets (~900 opens/s, all partitions in ~5 s); lazy wake; local manifest cache (§14.1) |
@@ -980,3 +1008,6 @@ Worked through, with experiments, exit criteria and fallbacks, in
     cq | event`, §7); subscriptions no longer block hibernation, scheduled wakes cover
     temporal boundaries (§14.1); new components and crates (§8, §16); delivery
     milestones (§18); new risks (§19).
+20. **Platform tables (v1.5, 24 Oct):** hosted A3T's platform data moves into ADB as a
+    second table family with `call:lancedb`'s six operations, over Arrow Flight; local
+    dev and CE keep embedded LanceDB (§3, §15.1, §19).
