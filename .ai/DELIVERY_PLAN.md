@@ -45,7 +45,7 @@ M2 can overlap the end of M1, and M3 can start as soon as M1's log trait is stab
 | Schema write-up (D3) — ✅ *24 Oct* | Concrete Arrow schema per `kind` (incl. `event`, `sub`, `cq`, `_meta`), nullability, plaintext vs encrypted `value` fields, one platform embedding model and dimension, re-embedding procedure | D3 |
 | Temporal write-up (D2) — ✅ *24 Oct* | Supersede-by-default for SEMANTIC / PROCEDURAL, overwrite for WORKING / TOOLS; `valid_from` / `valid_to` / `superseded_by`; TTL; how `UPDATE`, `FORGET`, `WINDOW` map | D2 |
 | CI — ⏸ *deferred 24 Oct (user): run the checks by hand until the repos are pushed* | Build + tests on stable, `cargo deny` licences, AQL conformance runner against ADB, spike crash tests (S1, S2, R11, R12) ported as integration tests | B4, K3 |
-| Lance bug | File the MemWAL replay report (`lancebug.md`) | K7 |
+| Lance bug — ⏸ *parked 24 Oct (user): doesn't affect dev; ADB-driven seals work around it* | File the MemWAL replay report (`lancebug.md`) | K7 |
 
 **Exit:** workspace builds on stable with one Arrow version; D2 and D3 agreed; CI green.
 
