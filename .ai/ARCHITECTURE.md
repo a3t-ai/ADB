@@ -797,8 +797,10 @@ and sequencer constraints, which need plaintext. So:
   data key. Destroying the key crypto-shreds them, including backups, where physical
   deletion is impractical.
 - **Lance rows** keep searchable fields in plaintext (`text`, constraint fields,
-  `embedding`) under server-side encryption; non-searched payload fields inside
-  `value` stay encrypted with the tenant key. Hetzner supports **SSE-C only** (no
+  `embedding`) under server-side encryption. AQL can filter on any payload field, so
+  all of `value` is plaintext too; only fields a scope declares **sealed** are
+  encrypted with the tenant key, in their own column, and can't be filtered
+  ([`D3_SCHEMA.md`](D3_SCHEMA.md) S2). Hetzner supports **SSE-C only** (no
   SSE-S3, no bucket default), one key per store, i.e. per partition table (S12). So
   at-rest keys are **per partition** in the shared tier and **per tenant** only in the
   dedicated tier, where a tenant owns its partitions.
