@@ -40,7 +40,7 @@ should be picked up. Items fixed later move to the bottom with the commit.
 |---|---|---|---|
 | S1 | **One partition** (`PartitionId(0)`); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per memory type. | Not atomic across types. | M3 placement / multi-partition txns. |
 | S2 | **`adb-backends` not deleted**; it still provides the WORKING / TOOLS hot tier and the query code for views. | Agreed 25 Oct. | M2. |
-| S3 | **Lance R11/R12 crash tests not ported** into the suite (MemWAL durability under crash, from the spikes). | Our own crash test (SIGKILL rounds) passes; Lance-level cases aren't regression-tested. | Before the D gate. |
+| S3 | ~~Lance R11/R12 crash tests not ported~~ — ported 25 Oct as `adb-store/tests/crash_recovery.rs` (SIGKILL mid-apply → table = model at `_meta`; `_meta` ≥ every claimed durable offset; fenced writer can't change the table). Still single node, local disk, no power-loss test. | — | M3 adds the Raft / multi-node variants (R6, R10). |
 | S4 | **Lance MemWAL bug parked** (K7, `lancebug.md`): generations sealed during WAL replay lack `_pk_index`, breaking LSM reads. ADB-driven seals avoid it. | Must stay on ADB-driven seals until fixed upstream. | File the report; re-check on each Lance upgrade. |
 | S5 | **CI deferred** (user, 24 Oct): build, workspace tests, AQL conformance, FlowR integration and the crash test run by hand before commits. | Easy to miss a regression. | Before M1 ends. |
 | S6 | **`LocalEngine::replay_only` (test oracle) needs the complete log**; the log is purged below Lance's durable offset every 256 records. | Only usable in tests with < 256 records. | Fine as is; noted so nobody uses it on real data. |
