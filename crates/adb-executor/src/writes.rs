@@ -11,10 +11,13 @@
 //! live and the same write replayed after a restart produce the same records (same
 //! ids, `created_at`, TTL start, expiry checks; D2_TEMPORAL.md T2).
 //!
-//! Stage C limits: one partition (`PartitionId(0)`); `UPDATE` patches every memory
-//! type in place (D2's supersede for SEMANTIC / PROCEDURAL comes with the Lance
-//! store, stage D); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per
-//! memory type.
+//! `UPDATE` on SEMANTIC / PROCEDURAL supersedes (D2 §2, stage D4.3): each matched
+//! record gets a new version row (new id, same lineage, `version + 1`, fields
+//! merged, TTL kept), and the old one is closed. Other memory types, and engines
+//! without a Lance table, patch in place.
+//!
+//! Limits: one partition (`PartitionId(0)`); `FORGET FROM ALL` / `UPDATE ALL` commit
+//! one transaction per memory type.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,6 +290,28 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                 m
             }
         };
+        if let (Some(store), true) = (&self.store, supersedes(memory_type)) {
+            // Every earlier record is in Lance first, so the current versions read
+            // here are the ones this update follows.
+            if let Some(b) = self.barrier() {
+                b.wait_for_committed().await;
+            }
+            let mut effects = Vec::with_capacity(ids.len());
+            for key in &ids {
+                let cur = store
+                    .current_version(memory_type.into(), key, ts)
+                    .await
+                    .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+                    .ok_or_else(|| AdbError::Internal(format!("{memory_type:?} {key}: no current version in Lance")))?;
+                effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: next_version(&cur, &fields, seq.new_id(ts)) });
+            }
+            let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+            for effect in &effects {
+                apply(&self.adb, ts, effect).await?;
+            }
+            self.to_store(&record, seq.log()).await;
+            return Ok(effects.len() as u64);
+        }
         let effects: Vec<Effect> = ids
             .iter()
             .map(|id| Effect::Patch { memory: memory_type.into(), id: RecordId(id.clone()), fields: fields.clone(), version: 0 })
@@ -435,6 +460,47 @@ pub async fn replay<L: Log>(adb: &Adb, log: &L) -> AdbResult<ReplayStats> {
     Ok(stats)
 }
 
+/// Memory types whose `UPDATE` writes a new version (D2 §2).
+fn supersedes(memory: MemoryType) -> bool {
+    matches!(memory, MemoryType::Semantic | MemoryType::Procedural)
+}
+
+/// The version after `cur` with `fields` merged in, under the new row id `id`.
+fn next_version(cur: &adb_store::StoredRow, fields: &serde_json::Map<String, serde_json::Value>, id: RecordId) -> NewRow {
+    let mut data = cur.data.clone();
+    match &mut data.value {
+        serde_json::Value::Object(v) => v.extend(fields.clone()),
+        other => *other = serde_json::Value::Object(fields.clone()),
+    }
+    if let Some(c) = fields.get("content").and_then(|v| v.as_str()) {
+        data.text = Some(c.to_string());
+    }
+    // `ttl_at` is carried over as is: UPDATE doesn't extend a TTL (D2 T6).
+    NewRow { id, lineage_id: RecordId(cur.key().to_string()), version: cur.version + 1, data }
+}
+
+/// The in-memory tier after a supersede: the record (its lineage id) holds the new
+/// version, as a restart rebuilds it from Lance (`hydrate`).
+async fn apply_version(adb: &Adb, ts: CommitTs, new: &NewRow) -> AdbResult<MemoryRecord> {
+    let row = adb_store::StoredRow::from_new(&adb_store::qualified(new), ts, 0, 0);
+    let rec = crate::reads::to_record(&row);
+    match MemoryType::from(new.data.memory) {
+        MemoryType::Procedural => {
+            // The backend's `store` adds a node per call: drop the old version first.
+            adb.forget_ids(MemoryType::Procedural, &[row.key().to_string()]).await?;
+            let stored = adb
+                .store_with_options(MemoryType::Procedural, row.key(), row.data.value.clone(), rec.metadata.scope, row.data.namespace.as_deref(), rec.metadata.ttl)
+                .await?;
+            adb.procedural().set_version(row.key(), u64::from(row.version));
+            Ok(stored)
+        }
+        _ => {
+            adb.semantic().insert_record(rec.clone());
+            Ok(rec)
+        }
+    }
+}
+
 /// Apply one effect at its commit time; returns the stored record for `Put*`.
 async fn apply(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Option<MemoryRecord>> {
     time::at(ts.to_datetime(), async {
@@ -453,6 +519,7 @@ async fn apply(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Option<Mem
                     .await?;
                 Ok(Some(record))
             }
+            Effect::Supersede { new, .. } => apply_version(adb, ts, new).await.map(Some),
             _ => {
                 apply_count_now(adb, effect).await?;
                 Ok(None)
@@ -464,7 +531,7 @@ async fn apply(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Option<Mem
 
 async fn apply_count(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<u64> {
     match effect {
-        Effect::PutEntity(_) | Effect::PutEpisode(_) | Effect::PutTool(_) | Effect::PutFact(_) => {
+        Effect::PutEntity(_) | Effect::PutEpisode(_) | Effect::PutTool(_) | Effect::PutFact(_) | Effect::Supersede { .. } => {
             apply(adb, ts, effect).await.map(|r| r.is_some() as u64)
         }
         _ => time::at(ts.to_datetime(), apply_count_now(adb, effect)).await,
@@ -480,7 +547,7 @@ async fn apply_count_now(adb: &Adb, effect: &Effect) -> AdbResult<u64> {
         Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
             adb.forget_ids((*memory).into(), &[lineage_id.0.clone()]).await
         }
-        // Subscriptions, events and supersede arrive with stages D and E.
+        // Subscriptions and events arrive with stage E.
         _ => Ok(0),
     }
 }

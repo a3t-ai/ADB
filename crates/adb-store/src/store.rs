@@ -300,6 +300,13 @@ impl PartitionStore {
         Ok(rows)
     }
 
+    /// The current version of record `key` of memory type `memory` (its lineage's
+    /// current row, D2 T1), if any.
+    pub async fn current_version(&self, memory: adb_core::log::Memory, key: &str, now: CommitTs) -> StoreResult<Option<StoredRow>> {
+        let filter = format!("lineage_id = {} AND kind != 'edge'", sql_str(&row_id(memory, key)));
+        Ok(self.current(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
+    }
+
     /// The newest version of row `id`, if any.
     pub async fn get(&self, id: &str) -> StoreResult<Option<StoredRow>> {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())

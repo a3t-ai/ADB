@@ -402,3 +402,69 @@ async fn forgetting_a_record_removes_its_links() {
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     assert_eq!(links(engine.query(with_links, None).await.unwrap()), 1, "same after a restart");
 }
+
+/// Every version of the store's rows (history included), engine closed; caught up
+/// from the log first, as the background applier may not have finished.
+async fn lance_history(dir: &std::path::Path) -> Vec<adb_store::StoredRow> {
+    use adb_core::log::PartitionId;
+    let store = adb_store::PartitionStore::open(&adb_store::StoreConfig::new(dir.join("store")), PartitionId(0)).await.unwrap();
+    let wal = adb_log::LocalWal::open(PartitionId(0), adb_log::WalConfig::new(dir.join("p0"))).unwrap();
+    adb_executor::writes::catch_up(&store, &wal).await.unwrap();
+    drop(wal);
+    let rows = store.scan(None).await.unwrap();
+    store.close().await.unwrap();
+    rows
+}
+
+/// D4.3: UPDATE on SEMANTIC / PROCEDURAL supersedes (D2 §2). History stays in
+/// Lance, reads see the current version only, links made to the first version still
+/// reach the record, and FORGET removes every version.
+#[tokio::test]
+async fn update_supersedes_facts_and_procedures() {
+    let dir = tempfile::tempdir().unwrap();
+    let fact = r#"LOOKUP FROM SEMANTIC KEY id = "acme""#;
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        for q in [
+            r#"STORE INTO SEMANTIC (key = "acme", concept = "acme", content = "Acme renews on 1 Nov", ttl_note = "none")"#,
+            r#"STORE INTO EPISODIC (key = "e1", bid_id = "e1")"#,
+            r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
+            r#"LINK FROM EPISODIC WHERE bid_id = "e1" TO SEMANTIC WHERE concept = "acme" TYPE "about" WEIGHT 0.5"#,
+            r#"UPDATE INTO SEMANTIC WHERE concept = "acme" (content = "Acme renews on 15 Nov")"#,
+            r#"UPDATE INTO SEMANTIC WHERE concept = "acme" (content = "Acme renews on 20 Nov")"#,
+            r#"STORE INTO PROCEDURAL (pattern_id = "p1", pattern = "disk full", steps = "prune", confidence = 0.5)"#,
+            r#"UPDATE INTO PROCEDURAL WHERE pattern_id = "p1" (confidence = 0.9)"#,
+        ] {
+            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        let r = engine.query(fact, None).await.unwrap().to_string();
+        assert!(r.contains("20 Nov") && !r.contains("15 Nov") && r.contains(r#""version":3"#), "current version only: {r}");
+        let r = engine.query(r#"RECALL FROM SEMANTIC ALL"#, None).await.unwrap();
+        assert_eq!(r["data"]["count"], 1, "one record, not one per version: {r}");
+        let r = engine.query(r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#, None).await.unwrap().to_string();
+        assert!(r.contains(r#""bid_id":"e1""#), "links from the record survive a supersede: {r}");
+        let r = engine.query(r#"RECALL FROM EPISODIC WHERE bid_id = "e1" FOLLOW LINKS TYPE "about""#, None).await.unwrap().to_string();
+        assert!(r.contains("20 Nov"), "links to the record reach its current version: {r}");
+        let r = engine.query(r#"LOOKUP FROM PROCEDURAL KEY id = "p1""#, None).await.unwrap().to_string();
+        assert!(r.contains(r#""confidence":0.9"#) && r.contains(r#""version":2"#), "{r}");
+    }
+    // History in Lance: three versions of acme, v1 and v2 closed and chained.
+    let rows = lance_history(dir.path()).await;
+    let mut acme: Vec<_> = rows.iter().filter(|r| r.lineage_id == "semantic:acme").collect();
+    acme.sort_by_key(|r| r.version);
+    assert_eq!(acme.iter().map(|r| r.version).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(acme[0].superseded_by.as_deref(), Some(acme[1].id.as_str()));
+    assert_eq!(acme[1].superseded_by.as_deref(), Some(acme[2].id.as_str()));
+    assert!(acme[2].superseded_by.is_none() && acme[0].valid_to.is_some());
+    assert_eq!(acme[0].data.text.as_deref(), Some("Acme renews on 1 Nov"), "old versions keep their values");
+
+    // After a restart: same current view; then FORGET takes every version.
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let r = engine.query(fact, None).await.unwrap().to_string();
+    assert!(r.contains("20 Nov") && r.contains(r#""version":3"#), "{r}");
+    let n = engine.query(r#"FORGET FROM SEMANTIC WHERE concept = "acme""#, None).await.unwrap();
+    assert_eq!(n["data"]["affected"].as_u64().or(n["data"]["count"].as_u64()).or(n["data"]["affected_count"].as_u64()), Some(1), "one lineage: {n}");
+    drop(engine);
+    let rows = lance_history(dir.path()).await;
+    assert!(rows.iter().filter(|r| r.lineage_id == "semantic:acme").all(|r| r.tombstone), "every version tombstoned");
+}
