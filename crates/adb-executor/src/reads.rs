@@ -7,9 +7,9 @@
 //!
 //! `LanceReads` rebuilds the records from the table and answers with the backend's
 //! own query code (a throwaway backend filled with `insert_record`), so predicates,
-//! ordering and modifiers behave exactly as before. Filters are not pushed into Lance
-//! yet: every read loads the memory type's current rows (fine for dev-sized
-//! partitions; pushdown is a later D3 step).
+//! ordering and modifiers behave exactly as before. The predicate is also pushed into
+//! the Lance scan where it can be (`adb_store::predicate_filter`, stage D3.6), so a
+//! read loads only a superset of the matching rows instead of the whole memory type.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,8 @@ use std::time::Duration;
 use adb_backends::{Adb, Backend, EpisodicBackend, SemanticBackend};
 use adb_core::log::{CommitTs, Memory};
 use adb_core::{time, AdbError, AdbResult, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
-use adb_store::{sql_str, PartitionStore, StoredRow};
+use adb_store::{predicate_filter, PartitionStore, StoredRow};
+use datafusion::prelude::{col, lit};
 use async_trait::async_trait;
 
 use crate::apply::ApplyBarrier;
@@ -83,18 +84,22 @@ impl LanceReads {
         matches!(memory, MemoryType::Semantic | MemoryType::Episodic)
     }
 
-    /// A throwaway backend holding the memory type's current rows.
-    async fn view(&self, memory: MemoryType) -> AdbResult<View> {
+    /// A throwaway backend holding the memory type's current rows that may match
+    /// `predicate`.
+    async fn view(&self, memory: MemoryType, predicate: &Predicate) -> AdbResult<View> {
         if let Some(b) = &self.barrier {
             b.wait_for_committed().await;
         }
         let m: Memory = memory.into();
         let tag = serde_json::to_value(m).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-        let filter = format!("memory = {} AND kind != 'edge'", sql_str(&tag));
+        let mut filter = col("memory").eq(lit(tag)).and(col("kind").not_eq(lit("edge")));
+        if let Some(p) = predicate_filter(predicate) {
+            filter = filter.and(p);
+        }
         let now = CommitTs::from_datetime(time::now());
         let rows = self
             .store
-            .current(Some(&filter), now)
+            .current_expr(Some(filter), now)
             .await
             .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
         Ok(match memory {
@@ -118,7 +123,7 @@ impl Reads for LanceReads {
         if !Self::serves(memory) {
             return self.adb.lookup_with_modifiers(memory, predicate, modifiers).await;
         }
-        match self.view(memory).await? {
+        match self.view(memory, predicate).await? {
             View::Semantic(b) => b.lookup(predicate, modifiers).await,
             View::Episodic(b) => b.lookup(predicate, modifiers).await,
         }
@@ -128,7 +133,7 @@ impl Reads for LanceReads {
         if !Self::serves(memory) {
             return self.adb.recall_with_modifiers(memory, predicate, modifiers).await;
         }
-        match self.view(memory).await? {
+        match self.view(memory, predicate).await? {
             View::Semantic(b) => b.recall(predicate, modifiers).await,
             View::Episodic(b) => b.recall(predicate, modifiers).await,
         }

@@ -9,6 +9,10 @@ description = "ADB storage: Lance tables and the MemWAL applier (ARCHITECTURE.md
 adb-core.workspace = true
 lance.workspace = true
 lance-index.workspace = true
+lance-arrow = "=12.0.0"
+lance-datafusion = "=12.0.0"
+jsonb = "=0.5.6"
+datafusion.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 half.workspace = true

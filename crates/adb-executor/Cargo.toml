@@ -12,6 +12,7 @@ aql-planner = { path = "../aql-planner" }
 adb-log = { path = "../adb-log" }
 adb-sequencer = { path = "../adb-sequencer" }
 adb-store = { path = "../adb-store" }
+datafusion.workspace = true
 aql-parser.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

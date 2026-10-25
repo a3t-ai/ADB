@@ -1,6 +1,8 @@
 //! The memory table's Arrow schema (D3_SCHEMA.md §1).
 //!
-//! Two simplifications against D3, both storage-level only:
+//! Storage-level choices against D3:
+//! - `value` is JSONB (`lance.json`, schema v2), so payload predicates can be pushed
+//!   into Lance (D3.6);
 //! - enum columns (`visibility`, `memory`, `kind`) are plain `Utf8`; Lance's file
 //!   format dictionary-encodes low-cardinality strings itself;
 //! - `provenance` is three flat columns (`provenance_agent`, `provenance_source`,
@@ -13,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// Id of the control row (D3 `kind = meta`).
 pub const META_ID: &str = "_meta";
 /// Schema version written into `_meta` (D3 §4).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 fn ts() -> DataType {
     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
@@ -40,7 +42,11 @@ pub fn memory_schema(dim: i32) -> SchemaRef {
         Field::new("object_id", DataType::Utf8, true),
         Field::new("link_type", DataType::Utf8, true),
         Field::new("weight", DataType::Float32, true),
-        Field::new("value", DataType::Utf8, true),
+        // JSONB (`lance.json`), so payload filters run inside Lance with its json_*
+        // functions (stage D3.6; schema v2 — v1 held JSON text).
+        Field::new("value", DataType::LargeBinary, true).with_metadata(
+            [("ARROW:extension:name".to_string(), lance_arrow::json::JSON_EXT_NAME.to_string())].into(),
+        ),
         Field::new("sealed", DataType::LargeBinary, true),
         Field::new("text", DataType::Utf8, true),
         Field::new(

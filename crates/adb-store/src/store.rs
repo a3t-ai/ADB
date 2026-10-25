@@ -22,6 +22,7 @@ use std::time::Duration;
 use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, PartitionId, RecordId};
 use arrow_array::RecordBatchIterator;
 use arrow_schema::SchemaRef;
+use datafusion::logical_expr::Expr;
 use lance::dataset::mem_wal::scanner::{DatasetCache, LsmScanner, ShardSnapshot, SsTableCache};
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriter, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
@@ -123,6 +124,14 @@ impl PartitionStore {
             Self::create(&uri, &schema, cfg.embedding_dim).await?;
         }
         let base = Arc::new(Dataset::open(&uri).await.map_err(lance)?);
+        // Schema v1 kept `value` as JSON text; v2 needs JSONB (D3.6). No in-place
+        // migration yet: rebuild the table from the log.
+        if base.schema().field("value").map(|f| !matches!(f.data_type(), arrow_schema::DataType::LargeBinary)).unwrap_or(false) {
+            return Err(StoreError::Decode(format!(
+                "{uri} is a schema-v1 table (value as JSON text); this ADB needs v2 (JSONB). \
+                 Move the store directory aside and restart: it is rebuilt from the log, if the log is complete"
+            )));
+        }
         let shard = shard_id(partition);
         let config = ShardWriterConfig::new(shard)
             .with_durable_write(false)
@@ -176,6 +185,38 @@ impl PartitionStore {
 
     /// Every row version matching `filter` (Lance SQL), newest per id, `_meta` included.
     pub async fn scan(&self, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
+        let mut scanner = self.scanner().await?;
+        if let Some(f) = filter {
+            scanner = scanner.filter(f).map_err(lance)?;
+        }
+        let batch = scanner.try_into_batch().await.map_err(lance)?;
+        decode(&batch)
+    }
+
+    /// As [`PartitionStore::scan`] with a DataFusion expression, for filters the SQL
+    /// parser can't express: Lance's json_* functions on `value` (stage D3.6).
+    /// Filtering happens after the LSM picks the newest version of each row.
+    pub async fn scan_expr(&self, filter: Option<Expr>) -> StoreResult<Vec<StoredRow>> {
+        let mut scanner = self.scanner().await?;
+        if let Some(f) = filter {
+            scanner = scanner.filter_expr(f);
+        }
+        let batch = scanner.try_into_batch().await.map_err(lance)?;
+        decode(&batch)
+    }
+
+    /// The current view at `now` of the rows matching `filter` (an expression).
+    pub async fn current_expr(&self, filter: Option<Expr>, now: CommitTs) -> StoreResult<Vec<StoredRow>> {
+        Ok(self
+            .scan_expr(filter)
+            .await?
+            .into_iter()
+            .filter(|r| r.id != META_ID && r.data.kind != Kind::Meta && r.is_current(now))
+            .collect())
+    }
+
+    /// An LSM scanner over memtable + flushed generations + base table.
+    async fn scanner(&self) -> StoreResult<LsmScanner> {
         let manifest = self.writer.manifest().await.map_err(lance)?;
         let mut snap = ShardSnapshot::new(self.writer.shard_id());
         if let Some(m) = &manifest {
@@ -184,14 +225,9 @@ impl PartitionStore {
                 snap = snap.with_sstable(t.generation, t.path.clone());
             }
         }
-        let mut scanner = LsmScanner::new(self.base.clone(), vec![snap], vec!["id".into()])
+        Ok(LsmScanner::new(self.base.clone(), vec![snap], vec!["id".into()])
             .with_in_memory_memtables(self.writer.shard_id(), self.writer.in_memory_memtable_refs().await.map_err(lance)?)
-            .with_sstable_cache(self.cache.clone());
-        if let Some(f) = filter {
-            scanner = scanner.filter(f).map_err(lance)?;
-        }
-        let batch = scanner.try_into_batch().await.map_err(lance)?;
-        decode(&batch)
+            .with_sstable_cache(self.cache.clone()))
     }
 
     /// The current view (D2 §3) at `now`, without `_meta`.

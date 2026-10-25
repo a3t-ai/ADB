@@ -176,7 +176,20 @@ pub fn encode(rows: &[StoredRow], schema: &SchemaRef, dim: i32) -> StoreResult<R
         s(&|r| r.data.object_id.clone()),
         s(&|r| r.data.link_type.clone()),
         Arc::new(weight.finish()),
-        s(&|r| (!r.data.value.is_null()).then(|| r.data.value.to_string())),
+        {
+            // JSONB, as Lance's json_* functions read it.
+            let mut b = LargeBinaryBuilder::new();
+            for r in rows {
+                if r.data.value.is_null() {
+                    b.append_null();
+                } else {
+                    let bytes = lance_arrow::json::encode_json(&r.data.value.to_string())
+                        .map_err(|e| StoreError::Encode(format!("value: {e}")))?;
+                    b.append_value(bytes);
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        },
         Arc::new(sealed.finish()),
         s(&|r| r.data.text.clone()),
         Arc::new(embedding.finish()),
@@ -226,7 +239,7 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
     let object = col::<StringArray>(b, "object_id")?;
     let link_type = col::<StringArray>(b, "link_type")?;
     let weight = col::<Float32Array>(b, "weight")?;
-    let value = col::<StringArray>(b, "value")?;
+    let value = col::<LargeBinaryArray>(b, "value")?;
     let sealed = col::<LargeBinaryArray>(b, "sealed")?;
     let text = col::<StringArray>(b, "text")?;
     let embedding = col::<FixedSizeListArray>(b, "embedding")?;
@@ -250,9 +263,11 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
             let f = v.as_any().downcast_ref::<Float32Array>().map(|a| a.values().to_vec()).unwrap_or_default();
             f.into_iter().map(f16::from_f32).collect::<Vec<_>>()
         });
-        let value = match opt_str(value, i) {
-            Some(s) => serde_json::from_str(&s).map_err(|e| StoreError::Decode(format!("value: {e}")))?,
-            None => serde_json::Value::Null,
+        let value = if value.is_null(i) {
+            serde_json::Value::Null
+        } else {
+            let text = lance_arrow::json::decode_json(value.value(i));
+            serde_json::from_str(&text).map_err(|e| StoreError::Decode(format!("value: {e}")))?
         };
         rows.push(StoredRow {
             id: id.value(i).to_string(),
