@@ -494,7 +494,7 @@ fn value_to_string_json(value: &serde_json::Value) -> String {
 }
 
 /// Compare two JSON values
-fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+pub(crate) fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
     match (a, b) {
         (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
             let a_f = a.as_f64().unwrap_or(0.0);

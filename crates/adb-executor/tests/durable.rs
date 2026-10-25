@@ -191,6 +191,9 @@ async fn lance_reads_match_backend_reads() {
         r#"STORE INTO EPISODIC (bid_id = "e3", campaign = "winter", won = true, cpm_paid = 4.0)"#,
         r#"STORE INTO EPISODIC (bid_id = "e4", campaign = "summer", won = false, cpm_paid = 0.5)"#,
         r#"UPDATE INTO SEMANTIC WHERE concept = "gamma" (avg_cpm = 3.6)"#,
+        r#"STORE INTO PROCEDURAL (pattern_id = "disk-fix", pattern = "disk full node pressure", steps = "prune build dirs", severity = "high", confidence = 0.7)"#,
+        r#"STORE INTO PROCEDURAL (pattern_id = "oom-2", pattern = "OOMKilled container memory", steps = "raise the limit", confidence = 0.4)"#,
+        r#"UPDATE INTO PROCEDURAL WHERE pattern_id = "disk-fix" (confidence = 0.8)"#,
     ];
     const QUERIES: &[&str] = &[
         r#"RECALL FROM SEMANTIC WHERE active = true"#,
@@ -206,6 +209,11 @@ async fn lance_reads_match_backend_reads() {
         r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#,
         r#"LOOKUP FROM SEMANTIC KEY concept = "acme" WITH LINKS ALL"#,
         r#"RECALL FROM ALL WHERE campaign = "summer""#,
+        r#"LOOKUP FROM PROCEDURAL ALL ORDER BY confidence DESC"#,
+        r#"LOOKUP FROM PROCEDURAL WHERE severity = "medium""#,
+        r#"LOOKUP FROM PROCEDURAL WHERE confidence > 0.5 RETURN pattern_id, confidence, version"#,
+        r#"LOOKUP FROM PROCEDURAL KEY id = "disk-fix""#,
+        r#"LOOKUP FROM PROCEDURAL WHERE pattern = "oom" FOLLOW LINKS TYPE "applied_to""#,
     ];
     let dir = tempfile::tempdir().unwrap();
     {

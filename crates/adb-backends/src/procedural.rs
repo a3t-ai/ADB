@@ -443,9 +443,30 @@ impl Backend for ProceduralBackend {
             results.retain(|r| r.metadata.namespace.as_ref() == Some(namespace));
         }
 
+        // Apply ORDER BY (as SEMANTIC does): without it the order was the graph's
+        // insertion order, which differs after a restart.
+        if let Some(ref order_by) = modifiers.order_by {
+            results.sort_by(|a, b| {
+                let cmp = match (a.data.get(&order_by.field), b.data.get(&order_by.field)) {
+                    (Some(a), Some(b)) => crate::semantic::compare_json_values(a, b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                if order_by.ascending { cmp } else { cmp.reverse() }
+            });
+        }
+
         // Apply limit
         if let Some(limit) = modifiers.limit {
             results.truncate(limit);
+        }
+
+        // Apply RETURN (field projection)
+        if let Some(ref return_fields) = modifiers.return_fields {
+            for record in &mut results {
+                record.data = record.project_fields(return_fields);
+            }
         }
 
         Ok(results)

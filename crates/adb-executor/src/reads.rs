@@ -3,8 +3,8 @@
 //! - [`DirectReads`] — the in-memory backends (`adb-backends`).
 //! - [`LanceReads`] — SEMANTIC and EPISODIC records, and every link, from the
 //!   partition's Lance table (its current view, D2_TEMPORAL.md §3); other memory
-//!   types from the backends (WORKING and TOOLS are the in-memory hot tier;
-//!   PROCEDURAL moves later). Links are the table's edge rows (stage D4.1), so a
+//!   types from the backends (WORKING and TOOLS are the in-memory hot tier).
+//!   PROCEDURAL reads from Lance too (stage D4.2). Links are the table's edge rows (stage D4.1), so a
 //!   forgotten record's links are gone at once, as D2 §5 says, not only after a
 //!   restart.
 //!
@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adb_backends::{Adb, Backend, EpisodicBackend, SemanticBackend};
+use adb_backends::{Adb, Backend, EpisodicBackend, ProceduralBackend, SemanticBackend};
 use adb_core::log::{CommitTs, Memory};
 use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
 use adb_store::{predicate_filter, PartitionStore, StoredRow};
@@ -100,6 +100,7 @@ pub struct LanceReads {
 enum View {
     Semantic(SemanticBackend),
     Episodic(EpisodicBackend),
+    Procedural(ProceduralBackend),
 }
 
 impl LanceReads {
@@ -109,7 +110,7 @@ impl LanceReads {
 
     /// The memory types served from Lance.
     pub fn serves(memory: MemoryType) -> bool {
-        matches!(memory, MemoryType::Semantic | MemoryType::Episodic)
+        matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
     }
 
     /// A throwaway backend holding the memory type's current rows that may match
@@ -120,8 +121,13 @@ impl LanceReads {
         }
         let m: Memory = memory.into();
         let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").not_eq(lit("edge")));
-        if let Some(p) = predicate_filter(m, predicate) {
-            filter = filter.and(p);
+        // Not for PROCEDURAL: its conditions see the backend's `ProcedureNode`, whose
+        // defaults (`severity`, `confidence`, `version`, counts) the payload may lack,
+        // so a payload filter could drop a match. Procedure sets are small.
+        if memory != MemoryType::Procedural {
+            if let Some(p) = predicate_filter(m, predicate) {
+                filter = filter.and(p);
+            }
         }
         let now = CommitTs::from_datetime(time::now());
         let rows = self
@@ -134,6 +140,21 @@ impl LanceReads {
                 let b = SemanticBackend::new()?;
                 rows.iter().for_each(|r| b.insert_record(to_record(r)));
                 View::Semantic(b)
+            }
+            MemoryType::Procedural => {
+                // The backend shapes payloads into its own nodes: re-run each `store`
+                // at its commit time (as `hydrate` does), oldest first, then restore
+                // the version.
+                let b = ProceduralBackend::new();
+                let mut rows = rows;
+                rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
+                for r in &rows {
+                    let rec = to_record(r);
+                    let stored = b.store(r.key(), r.data.value.clone(), rec.metadata.scope, r.data.namespace.as_deref(), rec.metadata.ttl);
+                    time::at(r.commit_ts.to_datetime(), stored).await?;
+                    b.set_version(r.key(), u64::from(r.version));
+                }
+                View::Procedural(b)
             }
             _ => {
                 let b = EpisodicBackend::new();
@@ -153,6 +174,7 @@ impl Reads for LanceReads {
         match self.view(memory, predicate).await? {
             View::Semantic(b) => b.lookup(predicate, modifiers).await,
             View::Episodic(b) => b.lookup(predicate, modifiers).await,
+            View::Procedural(b) => b.lookup(predicate, modifiers).await,
         }
     }
 
@@ -176,6 +198,7 @@ impl Reads for LanceReads {
         match self.view(memory, predicate).await? {
             View::Semantic(b) => b.recall(predicate, modifiers).await,
             View::Episodic(b) => b.recall(predicate, modifiers).await,
+            View::Procedural(b) => b.recall(predicate, modifiers).await,
         }
     }
 }
