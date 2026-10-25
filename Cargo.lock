@@ -148,10 +148,17 @@ dependencies = [
 name = "adb-store"
 version = "0.1.0"
 dependencies = [
+ "adb-core",
  "arrow-array",
  "arrow-schema",
  "futures",
+ "half",
  "lance",
+ "lance-index",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "uuid",
 ]

@@ -1,0 +1,290 @@
+//! One partition's memory table: a Lance dataset written through its MemWAL shard
+//! (option A, ARCHITECTURE.md §9.2–9.3; spikes B2, R11).
+//!
+//! - **Apply:** each log record becomes ONE MemWAL `put` holding its rows plus the
+//!   `_meta` row (`applied_offset` = the record's offset), so a crash leaves either
+//!   all of a record or none of it, and `_meta` says where replay resumes.
+//! - **Idempotent:** a record at or below `applied_offset` is skipped, so replaying the
+//!   log from anywhere below is safe.
+//! - **Reads:** `LsmScanner` over memtable + flushed generations + base table, newest
+//!   row per `id`.
+//! - **Seals:** ADB-driven (Lance's automatic limits set out of reach, §9.2 workaround
+//!   for the replay bug): the active memtable is sealed when it reaches `memtable_rows`.
+//! - **Durability:** puts are not durable on their own (`durable_write(false)`): the ADB
+//!   log is the WAL. The MemWAL WAL flushes every `wal_flush`; until then a crash is
+//!   recovered by replaying the log from `applied_offset + 1`.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, PartitionId, RecordId};
+use arrow_array::RecordBatchIterator;
+use arrow_schema::SchemaRef;
+use lance::dataset::mem_wal::scanner::{DatasetCache, LsmScanner, ShardSnapshot, SsTableCache};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriter, ShardWriterConfig};
+use lance::dataset::{Dataset, WriteParams};
+use lance::index::DatasetIndexExt;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::IndexType;
+use uuid::Uuid;
+
+use crate::rows::{decode, encode, StoredRow};
+use crate::schema::{memory_schema, META_ID};
+use crate::{StoreError, StoreResult};
+
+#[derive(Debug, Clone)]
+pub struct StoreConfig {
+    /// Directory (or object-store URI) holding `p{partition}/memory.lance`.
+    pub root: PathBuf,
+    /// Platform embedding dimension (D3 S5).
+    pub embedding_dim: i32,
+    /// ADB seals the active memtable at this many rows.
+    pub memtable_rows: usize,
+    /// MemWAL WAL flush interval.
+    pub wal_flush: Duration,
+}
+
+impl StoreConfig {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into(), embedding_dim: 768, memtable_rows: 10_000, wal_flush: Duration::from_secs(1) }
+    }
+}
+
+fn lance(e: impl std::fmt::Display) -> StoreError {
+    StoreError::Lance(e.to_string())
+}
+
+/// Quote a string for a Lance SQL filter.
+pub fn sql_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The MemWAL shard of a partition: stable across reopen, so a new owner replays it.
+fn shard_id(p: PartitionId) -> Uuid {
+    Uuid::from_u128(0xadb0_0000_0000_4000_8000_0000_0000_0000 | u128::from(p.0))
+}
+
+pub struct PartitionStore {
+    partition: PartitionId,
+    base: Arc<Dataset>,
+    writer: ShardWriter,
+    cache: Arc<dyn DatasetCache>,
+    schema: SchemaRef,
+    dim: i32,
+    memtable_rows: usize,
+}
+
+impl PartitionStore {
+    /// Open (creating if needed) the partition's table and become its writer.
+    pub async fn open(cfg: &StoreConfig, partition: PartitionId) -> StoreResult<Self> {
+        let schema = memory_schema(cfg.embedding_dim);
+        let dir = cfg.root.join(format!("p{}", partition.0)).join("memory.lance");
+        let uri = dir.to_string_lossy().to_string();
+        if !dir.exists() {
+            Self::create(&uri, &schema, cfg.embedding_dim).await?;
+        }
+        let base = Arc::new(Dataset::open(&uri).await.map_err(lance)?);
+        let shard = shard_id(partition);
+        let config = ShardWriterConfig::new(shard)
+            .with_durable_write(false)
+            .with_max_wal_flush_interval(cfg.wal_flush)
+            .with_stats_log_interval(None)
+            // ADB seals (see the module docs): Lance's own limits out of reach, but finite —
+            // Lance sizes buffers from them (usize::MAX overflows), values from spike R11.
+            .with_max_memtable_rows(10_000_000)
+            .with_max_memtable_size(4 << 30)
+            .with_max_memtable_batches(1_000_000)
+            .with_max_unflushed_memtable_bytes(8 << 30);
+        let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
+        Ok(Self {
+            partition,
+            base,
+            writer,
+            cache: Arc::new(SsTableCache::new(64)),
+            schema,
+            dim: cfg.embedding_dim,
+            memtable_rows: cfg.memtable_rows,
+        })
+    }
+
+    /// Base table with the `_meta` row, a BTree on `id`, and a MemWAL maintaining it.
+    async fn create(uri: &str, schema: &SchemaRef, dim: i32) -> StoreResult<()> {
+        let meta = StoredRow::meta(0, CommitTs(0), 0, serde_json::json!({ "embedding_dim": dim }));
+        let batch = encode(&[meta], schema, dim)?;
+        let mut ds = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema.clone()), uri, Some(WriteParams::default()))
+            .await
+            .map_err(lance)?;
+        ds.create_index(&["id"], IndexType::BTree, Some("id_idx".into()), &ScalarIndexParams::default(), true)
+            .await
+            .map_err(lance)?;
+        ds.initialize_mem_wal().unsharded().maintained_indexes(["id_idx"]).execute().await.map_err(lance)?;
+        Ok(())
+    }
+
+    pub fn partition(&self) -> PartitionId {
+        self.partition
+    }
+
+    /// Every row version matching `filter` (Lance SQL), newest per id, `_meta` included.
+    pub async fn scan(&self, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
+        let manifest = self.writer.manifest().await.map_err(lance)?;
+        let mut snap = ShardSnapshot::new(self.writer.shard_id());
+        if let Some(m) = &manifest {
+            snap = snap.with_current_generation(m.current_generation);
+            for t in &m.sstables {
+                snap = snap.with_sstable(t.generation, t.path.clone());
+            }
+        }
+        let mut scanner = LsmScanner::new(self.base.clone(), vec![snap], vec!["id".into()])
+            .with_in_memory_memtables(self.writer.shard_id(), self.writer.in_memory_memtable_refs().await.map_err(lance)?)
+            .with_sstable_cache(self.cache.clone());
+        if let Some(f) = filter {
+            scanner = scanner.filter(f).map_err(lance)?;
+        }
+        let batch = scanner.try_into_batch().await.map_err(lance)?;
+        decode(&batch)
+    }
+
+    /// The current view (D2 §3) at `now`, without `_meta`.
+    pub async fn current(&self, filter: Option<&str>, now: CommitTs) -> StoreResult<Vec<StoredRow>> {
+        Ok(self
+            .scan(filter)
+            .await?
+            .into_iter()
+            .filter(|r| r.id != META_ID && r.data.kind != Kind::Meta && r.is_current(now))
+            .collect())
+    }
+
+    /// The newest version of row `id`, if any.
+    pub async fn get(&self, id: &str) -> StoreResult<Option<StoredRow>> {
+        Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())
+    }
+
+    /// The last log offset applied to this table.
+    pub async fn applied_offset(&self) -> StoreResult<LogOffset> {
+        let meta = self.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
+        Ok(LogOffset(meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0)))
+    }
+
+    /// Apply one committed log record as a single MemWAL put. Records at or below
+    /// the applied offset are skipped. Returns whether it was applied.
+    pub async fn apply(&self, record: &LogRecord) -> StoreResult<bool> {
+        if record.offset <= self.applied_offset().await? {
+            return Ok(false);
+        }
+        let ts = record.commit_ts;
+        let (off, epoch) = (record.offset.0, record.epoch.0);
+        // Rows this record writes, one per id (later effects see earlier ones).
+        let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
+
+        for effect in &record.effects {
+            match effect {
+                Effect::PutEntity(n)
+                | Effect::PutFact(n)
+                | Effect::PutEpisode(n)
+                | Effect::PutTool(n)
+                | Effect::PutEdge(n)
+                | Effect::PublishEvent(n)
+                | Effect::Register(n) => {
+                    out.insert(n.id.0.clone(), StoredRow::from_new(n, ts, off, epoch));
+                }
+                Effect::Supersede { old, new } => {
+                    if let Some(mut prev) = self.row(&out, &old.0).await? {
+                        prev.valid_to = Some(ts);
+                        prev.superseded_by = Some(new.id.0.clone());
+                        prev.log_offset = off;
+                        out.insert(prev.id.clone(), prev);
+                    }
+                    out.insert(new.id.0.clone(), StoredRow::from_new(new, ts, off, epoch));
+                }
+                Effect::Patch { id, fields, .. } => {
+                    if let Some(mut cur) = self.row(&out, &id.0).await? {
+                        match &mut cur.data.value {
+                            serde_json::Value::Object(v) => v.extend(fields.clone()),
+                            other => *other = serde_json::Value::Object(fields.clone()),
+                        }
+                        if let Some(c) = fields.get("content").and_then(|v| v.as_str()) {
+                            cur.data.text = Some(c.to_string());
+                        }
+                        cur.version += 1;
+                        cur.valid_from = ts; // last write (D2 T7)
+                        cur.commit_ts = ts;
+                        cur.log_offset = off;
+                        out.insert(cur.id.clone(), cur);
+                    }
+                }
+                Effect::Forget { lineage_id, .. } | Effect::Expire { lineage_id, .. } => {
+                    for mut r in self.lineage_and_edges(&out, lineage_id).await? {
+                        r.tombstone = true;
+                        r.log_offset = off;
+                        out.insert(r.id.clone(), r);
+                    }
+                }
+                Effect::UpdateSubCursor { sub_id, cursor } => {
+                    if let Some(mut sub) = self.row(&out, &sub_id.0).await? {
+                        if let serde_json::Value::Object(v) = &mut sub.data.value {
+                            v.insert("cursor".into(), cursor.0.into());
+                        }
+                        sub.log_offset = off;
+                        out.insert(sub.id.clone(), sub);
+                    }
+                }
+                Effect::Unregister { id } => {
+                    if let Some(mut r) = self.row(&out, &id.0).await? {
+                        r.tombstone = true;
+                        r.log_offset = off;
+                        out.insert(r.id.clone(), r);
+                    }
+                }
+            }
+        }
+        out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, serde_json::json!({ "embedding_dim": self.dim })));
+
+        let rows: Vec<StoredRow> = out.into_values().collect();
+        let batch = encode(&rows, &self.schema, self.dim)?;
+        self.writer.put(vec![batch]).await.map_err(lance)?;
+        if self.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
+            self.writer.force_seal_active().await.map_err(lance)?;
+        }
+        Ok(true)
+    }
+
+    /// A row as this record has it so far, else as stored.
+    async fn row(&self, out: &BTreeMap<String, StoredRow>, id: &str) -> StoreResult<Option<StoredRow>> {
+        match out.get(id) {
+            Some(r) => Ok(Some(r.clone())),
+            None => self.get(id).await,
+        }
+    }
+
+    /// Every version of a lineage, and every edge touching it (D2 §5).
+    async fn lineage_and_edges(&self, out: &BTreeMap<String, StoredRow>, lineage: &RecordId) -> StoreResult<Vec<StoredRow>> {
+        let l = sql_str(&lineage.0);
+        let filter = format!("lineage_id = {l} OR subject_id = {l} OR object_id = {l}");
+        let mut rows: BTreeMap<String, StoredRow> =
+            self.scan(Some(&filter)).await?.into_iter().map(|r| (r.id.clone(), r)).collect();
+        for r in out.values() {
+            let hit = r.lineage_id == lineage.0
+                || r.data.subject_id.as_deref() == Some(&lineage.0)
+                || r.data.object_id.as_deref() == Some(&lineage.0);
+            if hit {
+                rows.insert(r.id.clone(), r.clone());
+            }
+        }
+        Ok(rows.into_values().collect())
+    }
+
+    /// Batches the MemWAL has made durable, and the writer's batch numbering base
+    /// (for mapping durable batches back to log offsets, D2 of the plan).
+    pub async fn durable_batches(&self) -> StoreResult<(usize, usize)> {
+        let st = self.writer.memtable_stats().await.map_err(lance)?;
+        Ok((st.durable_batch_count, st.global_offset))
+    }
+
+    /// Flush and release the writer.
+    pub async fn close(self) -> StoreResult<()> {
+        self.writer.close().await.map_err(lance)
+    }
+}
