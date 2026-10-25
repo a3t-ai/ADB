@@ -3,6 +3,12 @@
 use adb_executor::{Engine, LocalEngine};
 use serde_json::Value;
 
+/// Lance's memory pool is process-wide and each LSM read reserves a fixed chunk for
+/// its sort-merge, so engines in parallel tests can exhaust it ("Resources exhausted").
+/// Tests take turns on Lance; production has one engine per process (risk noted in
+/// RISK_BURNDOWN.md for concurrent reads in stage D3).
+static LANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Writes covering every memory type, UPDATE, FORGET and LINK.
 const WRITES: &[&str] = &[
     r#"STORE INTO WORKING (task = "t1", step = 1) TTL 1h"#,
@@ -50,6 +56,7 @@ async fn snapshot(engine: &LocalEngine) -> Vec<Value> {
 
 #[tokio::test]
 async fn restart_rebuilds_identical_state() {
+    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
 
     let before = {
@@ -85,6 +92,7 @@ async fn restart_rebuilds_identical_state() {
 
 #[tokio::test]
 async fn ttl_measured_from_commit_time_after_restart() {
+    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -100,6 +108,7 @@ async fn ttl_measured_from_commit_time_after_restart() {
 
 #[tokio::test]
 async fn reads_and_failed_writes_are_not_logged() {
+    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -111,4 +120,74 @@ async fn reads_and_failed_writes_are_not_logged() {
     }
     let (_, replayed) = LocalEngine::durable(dir.path()).await.unwrap();
     assert_eq!(replayed.records, 0);
+}
+
+/// Stage D2: the partition's Lance table, brought up to the log's end, as engine
+/// startup does it (open the store, catch up from the log).
+async fn lance_view(dir: &std::path::Path) -> (u64, Vec<adb_store::StoredRow>) {
+    use adb_core::log::{CommitTs, PartitionId};
+    let store = adb_store::PartitionStore::open(&adb_store::StoreConfig::new(dir.join("store")), PartitionId(0)).await.unwrap();
+    let wal = adb_log::LocalWal::open(PartitionId(0), adb_log::WalConfig::new(dir.join("p0"))).unwrap();
+    adb_executor::writes::catch_up(&store, &wal).await.unwrap();
+    let applied = store.applied_offset().await.unwrap().0;
+    let now = CommitTs::from_datetime(chrono::Utc::now());
+    let rows = store.current(None, now).await.unwrap();
+    store.close().await.unwrap();
+    (applied, rows)
+}
+
+fn summary(rows: &[adb_store::StoredRow]) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (format!("{:?}/{:?}", r.data.memory, r.data.kind), r.data.value.get("bid_id").or(r.data.value.get("task")).or(r.data.value.get("concept")).or(r.data.value.get("pattern")).or(r.data.value.get("tool_id")).or(r.data.link_type.as_ref().map(|_| &r.data.value)).map(|v| v.to_string()).unwrap_or_default()))
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn lance_table_mirrors_the_engine() {
+    let _lance = LANCE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        for q in WRITES {
+            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+    }
+    let (applied, rows) = lance_view(dir.path()).await;
+    assert_eq!(applied, WRITES.len() as u64, "every log record applied");
+    let s = summary(&rows);
+    // working t1 (t2 forgotten), semantic acme, episodic e1 (e2 forgotten),
+    // procedural oom-fix, tools search, two edges.
+    assert_eq!(rows.len(), 7, "{s:?}");
+    let e1 = rows.iter().find(|r| r.data.value.get("bid_id").and_then(|v| v.as_str()) == Some("e1")).unwrap();
+    assert_eq!(e1.data.value["won"], true, "UPDATE applied in Lance");
+    assert_eq!(e1.data.value["brand_lift"], 0.04);
+    let t1 = rows.iter().find(|r| r.data.value.get("task").and_then(|v| v.as_str()) == Some("t1")).unwrap();
+    assert_eq!(t1.data.value["step"], 5);
+    assert!(t1.data.ttl_at.is_some(), "TTL carried into Lance");
+    assert_eq!(rows.iter().filter(|r| r.data.link_type.is_some()).count(), 2, "{s:?}");
+}
+
+#[tokio::test]
+async fn lance_catches_up_from_the_log() {
+    let _lance = LANCE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        for q in WRITES {
+            engine.query(q, None).await.unwrap();
+        }
+    }
+    let (_, before) = lance_view(dir.path()).await;
+    // Lose the Lance table entirely: the log rebuilds it on the next open.
+    std::fs::remove_dir_all(dir.path().join("store")).unwrap();
+    {
+        let (_engine, stats) = LocalEngine::durable(dir.path()).await.unwrap();
+        assert_eq!(stats.store_caught_up, WRITES.len() as u64);
+    }
+    let (applied, after) = lance_view(dir.path()).await;
+    assert_eq!(applied, WRITES.len() as u64);
+    assert_eq!(summary(&before), summary(&after));
 }

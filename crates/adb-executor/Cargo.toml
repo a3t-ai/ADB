@@ -11,6 +11,7 @@ adb-backends = { path = "../adb-backends" }
 aql-planner = { path = "../aql-planner" }
 adb-log = { path = "../adb-log" }
 adb-sequencer = { path = "../adb-sequencer" }
+adb-store = { path = "../adb-store" }
 aql-parser.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
@@ -22,4 +23,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+chrono.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }

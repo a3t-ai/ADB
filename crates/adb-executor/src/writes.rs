@@ -21,11 +21,13 @@ use std::time::Duration;
 
 use adb_backends::Adb;
 use adb_core::log::{
-    CommitTs, Effect, Kind, LogOffset, Memory, NewRow, PartitionId, Provenance, RecordId, RowData, Visibility,
+    CommitTs, Effect, Kind, LogOffset, LogRecord, Memory, NewRow, PartitionId, Provenance, RecordId, RowData,
+    Visibility,
 };
 use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Predicate, Scope};
 use adb_log::{Log, LogError};
 use adb_sequencer::Sequencer;
+use adb_store::PartitionStore;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -140,22 +142,64 @@ fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
 pub struct DurableWrites<L: Log> {
     adb: Arc<Adb>,
     seq: Mutex<Sequencer<L>>,
+    /// The partition's Lance table (stage D2: written alongside the in-memory
+    /// backends; reads move to it in D3). `None` = log + memory only.
+    store: Option<PartitionStore>,
 }
 
 impl<L: Log + 'static> DurableWrites<L> {
-    /// Replay `log` into `adb`, then accept new writes on top of it.
-    pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>) -> AdbResult<(Self, ReplayStats)> {
-        let stats = replay(&adb, seq.log()).await?;
+    /// Replay `log` into `adb`, bring `store` up to the log's end, then accept new
+    /// writes on top of both.
+    pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>, store: Option<PartitionStore>) -> AdbResult<(Self, ReplayStats)> {
+        let mut stats = replay(&adb, seq.log()).await?;
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
         }
-        Ok((Self { adb, seq: Mutex::new(seq) }, stats))
+        if let Some(s) = &store {
+            stats.store_caught_up = catch_up(s, seq.log()).await?;
+        }
+        Ok((Self { adb, seq: Mutex::new(seq), store }, stats))
     }
 
     /// The last durable offset (tests and metrics).
     pub async fn durable_offset(&self) -> LogOffset {
         self.seq.lock().await.log().durable_offset()
     }
+
+    /// The Lance table, if any (tests and D3 reads).
+    pub fn store(&self) -> Option<&PartitionStore> {
+        self.store.as_ref()
+    }
+
+    /// Apply a committed record to the Lance table. Called with the sequencer held,
+    /// so records arrive in log order. A failure is logged, not returned: the write
+    /// is already durable in the log, and `catch_up` re-applies it on the next open.
+    async fn to_store(&self, record: &LogRecord) {
+        if let Some(s) = &self.store {
+            if let Err(e) = s.apply(record).await {
+                tracing::warn!(offset = record.offset.0, error = %e, "Lance apply failed; the log has it, catch-up on next open");
+            }
+        }
+    }
+}
+
+/// Apply every log record above the table's `_meta` offset (records lost from the
+/// MemWAL by a crash, or written while Lance applies failed). Returns how many.
+pub async fn catch_up<L: Log>(store: &PartitionStore, log: &L) -> AdbResult<u64> {
+    let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+    let mut from = store.applied_offset().await.map_err(store_err)?.next();
+    let mut applied = 0;
+    loop {
+        let batch = log.read(from, 1024).await.map_err(log_err)?;
+        let Some(last) = batch.last().map(|r| r.offset) else { break };
+        for record in &batch {
+            if store.apply(record).await.map_err(store_err)? {
+                applied += 1;
+            }
+        }
+        from = last.next();
+    }
+    Ok(applied)
 }
 
 #[async_trait]
@@ -182,8 +226,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             MemoryType::Tools => Effect::PutTool(new),
             _ => Effect::PutEntity(new),
         };
-        seq.append(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
-        apply(&self.adb, ts, &effect).await?.ok_or_else(|| AdbError::Internal("store produced no record".into()))
+        let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        let stored = apply(&self.adb, ts, &effect).await?.ok_or_else(|| AdbError::Internal("store produced no record".into()))?;
+        self.to_store(&record).await;
+        Ok(stored)
     }
 
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64> {
@@ -205,9 +251,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             .iter()
             .map(|id| Effect::Patch { memory: memory_type.into(), id: RecordId(id.clone()), fields: fields.clone(), version: 0 })
             .collect();
-        seq.append(ts, None, effects).await.map_err(log_err)?;
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         // Apply exactly what was logged, so live and replayed updates agree.
-        time::at(ts.to_datetime(), self.adb.update_ids(memory_type, &ids, serde_json::Value::Object(fields))).await
+        let n = time::at(ts.to_datetime(), self.adb.update_ids(memory_type, &ids, serde_json::Value::Object(fields))).await?;
+        self.to_store(&record).await;
+        Ok(n)
     }
 
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64> {
@@ -219,11 +267,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         let effects: Vec<Effect> =
             ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
-        seq.append(ts, None, effects.clone()).await.map_err(log_err)?;
+        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         let mut removed = 0;
         for effect in &effects {
             removed += apply_count(&self.adb, ts, effect).await?;
         }
+        self.to_store(&record).await;
         Ok(removed)
     }
 
@@ -249,8 +298,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         data.link_type = Some(link_type.into());
         data.weight = Some(weight);
         let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
-        seq.append(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
-        apply_link(&self.adb, ts, &effect).await
+        let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        let link = apply_link(&self.adb, ts, &effect).await?;
+        self.to_store(&record).await;
+        Ok(link)
     }
 }
 
@@ -261,6 +312,8 @@ pub struct ReplayStats {
     pub effects: u64,
     pub last_offset: LogOffset,
     pub last_commit_ts: Option<CommitTs>,
+    /// Log records the Lance table was missing and got on open.
+    pub store_caught_up: u64,
 }
 
 /// Rebuild `adb` from every record in `log`, in order.

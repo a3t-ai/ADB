@@ -122,6 +122,11 @@ impl<L: Log> Sequencer<L> {
 
     /// Log a prepared transaction at `commit_ts`. Resolves once it is durable.
     pub async fn append(&mut self, commit_ts: CommitTs, txn_id: Option<String>, effects: Vec<Effect>) -> LogResult<LogOffset> {
+        self.append_record(commit_ts, txn_id, effects).await.map(|r| r.offset)
+    }
+
+    /// As [`Sequencer::append`], returning the logged record (for appliers).
+    pub async fn append_record(&mut self, commit_ts: CommitTs, txn_id: Option<String>, effects: Vec<Effect>) -> LogResult<LogRecord> {
         let record = LogRecord {
             partition: self.log.partition(),
             offset: self.log.last_offset().next(),
@@ -130,11 +135,11 @@ impl<L: Log> Sequencer<L> {
             txn_id: txn_id.clone(),
             effects,
         };
-        let offset = self.log.append(record).await?;
+        let offset = self.log.append(record.clone()).await?;
         if let Some(id) = txn_id {
             self.seen.insert(id, offset);
         }
-        Ok(offset)
+        Ok(record)
     }
 
     /// Resume after replay: the clock continues after the last committed timestamp.

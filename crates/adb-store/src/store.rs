@@ -74,6 +74,9 @@ pub struct PartitionStore {
     schema: SchemaRef,
     dim: i32,
     memtable_rows: usize,
+    /// `_meta`'s applied offset, read once on open and advanced by `apply`, so
+    /// applying a record doesn't scan the table just to check it.
+    applied: std::sync::atomic::AtomicU64,
 }
 
 impl PartitionStore {
@@ -98,7 +101,7 @@ impl PartitionStore {
             .with_max_memtable_batches(1_000_000)
             .with_max_unflushed_memtable_bytes(8 << 30);
         let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
-        Ok(Self {
+        let store = Self {
             partition,
             base,
             writer,
@@ -106,7 +109,12 @@ impl PartitionStore {
             schema,
             dim: cfg.embedding_dim,
             memtable_rows: cfg.memtable_rows,
-        })
+            applied: std::sync::atomic::AtomicU64::new(0),
+        };
+        let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
+        let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
+        Ok(store)
     }
 
     /// Base table with the `_meta` row, a BTree on `id`, and a MemWAL maintaining it.
@@ -162,10 +170,9 @@ impl PartitionStore {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())
     }
 
-    /// The last log offset applied to this table.
+    /// The last log offset applied to this table (`_meta`, cached).
     pub async fn applied_offset(&self) -> StoreResult<LogOffset> {
-        let meta = self.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
-        Ok(LogOffset(meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0)))
+        Ok(LogOffset(self.applied.load(std::sync::atomic::Ordering::SeqCst)))
     }
 
     /// Apply one committed log record as a single MemWAL put. Records at or below
@@ -209,8 +216,9 @@ impl PartitionStore {
                             cur.data.text = Some(c.to_string());
                         }
                         cur.version += 1;
-                        cur.valid_from = ts; // last write (D2 T7)
-                        cur.commit_ts = ts;
+                        // Last write (D2 T7); commit_ts stays the STORE's, so annotating an
+                        // episode doesn't reorder it (D2 §3).
+                        cur.valid_from = ts;
                         cur.log_offset = off;
                         out.insert(cur.id.clone(), cur);
                     }
@@ -245,6 +253,7 @@ impl PartitionStore {
         let rows: Vec<StoredRow> = out.into_values().collect();
         let batch = encode(&rows, &self.schema, self.dim)?;
         self.writer.put(vec![batch]).await.map_err(lance)?;
+        self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
         if self.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
             self.writer.force_seal_active().await.map_err(lance)?;
         }

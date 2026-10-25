@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 use adb_core::log::Epoch;
 use adb_log::{LocalWal, WalConfig};
 use adb_sequencer::Sequencer;
+use adb_store::{PartitionStore, StoreConfig};
 
 use crate::writes::{DurableWrites, ReplayStats, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
@@ -47,13 +48,17 @@ impl LocalEngine {
 
 impl LocalEngine {
     /// A durable engine: replays the write-ahead log in `dir`, then logs every write
-    /// there before applying it (stage C). Returns what the replay found.
+    /// there before applying it (stage C), and applies it to the partition's Lance
+    /// table in `dir/store` too (stage D2). Returns what the replay found.
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         let adb = Arc::new(Adb::new());
         let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
         let seq = Sequencer::new(wal, Epoch(1));
-        let (writes, stats) = DurableWrites::open(Arc::clone(&adb), seq).await.map_err(|e| e.to_string())?;
+        let store = PartitionStore::open(&StoreConfig::new(dir.join("store")), SINGLE_PARTITION)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (writes, stats) = DurableWrites::open(Arc::clone(&adb), seq, Some(store)).await.map_err(|e| e.to_string())?;
         let executor = Executor::with_writes(Arc::clone(&adb), Arc::new(writes));
         Ok((Self { adb, executor }, stats))
     }
