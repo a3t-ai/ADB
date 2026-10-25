@@ -3,12 +3,6 @@
 use adb_executor::{Engine, LocalEngine};
 use serde_json::Value;
 
-/// Lance's memory pool is process-wide and each LSM read reserves a fixed chunk for
-/// its sort-merge, so engines in parallel tests can exhaust it ("Resources exhausted").
-/// Tests take turns on Lance; production has one engine per process (risk noted in
-/// RISK_BURNDOWN.md for concurrent reads in stage D3).
-static LANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Writes covering every memory type, UPDATE, FORGET and LINK.
 const WRITES: &[&str] = &[
     r#"STORE INTO WORKING (task = "t1", step = 1) TTL 1h"#,
@@ -56,7 +50,6 @@ async fn snapshot(engine: &LocalEngine) -> Vec<Value> {
 
 #[tokio::test]
 async fn restart_rebuilds_identical_state() {
-    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
 
     let before = {
@@ -92,7 +85,6 @@ async fn restart_rebuilds_identical_state() {
 
 #[tokio::test]
 async fn ttl_measured_from_commit_time_after_restart() {
-    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -108,7 +100,6 @@ async fn ttl_measured_from_commit_time_after_restart() {
 
 #[tokio::test]
 async fn reads_and_failed_writes_are_not_logged() {
-    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -147,7 +138,6 @@ fn summary(rows: &[adb_store::StoredRow]) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn lance_table_mirrors_the_engine() {
-    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -172,7 +162,6 @@ async fn lance_table_mirrors_the_engine() {
 
 #[tokio::test]
 async fn lance_catches_up_from_the_log() {
-    let _lance = LANCE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();

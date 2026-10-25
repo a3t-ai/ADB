@@ -79,9 +79,27 @@ pub struct PartitionStore {
     applied: std::sync::atomic::AtomicU64,
 }
 
+/// Lance runtime settings for ADB's workload, applied once before Lance is first used.
+///
+/// Lance's default execution session spills sorts to disk, reserving
+/// `min(pool / 3, 40 MB)` up front per sort from a process-wide pool
+/// (`LANCE_MEM_POOL_SIZE`, 150 MB): only ~3 sorts can run at once, however small, and
+/// concurrent LSM reads fail with "Resources exhausted" (risk K10). ADB's sorts are
+/// per-partition and small, so spilling buys nothing: bypass it. `ADB_LANCE_SPILL=1`
+/// (or an explicit `LANCE_BYPASS_SPILLING`) keeps Lance's behaviour.
+pub fn configure_lance_runtime() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("LANCE_BYPASS_SPILLING").is_none() && std::env::var_os("ADB_LANCE_SPILL").is_none() {
+            std::env::set_var("LANCE_BYPASS_SPILLING", "1");
+        }
+    });
+}
+
 impl PartitionStore {
     /// Open (creating if needed) the partition's table and become its writer.
     pub async fn open(cfg: &StoreConfig, partition: PartitionId) -> StoreResult<Self> {
+        configure_lance_runtime();
         let schema = memory_schema(cfg.embedding_dim);
         let dir = cfg.root.join(format!("p{}", partition.0)).join("memory.lance");
         let uri = dir.to_string_lossy().to_string();

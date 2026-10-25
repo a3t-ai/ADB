@@ -9,7 +9,7 @@ pub mod store;
 pub use lance;
 pub use rows::StoredRow;
 pub use schema::{memory_schema, META_ID};
-pub use store::{sql_str, PartitionStore, StoreConfig};
+pub use store::{configure_lance_runtime, sql_str, PartitionStore, StoreConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
