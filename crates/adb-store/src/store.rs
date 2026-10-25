@@ -68,6 +68,8 @@ fn shard_id(p: PartitionId) -> Uuid {
 }
 
 pub struct PartitionStore {
+    /// The store's root directory (`sync_to_disk`).
+    root: std::path::PathBuf,
     partition: PartitionId,
     base: Arc<Dataset>,
     writer: ShardWriter,
@@ -145,6 +147,7 @@ impl PartitionStore {
             .with_max_unflushed_memtable_bytes(8 << 30);
         let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
         let store = Self {
+            root: cfg.root.clone(),
             partition,
             base,
             writer,
@@ -474,6 +477,28 @@ impl PartitionStore {
         }
         p.durable_at_open = p.durable_at_open.max(off);
         Ok(LogOffset(off))
+    }
+
+    /// Flush everything written under the store's root to stable storage (`syncfs`
+    /// on its filesystem). Lance on local disk doesn't fsync (risk K8, spike R12 §1):
+    /// its data files, manifests and MemWAL entries can sit in the page cache, so a
+    /// power failure could lose writes Lance reported durable. ADB calls this before
+    /// purging its log below Lance's durable offset (stage D3.5), so the log is only
+    /// dropped once what replaces it is on disk.
+    pub async fn sync_to_disk(&self) -> StoreResult<()> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::os::fd::AsRawFd;
+            let dir = std::fs::File::open(&root)?;
+            // SAFETY: `dir` is an open descriptor for the duration of the call.
+            if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Lance(format!("syncfs task: {e}")))?
+        .map_err(|e| StoreError::Lance(format!("syncfs {}: {e}", self.root.display())))
     }
 
     /// Flush and release the writer.

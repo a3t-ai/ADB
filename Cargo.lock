@@ -162,6 +162,7 @@ dependencies = [
  "lance-arrow",
  "lance-datafusion",
  "lance-index",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

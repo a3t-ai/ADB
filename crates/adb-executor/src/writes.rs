@@ -264,7 +264,13 @@ impl<L: Log + 'static> DurableWrites<L> {
         applier.enqueue(record.clone());
         if record.offset.0 % PURGE_EVERY == 0 {
             match s.durable_offset().await {
+                // Lance doesn't fsync on local disk (risk K8): sync first, so the
+                // records purged from the log are on disk in Lance, not only cached.
                 Ok(d) if d.0 > 0 => {
+                    if let Err(e) = s.sync_to_disk().await {
+                        tracing::warn!(error = %e, "store sync failed; log not purged");
+                        return;
+                    }
                     if let Err(e) = log.purge_below(d.next()).await {
                         tracing::warn!(below = d.0 + 1, error = %e, "log purge failed; segments kept");
                     }

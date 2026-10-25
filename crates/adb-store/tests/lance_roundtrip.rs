@@ -33,3 +33,14 @@ async fn write_and_reopen_a_lance_table() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Risk K8: the store can flush its filesystem (`syncfs`), which the log purge
+/// waits for.
+#[tokio::test]
+async fn store_syncs_to_disk() {
+    use adb_core::log::PartitionId;
+    let dir = tempfile::tempdir().unwrap();
+    let store = adb_store::PartitionStore::open(&adb_store::StoreConfig::new(dir.path()), PartitionId(0)).await.unwrap();
+    store.sync_to_disk().await.unwrap();
+    store.close().await.unwrap();
+}
