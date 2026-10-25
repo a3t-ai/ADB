@@ -10,6 +10,7 @@
 //! | `GET /stats` | `{success, data: {working: n, …}}` |
 //! | `POST /mcp` | MCP over streamable HTTP (JSON responses) |
 //! | `GET /mcp/sse`, `POST /mcp/message?sessionId=…` | MCP over HTTP+SSE (no `sessionId`: reply in the body) |
+//! | `GET /subscriptions/{id}/events?from=N` | A subscription's deliveries as SSE (stage E): `event: delivery`, `id: <offset>`; reconnect with `Last-Event-ID` to resume; `event: heartbeat` with the tip when idle |
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -55,6 +56,7 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
         .route("/mcp", post(mcp_post).get(mcp_get))
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
+        .route("/subscriptions/:id/events", get(subscription_events))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(AppState::new(engine))
 }
@@ -64,6 +66,65 @@ pub async fn serve(addr: SocketAddr, engine: Arc<dyn Engine>) -> std::io::Result
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("ADB listening on http://{}", listener.local_addr()?);
     axum::serve(listener, router(engine)).await
+}
+
+// ---------------------------------------------------------------- subscriptions
+
+#[derive(Deserialize)]
+struct EventsParams {
+    from: Option<u64>,
+}
+
+/// `GET /subscriptions/{id}/events` — deliveries as SSE (E1). Each delivery is an
+/// `event: delivery` with `id: <offset>`, so `Last-Event-ID` resumes after the last one
+/// received; idle periods send `event: heartbeat` with `{tip, next}`. An error (e.g.
+/// `cursor_expired`) is sent as `event: error` and ends the stream.
+async fn subscription_events(
+    State(s): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(p): Query<EventsParams>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(gw) = s.engine.gateway() else {
+        return (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({ "error": "subscriptions need a durable engine (start ADB with --data-dir)" })))
+            .into_response();
+    };
+    if gw.registry().get(&id).is_none() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("unknown subscription {id}") }))).into_response();
+    }
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|last| last + 1);
+    let from = p.from.or(resume);
+    use futures::StreamExt as _;
+    let stream = futures::stream::unfold(Some(from), move |state| {
+        let gw = gw.clone();
+        let id = id.clone();
+        async move {
+            let from = state?;
+            let events: Vec<Result<Event, Infallible>> = match gw.next(&id, from, 100, Duration::from_secs(15)).await {
+                Ok(b) if b.deliveries.is_empty() => {
+                    let hb = serde_json::json!({ "tip": b.tip, "next": b.next });
+                    return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(Some(b.next))));
+                }
+                Ok(b) => {
+                    let next = b.next;
+                    let evs: Vec<Result<Event, Infallible>> = b
+                        .deliveries
+                        .iter()
+                        .map(|d| Ok(Event::default().event("delivery").id(d.offset.to_string()).data(serde_json::to_string(d).unwrap_or_default())))
+                        .collect();
+                    return Some((futures::stream::iter(evs), Some(Some(next))));
+                }
+                Err(e) => vec![Ok(Event::default().event("error").data(serde_json::json!({ "error": e.to_string() }).to_string()))],
+            };
+            Some((futures::stream::iter(events), None))
+        }
+    })
+    .flatten();
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 // ---------------------------------------------------------------- REST

@@ -36,4 +36,18 @@ Rules of thumb:
 - `PIPELINE` needs a `TIMEOUT`: `PIPELINE p TIMEOUT 80ms RECALL … | RECALL …`.
 - Store a `key` field on records you will want to update, link or forget later.
 
+## Topics and subscriptions
+
+Agents (and FlowR instances) can tell each other things through topics. Every
+subscriber of a topic sees the same messages in the same order.
+
+- `subscribe` with `topic` (or `scope` = `"tenant:default"` for every memory change) → a subscription id.
+- `publish` with `topic` and `fields` sends a message (kept 7 days unless `ttl`).
+- `next_events` with the subscription id waits for and returns deliveries; pass its `next` back as `from`.
+- `ack` the last offset you handled, so after a restart you continue from there.
+- `unsubscribe` when done.
+
+In AQL: `SUBSCRIBE TOPIC "orders"`, `PUBLISH TOPIC "orders" (order_id = "o-1")`,
+`ACK "<id>" OFFSET 42`, `UNSUBSCRIBE "<id>"`.
+
 The full grammar is the resource `adb://aql/grammar`.

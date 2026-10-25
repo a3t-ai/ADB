@@ -87,6 +87,51 @@ pub fn tool_list() -> Value {
                 "link_type": { "type": "string", "description": "Relationship, e.g. \"applied_to\"" },
                 "weight": { "type": "number", "description": "Strength 0–1 (optional)" }
             }, "required": ["from_type", "from_key", "to_type", "to_key", "link_type"] }
+        },
+        {
+            "name": "subscribe",
+            "description": "Follow a topic (messages sent with `publish`) or a scope (every memory change in it). Returns a subscription id; read with `next_events`. Every subscriber of a topic sees the same messages in the same order.",
+            "inputSchema": { "type": "object", "properties": {
+                "topic": { "type": "string", "description": "Topic name (give this or scope)" },
+                "scope": { "type": "string", "description": "Scope, e.g. \"tenant:default\" for every memory change (give this or topic)" },
+                "kinds": { "type": "array", "items": { "type": "string", "enum": ["entity", "fact", "edge", "episode", "tool", "event"] }, "description": "Only these row kinds (optional)" },
+                "filter": { "type": "object", "description": "Field = value conditions on each change's value (optional)" },
+                "from_offset": { "type": "integer", "description": "Replay from this log offset (optional; default: from now)" }
+            } }
+        },
+        {
+            "name": "publish",
+            "description": "Send a message to a topic. Every subscriber of the topic receives it.",
+            "inputSchema": { "type": "object", "properties": {
+                "topic": { "type": "string" },
+                "fields": { "type": "object", "description": "The message, e.g. {\"order_id\": \"o-1\", \"status\": \"paid\"}" },
+                "ttl": { "type": "string", "description": "How long to keep it, e.g. \"1h\", \"7d\" (optional, default 7d)" }
+            }, "required": ["topic", "fields"] }
+        },
+        {
+            "name": "next_events",
+            "description": "Read a subscription's next deliveries, waiting up to `wait_seconds` for one. Pass the returned `next` as `from` on the following call, and `ack` what you have handled so a restart resumes after it.",
+            "inputSchema": { "type": "object", "properties": {
+                "subscription": { "type": "string" },
+                "from": { "type": "integer", "description": "First offset to read (optional; default: after the last ack)" },
+                "max": { "type": "integer", "description": "Most deliveries to return (default 20)" },
+                "wait_seconds": { "type": "integer", "description": "How long to wait for a delivery (default 10, at most 30)" }
+            }, "required": ["subscription"] }
+        },
+        {
+            "name": "ack",
+            "description": "Mark a subscription's deliveries up to `offset` as handled.",
+            "inputSchema": { "type": "object", "properties": {
+                "subscription": { "type": "string" },
+                "offset": { "type": "integer" }
+            }, "required": ["subscription", "offset"] }
+        },
+        {
+            "name": "unsubscribe",
+            "description": "Stop a subscription.",
+            "inputSchema": { "type": "object", "properties": {
+                "subscription": { "type": "string" }
+            }, "required": ["subscription"] }
         }
     ]})
 }

@@ -111,6 +111,11 @@ impl McpServer {
             "recall" => self.run(recall(&args)).await,
             "forget" => self.run(forget(&args)).await,
             "link" => self.run(link(&args)).await,
+            "subscribe" => self.run(subscribe(&args)).await,
+            "publish" => self.run(publish(&args)).await,
+            "ack" => self.run(ack(&args)).await,
+            "unsubscribe" => self.run(unsubscribe(&args)).await,
+            "next_events" => self.next_events(&args).await,
             other => Err(format!("Unknown tool: {other}")),
         };
         Ok(match result {
@@ -126,6 +131,17 @@ impl McpServer {
             .and_then(Value::as_object)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
         self.engine.query(query, vars.as_ref()).await.map_err(|e| format!("Query failed: {e}"))
+    }
+
+    /// A subscription's next deliveries through the gateway (stage E).
+    async fn next_events(&self, args: &Value) -> Result<Value, String> {
+        let gw = self.engine.gateway().ok_or("subscriptions need a durable engine (start ADB with --data-dir)")?;
+        let sub = args.get("subscription").and_then(Value::as_str).ok_or("Missing required: subscription")?;
+        let from = args.get("from").and_then(Value::as_u64);
+        let max = args.get("max").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+        let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
+        let batch = gw.next(sub, from, max, std::time::Duration::from_secs(wait)).await.map_err(|e| e.to_string())?;
+        serde_json::to_value(batch).map_err(|e| e.to_string())
     }
 
     /// Run AQL built by a shortcut tool.
@@ -148,7 +164,7 @@ fn initialize(params: Option<&Value>) -> Value {
             "prompts": { "listChanged": false }
         },
         "serverInfo": { "name": "adb", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "ADB is agent memory. Use remember / recall / forget / link for everyday memory, or aql_query for anything in AQL. Read adb://guide/memory first."
+        "instructions": "ADB is agent memory. Use remember / recall / forget / link for everyday memory, subscribe / publish / next_events / ack for topics shared between agents, or aql_query for anything in AQL. Read adb://guide/memory first."
     })
 }
 
@@ -188,6 +204,64 @@ fn recall_memory(args: &Value) -> Result<String, String> {
         q.push_str(&format!(" LIMIT {limit}"));
     }
     Ok(q)
+}
+
+fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
+    args.get(name).and_then(Value::as_str).ok_or(format!("Missing required: {name}"))
+}
+
+/// `SUBSCRIBE TOPIC "t" | SCOPE "s" [KINDS …] [WHERE …] [FROM OFFSET n]`.
+fn subscribe(args: &Value) -> Result<String, String> {
+    let mut q = match (args.get("topic").and_then(Value::as_str), args.get("scope").and_then(Value::as_str)) {
+        (Some(t), None) => format!("SUBSCRIBE TOPIC {}", quote(t)),
+        (None, Some(s)) => format!("SUBSCRIBE SCOPE {}", quote(s)),
+        _ => return Err("subscribe needs exactly one of topic or scope".into()),
+    };
+    if let Some(kinds) = args.get("kinds").and_then(Value::as_array).filter(|k| !k.is_empty()) {
+        let kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
+        if let Some(bad) = kinds.iter().find(|k| !["entity", "fact", "edge", "episode", "tool", "event"].contains(k)) {
+            return Err(format!("unknown kind {bad}"));
+        }
+        q.push_str(&format!(" KINDS {}", kinds.join(", ")));
+    }
+    let conds: Vec<String> = obj(args, "filter")
+        .iter()
+        .map(|(k, v)| Ok(format!("{} = {}", tools::field(k)?, literal(v))))
+        .collect::<Result<_, String>>()?;
+    if !conds.is_empty() {
+        q.push_str(&format!(" WHERE {}", conds.join(" AND ")));
+    }
+    if let Some(n) = args.get("from_offset").and_then(Value::as_u64) {
+        q.push_str(&format!(" FROM OFFSET {n}"));
+    }
+    Ok(q)
+}
+
+/// `PUBLISH TOPIC "t" (fields) [TTL d]`.
+fn publish(args: &Value) -> Result<String, String> {
+    let topic = str_arg(args, "topic")?;
+    let fields = obj(args, "fields");
+    if fields.is_empty() {
+        return Err("publish needs non-empty fields".into());
+    }
+    let mut q = format!("PUBLISH TOPIC {} {}", quote(topic), payload(&fields)?);
+    if let Some(ttl) = args.get("ttl").and_then(Value::as_str) {
+        let ok = ttl.len() > 1 && ttl[..ttl.len() - 1].chars().all(|c| c.is_ascii_digit()) && ttl.ends_with(['s', 'm', 'h', 'd']);
+        if !ok {
+            return Err(format!("ttl must look like 30s, 15m, 1h or 7d, not {ttl:?}"));
+        }
+        q.push_str(&format!(" TTL {ttl}"));
+    }
+    Ok(q)
+}
+
+fn ack(args: &Value) -> Result<String, String> {
+    let offset = args.get("offset").and_then(Value::as_u64).ok_or("Missing required: offset")?;
+    Ok(format!("ACK {} OFFSET {offset}", quote(str_arg(args, "subscription")?)))
+}
+
+fn unsubscribe(args: &Value) -> Result<String, String> {
+    Ok(format!("UNSUBSCRIBE {}", quote(str_arg(args, "subscription")?)))
 }
 
 fn remember(args: &Value) -> Result<String, String> {
