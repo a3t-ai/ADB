@@ -47,6 +47,21 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | S7 | **`PATTERN` needs a bound variable** (`PATTERN $var`); a string literal doesn't parse. | Pattern recall isn't covered by the differential test. | AQL grammar / test harness with variables. |
 | S8 | **Lance logs at INFO by default**, noisy at startup. | Log volume. | Set `RUST_LOG=info,lance=warn` in the manifest. |
 
+## Subscriptions (stage E)
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| E-L1 | **Each subscriber reads the log itself** (tails the applied log) instead of a matcher at apply fanning out. | Cost grows with subscribers × writes; fine for tens of subscribers on one node. | M4 cluster gateway (spec §6 matcher at apply). |
+| E-L2 | **No table catch-up / `reset`**: past log retention a subscription gets `cursor_expired` and must re-subscribe. | A subscriber away for > 100k records loses its place. | Spec §4.4 + reconciliation note 2. |
+| E-L3 | **An abandoned subscription pins the log** (purge keeps everything after the oldest cursor, up to the 100k-record cap). | Up to 100k extra log records kept per partition. | Subscription idle TTL / auto-expiry. |
+| E-L4 | **Every `ACK` is a log record.** | Log volume with many subscribers acking often. | Batch cursors (one effect, many subscriptions) or gateway-held cursors (spec open question). |
+| E-L5 | **No authorization at registration or delivery** (ADB has no credentials yet). | Anyone who can reach ADB can subscribe to any topic or scope. | §14.4 auth, with the SaaS control plane. |
+| E-L6 | **Every row has scope `tenant:default`**, so `SUBSCRIBE SCOPE` can only mean "everything". | Scope subscriptions can't be narrowed by team / agent yet. | Named scopes on STORE (`IN SCOPE …`). |
+| E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | With CQ watch sets (M2). |
+| E-L8 | **A patch / forget delivery looks up the record's scope and kind in Lance**; if compaction ever removes all its rows, the change is skipped. | Only matters once compaction exists (D5 / M2). | Carry scope in `Patch` / `Forget` effects. |
+| E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. FlowR has no topic *trigger* yet. | Agents poll; flows can't start on a message. | FlowR wiring (stage F). |
+| E-L10 | **No subscriber timers** (topic message TTL is a read filter like L3; expiry isn't delivered). | Subscribers aren't told a message expired. | With L3 (timer `Expire`). |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |
