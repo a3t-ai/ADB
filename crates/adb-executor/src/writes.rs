@@ -378,7 +378,7 @@ pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<u64> {
             MemoryType::Tools | MemoryType::Procedural => {
                 let stored = adb.store_with_options(
                     memory,
-                    &r.id,
+                    r.key(),
                     r.data.value.clone(),
                     rec.metadata.scope,
                     r.data.namespace.as_deref(),
@@ -386,17 +386,21 @@ pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<u64> {
                 );
                 time::at(r.commit_ts.to_datetime(), stored).await?;
                 if memory == MemoryType::Procedural {
-                    adb.procedural().set_version(&r.id, u64::from(r.version));
+                    adb.procedural().set_version(r.key(), u64::from(r.version));
                 }
             }
         }
     }
     for e in &edges {
+        // Back to the log's ids: the table qualifies them by memory type.
+        let mut data = e.data.clone();
+        data.subject_id = data.subject_id.as_deref().map(|s| adb_store::key_of(s).to_string());
+        data.object_id = data.object_id.as_deref().map(|s| adb_store::key_of(s).to_string());
         let effect = Effect::PutEdge(NewRow {
-            id: RecordId(e.id.clone()),
-            lineage_id: RecordId(e.lineage_id.clone()),
+            id: RecordId(adb_store::key_of(&e.id).to_string()),
+            lineage_id: RecordId(adb_store::key_of(&e.lineage_id).to_string()),
             version: e.version,
-            data: e.data.clone(),
+            data,
         });
         apply_link(adb, e.commit_ts, &effect).await?;
     }

@@ -15,7 +15,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// Id of the control row (D3 `kind = meta`).
 pub const META_ID: &str = "_meta";
 /// Schema version written into `_meta` (D3 §4).
-pub const SCHEMA_VERSION: u32 = 2;
+/// v2: `value` is JSONB; v3: row ids qualified by memory type (`rows::row_id`).
+pub const SCHEMA_VERSION: u32 = 3;
 
 fn ts() -> DataType {
     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))

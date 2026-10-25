@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, PartitionId, RecordId};
+use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, NewRow, PartitionId, RecordId};
 use arrow_array::RecordBatchIterator;
 use arrow_schema::SchemaRef;
 use datafusion::logical_expr::Expr;
@@ -31,7 +31,7 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use uuid::Uuid;
 
-use crate::rows::{decode, encode, StoredRow};
+use crate::rows::{decode, encode, qualified, row_id, StoredRow};
 use crate::schema::{memory_schema, META_ID};
 use crate::{StoreError, StoreResult};
 
@@ -158,11 +158,52 @@ impl PartitionStore {
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
         store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
+        if meta.data.value.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0) < 3 {
+            store.qualify_row_ids(&meta).await?;
+        }
         // Everything present after the writer's replay is WAL-durable: it is the base
         // of the batch numbering, and `applied` is durable already.
         let st = store.writer.memtable_stats().await.map_err(lance)?;
         *store.puts.lock().unwrap() = PutLedger { base: st.global_offset + st.batch_count, first: 0, offsets: Default::default(), durable_at_open: applied };
         Ok(store)
+    }
+
+    /// Schema v2 → v3: rewrite every record and edge row under its memory-qualified id
+    /// (`rows::row_id`) and tombstone the unqualified one, in one put with the v3
+    /// `_meta`. Records that shared a key across memory types were already one row in
+    /// v2; the surviving version keeps the memory type it was last written as. A crash
+    /// before the put is durable leaves `_meta` at v2, so the next open redoes it.
+    async fn qualify_row_ids(&self, meta: &StoredRow) -> StoreResult<()> {
+        let mut out = Vec::new();
+        for r in self.scan(None).await? {
+            if !matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool | Kind::Edge) {
+                continue;
+            }
+            let mut q = r.clone();
+            let m = r.data.memory;
+            q.id = row_id(m, &r.id);
+            q.lineage_id = row_id(m, &r.lineage_id);
+            q.superseded_by = r.superseded_by.as_deref().map(|s| row_id(m, s));
+            if r.data.kind == Kind::Edge {
+                let n = qualified(&NewRow {
+                    id: RecordId(r.id.clone()),
+                    lineage_id: RecordId(r.lineage_id.clone()),
+                    version: r.version,
+                    data: r.data.clone(),
+                });
+                q.data.subject_id = n.data.subject_id;
+                q.data.object_id = n.data.object_id;
+            }
+            let mut old = r;
+            old.tombstone = true;
+            out.push(old);
+            out.push(q);
+        }
+        let applied = self.applied.load(std::sync::atomic::Ordering::SeqCst);
+        out.push(StoredRow::meta(applied, meta.commit_ts, meta.epoch, serde_json::json!({ "embedding_dim": self.dim })));
+        let batch = encode(&out, &self.schema, self.dim)?;
+        self.writer.put(vec![batch]).await.map_err(lance)?;
+        Ok(())
     }
 
     /// Base table with the `_meta` row, a BTree on `id`, and a MemWAL maintaining it.
@@ -263,26 +304,26 @@ impl PartitionStore {
 
         for effect in &record.effects {
             match effect {
-                Effect::PutEntity(n)
-                | Effect::PutFact(n)
-                | Effect::PutEpisode(n)
-                | Effect::PutTool(n)
-                | Effect::PutEdge(n)
-                | Effect::PublishEvent(n)
-                | Effect::Register(n) => {
+                // Records and edges get memory-qualified row ids (`rows::row_id`).
+                Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) | Effect::PutEdge(n) => {
+                    let n = qualified(n);
+                    out.insert(n.id.0.clone(), StoredRow::from_new(&n, ts, off, epoch));
+                }
+                Effect::PublishEvent(n) | Effect::Register(n) => {
                     out.insert(n.id.0.clone(), StoredRow::from_new(n, ts, off, epoch));
                 }
                 Effect::Supersede { old, new } => {
-                    if let Some(mut prev) = self.row(&out, &old.0).await? {
+                    let new = qualified(new);
+                    if let Some(mut prev) = self.row(&out, &row_id(new.data.memory, &old.0)).await? {
                         prev.valid_to = Some(ts);
                         prev.superseded_by = Some(new.id.0.clone());
                         prev.log_offset = off;
                         out.insert(prev.id.clone(), prev);
                     }
-                    out.insert(new.id.0.clone(), StoredRow::from_new(new, ts, off, epoch));
+                    out.insert(new.id.0.clone(), StoredRow::from_new(&new, ts, off, epoch));
                 }
-                Effect::Patch { id, fields, .. } => {
-                    if let Some(mut cur) = self.row(&out, &id.0).await? {
+                Effect::Patch { memory, id, fields, .. } => {
+                    if let Some(mut cur) = self.row(&out, &row_id(*memory, &id.0)).await? {
                         match &mut cur.data.value {
                             serde_json::Value::Object(v) => v.extend(fields.clone()),
                             other => *other = serde_json::Value::Object(fields.clone()),
@@ -298,8 +339,8 @@ impl PartitionStore {
                         out.insert(cur.id.clone(), cur);
                     }
                 }
-                Effect::Forget { lineage_id, .. } | Effect::Expire { lineage_id, .. } => {
-                    for mut r in self.lineage_and_edges(&out, lineage_id).await? {
+                Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
+                    for mut r in self.lineage_and_edges(&out, &row_id(*memory, &lineage_id.0)).await? {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
@@ -345,15 +386,15 @@ impl PartitionStore {
     }
 
     /// Every version of a lineage, and every edge touching it (D2 §5).
-    async fn lineage_and_edges(&self, out: &BTreeMap<String, StoredRow>, lineage: &RecordId) -> StoreResult<Vec<StoredRow>> {
-        let l = sql_str(&lineage.0);
+    async fn lineage_and_edges(&self, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
+        let l = sql_str(lineage);
         let filter = format!("lineage_id = {l} OR subject_id = {l} OR object_id = {l}");
         let mut rows: BTreeMap<String, StoredRow> =
             self.scan(Some(&filter)).await?.into_iter().map(|r| (r.id.clone(), r)).collect();
         for r in out.values() {
-            let hit = r.lineage_id == lineage.0
-                || r.data.subject_id.as_deref() == Some(&lineage.0)
-                || r.data.object_id.as_deref() == Some(&lineage.0);
+            let hit = r.lineage_id == lineage
+                || r.data.subject_id.as_deref() == Some(lineage)
+                || r.data.object_id.as_deref() == Some(lineage);
             if hit {
                 rows.insert(r.id.clone(), r.clone());
             }

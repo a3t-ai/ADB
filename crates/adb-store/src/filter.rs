@@ -95,29 +95,31 @@ pub fn field_num(key: &str) -> Expr {
 /// Integers whose f64 is exact and keeps order against every JSON number (|i| < 2^53).
 const EXACT_INT: i64 = 1 << 53;
 
-/// A Lance filter for `predicate`, or `None` for "no pushdown". The result matches a
-/// superset of what the backends' query code matches: conditions it can't express
-/// become TRUE, combined left to right exactly as `evaluate_conditions_on_record`
-/// does, and the backend still filters the rows it returns.
-pub fn predicate_filter(predicate: &adb_core::Predicate) -> Option<Expr> {
+/// A Lance filter for `predicate` over `memory`'s rows, or `None` for "no pushdown".
+/// The result matches a superset of what the backends' query code matches: conditions
+/// it can't express become TRUE, combined left to right exactly as
+/// `evaluate_conditions_on_record` does, and the backend still filters the rows it
+/// returns. Record ids compare as row ids (`rows::row_id`): within one memory type
+/// the prefix is common, so equality and order are the keys'.
+pub fn predicate_filter(memory: adb_core::log::Memory, predicate: &adb_core::Predicate) -> Option<Expr> {
     use adb_core::Predicate;
     match predicate {
-        Predicate::Where { conditions } => conditions_filter(conditions),
+        Predicate::Where { conditions } => conditions_filter(memory, conditions),
         // The backends match KEY id / KEY key on the record id, other KEY fields on
         // the stringified payload value (no pushdown).
         Predicate::Key { field, value } if field == "id" || field == "key" => {
-            key_text(value).map(|v| col("id").eq(lit(v)))
+            key_text(value).map(|v| col("lineage_id").eq(lit(crate::row_id(memory, &v))))
         }
         _ => None,
     }
 }
 
-fn conditions_filter(conditions: &[adb_core::Condition]) -> Option<Expr> {
+fn conditions_filter(memory: adb_core::log::Memory, conditions: &[adb_core::Condition]) -> Option<Expr> {
     use adb_core::LogicalOp;
     let mut it = conditions.iter();
-    let mut acc = condition_filter(it.next()?);
+    let mut acc = condition_filter(memory, it.next()?);
     for c in it {
-        let next = condition_filter(c);
+        let next = condition_filter(memory, c);
         acc = match c.logical_op() {
             Some(LogicalOp::Or) => match (acc, next) {
                 (Some(a), Some(b)) => Some(a.or(b)),
@@ -133,23 +135,23 @@ fn conditions_filter(conditions: &[adb_core::Condition]) -> Option<Expr> {
 }
 
 /// `None` = TRUE (not expressible).
-fn condition_filter(c: &adb_core::Condition) -> Option<Expr> {
+fn condition_filter(memory: adb_core::log::Memory, c: &adb_core::Condition) -> Option<Expr> {
     use adb_core::{Condition, Operator, Value};
     let (field, operator, value) = match c {
-        Condition::Group { conditions, .. } => return conditions_filter(conditions),
+        Condition::Group { conditions, .. } => return conditions_filter(memory, conditions),
         Condition::Simple { field, operator, value, .. } => (field, *operator, value),
     };
     if field == "id" {
-        // `resolve_field("id")` is the record id, a string.
+        // `resolve_field("id")` is the record id (its lineage's), a string.
         let Value::String(s) = value else { return None };
-        return compare(col("id"), operator, lit(s.clone()));
+        return compare(col("lineage_id"), operator, lit(crate::row_id(memory, s)));
     }
     let key = payload_key(field)?;
     match (operator, value) {
         (Operator::In, Value::Array(items)) => {
             let mut any: Option<Expr> = None;
             for v in items {
-                let e = condition_filter(&Condition::new(field.clone(), Operator::Eq, v.clone()))?;
+                let e = condition_filter(memory, &Condition::new(field.clone(), Operator::Eq, v.clone()))?;
                 any = Some(match any { Some(a) => a.or(e), None => e });
             }
             // An empty list matches nothing.

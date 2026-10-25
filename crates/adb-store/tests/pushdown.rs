@@ -156,14 +156,14 @@ async fn pushdown_is_a_superset_on_every_layer() {
     let now = CommitTs(T0 + 1_000_000_000);
     let mut pushed = 0;
     for p in predicates() {
-        let filter = predicate_filter(&p);
+        let filter = predicate_filter(Memory::Episodic, &p);
         pushed += usize::from(filter.is_some());
         let got: std::collections::BTreeSet<String> = store
             .current_expr(filter.clone(), now)
             .await
             .unwrap_or_else(|e| panic!("{p:?}: {e}"))
             .into_iter()
-            .map(|r| r.id)
+            .map(|r| r.key().to_string())
             .collect();
         let want: std::collections::BTreeSet<String> =
             current.iter().filter(|(id, v)| backend_matches(&p, &record(id, v))).map(|(id, _)| id.clone()).collect();
@@ -177,10 +177,10 @@ async fn pushdown_is_a_superset_on_every_layer() {
     assert!(pushed >= 20, "only {pushed} predicates were pushed down");
 
     // Exact results where types are clean.
-    let ids = |v: Vec<adb_store::StoredRow>| v.into_iter().map(|r| r.id).collect::<std::collections::BTreeSet<_>>();
-    let summer = predicate_filter(&Predicate::where_eq("campaign", "summer"));
+    let ids = |v: Vec<adb_store::StoredRow>| v.into_iter().map(|r| r.key().to_string()).collect::<std::collections::BTreeSet<_>>();
+    let summer = predicate_filter(Memory::Episodic, &Predicate::where_eq("campaign", "summer"));
     assert_eq!(ids(store.current_expr(summer, now).await.unwrap()), ["p3", "p8"].map(String::from).into());
-    let n7 = predicate_filter(&Predicate::where_eq("n", 7_i64));
+    let n7 = predicate_filter(Memory::Episodic, &Predicate::where_eq("n", 7_i64));
     // p4 (7.0) and p6 ("7") are the loose extras; the backend drops them.
     assert_eq!(ids(store.current_expr(n7, now).await.unwrap()), ["p4", "p6"].map(String::from).into());
 }

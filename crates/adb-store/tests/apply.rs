@@ -7,7 +7,7 @@ use adb_core::log::{
     CommitTs, Effect, Epoch, Kind, LogOffset, LogRecord, Memory, NewRow, PartitionId, Provenance, RecordId, RowData,
     Visibility,
 };
-use adb_store::{PartitionStore, StoreConfig, StoredRow};
+use adb_store::{key_of, PartitionStore, StoreConfig, StoredRow};
 use serde_json::json;
 
 const T0: i64 = 1_761_300_000_000_000;
@@ -84,7 +84,8 @@ fn story() -> Vec<LogRecord> {
 }
 
 fn ids(rows: &[StoredRow]) -> Vec<String> {
-    let mut v: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    // Row ids are memory-qualified (`semantic:acme`); compare by key.
+    let mut v: Vec<String> = rows.iter().map(|r| key_of(&r.id).to_string()).collect();
     v.sort();
     v
 }
@@ -103,7 +104,7 @@ async fn d2_rules_on_a_lance_partition() {
 
         // Before the forget (offset 5), the patch had applied in place.
         let all = store.scan(None).await.unwrap();
-        let e1 = all.iter().find(|r| r.id == "e1").unwrap();
+        let e1 = all.iter().find(|r| r.id == "episodic:e1").unwrap();
         assert_eq!(e1.data.value["won"], true);
         assert_eq!(e1.data.value["brand_lift"], 0.04);
         assert_eq!(e1.version, 2);
@@ -113,14 +114,19 @@ async fn d2_rules_on_a_lance_partition() {
         let cur = store.current(None, now).await.unwrap();
         assert_eq!(ids(&cur), vec!["acme-v2"]);
         assert_eq!(cur[0].data.text.as_deref(), Some("Acme renews on 15 Nov"));
-        assert_eq!(cur[0].lineage_id, "acme");
+        assert_eq!(cur[0].lineage_id, "semantic:acme");
+        assert_eq!(cur[0].key(), "acme");
         assert_eq!(cur[0].version, 2);
 
         // History is kept: v1 is closed and points at v2.
-        let v1 = all.iter().find(|r| r.id == "acme").unwrap();
-        assert_eq!(v1.superseded_by.as_deref(), Some("acme-v2"));
+        let v1 = all.iter().find(|r| r.id == "semantic:acme").unwrap();
+        assert_eq!(v1.superseded_by.as_deref(), Some("semantic:acme-v2"));
         assert_eq!(v1.valid_to, Some(CommitTs(T0 + 3_000)));
-        assert!(all.iter().find(|r| r.id == "edge-1").unwrap().tombstone, "forget removes edges touching e1");
+        let edge = all.iter().find(|r| r.id == "semantic:edge-1").unwrap();
+        assert!(edge.tombstone, "forget removes edges touching e1");
+        // Edge ends are qualified by the memory type each end belongs to.
+        assert_eq!(edge.data.subject_id.as_deref(), Some("semantic:acme"));
+        assert_eq!(edge.data.object_id.as_deref(), Some("episodic:e1"));
 
         // Replaying an applied record is a no-op.
         assert!(!store.apply(&story()[2]).await.unwrap());
@@ -173,14 +179,14 @@ async fn reads_span_sealed_generations() {
             .unwrap();
         let cur = store.current(None, now).await.unwrap();
         assert_eq!(cur.len(), n as usize);
-        assert_eq!(cur.iter().find(|r| r.id == "b2").unwrap().data.value["i"], 200);
+        assert_eq!(cur.iter().find(|r| r.key() == "b2").unwrap().data.value["i"], 200);
         store.close().await.unwrap();
     }
     let store = PartitionStore::open(&cfg(dir.path(), 5), PartitionId(3)).await.unwrap();
     assert_eq!(store.applied_offset().await.unwrap(), LogOffset(n + 1));
     let cur = store.current(None, now).await.unwrap();
     assert_eq!(cur.len(), n as usize);
-    assert_eq!(cur.iter().find(|r| r.id == "b2").unwrap().data.value["i"], 200);
+    assert_eq!(cur.iter().find(|r| r.key() == "b2").unwrap().data.value["i"], 200);
     store.close().await.unwrap();
 }
 

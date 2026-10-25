@@ -19,6 +19,39 @@ use serde::Serialize;
 use crate::schema::META_ID;
 use crate::{StoreError, StoreResult};
 
+/// The table's row id for record or edge `id` of memory type `memory`:
+/// `<memory>:<id>`. Record ids are the AQL keys, unique per memory type only, and one
+/// table holds every type under one primary key — unqualified, `x` stored in WORKING
+/// and in SEMANTIC was one row, and the second write replaced the first (schema v3).
+pub fn row_id(memory: Memory, id: &str) -> String {
+    format!("{}:{id}", memory.tag())
+}
+
+/// The id a row id was made from (`row_id`'s inverse); other ids unchanged.
+pub fn key_of(row_id: &str) -> &str {
+    match row_id.split_once(':') {
+        Some((tag, id)) if Memory::from_tag(tag).is_some() => id,
+        _ => row_id,
+    }
+}
+
+/// `n` as the table stores it: id and lineage qualified by its memory type, and an
+/// edge's ends by the memory types they belong to.
+pub fn qualified(n: &NewRow) -> NewRow {
+    let mut n = n.clone();
+    let m = n.data.memory;
+    n.id.0 = row_id(m, &n.id.0);
+    n.lineage_id.0 = row_id(m, &n.lineage_id.0);
+    if n.data.kind == Kind::Edge {
+        n.data.subject_id = n.data.subject_id.map(|s| row_id(m, &s));
+        let to = n.data.value.get("to_memory").and_then(|v| serde_json::from_value::<Memory>(v.clone()).ok());
+        if let (Some(to), Some(o)) = (to, n.data.object_id.as_deref()) {
+            n.data.object_id = Some(row_id(to, o));
+        }
+    }
+    n
+}
+
 /// One row version: the writer's fields plus the engine's (D3 §1, D2 §1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredRow {
@@ -51,6 +84,11 @@ impl StoredRow {
             log_offset,
             epoch,
         }
+    }
+
+    /// The record's id as AQL sees it: its lineage's (D2 T1), unqualified.
+    pub fn key(&self) -> &str {
+        key_of(&self.lineage_id)
     }
 
     /// In the current view at `now` (D2 §3): not superseded, not closed, not expired,

@@ -343,3 +343,21 @@ async fn reads_see_their_own_writes_with_the_background_applier() {
         }
     }
 }
+
+/// The same key in two memory types is two records, in memory and in Lance. Before
+/// schema v3 they were one Lance row: the restart lost WORKING's.
+#[tokio::test]
+async fn same_key_in_two_memory_types_is_two_records() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        engine.query(r#"STORE INTO WORKING (key = "x", note = "working")"#, None).await.unwrap();
+        engine.query(r#"STORE INTO SEMANTIC (key = "x", concept = "x", note = "semantic")"#, None).await.unwrap();
+        engine.query(r#"STORE INTO EPISODIC (key = "x", note = "episodic")"#, None).await.unwrap();
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    for (m, note) in [("WORKING", "working"), ("SEMANTIC", "semantic"), ("EPISODIC", "episodic")] {
+        let r = engine.query(&format!("RECALL FROM {m} ALL"), None).await.unwrap().to_string();
+        assert!(r.contains(&format!(r#""note":"{note}""#)), "{m} lost its record after a restart: {r}");
+    }
+}

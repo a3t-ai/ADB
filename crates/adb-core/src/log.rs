@@ -104,6 +104,25 @@ pub enum Memory {
     Episodic,
 }
 
+impl Memory {
+    /// The snake_case name, as serialized and as stored in the `memory` column.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Memory::Working => "working",
+            Memory::Tools => "tools",
+            Memory::Procedural => "procedural",
+            Memory::Semantic => "semantic",
+            Memory::Episodic => "episodic",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        [Memory::Working, Memory::Tools, Memory::Procedural, Memory::Semantic, Memory::Episodic]
+            .into_iter()
+            .find(|m| m.tag() == tag)
+    }
+}
+
 impl From<crate::MemoryType> for Memory {
     fn from(t: crate::MemoryType) -> Self {
         match t {

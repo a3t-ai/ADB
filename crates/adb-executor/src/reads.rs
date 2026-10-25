@@ -57,7 +57,7 @@ pub fn to_record(r: &StoredRow) -> MemoryRecord {
     m.namespace = r.data.namespace.clone();
     m.ttl = r.data.ttl_at.map(|t| Duration::from_micros((t.0 - r.commit_ts.0).max(0) as u64));
     m.version = u64::from(r.version);
-    MemoryRecord { id: r.id.clone(), memory_type: r.data.memory.into(), data: r.data.value.clone(), metadata: m }
+    MemoryRecord { id: r.key().to_string(), memory_type: r.data.memory.into(), data: r.data.value.clone(), metadata: m }
 }
 
 /// SEMANTIC and EPISODIC from Lance, the rest from the backends.
@@ -91,9 +91,8 @@ impl LanceReads {
             b.wait_for_committed().await;
         }
         let m: Memory = memory.into();
-        let tag = serde_json::to_value(m).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-        let mut filter = col("memory").eq(lit(tag)).and(col("kind").not_eq(lit("edge")));
-        if let Some(p) = predicate_filter(predicate) {
+        let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").not_eq(lit("edge")));
+        if let Some(p) = predicate_filter(m, predicate) {
             filter = filter.and(p);
         }
         let now = CommitTs::from_datetime(time::now());

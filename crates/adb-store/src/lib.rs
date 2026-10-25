@@ -10,7 +10,7 @@ pub mod store;
 pub use datafusion::logical_expr::Expr;
 pub use filter::predicate_filter;
 pub use lance;
-pub use rows::StoredRow;
+pub use rows::{key_of, row_id, StoredRow};
 pub use schema::{memory_schema, META_ID};
 pub use store::{configure_lance_runtime, sql_str, PartitionStore, StoreConfig};
 
