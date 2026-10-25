@@ -62,6 +62,18 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. FlowR has no topic *trigger* yet. | Agents poll; flows can't start on a message. | FlowR wiring (stage F). |
 | E-L10 | **No subscriber timers** (topic message TTL is a read filter like L3; expiry isn't delivered). | Subscribers aren't told a message expired. | With L3 (timer `Expire`). |
 
+## FlowR wiring (stage F)
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| F-L1 | **SEMANTIC recall is "newest 5 facts in the namespace"**, not relevance. | A busy namespace pushes older relevant facts out of the prompt. | M2 hybrid recall (vector + FTS). |
+| F-L2 | **Procedures have no namespace** (ADB's procedural backend ignores it) and are matched in FlowR (token overlap), since `PATTERN` needs a bound variable. | Every agent with PROCEDURAL reads sees every procedure. | With L7 / M2. |
+| F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | Reflection / summarisation (M2 lifecycle). |
+| F-L4 | **`adb_topic` triggers can only be created through the API / `create_trigger`** — A3T's Triggers page lists webhook and cron. | No UI to set one up yet. | A3T UI. |
+| F-L5 | **`adb_topic` delivers to workflow targets only** (FlowR has no agent inbox). | Point the trigger at an agent's flow. | — |
+| F-L6 | **Topic trigger flows run without a caller** (`principal: None`, the runtime service). | Cedar policies for those runs apply to the service principal. | Give triggers an owner principal (as agents have). |
+| F-L7 | `a3t/backend/resources/a3t-resources.yaml` is gitignored; its ADB URLs were updated to `http://adb:3000` locally only. | A fresh A3T install from another checkout still points at `clawdb`. | Commit a template without secrets. |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |
