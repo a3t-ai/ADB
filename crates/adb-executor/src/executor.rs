@@ -358,8 +358,8 @@ impl Executor {
 
                         // Get links from this record
                         let links = self
-                            .adb
-                            .get_links_from(
+                            .reads
+                            .links_from(
                                 source_mem_type,
                                 &record.id,
                                 link_opts.link_type.as_deref(),
@@ -412,8 +412,8 @@ impl Executor {
                 for source_result in &source_results {
                     for record in &source_result.records {
                         let links = self
-                            .adb
-                            .get_links_from(
+                            .reads
+                            .links_from(
                                 record.memory_type,
                                 &record.id,
                                 link_opts.link_type.as_deref(),
@@ -525,8 +525,8 @@ impl Executor {
             for record in &records {
                 // Get links from this record
                 let links = self
-                    .adb
-                    .get_links_from(
+                    .reads
+                    .links_from(
                         record.memory_type,
                         &record.id,
                         Some(&follow_links.link_type),
@@ -578,8 +578,8 @@ impl Executor {
                 };
 
                 let links = self
-                    .adb
-                    .get_links_from(record.memory_type, &record.id, link_type_filter)
+                    .reads
+                    .links_from(record.memory_type, &record.id, link_type_filter)
                     .await?;
 
                 // Add links array to record data
@@ -632,8 +632,8 @@ impl Executor {
                 };
 
                 let links = self
-                    .adb
-                    .get_links_from(record.memory_type, &record.id, link_type_filter)
+                    .reads
+                    .links_from(record.memory_type, &record.id, link_type_filter)
                     .await?;
 
                 if let Some(obj) = record.data.as_object_mut() {

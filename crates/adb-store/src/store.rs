@@ -281,6 +281,25 @@ impl PartitionStore {
             .collect())
     }
 
+    /// The current edges leaving record `from` of memory type `memory`, of
+    /// `link_type` if given, oldest first (D4.1: links are read from the table, so
+    /// a forgotten record's edges are gone, live and after a restart alike).
+    pub async fn edges_from(
+        &self,
+        memory: adb_core::log::Memory,
+        from: &str,
+        link_type: Option<&str>,
+        now: CommitTs,
+    ) -> StoreResult<Vec<StoredRow>> {
+        let mut filter = format!("kind = 'edge' AND subject_id = {}", sql_str(&row_id(memory, from)));
+        if let Some(t) = link_type {
+            filter.push_str(&format!(" AND link_type = {}", sql_str(t)));
+        }
+        let mut rows = self.current(Some(&filter), now).await?;
+        rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
+        Ok(rows)
+    }
+
     /// The newest version of row `id`, if any.
     pub async fn get(&self, id: &str) -> StoreResult<Option<StoredRow>> {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())

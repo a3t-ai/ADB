@@ -1,9 +1,12 @@
 //! Where the executor's reads come from (DELIVERY_PLAN.md stage D3).
 //!
 //! - [`DirectReads`] — the in-memory backends (`adb-backends`).
-//! - [`LanceReads`] — SEMANTIC and EPISODIC from the partition's Lance table (its
-//!   current view, D2_TEMPORAL.md §3); other memory types from the backends (WORKING
-//!   and TOOLS are the in-memory hot tier; PROCEDURAL moves later).
+//! - [`LanceReads`] — SEMANTIC and EPISODIC records, and every link, from the
+//!   partition's Lance table (its current view, D2_TEMPORAL.md §3); other memory
+//!   types from the backends (WORKING and TOOLS are the in-memory hot tier;
+//!   PROCEDURAL moves later). Links are the table's edge rows (stage D4.1), so a
+//!   forgotten record's links are gone at once, as D2 §5 says, not only after a
+//!   restart.
 //!
 //! `LanceReads` rebuilds the records from the table and answers with the backend's
 //! own query code (a throwaway backend filled with `insert_record`), so predicates,
@@ -16,7 +19,7 @@ use std::time::Duration;
 
 use adb_backends::{Adb, Backend, EpisodicBackend, SemanticBackend};
 use adb_core::log::{CommitTs, Memory};
-use adb_core::{time, AdbError, AdbResult, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
+use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
 use adb_store::{predicate_filter, PartitionStore, StoredRow};
 use datafusion::prelude::{col, lit};
 use async_trait::async_trait;
@@ -33,6 +36,9 @@ pub trait Reads: Send + Sync {
     async fn lookup(&self, memory: MemoryType, predicate: &Predicate) -> AdbResult<Vec<MemoryRecord>> {
         self.lookup_with_modifiers(memory, predicate, &Modifiers::default()).await
     }
+
+    /// Links leaving record `from_id` (`WITH LINKS`, `FOLLOW LINKS`), oldest first.
+    async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>>;
 }
 
 /// Reads from the in-memory backends.
@@ -47,6 +53,10 @@ impl Reads for DirectReads {
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         self.0.recall_with_modifiers(memory, predicate, modifiers).await
     }
+
+    async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
+        self.0.get_links_from(from_type, from_id, link_type).await
+    }
 }
 
 /// A stored row as the backends hold it.
@@ -60,7 +70,25 @@ pub fn to_record(r: &StoredRow) -> MemoryRecord {
     MemoryRecord { id: r.key().to_string(), memory_type: r.data.memory.into(), data: r.data.value.clone(), metadata: m }
 }
 
-/// SEMANTIC and EPISODIC from Lance, the rest from the backends.
+/// An edge row as a link: ends back to their record ids, `created_at` its commit.
+pub fn to_link(r: &StoredRow) -> Option<Link> {
+    let d = &r.data;
+    let to: Memory = d.value.get("to_memory").cloned().and_then(|v| serde_json::from_value(v).ok())?;
+    Some(Link {
+        id: r.key().to_string(),
+        from_type: d.memory.into(),
+        from_id: adb_store::key_of(d.subject_id.as_deref()?).to_string(),
+        to_type: to.into(),
+        to_id: adb_store::key_of(d.object_id.as_deref()?).to_string(),
+        link_type: d.link_type.clone().unwrap_or_default(),
+        weight: d.weight.unwrap_or(1.0),
+        created_at: r.commit_ts.to_datetime(),
+        updated_at: r.valid_from.to_datetime(),
+    })
+}
+
+/// SEMANTIC and EPISODIC records and every link from Lance, the rest from the
+/// backends.
 pub struct LanceReads {
     adb: Arc<Adb>,
     store: Arc<PartitionStore>,
@@ -126,6 +154,19 @@ impl Reads for LanceReads {
             View::Semantic(b) => b.lookup(predicate, modifiers).await,
             View::Episodic(b) => b.lookup(predicate, modifiers).await,
         }
+    }
+
+    async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
+        let now = CommitTs::from_datetime(time::now());
+        let rows = self
+            .store
+            .edges_from(from_type.into(), from_id, link_type, now)
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        Ok(rows.iter().filter_map(to_link).collect())
     }
 
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {

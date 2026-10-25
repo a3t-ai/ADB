@@ -361,3 +361,36 @@ async fn same_key_in_two_memory_types_is_two_records() {
         assert!(r.contains(&format!(r#""note":"{note}""#)), "{m} lost its record after a restart: {r}");
     }
 }
+
+/// Links are read from Lance's edge rows (D4.1): forgetting either end removes the
+/// link at once (D2 §5), live and after a restart, and links of the same key in
+/// another memory type are untouched.
+#[tokio::test]
+async fn forgetting_a_record_removes_its_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let links = |r: Value| r.to_string().matches(r#""link_type""#).count();
+    let with_links = r#"RECALL FROM SEMANTIC WHERE concept = "acme" WITH LINKS ALL"#;
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        for q in [
+            r#"STORE INTO SEMANTIC (key = "acme", concept = "acme")"#,
+            r#"STORE INTO EPISODIC (key = "e1", bid_id = "e1")"#,
+            r#"STORE INTO EPISODIC (key = "e2", bid_id = "e2")"#,
+            r#"STORE INTO WORKING (key = "e1", note = "same key, other type")"#,
+            r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
+            r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e2" TYPE "evidence" WEIGHT 0.5"#,
+        ] {
+            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        assert_eq!(links(engine.query(with_links, None).await.unwrap()), 2);
+        engine.query(r#"FORGET FROM WORKING WHERE note = "same key, other type""#, None).await.unwrap();
+        assert_eq!(links(engine.query(with_links, None).await.unwrap()), 2, "forgetting WORKING e1 leaves EPISODIC e1's link");
+        engine.query(r#"FORGET FROM EPISODIC WHERE bid_id = "e1""#, None).await.unwrap();
+        let r = engine.query(with_links, None).await.unwrap();
+        assert_eq!(links(r.clone()), 1, "the forgotten episode's link is gone: {r}");
+        let follow = engine.query(r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#, None).await.unwrap();
+        assert!(follow.to_string().contains(r#""bid_id":"e2""#) && !follow.to_string().contains(r#""bid_id":"e1""#), "{follow}");
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    assert_eq!(links(engine.query(with_links, None).await.unwrap()), 1, "same after a restart");
+}
