@@ -9,6 +9,6 @@ mod planner;
 pub use error::{PlanError, PlanResult};
 pub use plan::{
     ExecutionPlan, FanOutPlan, LinkData, LinkOptions, Operation, PipelinePlan, PipelineStage,
-    ReflectPlan, ReflectSourcePlan, StepPlan, StoreData,
+    ReflectPlan, ReflectSourcePlan, StepPlan, StoreData, SubscriptionPlan, SubscriptionTarget,
 };
 pub use planner::Planner;

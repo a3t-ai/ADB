@@ -18,6 +18,7 @@ use crate::error::{PlanError, PlanResult};
 use crate::plan::{
     ExecutionPlan, FanOutPlan, LinkData, LinkOptions, Operation, PipelinePlan, PipelineStage,
     ReflectPlan, ReflectSourcePlan, StepPlan, StoreData,
+    SubscriptionPlan, SubscriptionTarget,
 };
 
 /// The query planner
@@ -59,10 +60,30 @@ impl Planner {
             Statement::Forget(f) => self.plan_forget(f),
             Statement::Link(l) => Ok(ExecutionPlan::Single(self.plan_link(l)?)),
             // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
-            Statement::Subscribe(_)
-            | Statement::Unsubscribe(_)
-            | Statement::Ack(_)
-            | Statement::Publish(_) => Err(PlanError::NotImplemented("Subscriptions (SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH)")),
+            Statement::Subscribe(s) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
+                target: match &s.target {
+                    aql_parser::ast::SubscribeTarget::Scope(v) => SubscriptionTarget::Scope(v.clone()),
+                    aql_parser::ast::SubscribeTarget::Topic(v) => SubscriptionTarget::Topic(v.clone()),
+                },
+                kinds: s.kinds.iter().map(|k| k.to_lowercase()).collect(),
+                filter: s.filter.as_ref().map(|c| c.iter().map(convert_condition).collect::<PlanResult<Vec<_>>>()).transpose()?,
+                from: match s.start {
+                    aql_parser::ast::StartPosition::Now => None,
+                    aql_parser::ast::StartPosition::Offset(n) => Some(n),
+                },
+            })),
+            Statement::Unsubscribe(u) => {
+                Ok(ExecutionPlan::Subscription(SubscriptionPlan::Unsubscribe { subscription: u.subscription.clone() }))
+            }
+            Statement::Ack(a) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Ack {
+                subscription: a.subscription.clone(),
+                offset: a.offset,
+            })),
+            Statement::Publish(p) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Publish {
+                topic: p.topic.clone(),
+                payload: assignments_to_json(&p.payload),
+                ttl: p.modifiers.ttl,
+            })),
             Statement::Watch(_) | Statement::Unwatch(_) => {
                 Err(PlanError::NotImplemented("Continuous queries (WATCH / UNWATCH)"))
             }
@@ -83,6 +104,12 @@ impl Planner {
                 ExecutionPlan::Reflect(r) => {
                     // Support REFLECT as a pipeline stage
                     stages.push(PipelineStage::Reflect(r));
+                }
+                ExecutionPlan::Subscription(_) => {
+                    return Err(PlanError::UnsupportedOperation {
+                        op: "SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH in PIPELINE".to_string(),
+                        memory_type: "-".to_string(),
+                    });
                 }
                 ExecutionPlan::FanOut(_) => {
                     // FanOut in pipeline requires special handling

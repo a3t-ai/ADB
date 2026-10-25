@@ -12,6 +12,11 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
+/// SQL filter for record rows — what memory-type reads, counts and history see. Not
+/// edges (links), topic events, subscriptions, continuous queries or `_meta`
+/// (stage E puts `event` / `sub` rows in the same table).
+pub const RECORD_KINDS: &str = "kind IN ('entity', 'fact', 'episode', 'tool')";
+
 /// Id of the control row (D3 `kind = meta`).
 pub const META_ID: &str = "_meta";
 /// Schema version written into `_meta` (D3 §4).

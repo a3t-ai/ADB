@@ -180,7 +180,9 @@ pub fn lance_owned(memory: MemoryType) -> bool {
 /// A view of `memory`'s current rows at `now` that may match `predicate`.
 pub(crate) async fn current_view(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, now: CommitTs) -> AdbResult<View> {
     let m: Memory = memory.into();
-    let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").not_eq(lit("edge")));
+    // Record rows only: not edges, topic events or subscriptions (`RECORD_KINDS`).
+    let kinds = ["entity", "fact", "episode", "tool"].map(lit).to_vec();
+    let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").in_list(kinds, false));
     // Not for PROCEDURAL: its conditions see the backend's `ProcedureNode`, whose
     // defaults (`severity`, `confidence`, `version`, counts) the payload may lack,
     // so a payload filter could drop a match. Procedure sets are small.

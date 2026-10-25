@@ -33,6 +33,7 @@ use adb_sequencer::Sequencer;
 use adb_store::PartitionStore;
 
 use crate::apply::{Applier, ApplyBarrier};
+use adb_gateway::{sub_value, Registry, SubSpec};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -68,7 +69,38 @@ pub trait Writes: Send + Sync {
         link_type: &str,
         weight: f32,
     ) -> AdbResult<Link>;
+
+    /// `PUBLISH TOPIC`: a committed `event` row (stage E). Returns its id and offset.
+    async fn publish(&self, _topic: &str, _payload: serde_json::Value, _ttl: Option<Duration>) -> AdbResult<(String, u64)> {
+        Err(needs_log())
+    }
+
+    /// `SUBSCRIBE`: register a cursor from offset `from` (`None` = from now). Returns
+    /// the subscription id and the first offset it will be delivered.
+    async fn subscribe(&self, _spec: SubSpec, _from: Option<u64>) -> AdbResult<(String, u64)> {
+        Err(needs_log())
+    }
+
+    /// `ACK`: move the subscription's cursor to `offset`. Returns the cursor.
+    async fn ack(&self, _subscription: &str, _offset: u64) -> AdbResult<u64> {
+        Err(needs_log())
+    }
+
+    /// `UNSUBSCRIBE`. Returns whether the subscription existed.
+    async fn unsubscribe(&self, _subscription: &str) -> AdbResult<bool> {
+        Err(needs_log())
+    }
 }
+
+/// Subscriptions follow the committed log (E9).
+fn needs_log() -> AdbError {
+    AdbError::UnsupportedOperation("subscriptions need a durable engine (start ADB with --data-dir)".into())
+}
+
+/// Default topic message TTL (E8).
+pub const DEFAULT_EVENT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// The most records the log keeps behind its tip for subscribers (E3).
+pub const RETAIN_MAX: u64 = 100_000;
 
 /// Writes straight to the backends.
 pub struct DirectWrites(pub Arc<Adb>);
@@ -152,6 +184,8 @@ pub struct DurableWrites<L: Log> {
     store: Option<Arc<PartitionStore>>,
     /// Background task applying committed records to `store` (stage D3.7).
     applier: Option<Applier>,
+    /// Live subscriptions (stage E), following registrations as they commit.
+    subs: Arc<Registry>,
 }
 
 impl<L: Log + 'static> DurableWrites<L> {
@@ -180,7 +214,11 @@ impl<L: Log + 'static> DurableWrites<L> {
         let applier = store
             .as_ref()
             .map(|s| Applier::spawn(Arc::clone(s), ApplyBarrier::new(seq.log().last_offset().0)));
-        Ok((Self { adb, seq: Mutex::new(seq), store, applier }, stats))
+        let subs = match &store {
+            Some(s) => Registry::load(s, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?,
+            None => Registry::default(),
+        };
+        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs) }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -246,6 +284,11 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(ids)
     }
 
+    /// Live subscriptions (stage E).
+    pub fn subscriptions(&self) -> &Arc<Registry> {
+        &self.subs
+    }
+
     /// The read barrier for Lance reads (stage D3.7), if there is a table.
     pub fn barrier(&self) -> Option<Arc<ApplyBarrier>> {
         self.applier.as_ref().map(|a| Arc::clone(a.barrier()))
@@ -271,8 +314,18 @@ impl<L: Log + 'static> DurableWrites<L> {
                         tracing::warn!(error = %e, "store sync failed; log not purged");
                         return;
                     }
-                    if let Err(e) = log.purge_below(d.next()).await {
-                        tracing::warn!(below = d.0 + 1, error = %e, "log purge failed; segments kept");
+                    // Keep what subscribers haven't acked, up to RETAIN_MAX behind the
+                    // tip (E3); never above Lance's durable offset.
+                    let mut floor = d.next();
+                    if let Some(cursor) = self.subs.min_cursor() {
+                        let cap = record.offset.0.saturating_sub(RETAIN_MAX);
+                        floor = LogOffset(floor.0.min(cursor.max(cap) + 1));
+                    }
+                    if floor.0 <= 1 {
+                        return;
+                    }
+                    if let Err(e) = log.purge_below(floor).await {
+                        tracing::warn!(below = floor.0, error = %e, "log purge failed; segments kept");
                     }
                 }
                 Ok(_) => {}
@@ -438,6 +491,86 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.to_store(&record, seq.log()).await;
         Ok(link)
     }
+
+    async fn publish(&self, topic: &str, payload: serde_json::Value, ttl: Option<Duration>) -> AdbResult<(String, u64)> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let id = seq.new_id(ts);
+        // Topic messages aren't records of any memory type (`RECORD_KINDS`); the
+        // `memory` column just needs a value.
+        let mut data = row(MemoryType::Episodic, Kind::Event, payload);
+        data.key = None;
+        data.text = None;
+        data.subject_id = Some(topic.to_string());
+        data.ttl_at = Some(CommitTs(ts.0 + ttl.unwrap_or(DEFAULT_EVENT_TTL).as_micros() as i64));
+        let effect = Effect::PublishEvent(NewRow { id: id.clone(), lineage_id: id.clone(), version: 1, data });
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok((id.0, record.offset.0))
+    }
+
+    async fn subscribe(&self, spec: SubSpec, from: Option<u64>) -> AdbResult<(String, u64)> {
+        let mut seq = self.seq.lock().await;
+        let tip = seq.log().last_offset().0;
+        let cursor = match from {
+            None => tip,
+            Some(n) => {
+                let n = n.max(1);
+                if n <= tip {
+                    if let Err(LogError::Purged { oldest, .. }) = seq.log().read(LogOffset(n), 1).await {
+                        return Err(AdbError::QueryError(format!(
+                            "cursor_expired: offset {n} is no longer retained; oldest available is {}",
+                            oldest.0
+                        )));
+                    }
+                }
+                n.min(tip + 1) - 1
+            }
+        };
+        let ts = seq.begin();
+        let id = seq.new_id(ts);
+        let mut data = row(MemoryType::Working, Kind::Sub, sub_value(&spec, cursor));
+        data.key = None;
+        data.text = None;
+        data.subject_id = Some(id.0.clone());
+        let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id.clone(), version: 1, data });
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.subs.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok((id.0, cursor + 1))
+    }
+
+    async fn ack(&self, subscription: &str, offset: u64) -> AdbResult<u64> {
+        let mut seq = self.seq.lock().await;
+        let sub = self.subs.get(subscription).ok_or_else(|| unknown_sub(subscription))?;
+        let offset = offset.min(seq.log().last_offset().0);
+        if offset <= sub.cursor {
+            return Ok(sub.cursor);
+        }
+        let ts = seq.begin();
+        let effect = Effect::UpdateSubCursor { sub_id: RecordId(subscription.to_string()), cursor: LogOffset(offset) };
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.subs.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok(offset)
+    }
+
+    async fn unsubscribe(&self, subscription: &str) -> AdbResult<bool> {
+        let mut seq = self.seq.lock().await;
+        if self.subs.get(subscription).is_none() {
+            return Ok(false);
+        }
+        let ts = seq.begin();
+        let effect = Effect::Unregister { id: RecordId(subscription.to_string()) };
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.subs.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok(true)
+    }
+}
+
+fn unknown_sub(id: &str) -> AdbError {
+    AdbError::NotFound { memory_type: "subscription".into(), id: id.to_string() }
 }
 
 /// What a replay did.
@@ -465,7 +598,7 @@ pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<u64> {
     // are read from Lance (D4.4a).
     let records: Vec<_> = rows
         .into_iter()
-        .filter(|r| r.data.kind != Kind::Edge && !crate::reads::lance_owned(r.data.memory.into()))
+        .filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool) && !crate::reads::lance_owned(r.data.memory.into()))
         .collect();
     for r in &records {
         let memory: MemoryType = r.data.memory.into();

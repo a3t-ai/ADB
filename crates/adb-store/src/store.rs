@@ -32,7 +32,7 @@ use lance_index::IndexType;
 use uuid::Uuid;
 
 use crate::rows::{decode, encode, qualified, row_id, StoredRow};
-use crate::schema::{memory_schema, META_ID};
+use crate::schema::{memory_schema, META_ID, RECORD_KINDS};
 use crate::{StoreError, StoreResult};
 
 #[derive(Debug, Clone)]
@@ -306,20 +306,20 @@ impl PartitionStore {
     /// The current version of record `key` of memory type `memory` (its lineage's
     /// current row, D2 T1), if any.
     pub async fn current_version(&self, memory: adb_core::log::Memory, key: &str, now: CommitTs) -> StoreResult<Option<StoredRow>> {
-        let filter = format!("lineage_id = {} AND kind != 'edge'", sql_str(&row_id(memory, key)));
+        let filter = format!("lineage_id = {} AND {RECORD_KINDS}", sql_str(&row_id(memory, key)));
         Ok(self.current(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
     }
 
     /// `memory`'s superseded record versions that are not forgotten: what FORGET
     /// must also match (D2 T5).
     pub async fn superseded(&self, memory: adb_core::log::Memory) -> StoreResult<Vec<StoredRow>> {
-        let filter = format!("memory = {} AND kind != 'edge' AND superseded_by IS NOT NULL AND tombstone = false", sql_str(memory.tag()));
+        let filter = format!("memory = {} AND {RECORD_KINDS} AND superseded_by IS NOT NULL AND tombstone = false", sql_str(memory.tag()));
         self.scan(Some(&filter)).await
     }
 
     /// How many records of `memory` are current at `now`.
     pub async fn count_current(&self, memory: adb_core::log::Memory, now: CommitTs) -> StoreResult<u64> {
-        let filter = format!("memory = {} AND kind != 'edge'", sql_str(memory.tag()));
+        let filter = format!("memory = {} AND {RECORD_KINDS}", sql_str(memory.tag()));
         Ok(self.current(Some(&filter), now).await?.len() as u64)
     }
 

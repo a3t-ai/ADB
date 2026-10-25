@@ -55,6 +55,35 @@ pub trait Log: Send + Sync {
     async fn purge_below(&self, offset: LogOffset) -> LogResult<()>;
 }
 
+/// A shared log: the sequencer appends while readers (stage E subscribers) read the
+/// same log. `LocalWal` and `MemLog` synchronise internally.
+#[async_trait]
+impl<L: Log + ?Sized> Log for std::sync::Arc<L> {
+    fn partition(&self) -> PartitionId {
+        (**self).partition()
+    }
+
+    async fn append(&self, record: LogRecord) -> LogResult<LogOffset> {
+        (**self).append(record).await
+    }
+
+    async fn read(&self, from: LogOffset, max: usize) -> LogResult<Vec<LogRecord>> {
+        (**self).read(from, max).await
+    }
+
+    fn last_offset(&self) -> LogOffset {
+        (**self).last_offset()
+    }
+
+    fn durable_offset(&self) -> LogOffset {
+        (**self).durable_offset()
+    }
+
+    async fn purge_below(&self, offset: LogOffset) -> LogResult<()> {
+        (**self).purge_below(offset).await
+    }
+}
+
 /// An in-memory log: durable for the life of the process only.
 #[derive(Debug)]
 pub struct MemLog {

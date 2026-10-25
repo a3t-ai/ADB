@@ -11,12 +11,40 @@ use adb_core::{MemoryType, Modifiers, Predicate, Scope};
 pub enum ExecutionPlan {
     /// Single operation
     Single(StepPlan),
+    /// Subscriptions (AQL v0.6, stage E): SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH
+    Subscription(SubscriptionPlan),
     /// Pipeline of operations
     Pipeline(PipelinePlan),
     /// Reflect (multi-source query with optional link traversal)
     Reflect(ReflectPlan),
     /// Fan-out operation across ALL memory types
     FanOut(FanOutPlan),
+}
+
+/// A subscription statement, planned (E_SUBSCRIPTIONS.md).
+#[derive(Debug, Clone)]
+pub enum SubscriptionPlan {
+    /// Register a cursor on a scope or topic; `from` = first offset wanted (`None` =
+    /// from now).
+    Subscribe {
+        target: SubscriptionTarget,
+        /// Row kinds (`entity`, `fact`, `edge`, `episode`, `tool`, `event`); empty = all.
+        kinds: Vec<String>,
+        filter: Option<Vec<adb_core::Condition>>,
+        from: Option<u64>,
+    },
+    Unsubscribe { subscription: String },
+    Ack { subscription: String, offset: u64 },
+    /// A committed `event` row on `topic`.
+    Publish { topic: String, payload: serde_json::Value, ttl: Option<Duration> },
+}
+
+/// What a subscription follows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionTarget {
+    Scope(String),
+    Topic(String),
 }
 
 /// A pipeline execution plan

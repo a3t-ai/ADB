@@ -35,6 +35,9 @@ pub enum ResultSet {
         sources: Vec<SourceResult>,
         links: Vec<Link>,
     },
+    /// A subscription statement's answer (stage E): `{subscription, …}` or
+    /// `{id, offset}` for PUBLISH.
+    Subscription { value: serde_json::Value },
     /// Empty result
     Empty,
 }
@@ -106,6 +109,18 @@ impl QueryResult {
         Self {
             success: true,
             data: ResultSet::Aggregation { values },
+            metadata: ResultMetadata {
+                execution_time_ms,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A subscription statement's answer (stage E).
+    pub fn subscription(value: serde_json::Value, execution_time_ms: u64) -> Self {
+        Self {
+            success: true,
+            data: ResultSet::Subscription { value },
             metadata: ResultMetadata {
                 execution_time_ms,
                 ..Default::default()

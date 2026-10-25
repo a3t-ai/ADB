@@ -38,6 +38,11 @@ impl ApplyBarrier {
         self.applied.send_modify(|a| *a = (*a).max(offset));
     }
 
+    /// Follows the applied offset (stage E subscribers wait on it).
+    pub fn watch(&self) -> watch::Receiver<u64> {
+        self.applied.subscribe()
+    }
+
     pub fn applied_offset(&self) -> u64 {
         *self.applied.borrow()
     }

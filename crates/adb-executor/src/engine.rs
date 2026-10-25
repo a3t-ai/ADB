@@ -19,6 +19,7 @@ use adb_sequencer::Sequencer;
 use adb_store::{PartitionStore, StoreConfig};
 
 use crate::apply::ApplyBarrier;
+use adb_gateway::Gateway;
 use crate::reads::{DirectReads, LanceReads, Reads};
 use crate::writes::{DurableWrites, ReplayStats, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
@@ -33,6 +34,11 @@ pub trait Engine: Send + Sync {
 
     /// Record counts per memory type: `{"working": n, "episodic": n, …}`.
     async fn stats(&self) -> Result<Value, String>;
+
+    /// Subscriber reads (stage E), for engines with a log.
+    fn gateway(&self) -> Option<Arc<Gateway>> {
+        None
+    }
 }
 
 /// The engine backed by today's in-memory backends (`adb-backends`).
@@ -42,12 +48,13 @@ pub struct LocalEngine {
     /// The Lance table, which alone holds SEMANTIC / EPISODIC / PROCEDURAL (D4.4a),
     /// and the barrier its reads wait on.
     store: Option<(Arc<PartitionStore>, Option<Arc<ApplyBarrier>>)>,
+    gateway: Option<Arc<Gateway>>,
 }
 
 impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor, store: None }
+        Self { adb, executor, store: None, gateway: None }
     }
 }
 
@@ -59,8 +66,9 @@ impl LocalEngine {
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         let adb = Arc::new(Adb::new());
-        let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
-        let seq = Sequencer::new(wal, Epoch(1));
+        // Shared: the sequencer appends, subscribers read (stage E).
+        let wal = Arc::new(LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?);
+        let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
         let store = Arc::new(
             PartitionStore::open(&StoreConfig::new(dir.join("store")), SINGLE_PARTITION)
                 .await
@@ -69,9 +77,14 @@ impl LocalEngine {
         let (writes, stats) =
             DurableWrites::open(Arc::clone(&adb), seq, Some(Arc::clone(&store))).await.map_err(|e| e.to_string())?;
         let barrier = writes.barrier();
+        let gateway = barrier.as_ref().map(|b| {
+            let log: Arc<dyn adb_log::Log> = wal;
+            let lineages: Arc<dyn adb_gateway::Lineages> = Arc::clone(&store) as Arc<dyn adb_gateway::Lineages>;
+            Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
+        });
         let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: Some((store, barrier)) }, stats))
+        Ok((Self { adb, executor, store: Some((store, barrier)), gateway }, stats))
     }
 
     /// The log in `dir` replayed into the in-memory backends, with no Lance table:
@@ -86,7 +99,7 @@ impl LocalEngine {
             DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
         let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: None }, stats))
+        Ok((Self { adb, executor, store: None, gateway: None }, stats))
     }
 }
 
@@ -104,6 +117,10 @@ impl Engine for LocalEngine {
             _ => self.executor.execute(aql).await,
         };
         result.map(|r| to_wire(&r)).map_err(|e| e.to_string())
+    }
+
+    fn gateway(&self) -> Option<Arc<Gateway>> {
+        self.gateway.clone()
     }
 
     async fn stats(&self) -> Result<Value, String> {
@@ -175,6 +192,13 @@ fn wire_data(data: &ResultSet) -> Option<Value> {
             })).collect::<Vec<_>>(),
             "links": links,
         }),
+        ResultSet::Subscription { value } => {
+            let mut v = json!({ "type": "subscription" });
+            if let (Some(m), Some(extra)) = (v.as_object_mut(), value.as_object()) {
+                m.extend(extra.clone());
+            }
+            v
+        }
         ResultSet::Empty => return None,
     })
 }

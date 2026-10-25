@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use adb_backends::Adb;
 use adb_core::{Condition, MemoryType, Predicate, Scope, Value};
 use aql_parser::parse;
-use aql_planner::{ExecutionPlan, FanOutPlan, Operation, PipelinePlan, PipelineStage, Planner, ReflectPlan, StepPlan};
+use aql_planner::{
+    ExecutionPlan, FanOutPlan, Operation, PipelinePlan, PipelineStage, Planner, ReflectPlan, StepPlan, SubscriptionPlan,
+    SubscriptionTarget,
+};
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::result::{QueryResult, ResultSet, SourceResult};
@@ -109,6 +112,7 @@ impl Executor {
             ExecutionPlan::Pipeline(pipeline) => self.execute_pipeline(pipeline, bindings).await?,
             ExecutionPlan::Reflect(reflect) => self.execute_reflect(reflect).await?,
             ExecutionPlan::FanOut(fanout) => self.execute_fanout(fanout).await?,
+            ExecutionPlan::Subscription(sub) => self.execute_subscription(sub).await?,
         };
 
         let mut result = result;
@@ -676,6 +680,41 @@ impl Executor {
             records,
             start.elapsed().as_millis() as u64,
         ))
+    }
+
+    /// SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH (stage E, E_SUBSCRIPTIONS.md): each is a
+    /// committed write; deliveries are read through the gateway, not here.
+    async fn execute_subscription(&self, plan: &SubscriptionPlan) -> ExecutorResult<QueryResult> {
+        let start = Instant::now();
+        let value = match plan {
+            SubscriptionPlan::Subscribe { target, kinds, filter, from } => {
+                let target = match target {
+                    SubscriptionTarget::Scope(s) => adb_gateway::Target::Scope(s.clone()),
+                    SubscriptionTarget::Topic(t) => adb_gateway::Target::Topic(t.clone()),
+                };
+                let kinds = kinds
+                    .iter()
+                    .map(|k| serde_json::from_value(serde_json::Value::String(k.clone())))
+                    .collect::<Result<Vec<adb_core::log::Kind>, _>>()
+                    .map_err(|e| ExecutorError::InvalidOperation(format!("KINDS: {e}")))?;
+                let spec = adb_gateway::SubSpec { target, kinds, filter: filter.clone() };
+                let (id, start_offset) = self.writes.subscribe(spec, *from).await?;
+                serde_json::json!({ "subscription": id, "start_offset": start_offset })
+            }
+            SubscriptionPlan::Unsubscribe { subscription } => {
+                let existed = self.writes.unsubscribe(subscription).await?;
+                serde_json::json!({ "subscription": subscription, "unsubscribed": existed })
+            }
+            SubscriptionPlan::Ack { subscription, offset } => {
+                let cursor = self.writes.ack(subscription, *offset).await?;
+                serde_json::json!({ "subscription": subscription, "cursor": cursor })
+            }
+            SubscriptionPlan::Publish { topic, payload, ttl } => {
+                let (id, offset) = self.writes.publish(topic, payload.clone(), *ttl).await?;
+                serde_json::json!({ "id": id, "topic": topic, "offset": offset })
+            }
+        };
+        Ok(QueryResult::subscription(value, start.elapsed().as_millis() as u64))
     }
 
     async fn execute_store(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {

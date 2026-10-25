@@ -67,6 +67,7 @@ version = "0.1.0"
 dependencies = [
  "adb-backends",
  "adb-core",
+ "adb-gateway",
  "adb-log",
  "adb-sequencer",
  "adb-store",
@@ -87,6 +88,21 @@ dependencies = [
 [[package]]
 name = "adb-gateway"
 version = "0.1.0"
+dependencies = [
+ "adb-core",
+ "adb-log",
+ "adb-store",
+ "async-trait",
+ "chrono",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "adb-log"
