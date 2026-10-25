@@ -243,3 +243,24 @@ async fn lance_reads_match_backend_reads() {
     // The queries returned something (not two matching empty answers).
     assert!(backends[0].to_string().contains("acme"), "{}", backends[0]);
 }
+
+/// Stage D3: after a restart the in-memory tier is rebuilt from Lance (not the log):
+/// every read through the backends — WORKING, TOOLS, PROCEDURAL, links — is unchanged.
+#[tokio::test]
+async fn backends_rebuilt_from_lance_match() {
+    use adb_executor::ReadsFrom;
+    let dir = tempfile::tempdir().unwrap();
+    let before = {
+        let (engine, _) = LocalEngine::durable_with(dir.path(), ReadsFrom::Backends).await.unwrap();
+        for q in WRITES {
+            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        snapshot(&engine).await
+    };
+    let (engine, stats) = LocalEngine::durable_with(dir.path(), ReadsFrom::Backends).await.unwrap();
+    assert!(stats.hydrated_rows > 0, "{stats:?}");
+    let after = snapshot(&engine).await;
+    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(b, a, "read {i} ({}) differs after rebuilding from Lance", READS.get(i).unwrap_or(&"stats"));
+    }
+}

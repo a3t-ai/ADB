@@ -171,6 +171,15 @@ impl ProceduralBackend {
     }
 
     /// Add a procedure to the graph
+    /// Set a stored procedure's version (rebuilding from the Lance table on startup,
+    /// stage D3: `store` makes version 1, the table knows how many updates followed).
+    pub fn set_version(&self, pattern_id: &str, version: u64) -> bool {
+        let index = self.index.read();
+        let Some(&idx) = index.get(pattern_id) else { return false };
+        self.graph.write()[idx].version = version;
+        true
+    }
+
     pub fn add_procedure(&self, procedure: ProcedureNode) -> NodeIndex {
         let pattern_id = procedure.pattern_id.clone();
         let mut graph = self.graph.write();

@@ -151,12 +151,23 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Replay `log` into `adb`, bring `store` up to the log's end, then accept new
     /// writes on top of both.
     pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>, store: Option<Arc<PartitionStore>>) -> AdbResult<(Self, ReplayStats)> {
-        let mut stats = replay(&adb, seq.log()).await?;
+        let stats = match &store {
+            // Stage D3: no full log replay. Lance catches up from the log's tail, then
+            // the in-memory tier is rebuilt from Lance's current rows.
+            Some(s) => {
+                let store_caught_up = catch_up(s, seq.log()).await?;
+                let hydrated_rows = hydrate(&adb, s).await?;
+                let last_offset = seq.log().last_offset();
+                let last_commit_ts = match last_offset.0 {
+                    0 => None,
+                    _ => seq.log().read(last_offset, 1).await.map_err(log_err)?.first().map(|r| r.commit_ts),
+                };
+                ReplayStats { records: last_offset.0, effects: 0, last_offset, last_commit_ts, store_caught_up, hydrated_rows }
+            }
+            None => replay(&adb, seq.log()).await?,
+        };
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
-        }
-        if let Some(s) = &store {
-            stats.store_caught_up = catch_up(s, seq.log()).await?;
         }
         Ok((Self { adb, seq: Mutex::new(seq), store }, stats))
     }
@@ -314,6 +325,53 @@ pub struct ReplayStats {
     pub last_commit_ts: Option<CommitTs>,
     /// Log records the Lance table was missing and got on open.
     pub store_caught_up: u64,
+    /// Rows the in-memory tier was rebuilt from (Lance's current view), on open.
+    pub hydrated_rows: u64,
+}
+
+/// Rebuild the in-memory backends from the Lance table's current rows (stage D3),
+/// so startup needs only the log's tail, not all of it. Records go first, then the
+/// links that point at them. WORKING / SEMANTIC / EPISODIC records are put in place
+/// as rebuilt; TOOLS and PROCEDURAL re-run their `store` at the commit time (their
+/// backends shape the payload into their own structs), then get their version back.
+pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<u64> {
+    let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+    let now = CommitTs::from_datetime(time::now());
+    let rows = store.current(None, now).await.map_err(store_err)?;
+    let (edges, records): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.data.kind == Kind::Edge);
+    for r in &records {
+        let memory: MemoryType = r.data.memory.into();
+        let rec = crate::reads::to_record(r);
+        match memory {
+            MemoryType::Working => adb.working().insert_record(rec),
+            MemoryType::Semantic => adb.semantic().insert_record(rec),
+            MemoryType::Episodic => adb.episodic().insert_record(rec),
+            MemoryType::Tools | MemoryType::Procedural => {
+                let stored = adb.store_with_options(
+                    memory,
+                    &r.id,
+                    r.data.value.clone(),
+                    rec.metadata.scope,
+                    r.data.namespace.as_deref(),
+                    rec.metadata.ttl,
+                );
+                time::at(r.commit_ts.to_datetime(), stored).await?;
+                if memory == MemoryType::Procedural {
+                    adb.procedural().set_version(&r.id, u64::from(r.version));
+                }
+            }
+        }
+    }
+    for e in &edges {
+        let effect = Effect::PutEdge(NewRow {
+            id: RecordId(e.id.clone()),
+            lineage_id: RecordId(e.lineage_id.clone()),
+            version: e.version,
+            data: e.data.clone(),
+        });
+        apply_link(adb, e.commit_ts, &effect).await?;
+    }
+    Ok((records.len() + edges.len()) as u64)
 }
 
 /// Rebuild `adb` from every record in `log`, in order.

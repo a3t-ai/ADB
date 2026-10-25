@@ -42,6 +42,12 @@ impl WorkingBackend {
         }
     }
 
+    /// Put an already-built record in place (no new id or time): rebuilding the hot
+    /// tier from the Lance table on startup (stage D3).
+    pub fn insert_record(&self, record: MemoryRecord) {
+        self.store.insert(record.id.clone(), record);
+    }
+
     /// Create with initial capacity
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
