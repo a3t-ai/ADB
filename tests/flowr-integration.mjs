@@ -24,6 +24,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, all) => {
   if (a.startsWith('--')) acc.push([a.slice(2), all[i + 1]]);
@@ -228,6 +229,84 @@ try {
   })).json();
   check('ADB /query sees FlowR’s write (ClawDbMemory shape)', q.success && q.data?.data?.records?.[0]?.data?.content === 'Acme renews on 1 Nov', JSON.stringify(q));
 
+  // ---------------------------------------------------------------- stage F: call:a3t:agent memory on ADB
+  // A stub OpenAI-compatible LLM that answers with the system prompt it was given, so
+  // the test sees what memory reached the agent, and counts its calls.
+  let llmCalls = 0;
+  const llm = createHttpServer((req, res) => {
+    let body = '';
+    req.on('data', d => { body += d; });
+    req.on('end', () => {
+      llmCalls++;
+      const b = JSON.parse(body || '{}');
+      const system = (b.messages ?? []).find(m => m.role === 'system')?.content ?? '';
+      const content = `ECHO ${system}`;
+      if (b.stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`);
+        res.end('data: [DONE]\n\n');
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] }));
+      }
+    });
+  });
+  const llmPort = await freePort();
+  await new Promise(r => llm.listen(llmPort, '127.0.0.1', r));
+  r = await flowr('create_resource', {
+    namespace: 'a3t', name: 'stub-llm', type_ref: 'llm', description: 'stub LLM (echoes its system prompt)',
+    config: { provider: 'openai', api_url: `http://127.0.0.1:${llmPort}`, api_key: 'stub', model: 'stub' },
+  });
+  check('create stub LLM resource', !r.isError, r.text);
+  r = await flowr('create_flow', { yaml: `document:
+  dsl: 1.0.3
+  namespace: a3t
+  name: agent-memory-test
+  version: 1.0.0
+do:
+- run_agent:
+    call: a3t:agent
+    with:
+      config: \${ .input.config }
+      session_id: \${ .input.session_id }
+      message: \${ .input.message }
+` });
+  check('create agent-memory-test flow', !r.isError, r.text);
+  const agentConfig = (extra = {}) => ({
+    llm_resource: 'a3t/stub-llm', memory_resource: 'a3t/adb', memory_namespace: 'f-test',
+    system_prompt: 'You are a test agent.', mcp_servers: [], ...extra,
+  });
+  const ask = (session_id, message, extra) => flowr('execute_flow', {
+    namespace: 'a3t', name: 'agent-memory-test', input: { input: { session_id, message, config: agentConfig(extra) } },
+  });
+  const adbQ = async (query) => (await (await fetch(`${adbUrl}/query`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query }),
+  })).json()).data?.data;
+  await adbQ('STORE INTO SEMANTIC (key = "fav-colour", content = "The user\'s favourite colour is teal") NAMESPACE "f-test"');
+  await adbQ('STORE INTO SEMANTIC (key = "elsewhere", content = "Another agent\'s fact: purple") NAMESPACE "other-ns"');
+  r = await ask('f-s1', 'What is my favourite colour?');
+  const reply = flowOutput(r.text);
+  const text = JSON.stringify(reply ?? r.text);
+  check('agent recalls a fact from ADB into its prompt', !r.isError && text.includes('favourite colour is teal'), r.text.slice(0, 600));
+  check('only its own namespace', !text.includes('purple'), text.slice(0, 600));
+  const turns = await adbQ('RECALL FROM WORKING WHERE session_id = "f-s1" NAMESPACE "f-test"');
+  check('the user turn is stored in WORKING', turns?.records?.[0]?.data?.content === 'What is my favourite colour?', JSON.stringify(turns));
+  const eps = await adbQ('RECALL FROM EPISODIC WHERE session_id = "f-s1" NAMESPACE "f-test"');
+  check('the reply is stored in EPISODIC', eps?.records?.[0]?.data?.role === 'assistant' && String(eps.records[0].data.content).startsWith('ECHO'), JSON.stringify(eps).slice(0, 400));
+  // Procedural short-circuit: off by default, on with memory_config.procedural.read.
+  await adbQ('STORE INTO PROCEDURAL (pattern_id = "pw-reset", pattern = "reset my password", steps = ["Open Settings", "Choose Reset password"])');
+  const before = llmCalls;
+  r = await ask('f-s2', 'please reset my password now');
+  check('procedures stay out of the way by default (LLM answers)', llmCalls === before + 1 && !String(flowOutput(r.text)?.content ?? '').startsWith('Open Settings'), r.text.slice(0, 400));
+  const before2 = llmCalls;
+  r = await ask('f-s3', 'please reset my password now', { memory_config: { procedural: { read: true } } });
+  const out = flowOutput(r.text);
+  check('a matching procedure answers without the LLM when enabled', llmCalls === before2 && out?.content === 'Open Settings; Choose Reset password' && out?.procedural_hit === true, r.text.slice(0, 400));
+  // A broken memory resource never fails the turn.
+  r = await ask('f-s4', 'hello', { memory_resource: 'a3t/no-such-adb' });
+  check('a missing memory resource doesn\'t fail the turn', !r.isError && JSON.stringify(flowOutput(r.text)).includes('ECHO'), r.text.slice(0, 400));
+  llm.close();
+
   // ---------------------------------------------------------------- stage C: ADB crashes mid-conversation
   if (args['adb-data-dir'] && adbChild) {
     r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'STORE INTO WORKING (conversation = "c-42", turn = 3, topic = "renewal")' });
@@ -244,7 +323,8 @@ try {
     r = await callTool('recall', { contains: 'renews' });
     check('facts survive the crash too (MCP recall)', flowOutput(r.text)?.data?.records?.[0]?.data?.key === 'acme-renewal', r.text);
     r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'RECALL FROM WORKING WHERE name = "alice"' });
-    check('earlier call:adb writes survive', flowOutput(r.text)?.data?.records?.[0]?.data?.score === 95, r.text);
+    check('earlier call:adb writes survive', flowOutput(r.text)?.data?.records?.[0]?.data?.score === 95, r.text);    const facts = await adbQ('RECALL FROM SEMANTIC WHERE key = "fav-colour"');
+    check('agent memory survives the crash (stage F)', facts?.records?.[0]?.data?.content?.includes('teal'), JSON.stringify(facts));
   }
 } catch (e) {
   check('session', false, e.stack);
