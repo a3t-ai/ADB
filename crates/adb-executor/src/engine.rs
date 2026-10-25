@@ -18,6 +18,7 @@ use adb_log::{LocalWal, WalConfig};
 use adb_sequencer::Sequencer;
 use adb_store::{PartitionStore, StoreConfig};
 
+use crate::reads::{DirectReads, LanceReads, Reads};
 use crate::writes::{DurableWrites, ReplayStats, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
 
@@ -49,19 +50,41 @@ impl LocalEngine {
 impl LocalEngine {
     /// A durable engine: replays the write-ahead log in `dir`, then logs every write
     /// there before applying it (stage C), and applies it to the partition's Lance
-    /// table in `dir/store` too (stage D2). Returns what the replay found.
+    /// table in `dir/store` too (stage D2). SEMANTIC and EPISODIC are read from that
+    /// table (stage D3). Returns what the replay found.
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
+        Self::durable_with(dir, ReadsFrom::Lance).await
+    }
+
+    /// As [`LocalEngine::durable`], choosing where reads come from (tests compare both).
+    pub async fn durable_with(dir: impl Into<std::path::PathBuf>, reads_from: ReadsFrom) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         let adb = Arc::new(Adb::new());
         let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
         let seq = Sequencer::new(wal, Epoch(1));
-        let store = PartitionStore::open(&StoreConfig::new(dir.join("store")), SINGLE_PARTITION)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (writes, stats) = DurableWrites::open(Arc::clone(&adb), seq, Some(store)).await.map_err(|e| e.to_string())?;
-        let executor = Executor::with_writes(Arc::clone(&adb), Arc::new(writes));
+        let store = Arc::new(
+            PartitionStore::open(&StoreConfig::new(dir.join("store")), SINGLE_PARTITION)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        let (writes, stats) =
+            DurableWrites::open(Arc::clone(&adb), seq, Some(Arc::clone(&store))).await.map_err(|e| e.to_string())?;
+        let reads: Arc<dyn Reads> = match reads_from {
+            ReadsFrom::Lance => Arc::new(LanceReads::new(Arc::clone(&adb), store)),
+            ReadsFrom::Backends => Arc::new(DirectReads(Arc::clone(&adb))),
+        };
+        let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
         Ok((Self { adb, executor }, stats))
     }
+}
+
+/// Where a durable engine's reads come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadsFrom {
+    /// SEMANTIC and EPISODIC from the Lance table, the rest from memory (stage D3).
+    Lance,
+    /// Everything from the in-memory backends (stage C behaviour).
+    Backends,
 }
 
 impl Default for LocalEngine {

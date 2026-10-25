@@ -180,3 +180,66 @@ async fn lance_catches_up_from_the_log() {
     assert_eq!(applied, WRITES.len() as u64);
     assert_eq!(summary(&before), summary(&after));
 }
+
+/// Stage D3: SEMANTIC / EPISODIC reads from Lance answer exactly like the backends.
+#[tokio::test]
+async fn lance_reads_match_backend_reads() {
+    use adb_executor::ReadsFrom;
+    const EXTRA: &[&str] = &[
+        r#"STORE INTO SEMANTIC (concept = "beta", content = "Beta churned", active = false, avg_cpm = 1.5)"#,
+        r#"STORE INTO SEMANTIC (concept = "gamma", content = "Gamma upsell", active = true, avg_cpm = 3.2)"#,
+        r#"STORE INTO EPISODIC (bid_id = "e3", campaign = "winter", won = true, cpm_paid = 4.0)"#,
+        r#"STORE INTO EPISODIC (bid_id = "e4", campaign = "summer", won = false, cpm_paid = 0.5)"#,
+        r#"UPDATE INTO SEMANTIC WHERE concept = "gamma" (avg_cpm = 3.6)"#,
+    ];
+    const QUERIES: &[&str] = &[
+        r#"RECALL FROM SEMANTIC WHERE active = true"#,
+        r#"RECALL FROM SEMANTIC WHERE avg_cpm > 2 RETURN concept, avg_cpm"#,
+        r#"LOOKUP FROM SEMANTIC KEY concept = "gamma""#,
+        r#"LOOKUP FROM SEMANTIC KEY id = "acme""#,
+        r#"RECALL FROM SEMANTIC ALL ORDER BY concept ASC"#,
+        r#"RECALL FROM EPISODIC WHERE campaign = "summer""#,
+        r#"RECALL FROM EPISODIC WHERE cpm_paid > 1 ORDER BY cpm_paid DESC LIMIT 2"#,
+        r#"RECALL FROM EPISODIC ALL"#,
+        r#"RECALL FROM EPISODIC WHERE won = true RETURN bid_id, cpm_paid"#,
+        r#"RECALL FROM EPISODIC WHERE campaign = "summer" AGGREGATE COUNT(*) AS n, AVG(cpm_paid) AS avg RETURN n, avg"#,
+        r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#,
+        r#"LOOKUP FROM SEMANTIC KEY concept = "acme" WITH LINKS ALL"#,
+        r#"RECALL FROM ALL WHERE campaign = "summer""#,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, _) = LocalEngine::durable_with(dir.path(), ReadsFrom::Backends).await.unwrap();
+        for q in WRITES.iter().chain(EXTRA) {
+            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+    }
+    let run = |from: ReadsFrom| {
+        let path = dir.path().to_path_buf();
+        async move {
+            let (engine, _) = LocalEngine::durable_with(&path, from).await.unwrap();
+            let mut out = Vec::new();
+            for q in QUERIES {
+                out.push(stable(engine.query(q, None).await.unwrap_or_else(|e| panic!("{from:?} {q}: {e}"))));
+            }
+            out
+        }
+    };
+    let backends = run(ReadsFrom::Backends).await;
+    let lance = run(ReadsFrom::Lance).await;
+    // SEMANTIC keeps records in a HashMap, so without ORDER BY the order is
+    // unspecified (it differs between any two backends): compare those as sets.
+    let as_set = |mut v: Value, q: &str| {
+        if !q.contains("ORDER BY") {
+            if let Some(records) = v.pointer_mut("/data/records").and_then(|r| r.as_array_mut()) {
+                records.sort_by_key(|r| r["id"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        v
+    };
+    for (i, q) in QUERIES.iter().enumerate() {
+        assert_eq!(as_set(lance[i].clone(), q), as_set(backends[i].clone(), q), "Lance and backend reads differ for: {q}");
+    }
+    // The queries returned something (not two matching empty answers).
+    assert!(backends[0].to_string().contains("acme"), "{}", backends[0]);
+}

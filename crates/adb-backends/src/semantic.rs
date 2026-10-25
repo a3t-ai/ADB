@@ -48,6 +48,13 @@ impl SemanticBackend {
         Self::with_dimensions(DEFAULT_DIMENSIONS)
     }
 
+    /// Put an already-built record in place (no new id, time or embedding), so a
+    /// read-only view built from the Lance table answers queries exactly as this
+    /// backend does (stage D3).
+    pub fn insert_record(&self, record: MemoryRecord) {
+        self.records.write().insert(record.id.clone(), record);
+    }
+
     /// Create a new semantic backend with specified dimensions
     pub fn with_dimensions(dimensions: usize) -> AdbResult<Self> {
         let options = IndexOptions {

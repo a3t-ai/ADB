@@ -14,6 +14,7 @@ use aql_planner::{ExecutionPlan, FanOutPlan, Operation, PipelinePlan, PipelineSt
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::result::{QueryResult, ResultSet, SourceResult};
+use crate::reads::{DirectReads, Reads};
 use crate::writes::{DirectWrites, Writes};
 
 /// The query executor
@@ -22,6 +23,8 @@ pub struct Executor {
     adb: Arc<Adb>,
     /// Where writes go: straight to `adb`, or through the log (stage C)
     writes: Arc<dyn Writes>,
+    /// Where reads come from: `adb`, or the Lance table for some memory types (D3)
+    reads: Arc<dyn Reads>,
     /// The planner
     planner: Planner,
 }
@@ -35,9 +38,16 @@ impl Executor {
 
     /// An executor whose writes go through `writes` (e.g. [`crate::writes::DurableWrites`]).
     pub fn with_writes(adb: Arc<Adb>, writes: Arc<dyn Writes>) -> Self {
+        let reads = Arc::new(DirectReads(Arc::clone(&adb)));
+        Self::with_io(adb, writes, reads)
+    }
+
+    /// An executor with its own write and read paths (e.g. log + Lance, stage D3).
+    pub fn with_io(adb: Arc<Adb>, writes: Arc<dyn Writes>, reads: Arc<dyn Reads>) -> Self {
         Self {
             adb,
             writes,
+            reads,
             planner: Planner::new(),
         }
     }
@@ -270,7 +280,7 @@ impl Executor {
                 let mut all_records = Vec::new();
                 for mem_type in MemoryType::all() {
                     let records = self
-                        .adb
+                        .reads
                         .recall_with_modifiers(*mem_type, &fanout.predicate, &fanout.modifiers)
                         .await?;
                     all_records.extend(records);
@@ -325,7 +335,7 @@ impl Executor {
         // Execute each source
         for source in &reflect.sources {
             let records = self
-                .adb
+                .reads
                 .recall_with_modifiers(source.memory_type, &source.predicate, &source.modifiers)
                 .await?;
 
@@ -375,7 +385,7 @@ impl Executor {
                             for id in ids {
                                 // Lookup each target record
                                 let target_records = self
-                                    .adb
+                                    .reads
                                     .lookup(mem_type, &adb_core::Predicate::Key {
                                         field: "id".to_string(),
                                         value: adb_core::Value::String(id),
@@ -471,11 +481,11 @@ impl Executor {
             // Create modifiers without return_fields to preserve all fields for aggregation
             let mut mods_for_recall = step.modifiers.clone();
             mods_for_recall.return_fields = None;
-            self.adb
+            self.reads
                 .recall_with_modifiers(step.memory_type, &step.predicate, &mods_for_recall)
                 .await?
         } else {
-            self.adb
+            self.reads
                 .recall_with_modifiers(step.memory_type, &step.predicate, &step.modifiers)
                 .await?
         };
@@ -526,7 +536,7 @@ impl Executor {
                 // Fetch target records for each link
                 for link in links {
                     let targets = self
-                        .adb
+                        .reads
                         .lookup(link.to_type, &adb_core::Predicate::Key {
                             field: "id".to_string(),
                             value: adb_core::Value::String(link.to_id.clone()),
@@ -607,7 +617,7 @@ impl Executor {
         let start = Instant::now();
 
         let records = self
-            .adb
+            .reads
             .lookup_with_modifiers(step.memory_type, &step.predicate, &step.modifiers)
             .await?;
 
@@ -781,7 +791,7 @@ impl Executor {
 
         // Look up source records using step.memory_type and step.predicate
         let source_records = self
-            .adb
+            .reads
             .lookup(step.memory_type, &step.predicate)
             .await?;
 
@@ -793,7 +803,7 @@ impl Executor {
 
         // Look up target records
         let target_records = self
-            .adb
+            .reads
             .lookup(to_type, &to_predicate)
             .await?;
 

@@ -144,13 +144,13 @@ pub struct DurableWrites<L: Log> {
     seq: Mutex<Sequencer<L>>,
     /// The partition's Lance table (stage D2: written alongside the in-memory
     /// backends; reads move to it in D3). `None` = log + memory only.
-    store: Option<PartitionStore>,
+    store: Option<Arc<PartitionStore>>,
 }
 
 impl<L: Log + 'static> DurableWrites<L> {
     /// Replay `log` into `adb`, bring `store` up to the log's end, then accept new
     /// writes on top of both.
-    pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>, store: Option<PartitionStore>) -> AdbResult<(Self, ReplayStats)> {
+    pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>, store: Option<Arc<PartitionStore>>) -> AdbResult<(Self, ReplayStats)> {
         let mut stats = replay(&adb, seq.log()).await?;
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
@@ -167,7 +167,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     }
 
     /// The Lance table, if any (tests and D3 reads).
-    pub fn store(&self) -> Option<&PartitionStore> {
+    pub fn store(&self) -> Option<&Arc<PartitionStore>> {
         self.store.as_ref()
     }
 

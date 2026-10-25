@@ -42,6 +42,15 @@ impl EpisodicBackend {
         }
     }
 
+    /// Put an already-built record in place (no new id or time), so a read-only
+    /// view built from the Lance table answers queries exactly as this backend does
+    /// (stage D3).
+    pub fn insert_record(&self, record: MemoryRecord) {
+        let ts = Self::get_timestamp(&record);
+        self.id_index.write().insert(record.id.clone(), ts);
+        self.records.write().insert((ts, record.id.clone()), record);
+    }
+
     /// Get records within a time window
     pub fn get_window(&self, window: &Window) -> Vec<MemoryRecord> {
         let records = self.records.read();
