@@ -77,6 +77,22 @@ pub struct PartitionStore {
     /// `_meta`'s applied offset, read once on open and advanced by `apply`, so
     /// applying a record doesn't scan the table just to check it.
     applied: std::sync::atomic::AtomicU64,
+    /// Log offset of each put since open, to map the MemWAL's durable batch count
+    /// back to a log offset (`durable_offset`).
+    puts: std::sync::Mutex<PutLedger>,
+}
+
+/// Puts since open, numbered like the MemWAL writer numbers batches (R11 / R12).
+#[derive(Debug, Default)]
+struct PutLedger {
+    /// Writer-global batch number of the first put after open.
+    base: usize,
+    /// Puts dropped from the front of `offsets` (already known durable).
+    first: usize,
+    /// Log offset of put `base + first + i`.
+    offsets: std::collections::VecDeque<u64>,
+    /// Applied offset recovered on open (durable by definition).
+    durable_at_open: u64,
 }
 
 /// Lance runtime settings for ADB's workload, applied once before Lance is first used.
@@ -128,10 +144,15 @@ impl PartitionStore {
             dim: cfg.embedding_dim,
             memtable_rows: cfg.memtable_rows,
             applied: std::sync::atomic::AtomicU64::new(0),
+            puts: std::sync::Mutex::new(PutLedger::default()),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
         store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
+        // Everything present after the writer's replay is WAL-durable: it is the base
+        // of the batch numbering, and `applied` is durable already.
+        let st = store.writer.memtable_stats().await.map_err(lance)?;
+        *store.puts.lock().unwrap() = PutLedger { base: st.global_offset + st.batch_count, first: 0, offsets: Default::default(), durable_at_open: applied };
         Ok(store)
     }
 
@@ -272,6 +293,7 @@ impl PartitionStore {
         let batch = encode(&rows, &self.schema, self.dim)?;
         self.writer.put(vec![batch]).await.map_err(lance)?;
         self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
+        self.puts.lock().unwrap().offsets.push_back(off);
         if self.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
             self.writer.force_seal_active().await.map_err(lance)?;
         }
@@ -308,6 +330,34 @@ impl PartitionStore {
     pub async fn durable_batches(&self) -> StoreResult<(usize, usize)> {
         let st = self.writer.memtable_stats().await.map_err(lance)?;
         Ok((st.durable_batch_count, st.global_offset))
+    }
+
+    /// The highest log offset this table has made durable (MemWAL WAL flushed): a
+    /// crash now recovers at least up to it, so the partition log may be purged
+    /// below `durable_offset + 1` (stage D3.5). Maps the writer's durable batch count
+    /// to the log offset of that put, as the R11 / R12 spikes validated.
+    pub async fn durable_offset(&self) -> StoreResult<LogOffset> {
+        let durable = self.writer.memtable_stats().await.map_err(lance)?.durable_batch_count;
+        let mut p = self.puts.lock().unwrap();
+        if durable <= p.base {
+            return Ok(LogOffset(p.durable_at_open));
+        }
+        // Put number `durable - 1` is the newest durable one.
+        let idx = durable - p.base - 1;
+        if idx < p.first {
+            // Already trimmed: the front entry was durable when we dropped it.
+            return Ok(LogOffset(p.durable_at_open));
+        }
+        let Some(&off) = p.offsets.get(idx - p.first) else {
+            return Ok(LogOffset(p.offsets.back().copied().unwrap_or(p.durable_at_open)));
+        };
+        // Forget puts before it; keep it as the new floor.
+        while p.first < idx {
+            p.offsets.pop_front();
+            p.first += 1;
+        }
+        p.durable_at_open = p.durable_at_open.max(off);
+        Ok(LogOffset(off))
     }
 
     /// Flush and release the writer.

@@ -185,14 +185,32 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Apply a committed record to the Lance table. Called with the sequencer held,
     /// so records arrive in log order. A failure is logged, not returned: the write
     /// is already durable in the log, and `catch_up` re-applies it on the next open.
-    async fn to_store(&self, record: &LogRecord) {
-        if let Some(s) = &self.store {
-            if let Err(e) = s.apply(record).await {
-                tracing::warn!(offset = record.offset.0, error = %e, "Lance apply failed; the log has it, catch-up on next open");
+    ///
+    /// Every `PURGE_EVERY` records it also trims the log (stage D3.5): startup only
+    /// needs the records above what Lance has made durable, so segments below
+    /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
+    async fn to_store(&self, record: &LogRecord, log: &L) {
+        let Some(s) = &self.store else { return };
+        if let Err(e) = s.apply(record).await {
+            tracing::warn!(offset = record.offset.0, error = %e, "Lance apply failed; the log has it, catch-up on next open");
+            return;
+        }
+        if record.offset.0 % PURGE_EVERY == 0 {
+            match s.durable_offset().await {
+                Ok(d) if d.0 > 0 => {
+                    if let Err(e) = log.purge_below(d.next()).await {
+                        tracing::warn!(below = d.0 + 1, error = %e, "log purge failed; segments kept");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Lance durable offset unavailable; log not purged"),
             }
         }
     }
 }
+
+/// How often (in log records) the log is trimmed below Lance's durable offset.
+pub const PURGE_EVERY: u64 = 256;
 
 /// Apply every log record above the table's `_meta` offset (records lost from the
 /// MemWAL by a crash, or written while Lance applies failed). Returns how many.
@@ -239,7 +257,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
         let stored = apply(&self.adb, ts, &effect).await?.ok_or_else(|| AdbError::Internal("store produced no record".into()))?;
-        self.to_store(&record).await;
+        self.to_store(&record, seq.log()).await;
         Ok(stored)
     }
 
@@ -265,7 +283,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         // Apply exactly what was logged, so live and replayed updates agree.
         let n = time::at(ts.to_datetime(), self.adb.update_ids(memory_type, &ids, serde_json::Value::Object(fields))).await?;
-        self.to_store(&record).await;
+        self.to_store(&record, seq.log()).await;
         Ok(n)
     }
 
@@ -283,7 +301,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         for effect in &effects {
             removed += apply_count(&self.adb, ts, effect).await?;
         }
-        self.to_store(&record).await;
+        self.to_store(&record, seq.log()).await;
         Ok(removed)
     }
 
@@ -311,7 +329,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
         let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
         let link = apply_link(&self.adb, ts, &effect).await?;
-        self.to_store(&record).await;
+        self.to_store(&record, seq.log()).await;
         Ok(link)
     }
 }

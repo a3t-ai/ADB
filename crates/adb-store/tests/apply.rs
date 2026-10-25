@@ -183,3 +183,39 @@ async fn reads_span_sealed_generations() {
     assert_eq!(cur.iter().find(|r| r.id == "b2").unwrap().data.value["i"], 200);
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn durable_offset_follows_the_memwal_and_survives_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 8, wal_flush: Duration::from_millis(30) };
+    let put = |i: u64| {
+        let d = data(Memory::Episodic, Kind::Episode, json!({"bid_id": format!("b{i}")}));
+        rec(i, vec![Effect::PutEpisode(new(&format!("b{i}"), &format!("b{i}"), 1, d))])
+    };
+    let durable = {
+        let store = PartitionStore::open(&cfg, PartitionId(1)).await.unwrap();
+        assert_eq!(store.durable_offset().await.unwrap(), LogOffset(0));
+        for i in 1..=30 {
+            store.apply(&put(i)).await.unwrap(); // seals every 8 rows along the way
+        }
+        assert!(store.durable_offset().await.unwrap() <= LogOffset(30));
+        tokio::time::sleep(Duration::from_millis(400)).await; // past several WAL flushes
+        let d = store.durable_offset().await.unwrap();
+        assert_eq!(d, LogOffset(30), "all puts durable after the WAL flushed");
+        // A few more, then "crash": drop the writer without close.
+        for i in 31..=35 {
+            store.apply(&put(i)).await.unwrap();
+        }
+        let d2 = store.durable_offset().await.unwrap();
+        assert!(d2 >= d && d2 <= LogOffset(35));
+        d2
+    };
+    let store = PartitionStore::open(&cfg, PartitionId(1)).await.unwrap();
+    let recovered = store.applied_offset().await.unwrap();
+    assert!(recovered >= durable, "recovered {recovered:?} below the reported durable {durable:?}");
+    let rows = store.current(None, CommitTs(T0 + 1_000_000_000)).await.unwrap();
+    assert_eq!(rows.len() as u64, recovered.0, "every recovered offset's row is there");
+    // The reopened store reports at least what it recovered.
+    assert!(store.durable_offset().await.unwrap() >= durable);
+    store.close().await.unwrap();
+}

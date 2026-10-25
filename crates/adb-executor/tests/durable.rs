@@ -264,3 +264,61 @@ async fn backends_rebuilt_from_lance_match() {
         assert_eq!(b, a, "read {i} ({}) differs after rebuilding from Lance", READS.get(i).unwrap_or(&"stats"));
     }
 }
+
+/// Stage D3.5: the log is trimmed below what Lance holds durably, and a restart
+/// still has everything (rebuilt from Lance plus the log's tail).
+#[tokio::test]
+async fn log_is_purged_below_lances_durable_offset() {
+    use std::sync::Arc;
+    use adb_core::log::{Epoch, LogOffset, PartitionId};
+    use adb_executor::{DurableWrites, Writes};
+    use adb_log::{Log, LocalWal, WalConfig};
+    use adb_sequencer::Sequencer;
+    use adb_store::{PartitionStore, StoreConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };
+    let store_cfg = StoreConfig {
+        root: dir.path().join("store"),
+        embedding_dim: 4,
+        memtable_rows: 100,
+        wal_flush: std::time::Duration::from_millis(20),
+    };
+    let open = || async {
+        let adb = Arc::new(adb_backends::Adb::new());
+        let seq = Sequencer::new(LocalWal::open(PartitionId(0), wal_cfg.clone()).unwrap(), Epoch(1));
+        let store = Arc::new(PartitionStore::open(&store_cfg, PartitionId(0)).await.unwrap());
+        let (w, stats) = DurableWrites::open(Arc::clone(&adb), seq, Some(store)).await.unwrap();
+        (adb, w, stats)
+    };
+    let n = 700u64;
+    let segments_at_most;
+    {
+        let (_adb, w, _) = open().await;
+        for i in 1..=n {
+            Writes::store(&w, adb_core::MemoryType::Episodic, &format!("e{i}"), serde_json::json!({"bid_id": format!("e{i}"), "i": i}), adb_core::Scope::Private, None, None)
+                .await
+                .unwrap();
+            if i % 50 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await; // let the MemWAL flush
+            }
+        }
+        segments_at_most = std::fs::read_dir(dir.path().join("p0")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".wal")).count();
+    }
+    // Purged: the first records are gone from the log, and only a few segments are left.
+    let wal = LocalWal::open(PartitionId(0), wal_cfg.clone()).unwrap();
+    assert!(matches!(wal.read(LogOffset(1), 1).await, Err(adb_log::LogError::Purged { .. })), "log still holds offset 1");
+    assert_eq!(wal.last_offset(), LogOffset(n));
+    let total_bytes: u64 = std::fs::read_dir(dir.path().join("p0")).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
+    drop(wal);
+    assert!(segments_at_most < 40, "{segments_at_most} segments left ({total_bytes} bytes)");
+
+    // Restart: every record is back (from Lance), and new writes continue the log.
+    let (adb, w, stats) = open().await;
+    assert_eq!(stats.records, n);
+    assert_eq!(adb.count(adb_core::MemoryType::Episodic).await, n as usize);
+    Writes::store(&w, adb_core::MemoryType::Episodic, "after", serde_json::json!({"bid_id": "after"}), adb_core::Scope::Private, None, None)
+        .await
+        .unwrap();
+    assert_eq!(w.durable_offset().await, LogOffset(n + 1));
+}
