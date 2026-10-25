@@ -307,6 +307,19 @@ impl PartitionStore {
         Ok(self.current(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
     }
 
+    /// `memory`'s superseded record versions that are not forgotten: what FORGET
+    /// must also match (D2 T5).
+    pub async fn superseded(&self, memory: adb_core::log::Memory) -> StoreResult<Vec<StoredRow>> {
+        let filter = format!("memory = {} AND kind != 'edge' AND superseded_by IS NOT NULL AND tombstone = false", sql_str(memory.tag()));
+        self.scan(Some(&filter)).await
+    }
+
+    /// How many records of `memory` are current at `now`.
+    pub async fn count_current(&self, memory: adb_core::log::Memory, now: CommitTs) -> StoreResult<u64> {
+        let filter = format!("memory = {} AND kind != 'edge'", sql_str(memory.tag()));
+        Ok(self.current(Some(&filter), now).await?.len() as u64)
+    }
+
     /// The newest version of row `id`, if any.
     pub async fn get(&self, id: &str) -> StoreResult<Option<StoredRow>> {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())

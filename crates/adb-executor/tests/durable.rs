@@ -184,7 +184,6 @@ async fn lance_catches_up_from_the_log() {
 /// Stage D3: SEMANTIC / EPISODIC reads from Lance answer exactly like the backends.
 #[tokio::test]
 async fn lance_reads_match_backend_reads() {
-    use adb_executor::ReadsFrom;
     const EXTRA: &[&str] = &[
         r#"STORE INTO SEMANTIC (concept = "beta", content = "Beta churned", active = false, avg_cpm = 1.5)"#,
         r#"STORE INTO SEMANTIC (concept = "gamma", content = "Gamma upsell", active = true, avg_cpm = 3.2)"#,
@@ -217,24 +216,30 @@ async fn lance_reads_match_backend_reads() {
     ];
     let dir = tempfile::tempdir().unwrap();
     {
-        let (engine, _) = LocalEngine::durable_with(dir.path(), ReadsFrom::Backends).await.unwrap();
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
         for q in WRITES.iter().chain(EXTRA) {
             engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
         }
     }
-    let run = |from: ReadsFrom| {
+    // Oracle: the same log replayed into the in-memory backends, no table (D4.4a:
+    // a durable engine keeps SEMANTIC / EPISODIC / PROCEDURAL only in Lance).
+    let run = |lance: bool| {
         let path = dir.path().to_path_buf();
         async move {
-            let (engine, _) = LocalEngine::durable_with(&path, from).await.unwrap();
+            let engine = match lance {
+                true => LocalEngine::durable(&path).await.unwrap().0,
+                false => LocalEngine::replay_only(&path).await.unwrap().0,
+            };
             let mut out = Vec::new();
             for q in QUERIES {
-                out.push(stable(engine.query(q, None).await.unwrap_or_else(|e| panic!("{from:?} {q}: {e}"))));
+                out.push(stable(engine.query(q, None).await.unwrap_or_else(|e| panic!("lance={lance} {q}: {e}"))));
             }
+            out.push(engine.stats().await.unwrap());
             out
         }
     };
-    let backends = run(ReadsFrom::Backends).await;
-    let lance = run(ReadsFrom::Lance).await;
+    let backends = run(false).await;
+    let lance = run(true).await;
     // SEMANTIC keeps records in a HashMap, so without ORDER BY the order is
     // unspecified (it differs between any two backends): compare those as sets.
     let as_set = |mut v: Value, q: &str| {
@@ -245,32 +250,11 @@ async fn lance_reads_match_backend_reads() {
         }
         v
     };
-    for (i, q) in QUERIES.iter().enumerate() {
+    for (i, q) in QUERIES.iter().chain(&["stats"]).enumerate() {
         assert_eq!(as_set(lance[i].clone(), q), as_set(backends[i].clone(), q), "Lance and backend reads differ for: {q}");
     }
     // The queries returned something (not two matching empty answers).
     assert!(backends[0].to_string().contains("acme"), "{}", backends[0]);
-}
-
-/// Stage D3: after a restart the in-memory tier is rebuilt from Lance (not the log):
-/// every read through the backends — WORKING, TOOLS, PROCEDURAL, links — is unchanged.
-#[tokio::test]
-async fn backends_rebuilt_from_lance_match() {
-    use adb_executor::ReadsFrom;
-    let dir = tempfile::tempdir().unwrap();
-    let before = {
-        let (engine, _) = LocalEngine::durable_with(dir.path(), ReadsFrom::Backends).await.unwrap();
-        for q in WRITES {
-            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
-        }
-        snapshot(&engine).await
-    };
-    let (engine, stats) = LocalEngine::durable_with(dir.path(), ReadsFrom::Backends).await.unwrap();
-    assert!(stats.hydrated_rows > 0, "{stats:?}");
-    let after = snapshot(&engine).await;
-    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
-        assert_eq!(b, a, "read {i} ({}) differs after rebuilding from Lance", READS.get(i).unwrap_or(&"stats"));
-    }
 }
 
 /// Stage D3.5: the log is trimmed below what Lance holds durably, and a restart
@@ -321,10 +305,12 @@ async fn log_is_purged_below_lances_durable_offset() {
     drop(wal);
     assert!(segments_at_most < 40, "{segments_at_most} segments left ({total_bytes} bytes)");
 
-    // Restart: every record is back (from Lance), and new writes continue the log.
-    let (adb, w, stats) = open().await;
+    // Restart: every record is there (in Lance, its only copy), and new writes
+    // continue the log.
+    let (_adb, w, stats) = open().await;
     assert_eq!(stats.records, n);
-    assert_eq!(adb.count(adb_core::MemoryType::Episodic).await, n as usize);
+    let now = adb_core::log::CommitTs::from_datetime(chrono::Utc::now());
+    assert_eq!(w.store().unwrap().count_current(adb_core::log::Memory::Episodic, now).await.unwrap(), n);
     Writes::store(&w, adb_core::MemoryType::Episodic, "after", serde_json::json!({"bid_id": "after"}), adb_core::Scope::Private, None, None)
         .await
         .unwrap();
@@ -467,4 +453,33 @@ async fn update_supersedes_facts_and_procedures() {
     drop(engine);
     let rows = lance_history(dir.path()).await;
     assert!(rows.iter().filter(|r| r.lineage_id == "semantic:acme").all(|r| r.tombstone), "every version tombstoned");
+}
+
+/// D2 T5 (D4.4a): FORGET matches every version. A value that survives only in a
+/// superseded version still finds the record, and the whole lineage goes.
+#[tokio::test]
+async fn forget_matches_values_only_in_old_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    for q in [
+        r#"STORE INTO SEMANTIC (key = "u1", concept = "user", email = "old@example.com")"#,
+        r#"UPDATE INTO SEMANTIC WHERE concept = "user" (email = "new@example.com")"#,
+        r#"STORE INTO SEMANTIC (key = "u2", concept = "other", email = "keep@example.com")"#,
+        r#"STORE INTO PROCEDURAL (pattern_id = "p1", pattern = "rotate token", steps = "call ops", severity = "high")"#,
+        r#"UPDATE INTO PROCEDURAL WHERE pattern_id = "p1" (severity = "low")"#,
+    ] {
+        engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+    let current = engine.query(r#"RECALL FROM SEMANTIC WHERE email = "old@example.com""#, None).await.unwrap();
+    assert_eq!(current["data"]["count"], 0, "the old value isn't current: {current}");
+    let n = engine.query(r#"FORGET FROM SEMANTIC WHERE email = "old@example.com""#, None).await.unwrap();
+    assert!(n.to_string().contains("1"), "{n}");
+    let left = engine.query(r#"RECALL FROM SEMANTIC ALL"#, None).await.unwrap().to_string();
+    assert!(!left.contains("new@example.com") && left.contains("keep@example.com"), "the whole lineage is gone, the other record stays: {left}");
+    engine.query(r#"FORGET FROM PROCEDURAL WHERE severity = "high""#, None).await.unwrap();
+    let r = engine.query(r#"LOOKUP FROM PROCEDURAL ALL"#, None).await.unwrap();
+    assert_eq!(r["data"]["count"], 0, "{r}");
+    drop(engine);
+    let rows = lance_history(dir.path()).await;
+    assert!(rows.iter().filter(|r| r.lineage_id == "semantic:u1" || r.lineage_id == "procedural:p1").all(|r| r.tombstone));
 }

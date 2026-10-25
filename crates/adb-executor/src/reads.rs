@@ -97,56 +97,38 @@ pub struct LanceReads {
     barrier: Option<Arc<ApplyBarrier>>,
 }
 
-enum View {
+/// A throwaway backend over some of the table's rows, answering with the backend's
+/// own query code (reads, and the targets of UPDATE / FORGET, stage D4.4a).
+pub(crate) enum View {
     Semantic(SemanticBackend),
     Episodic(EpisodicBackend),
     Procedural(ProceduralBackend),
 }
 
-impl LanceReads {
-    pub fn new(adb: Arc<Adb>, store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { adb, store, barrier }
-    }
-
-    /// The memory types served from Lance.
-    pub fn serves(memory: MemoryType) -> bool {
-        matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
-    }
-
-    /// A throwaway backend holding the memory type's current rows that may match
-    /// `predicate`.
-    async fn view(&self, memory: MemoryType, predicate: &Predicate) -> AdbResult<View> {
-        if let Some(b) = &self.barrier {
-            b.wait_for_committed().await;
-        }
-        let m: Memory = memory.into();
-        let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").not_eq(lit("edge")));
-        // Not for PROCEDURAL: its conditions see the backend's `ProcedureNode`, whose
-        // defaults (`severity`, `confidence`, `version`, counts) the payload may lack,
-        // so a payload filter could drop a match. Procedure sets are small.
-        if memory != MemoryType::Procedural {
-            if let Some(p) = predicate_filter(m, predicate) {
-                filter = filter.and(p);
+impl View {
+    /// `rows` (current, or history with `by_row_id`) as `memory`'s backend holds
+    /// them. With `by_row_id` each row keeps its own row id, so several versions of
+    /// one record can sit in one view (FORGET over history, D2 T5).
+    pub(crate) async fn of(memory: MemoryType, mut rows: Vec<StoredRow>, by_row_id: bool) -> AdbResult<View> {
+        let record = |r: &StoredRow| {
+            let mut rec = to_record(r);
+            if by_row_id {
+                rec.id = r.id.clone();
             }
-        }
-        let now = CommitTs::from_datetime(time::now());
-        let rows = self
-            .store
-            .current_expr(Some(filter), now)
-            .await
-            .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            rec
+        };
         Ok(match memory {
             MemoryType::Semantic => {
                 let b = SemanticBackend::new()?;
-                rows.iter().for_each(|r| b.insert_record(to_record(r)));
+                rows.iter().for_each(|r| b.insert_record(record(r)));
                 View::Semantic(b)
             }
             MemoryType::Procedural => {
                 // The backend shapes payloads into its own nodes: re-run each `store`
                 // at its commit time (as `hydrate` does), oldest first, then restore
-                // the version.
+                // the version. Its ids come from the payload's `pattern_id`, so
+                // history needs one view per row (`by_row_id` is not supported).
                 let b = ProceduralBackend::new();
-                let mut rows = rows;
                 rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
                 for r in &rows {
                     let rec = to_record(r);
@@ -158,10 +140,76 @@ impl LanceReads {
             }
             _ => {
                 let b = EpisodicBackend::new();
-                rows.iter().for_each(|r| b.insert_record(to_record(r)));
+                rows.iter().for_each(|r| b.insert_record(record(r)));
                 View::Episodic(b)
             }
         })
+    }
+
+    fn backend(&self) -> &dyn Backend {
+        match self {
+            View::Semantic(b) => b,
+            View::Episodic(b) => b,
+            View::Procedural(b) => b,
+        }
+    }
+
+    pub(crate) async fn lookup(&self, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+        self.backend().lookup(predicate, modifiers).await
+    }
+
+    pub(crate) async fn recall(&self, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+        self.backend().recall(predicate, modifiers).await
+    }
+
+    pub(crate) async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        self.backend().update_targets(predicate).await
+    }
+
+    pub(crate) async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
+        self.backend().forget_targets(predicate).await
+    }
+}
+
+/// The memory types whose records live only in Lance once there is a table
+/// (stage D4.4a); WORKING and TOOLS are the in-memory hot tier.
+pub fn lance_owned(memory: MemoryType) -> bool {
+    matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
+}
+
+/// A view of `memory`'s current rows at `now` that may match `predicate`.
+pub(crate) async fn current_view(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, now: CommitTs) -> AdbResult<View> {
+    let m: Memory = memory.into();
+    let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").not_eq(lit("edge")));
+    // Not for PROCEDURAL: its conditions see the backend's `ProcedureNode`, whose
+    // defaults (`severity`, `confidence`, `version`, counts) the payload may lack,
+    // so a payload filter could drop a match. Procedure sets are small.
+    if memory != MemoryType::Procedural {
+        if let Some(p) = predicate_filter(m, predicate) {
+            filter = filter.and(p);
+        }
+    }
+    let rows = store.current_expr(Some(filter), now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+    View::of(memory, rows, false).await
+}
+
+impl LanceReads {
+    pub fn new(adb: Arc<Adb>, store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
+        Self { adb, store, barrier }
+    }
+
+    /// The memory types served from Lance.
+    pub fn serves(memory: MemoryType) -> bool {
+        lance_owned(memory)
+    }
+
+    /// A throwaway backend holding the memory type's current rows that may match
+    /// `predicate`.
+    async fn view(&self, memory: MemoryType, predicate: &Predicate) -> AdbResult<View> {
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
+        current_view(&self.store, memory, predicate, CommitTs::from_datetime(time::now())).await
     }
 }
 
@@ -171,11 +219,7 @@ impl Reads for LanceReads {
         if !Self::serves(memory) {
             return self.adb.lookup_with_modifiers(memory, predicate, modifiers).await;
         }
-        match self.view(memory, predicate).await? {
-            View::Semantic(b) => b.lookup(predicate, modifiers).await,
-            View::Episodic(b) => b.lookup(predicate, modifiers).await,
-            View::Procedural(b) => b.lookup(predicate, modifiers).await,
-        }
+        self.view(memory, predicate).await?.lookup(predicate, modifiers).await
     }
 
     async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
@@ -195,10 +239,6 @@ impl Reads for LanceReads {
         if !Self::serves(memory) {
             return self.adb.recall_with_modifiers(memory, predicate, modifiers).await;
         }
-        match self.view(memory, predicate).await? {
-            View::Semantic(b) => b.recall(predicate, modifiers).await,
-            View::Episodic(b) => b.recall(predicate, modifiers).await,
-            View::Procedural(b) => b.recall(predicate, modifiers).await,
-        }
+        self.view(memory, predicate).await?.recall(predicate, modifiers).await
     }
 }

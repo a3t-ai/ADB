@@ -18,6 +18,7 @@ use adb_log::{LocalWal, WalConfig};
 use adb_sequencer::Sequencer;
 use adb_store::{PartitionStore, StoreConfig};
 
+use crate::apply::ApplyBarrier;
 use crate::reads::{DirectReads, LanceReads, Reads};
 use crate::writes::{DurableWrites, ReplayStats, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
@@ -38,12 +39,15 @@ pub trait Engine: Send + Sync {
 pub struct LocalEngine {
     adb: Arc<Adb>,
     executor: Executor,
+    /// The Lance table, which alone holds SEMANTIC / EPISODIC / PROCEDURAL (D4.4a),
+    /// and the barrier its reads wait on.
+    store: Option<(Arc<PartitionStore>, Option<Arc<ApplyBarrier>>)>,
 }
 
 impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor }
+        Self { adb, executor, store: None }
     }
 }
 
@@ -53,11 +57,6 @@ impl LocalEngine {
     /// table in `dir/store` too (stage D2). SEMANTIC and EPISODIC are read from that
     /// table (stage D3). Returns what the replay found.
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
-        Self::durable_with(dir, ReadsFrom::Lance).await
-    }
-
-    /// As [`LocalEngine::durable`], choosing where reads come from (tests compare both).
-    pub async fn durable_with(dir: impl Into<std::path::PathBuf>, reads_from: ReadsFrom) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         let adb = Arc::new(Adb::new());
         let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
@@ -69,22 +68,26 @@ impl LocalEngine {
         );
         let (writes, stats) =
             DurableWrites::open(Arc::clone(&adb), seq, Some(Arc::clone(&store))).await.map_err(|e| e.to_string())?;
-        let reads: Arc<dyn Reads> = match reads_from {
-            ReadsFrom::Lance => Arc::new(LanceReads::new(Arc::clone(&adb), store, writes.barrier())),
-            ReadsFrom::Backends => Arc::new(DirectReads(Arc::clone(&adb))),
-        };
+        let barrier = writes.barrier();
+        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor }, stats))
+        Ok((Self { adb, executor, store: Some((store, barrier)) }, stats))
     }
-}
 
-/// Where a durable engine's reads come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadsFrom {
-    /// SEMANTIC and EPISODIC from the Lance table, the rest from memory (stage D3).
-    Lance,
-    /// Everything from the in-memory backends (stage C behaviour).
-    Backends,
+    /// The log in `dir` replayed into the in-memory backends, with no Lance table:
+    /// everything held and read in memory (stage C). An oracle for tests — the same
+    /// committed records through a second, independent path — valid while the log is
+    /// complete (it is purged below Lance's durable offset every 256 records).
+    pub async fn replay_only(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
+        let dir = dir.into();
+        let adb = Arc::new(Adb::new());
+        let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
+        let (writes, stats) =
+            DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
+        let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
+        let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
+        Ok((Self { adb, executor, store: None }, stats))
+    }
 }
 
 impl Default for LocalEngine {
@@ -112,7 +115,17 @@ impl Engine for LocalEngine {
             ("tools", MemoryType::Tools),
             ("semantic", MemoryType::Semantic),
         ] {
-            counts.insert(name.into(), json!(self.adb.count(t).await));
+            let n = match &self.store {
+                Some((store, barrier)) if crate::reads::lance_owned(t) => {
+                    if let Some(b) = barrier {
+                        b.wait_for_committed().await;
+                    }
+                    let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+                    store.count_current(t.into(), now).await.map_err(|e| e.to_string())? as usize
+                }
+                _ => self.adb.count(t).await,
+            };
+            counts.insert(name.into(), json!(n));
         }
         Ok(Value::Object(counts))
     }
