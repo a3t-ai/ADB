@@ -28,6 +28,8 @@ use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Predic
 use adb_log::{Log, LogError};
 use adb_sequencer::Sequencer;
 use adb_store::PartitionStore;
+
+use crate::apply::{Applier, ApplyBarrier};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -145,6 +147,8 @@ pub struct DurableWrites<L: Log> {
     /// The partition's Lance table (stage D2: written alongside the in-memory
     /// backends; reads move to it in D3). `None` = log + memory only.
     store: Option<Arc<PartitionStore>>,
+    /// Background task applying committed records to `store` (stage D3.7).
+    applier: Option<Applier>,
 }
 
 impl<L: Log + 'static> DurableWrites<L> {
@@ -169,7 +173,11 @@ impl<L: Log + 'static> DurableWrites<L> {
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
         }
-        Ok((Self { adb, seq: Mutex::new(seq), store }, stats))
+        // Caught up with the log: the applier starts from its end.
+        let applier = store
+            .as_ref()
+            .map(|s| Applier::spawn(Arc::clone(s), ApplyBarrier::new(seq.log().last_offset().0)));
+        Ok((Self { adb, seq: Mutex::new(seq), store, applier }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -182,19 +190,22 @@ impl<L: Log + 'static> DurableWrites<L> {
         self.store.as_ref()
     }
 
-    /// Apply a committed record to the Lance table. Called with the sequencer held,
-    /// so records arrive in log order. A failure is logged, not returned: the write
-    /// is already durable in the log, and `catch_up` re-applies it on the next open.
+    /// The read barrier for Lance reads (stage D3.7), if there is a table.
+    pub fn barrier(&self) -> Option<Arc<ApplyBarrier>> {
+        self.applier.as_ref().map(|a| Arc::clone(a.barrier()))
+    }
+
+    /// Hand a committed record to the Lance applier. Called with the sequencer held,
+    /// so records are queued in log order; the background task applies them in that
+    /// order (stage D3.7). A failed apply is logged there: the write is durable in
+    /// the log, and `catch_up` re-applies it on the next open.
     ///
     /// Every `PURGE_EVERY` records it also trims the log (stage D3.5): startup only
     /// needs the records above what Lance has made durable, so segments below
     /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
     async fn to_store(&self, record: &LogRecord, log: &L) {
-        let Some(s) = &self.store else { return };
-        if let Err(e) = s.apply(record).await {
-            tracing::warn!(offset = record.offset.0, error = %e, "Lance apply failed; the log has it, catch-up on next open");
-            return;
-        }
+        let (Some(s), Some(applier)) = (&self.store, &self.applier) else { return };
+        applier.enqueue(record.clone());
         if record.offset.0 % PURGE_EVERY == 0 {
             match s.durable_offset().await {
                 Ok(d) if d.0 > 0 => {

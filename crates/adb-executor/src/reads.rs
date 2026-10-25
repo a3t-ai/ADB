@@ -20,6 +20,8 @@ use adb_core::{time, AdbError, AdbResult, MemoryRecord, MemoryType, Metadata, Mo
 use adb_store::{sql_str, PartitionStore, StoredRow};
 use async_trait::async_trait;
 
+use crate::apply::ApplyBarrier;
+
 /// The executor's read operations.
 #[async_trait]
 pub trait Reads: Send + Sync {
@@ -61,6 +63,9 @@ pub fn to_record(r: &StoredRow) -> MemoryRecord {
 pub struct LanceReads {
     adb: Arc<Adb>,
     store: Arc<PartitionStore>,
+    /// Waits for the background applier, so reads see every write that returned
+    /// before them (stage D3.7). `None` = the table is written synchronously.
+    barrier: Option<Arc<ApplyBarrier>>,
 }
 
 enum View {
@@ -69,8 +74,8 @@ enum View {
 }
 
 impl LanceReads {
-    pub fn new(adb: Arc<Adb>, store: Arc<PartitionStore>) -> Self {
-        Self { adb, store }
+    pub fn new(adb: Arc<Adb>, store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
+        Self { adb, store, barrier }
     }
 
     /// The memory types served from Lance.
@@ -80,6 +85,9 @@ impl LanceReads {
 
     /// A throwaway backend holding the memory type's current rows.
     async fn view(&self, memory: MemoryType) -> AdbResult<View> {
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
         let m: Memory = memory.into();
         let tag = serde_json::to_value(m).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
         let filter = format!("memory = {} AND kind != 'edge'", sql_str(&tag));

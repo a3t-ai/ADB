@@ -322,3 +322,24 @@ async fn log_is_purged_below_lances_durable_offset() {
         .unwrap();
     assert_eq!(w.durable_offset().await, LogOffset(n + 1));
 }
+
+/// Stage D3.7: Lance is written by a background task, and a read served from Lance
+/// still sees every write that returned before it.
+#[tokio::test]
+async fn reads_see_their_own_writes_with_the_background_applier() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    for i in 0..200 {
+        engine
+            .query(&format!(r#"STORE INTO SEMANTIC (concept = "c{i}", n = {i})"#), None)
+            .await
+            .unwrap();
+        let r = engine.query(&format!(r#"RECALL FROM SEMANTIC WHERE concept = "c{i}""#), None).await.unwrap();
+        assert_eq!(r["data"]["count"], 1, "write {i} not visible to the next read: {r}");
+        if i % 20 == 0 {
+            engine.query(&format!(r#"UPDATE INTO SEMANTIC WHERE concept = "c{i}" (n = -1)"#), None).await.unwrap();
+            let r = engine.query(&format!(r#"RECALL FROM SEMANTIC WHERE concept = "c{i}" RETURN n"#), None).await.unwrap();
+            assert_eq!(r["data"]["records"][0]["data"]["n"], -1, "update {i} not visible: {r}");
+        }
+    }
+}

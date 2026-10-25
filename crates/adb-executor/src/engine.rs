@@ -70,7 +70,7 @@ impl LocalEngine {
         let (writes, stats) =
             DurableWrites::open(Arc::clone(&adb), seq, Some(Arc::clone(&store))).await.map_err(|e| e.to_string())?;
         let reads: Arc<dyn Reads> = match reads_from {
-            ReadsFrom::Lance => Arc::new(LanceReads::new(Arc::clone(&adb), store)),
+            ReadsFrom::Lance => Arc::new(LanceReads::new(Arc::clone(&adb), store, writes.barrier())),
             ReadsFrom::Backends => Arc::new(DirectReads(Arc::clone(&adb))),
         };
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
