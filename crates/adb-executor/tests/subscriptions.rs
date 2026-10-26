@@ -143,3 +143,40 @@ async fn subscriptions_need_a_durable_engine() {
     assert!(e.contains("durable engine"), "{e}");
     assert!(engine.gateway().is_none());
 }
+
+/// L3 / D2 §4: when a record's TTL passes, the expiry timer commits an `Expire`
+/// through the log, so subscribers get an `expire` change (WORKING and SEMANTIC
+/// alike); records without a TTL stay, and a restart neither loses nor repeats it.
+#[tokio::test]
+async fn ttl_expiry_is_committed_and_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = |b: &Batch| b.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect::<Vec<_>>();
+    let all;
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        let gw = engine.gateway().unwrap();
+        all = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default""#).await;
+        q(&engine, r#"STORE INTO WORKING (key = "w1", step = 1) TTL 1s"#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "s1", content = "short-lived") TTL 1s"#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "keep", content = "stays")"#).await;
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            seen = ops(&drain(&gw, &all, None).await);
+            if seen.contains(&"expire:w1".to_string()) && seen.contains(&"expire:s1".to_string()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(seen.contains(&"expire:w1".to_string()) && seen.contains(&"expire:s1".to_string()), "expiries delivered: {seen:?}");
+        assert!(!seen.iter().any(|o| o == "expire:keep"), "{seen:?}");
+        // The expired key is free again.
+        q(&engine, r#"STORE INTO SEMANTIC (key = "s1", content = "back")"#).await;
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let gw = engine.gateway().unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after = ops(&drain(&gw, &all, None).await);
+    assert_eq!(after.iter().filter(|o| *o == "expire:s1").count(), 1, "one expiry, not repeated after a restart: {after:?}");
+    let r = q(&engine, "RECALL FROM SEMANTIC ALL").await.to_string();
+    assert!(r.contains("stays") && r.contains("back") && !r.contains("short-lived"), "{r}");
+}

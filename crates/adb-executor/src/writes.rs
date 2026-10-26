@@ -99,6 +99,25 @@ pub trait Writes: Send + Sync {
 }
 
 /// Subscriptions follow the committed log (E9).
+/// Most lineages one expiry tick commits (one log record).
+const EXPIRE_BATCH: usize = 1000;
+
+/// Memory types whose keys are unique among current records (D3 S4): the
+/// long-term, versioned ones. WORKING (scratchpad) and TOOLS (registrations)
+/// keep replace-by-key.
+pub fn unique_keys(memory: MemoryType) -> bool {
+    matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
+}
+
+fn key_exists(memory: MemoryType, key: &str) -> AdbError {
+    AdbError::KeyExists { memory_type: format!("{memory:?}").to_uppercase(), key: key.to_string() }
+}
+
+/// Whether the in-memory backends hold a current `memory` record with id `id`.
+async fn backend_has(adb: &Adb, memory: MemoryType, id: &str) -> AdbResult<bool> {
+    Ok(!adb.lookup(memory, &Predicate::key("id", id)).await?.is_empty())
+}
+
 fn needs_log() -> AdbError {
     AdbError::UnsupportedOperation("subscriptions need a durable engine (start ADB with --data-dir)".into())
 }
@@ -122,6 +141,12 @@ impl Writes for DirectWrites {
         namespace: Option<&str>,
         ttl: Option<Duration>,
     ) -> AdbResult<MemoryRecord> {
+        if unique_keys(memory_type) {
+            let id = Adb::store_id(memory_type, key, &payload);
+            if backend_has(&self.0, memory_type, &id).await? {
+                return Err(key_exists(memory_type, &id));
+            }
+        }
         self.0.store_with_options(memory_type, key, payload, scope, namespace, ttl).await
     }
 
@@ -292,6 +317,40 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(ids)
     }
 
+    /// Commit `Expire` for the records whose TTL has passed (D2 §4, L3): one log
+    /// record per tick, so every subscriber sees those expiries at one offset.
+    /// Reads hide expired records already; this makes expiry an event and marks the
+    /// rows for compaction. Returns how many lineages expired.
+    pub async fn expire_due(&self) -> AdbResult<u64> {
+        let Some(store) = &self.store else { return Ok(0) };
+        let mut seq = self.seq.lock().await;
+        // Every earlier record is in Lance first.
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let ts = seq.begin();
+        let due = store
+            .due_expiries(ts, EXPIRE_BATCH)
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let effects: Vec<Effect> =
+            due.into_iter().map(|(memory, key)| Effect::Expire { memory, lineage_id: RecordId(key) }).collect();
+        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        // WORKING / TOOLS live in memory too: drop them there as replay would.
+        for effect in &effects {
+            if let Effect::Expire { memory, .. } = effect {
+                if self.in_lance((*memory).into()).is_none() {
+                    apply_count(&self.adb, ts, effect).await?;
+                }
+            }
+        }
+        self.to_store(&record, seq.log()).await;
+        Ok(effects.len() as u64)
+    }
+
     /// Live subscriptions (stage E).
     pub fn subscriptions(&self) -> &Arc<Registry> {
         &self.subs
@@ -410,6 +469,26 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let id = RecordId(Adb::store_id(memory_type, key, &payload));
+        // Checked under the sequencer lock, so two STOREs of one key can't both pass.
+        if unique_keys(memory_type) {
+            let taken = match self.in_lance(memory_type) {
+                Some(store) => {
+                    // Every earlier record is in Lance first.
+                    if let Some(b) = self.barrier() {
+                        b.wait_for_committed().await;
+                    }
+                    store
+                        .current_version(memory_type.into(), &id.0, ts)
+                        .await
+                        .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+                        .is_some()
+                }
+                None => time::at(ts.to_datetime(), backend_has(&self.adb, memory_type, &id.0)).await?,
+            };
+            if taken {
+                return Err(key_exists(memory_type, &id.0));
+            }
+        }
         let mut data = row(memory_type, kind_of(memory_type), payload);
         data.visibility = scope.into();
         data.namespace = namespace.map(String::from);

@@ -317,6 +317,27 @@ impl PartitionStore {
         self.scan(Some(&filter)).await
     }
 
+    /// Records whose TTL has passed at `now` and whose expiry isn't logged yet
+    /// (D2 §4): one `(memory, key)` per lineage, soonest-expired first, at most
+    /// `limit`. Reads already hide them; this is what the expiry timer commits.
+    pub async fn due_expiries(&self, now: CommitTs, limit: usize) -> StoreResult<Vec<(adb_core::log::Memory, String)>> {
+        let filter = format!("{RECORD_KINDS} AND ttl_at IS NOT NULL AND tombstone = false AND superseded_by IS NULL");
+        let mut rows: Vec<StoredRow> = self
+            .scan(Some(&filter))
+            .await?
+            .into_iter()
+            .filter(|r| r.valid_to.is_none() && r.data.ttl_at.is_some_and(|t| t <= now))
+            .collect();
+        rows.sort_by_key(|r| r.data.ttl_at);
+        let mut seen = std::collections::HashSet::new();
+        Ok(rows
+            .into_iter()
+            .filter(|r| seen.insert(r.lineage_id.clone()))
+            .take(limit)
+            .map(|r| (r.data.memory, r.key().to_string()))
+            .collect())
+    }
+
     /// How many records of `memory` are current at `now`.
     pub async fn count_current(&self, memory: adb_core::log::Memory, now: CommitTs) -> StoreResult<u64> {
         let filter = format!("memory = {} AND {RECORD_KINDS}", sql_str(memory.tag()));

@@ -62,12 +62,43 @@ pub struct LocalEngine {
     gateway: Option<Arc<Gateway>>,
     /// Platform tables (stage G) and the writes that commit them.
     platform: Option<(Arc<adb_platform::PlatformStore>, Arc<dyn Writes>)>,
+    /// The TTL expiry timer (L3), stopped with the engine.
+    expiry: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for LocalEngine {
+    fn drop(&mut self) {
+        if let Some(t) = &self.expiry {
+            t.abort();
+        }
+    }
+}
+
+/// How often the expiry timer commits the `Expire`s that came due (D2 §4).
+const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The expiry timer: every tick, `expire_due` on `writes` while it exists. Holds
+/// only a weak reference, so it never keeps the log (and its directory lock) open.
+fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(EXPIRE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(w) = writes.upgrade() else { return };
+            match w.expire_due().await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
+                Err(e) => tracing::warn!(error = %e, "TTL expiry failed; retrying next tick"),
+            }
+        }
+    })
 }
 
 impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor, store: None, gateway: None, platform: None }
+        Self { adb, executor, store: None, gateway: None, platform: None, expiry: None }
     }
 }
 
@@ -98,9 +129,11 @@ impl LocalEngine {
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });
         let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()));
-        let writes: Arc<dyn Writes> = Arc::new(writes);
+        let durable = Arc::new(writes);
+        let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
+        let writes: Arc<dyn Writes> = durable;
         let executor = Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), reads);
-        Ok((Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)) }, stats))
+        Ok((Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry }, stats))
     }
 
     /// The log in `dir` replayed into the in-memory backends, with no Lance table:
@@ -115,7 +148,7 @@ impl LocalEngine {
             DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
         let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: None, gateway: None, platform: None }, stats))
+        Ok((Self { adb, executor, store: None, gateway: None, platform: None, expiry: None }, stats))
     }
 }
 

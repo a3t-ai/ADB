@@ -48,6 +48,10 @@ pub enum AdbError {
     #[error("Record not found: {memory_type}/{id}")]
     NotFound { memory_type: String, id: String },
 
+    /// D3 S4: keys are unique among the current records of a long-term memory type.
+    #[error("key_exists: {memory_type} already has a record with key '{key}' (UPDATE changes it; FORGET frees the key)")]
+    KeyExists { memory_type: String, key: String },
+
     #[error("Cyclic dependency detected in task graph")]
     CyclicDependency,
 

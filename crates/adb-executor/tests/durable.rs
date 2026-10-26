@@ -483,3 +483,53 @@ async fn forget_matches_values_only_in_old_versions() {
     let rows = lance_history(dir.path()).await;
     assert!(rows.iter().filter(|r| r.lineage_id == "semantic:u1" || r.lineage_id == "procedural:p1").all(|r| r.tombstone));
 }
+
+/// Keys are unique among current SEMANTIC / EPISODIC / PROCEDURAL records (D3 S4):
+/// a second STORE of a key in use fails with key_exists, live and after a restart,
+/// on the durable and the in-memory engine; FORGET frees the key; WORKING and
+/// TOOLS keep replace-by-key; STOREs without a key never collide.
+#[tokio::test]
+async fn store_refuses_a_key_in_use() {
+    async fn seed(engine: &LocalEngine) {
+        for q in [
+            r#"STORE INTO SEMANTIC (key = "k1", content = "one")"#,
+            r#"STORE INTO EPISODIC (key = "k1", outcome = "won")"#,
+            r#"STORE INTO PROCEDURAL (pattern_id = "p1", pattern = "oom", steps = "a")"#,
+            r#"STORE INTO WORKING (key = "w", step = 1)"#,
+            r#"STORE INTO WORKING (key = "w", step = 2)"#,
+            r#"STORE INTO TOOLS (tool_id = "t", name = "t", description = "one")"#,
+            r#"STORE INTO TOOLS (tool_id = "t", name = "t", description = "two")"#,
+            r#"STORE INTO SEMANTIC (content = "no key")"#,
+            r#"STORE INTO SEMANTIC (content = "no key")"#,
+        ] {
+            engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+    }
+    async fn check(engine: &LocalEngine, label: &str) {
+        for (m, again) in [
+            ("SEMANTIC", r#"(key = "k1", content = "two")"#),
+            ("EPISODIC", r#"(key = "k1", outcome = "lost")"#),
+            ("PROCEDURAL", r#"(pattern_id = "p1", pattern = "oom", steps = "b")"#),
+        ] {
+            let msg = format!("{:?}", engine.query(&format!("STORE INTO {m} {again}"), None).await);
+            assert!(msg.contains("key_exists"), "{label}: {m} second STORE should fail with key_exists: {msg}");
+        }
+        let r = engine.query(r#"LOOKUP FROM SEMANTIC KEY id = "k1""#, None).await.unwrap().to_string();
+        assert!(r.contains(r#""content":"one""#), "{label}: the first record is untouched: {r}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        seed(&engine).await;
+        check(&engine, "durable").await;
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    check(&engine, "after restart").await;
+    // FORGET frees the key.
+    engine.query(r#"FORGET FROM SEMANTIC WHERE key = "k1""#, None).await.unwrap();
+    engine.query(r#"STORE INTO SEMANTIC (key = "k1", content = "three")"#, None).await.unwrap();
+
+    let mem = LocalEngine::new(std::sync::Arc::new(adb_backends::Adb::new()));
+    seed(&mem).await;
+    check(&mem, "in-memory").await;
+}

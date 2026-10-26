@@ -107,7 +107,7 @@ impl McpServer {
                 Ok(s) => Ok(s),
                 Err(e) => Err(format!("Stats failed: {e}")),
             },
-            "remember" => self.run(remember(&args)).await,
+            "remember" => self.remember(&args).await,
             "recall" => self.run(recall(&args)).await,
             "forget" => self.run(forget(&args)).await,
             "link" => self.run(link(&args)).await,
@@ -145,6 +145,26 @@ impl McpServer {
     }
 
     /// Run AQL built by a shortcut tool.
+    /// `remember` sets a fact: a new key is stored, a key in use is updated (a new
+    /// version, history kept) — unlike `STORE` / `store_memory`, which refuse a key
+    /// in use (D3 S4).
+    async fn remember(&self, args: &Value) -> Result<Value, String> {
+        let aql = remember(args)?;
+        let Some(key) = args.get("key").and_then(Value::as_str) else {
+            return self.run(Ok(aql)).await;
+        };
+        match self.engine.query(&aql, None).await {
+            Err(e) if e.to_string().contains("key_exists") => {
+                let mut v = self.run(remember_update(args, key)).await?;
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("updated_existing_key".into(), json!(key));
+                }
+                Ok(v)
+            }
+            other => other.map_err(|e| format!("Query failed: {e}\nAQL: {aql}")),
+        }
+    }
+
     async fn run(&self, aql: Result<String, String>) -> Result<Value, String> {
         let aql = aql?;
         self.engine.query(&aql, None).await.map_err(|e| format!("Query failed: {e}\nAQL: {aql}"))
@@ -277,6 +297,15 @@ fn remember(args: &Value) -> Result<String, String> {
         q.push_str(&format!(" NAMESPACE {}", quote(ns)));
     }
     Ok(q)
+}
+
+/// `remember` on a key in use: `UPDATE INTO <type> WHERE key = … (content, fields)`.
+fn remember_update(args: &Value, key: &str) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", Some("SEMANTIC"))?;
+    let content = args.get("content").and_then(Value::as_str).ok_or("Missing required: content")?;
+    let mut fields = obj(args, "fields");
+    fields.insert("content".into(), json!(content));
+    Ok(format!("UPDATE INTO {mt} WHERE key = {} {}", quote(key), payload(&fields)?))
 }
 
 fn recall(args: &Value) -> Result<String, String> {

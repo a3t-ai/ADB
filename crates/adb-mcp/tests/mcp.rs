@@ -132,3 +132,25 @@ async fn resources_and_prompts() {
     let r = s.handle(req(5, "resources/read", json!({"uri": "adb://nope"}))).await.unwrap();
     assert!(r.error.is_some());
 }
+
+/// `remember` sets a fact: the same key again updates it (a new version on the
+/// durable engine), while `store_memory` (a STORE shortcut) refuses the key (D3 S4).
+#[tokio::test]
+async fn remember_updates_a_key_in_use_and_store_refuses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = McpServer::new(Arc::new(engine));
+    let (err, v) = call(&s, "remember", json!({"content": "Acme renews on 1 Nov", "key": "acme", "fields": {"account": "acme"}})).await;
+    assert!(!err, "{v}");
+    let (err, v) = call(&s, "remember", json!({"content": "Acme renews on 1 Dec", "key": "acme"})).await;
+    assert!(!err, "second remember of a key must update it: {v}");
+    assert_eq!(v["updated_existing_key"], json!("acme"), "{v}");
+    let (_, v) = call(&s, "aql_query", json!({"query": r#"LOOKUP FROM SEMANTIC KEY id = "acme""#})).await;
+    let rec = &v["data"]["records"][0];
+    assert_eq!(rec["data"]["content"], json!("Acme renews on 1 Dec"), "{v}");
+    assert_eq!(rec["data"]["account"], json!("acme"), "fields not given are kept: {v}");
+    assert_eq!(rec["metadata"]["version"], json!(2), "{v}");
+
+    let (err, v) = call(&s, "store_memory", json!({"memory_type": "SEMANTIC", "data": {"key": "acme", "content": "x"}})).await;
+    assert!(err && v.to_string().contains("key_exists"), "{v}");
+}

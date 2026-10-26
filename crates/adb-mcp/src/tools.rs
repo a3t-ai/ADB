@@ -22,7 +22,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "store_memory",
-            "description": "Store data in agent memory. Shortcut for STORE INTO queries.",
+            "description": "Store data in agent memory. Shortcut for STORE INTO queries: a `key` already in use in SEMANTIC, EPISODIC or PROCEDURAL fails with key_exists (use UPDATE, or `remember`).",
             "inputSchema": { "type": "object", "properties": {
                 "memory_type": with_desc(&mt, "Type of memory to store in"),
                 "data": { "type": "object", "description": "Key-value pairs to store" },
@@ -52,7 +52,7 @@ pub fn tool_list() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "content": { "type": "string", "description": "What to remember, in plain words" },
                 "memory_type": with_desc(&mt, "Where to store it (default SEMANTIC)"),
-                "key": { "type": "string", "description": "A stable key, so you can update, link or forget it later (optional)" },
+                "key": { "type": "string", "description": "A stable key, so you can update, link or forget it later (optional). Remembering a key again updates that memory (a new version)." },
                 "fields": { "type": "object", "description": "Extra structured fields, e.g. {\"account\": \"acct-9\"} (optional)" },
                 "namespace": { "type": "string", "description": "Namespace for isolation (optional)" }
             }, "required": ["content"] }
