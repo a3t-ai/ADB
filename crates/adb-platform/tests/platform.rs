@@ -70,12 +70,27 @@ async fn call_lancedb_semantics() {
     s.apply(&rec(6, vec![insert("template_registry", json!([{"id": "t4", "org_id": "org-default"}]))])).await.unwrap();
     assert_eq!(select(&s, "template_registry", Some("id = 't4'")).await[0].get("name"), None);
     s.apply(&rec(7, vec![Effect::TableDelete { table: "template_registry".into(), filter: "id = 't4'".into() }])).await.unwrap();
-    assert_eq!(s.applied_offset().await, 7);
+    // Replace: new columns and rows in one step; an empty replace keeps the columns.
+    s.apply(&rec(8, vec![Effect::TableReplace {
+        table: "settings".into(),
+        columns: vec!["key".into(), "value".into(), "scope".into()],
+        rows: rows(json!([{"key": "theme", "value": "dark"}, {"key": "lang", "value": "en", "scope": "org"}])),
+    }])).await.unwrap();
+    s.apply(&rec(9, vec![Effect::TableReplace {
+        table: "settings".into(),
+        columns: vec!["key".into(), "value".into()],
+        rows: rows(json!([{"key": "theme", "value": "light"}])),
+    }])).await.unwrap();
+    let st = batches_to_json(&s.query("settings", None, 10).await.unwrap());
+    assert_eq!(st, vec![json!({"key": "theme", "value": "light"})], "replaced, columns included");
+    assert!(s.schema("settings").await.unwrap().field_with_name("scope").is_err());
+    assert!(s.validate(&Effect::TableReplace { table: "settings".into(), columns: vec!["key".into()], rows: rows(json!([{"key": "a", "x": "1"}])) }).await.is_err());
+    assert_eq!(s.applied_offset().await, 9);
 
     // Reopen: everything is there; applied records are skipped.
     drop(s);
     let s = PlatformStore::open(dir.path()).await.unwrap();
-    assert_eq!(s.applied_offset().await, 7);
+    assert_eq!(s.applied_offset().await, 9);
     assert_eq!(ids(&select(&s, "template_registry", None).await), ["t2", "t3"]);
     assert!(!s.apply(&rec(2, vec![insert("template_registry", json!([{"id": "dup"}]))])).await.unwrap());
 }

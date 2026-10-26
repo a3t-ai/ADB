@@ -219,6 +219,13 @@ impl PlatformStore {
                 }
                 Ok(())
             }
+            Effect::TableReplace { table, columns, rows } => {
+                check_name(table)?;
+                if let Some(k) = rows.iter().flat_map(|r| r.keys()).find(|k| !columns.contains(k)) {
+                    return bad(format!("row field {k} is not among the columns of {table}"));
+                }
+                Ok(())
+            }
             Effect::TableUpdate { table, filter, values } => {
                 check_name(table)?;
                 let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
@@ -257,7 +264,8 @@ impl PlatformStore {
             Effect::TableCreate { table, .. }
             | Effect::TableInsert { table, .. }
             | Effect::TableUpdate { table, .. }
-            | Effect::TableDelete { table, .. } => table.clone(),
+            | Effect::TableDelete { table, .. }
+            | Effect::TableReplace { table, .. } => table.clone(),
             _ => return Ok(()),
         };
         let current = self.dataset(&table).await.map(|d| d.version().version);
@@ -320,6 +328,20 @@ impl PlatformStore {
                 let mut ds = (*ds).clone();
                 ds.delete(filter).await.map_err(lance)?;
                 ds
+            }
+            Effect::TableReplace { columns, rows, .. } => {
+                // One overwrite commit: the new columns and rows, or an empty table.
+                let cols: Vec<String> = if columns.is_empty() { vec!["id".into()] } else { columns.clone() };
+                let schema = Arc::new(Schema::new(cols.iter().map(|c| Field::new(c, DataType::Utf8, true)).collect::<Vec<_>>()));
+                let batch = match rows.is_empty() {
+                    true => RecordBatch::new_empty(schema.clone()),
+                    false => rows_to_table_batch(schema.clone(), rows),
+                };
+                let mode = if current.is_some() { WriteMode::Overwrite } else { WriteMode::Create };
+                let params = WriteParams { mode, ..Default::default() };
+                Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), &self.uri(&table), Some(params))
+                    .await
+                    .map_err(lance)?
             }
             _ => unreachable!(),
         };

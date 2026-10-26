@@ -285,6 +285,9 @@ pub enum Effect {
     TableUpdate { table: String, filter: String, values: Vec<(String, String)> },
     /// Delete the rows matching `filter` (SQL).
     TableDelete { table: String, filter: String },
+    /// Replace the whole table — its columns and rows — in one step (copying a
+    /// platform database across backends, FlowR's switch).
+    TableReplace { table: String, columns: Vec<String>, rows: Vec<serde_json::Map<String, serde_json::Value>> },
 }
 
 /// One committed transaction on one partition.

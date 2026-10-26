@@ -149,6 +149,29 @@ try {
   await waitHealthy(adbUrl, 'ADB after SIGKILL');
   await reads('after an ADB SIGKILL');
   await both('the deleted template stays deleted', 'a3t-templates', { action: 'get', org_id: ORG, id: tpl.id });
+
+  // Settings → switch (FlowR EE): L moves to ADB (its tables copied over), writes
+  // there, and moves back — the write made on ADB comes back with it.
+  const sw = async (f, target) => {
+    const r = await fetch(`${f.url}/registry/platform-db/switch`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(target) });
+    return { ok: r.ok, body: await r.json() };
+  };
+  const st = async f => (await fetch(`${f.url}/registry/platform-db`)).json();
+  check('L starts on LanceDB', (await st(L)).backend === 'lancedb', JSON.stringify(await st(L)));
+  let r = await sw(L, { backend: 'adb', url: adbUrl, flight_url: flightUrl });
+  check('switch L to ADB', r.ok && r.body.tables >= 15 && r.body.to.startsWith('adb:'), JSON.stringify(r.body));
+  check('L now on ADB', (await st(L)).backend === 'adb');
+  r = await sw(L, { backend: 'adb', url: adbUrl, flight_url: flightUrl });
+  check('switching to where it is already is refused', !r.ok, JSON.stringify(r.body));
+  const tpl2 = { id: 'tpl-on-adb', name: 'Written on ADB', version: '1.0.0', source: 'my', spec_yaml: 'x', tags: '', vertical: '' };
+  await run(L, 'a3t-templates', { action: 'create', org_id: ORG, user_id: 'usr-test', timestamp: ts, data: tpl2 });
+  const seenByA = output((await run(A, 'a3t-templates', { action: 'get', org_id: ORG, id: tpl2.id })).text);
+  check('a write through L (on ADB) is seen by A', Array.isArray(seenByA) && seenByA[0]?.name === 'Written on ADB', JSON.stringify(seenByA));
+  r = await sw(L, { backend: 'lancedb' });
+  check('switch L back to LanceDB', r.ok && r.body.to.startsWith('lancedb:'), JSON.stringify(r.body));
+  const back = output((await run(L, 'a3t-templates', { action: 'get', org_id: ORG, id: tpl2.id })).text);
+  check('the write made on ADB came back to LanceDB', Array.isArray(back) && back[0]?.name === 'Written on ADB', JSON.stringify(back));
+  await reads('after switching L to ADB and back');
 } catch (e) {
   check('session', false, e.stack);
 } finally {

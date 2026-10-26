@@ -406,7 +406,7 @@ impl PartitionStore {
                 }
                 // Platform tables live in their own datasets (adb-platform); the
                 // memory table only moves its applied offset past them.
-                Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } => {}
+                Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableReplace { .. } => {}
             }
         }
         out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, serde_json::json!({ "embedding_dim": self.dim })));

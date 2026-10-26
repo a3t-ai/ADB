@@ -6,6 +6,8 @@
 //! |---|---|---|
 //! | `do_get` | ticket `{"table", "filter"?, "limit"?}` (Lance SQL filter, default limit 100) | the matching rows as Arrow batches |
 //! | `do_put` | descriptor path `[table]`, Arrow batches | one `PutResult`, metadata `{"inserted", "offset"}` |
+//! | `do_put` | descriptor path `[table, "replace"]`, Arrow batches | the table replaced (its columns = the batches'), `{"inserted", "offset"}` |
+//! | `do_action("replace_table")` | `{"table", "columns"}` | the table replaced by an empty one, `{"replaced": true, "offset"}` |
 //! | `do_action("create_table")` | `{"table", "columns"?: [..] \| "schema"?: {col: type}}` | `{"created", "exists", "table"}` |
 //! | `do_action("update")` | `{"table", "filter", "values": {col: value}}` | `{"updated": true, "offset"}` |
 //! | `do_action("delete")` | `{"table", "filter"}` | `{"deleted": true, "offset"}` |
@@ -159,6 +161,16 @@ impl AdbFlight {
                 let offset = self.write(Effect::TableUpdate { table, filter, values }).await?;
                 Ok(json!({ "updated": true, "offset": offset }))
             }
+            "replace_table" => {
+                let table = str_field(&b, "table")?.to_string();
+                let columns: Vec<String> = b
+                    .get("columns")
+                    .and_then(|c| c.as_array())
+                    .map(|c| c.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let offset = self.write(Effect::TableReplace { table, columns, rows: Vec::new() }).await?;
+                Ok(json!({ "replaced": true, "offset": offset }))
+            }
             "delete" => {
                 let table = str_field(&b, "table")?.to_string();
                 let filter = str_field(&b, "filter")?.to_string();
@@ -208,15 +220,14 @@ impl FlightService for AdbFlight {
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
         let mut stream = req.into_inner().peekable();
-        // The table comes in the first message's descriptor.
-        let table = {
+        // The table comes in the first message's descriptor; `[table, "replace"]`
+        // replaces the table with these rows instead of appending them.
+        let (table, replace) = {
             let first = Pin::new(&mut stream).peek().await.ok_or_else(|| Status::invalid_argument("empty do_put"))?;
             let first = first.as_ref().map_err(|e| Status::invalid_argument(e.to_string()))?;
-            first
-                .flight_descriptor
-                .as_ref()
-                .and_then(|d| d.path.first().cloned())
-                .ok_or_else(|| Status::invalid_argument("do_put needs a descriptor path [table]"))?
+            let path = first.flight_descriptor.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+            let table = path.first().cloned().ok_or_else(|| Status::invalid_argument("do_put needs a descriptor path [table]"))?;
+            (table, path.get(1).map(|p| p == "replace").unwrap_or(false))
         };
         let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
@@ -226,7 +237,17 @@ impl FlightService for AdbFlight {
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let rows = batches_to_rows(&batches);
         let n = rows.len();
-        let offset = if n == 0 { 0 } else { self.write(Effect::TableInsert { table, rows }).await? };
+        let offset = if replace {
+            let columns: Vec<String> = batches
+                .first()
+                .map(|b| b.schema().fields().iter().map(|f| f.name().clone()).collect())
+                .unwrap_or_default();
+            self.write(Effect::TableReplace { table, columns, rows }).await?
+        } else if n == 0 {
+            0
+        } else {
+            self.write(Effect::TableInsert { table, rows }).await?
+        };
         let r = PutResult { app_metadata: json!({ "inserted": n, "offset": offset }).to_string().into() };
         Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
     }
@@ -244,6 +265,7 @@ impl FlightService for AdbFlight {
             ("update", "Set values on matching rows: {table, filter, values}"),
             ("delete", "Delete matching rows: {table, filter}"),
             ("list_tables", "Platform table names"),
+            ("replace_table", "Replace a table with an empty one: {table, columns}"),
             ("aql", "Run AQL: {query, variables?} → the POST /query result"),
         ]
         .map(|(t, d)| Ok(ActionType { r#type: t.into(), description: d.into() }));
