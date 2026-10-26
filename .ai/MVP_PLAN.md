@@ -75,4 +75,10 @@ within M2: it is the gap agents notice.
 | Where | Setting |
 |---|---|
 | `deploy/flowr` (console) | `FLOWR_REGISTRY_ADB=http://adb.a3t.svc.cluster.local:3000` |
-| `deploy/a3t-controller` | image `ghcr.io/srirammails/a3t-controller:<date>` (`deploy.sh release controller`); `A3T_RUNTIME_IMAGE=ghcr.io/srirammails/flowr:<ee tag>`; `A3T_RUNTIME_ENV_FLOWR_REGISTRY_ADB`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_POLICY_HOOK=cedar`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_AUTHN=oidc`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_OIDC_ISSUER` |
+| `deploy/a3t-controller` | image `ghcr.io/srirammails/a3t-controller:<date>` (`deploy.sh release controller`), `imagePullSecrets: registry-credentials`; `A3T_RUNTIME_IMAGE=ghcr.io/srirammails/flowr:<ee tag>`; `A3T_RUNTIME_PULL_SECRET=registry-credentials`; `A3T_RUNTIME_ENV_FLOWR_REGISTRY_ADB`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_POLICY_HOOK=cedar`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_AUTHN=oidc`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_OIDC_ISSUER` |
+
+Rolled 26 Oct: console `flowr:2026-10-26-ee4` with the shared registry (seeded 83
+workflows, 28 resources, 32 agent-state rows); `a3t-controller:2026-10-26-b`.
+The Agent Sandbox controller doesn't replace a sandbox pod that failed (the 25 Oct
+evictions): delete the failed `cv-*` / `rt-worker` pods once so they come back on the
+new template.
