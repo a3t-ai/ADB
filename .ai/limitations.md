@@ -83,8 +83,22 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | G-L3 | **Platform writes are synchronous and serialised with memory writes** (one sequencer). | Fine for registry traffic; a heavy writer would queue behind memory writes. | Separate partition for platform tables (M3 placement). |
 | G-L4 | **No compaction of platform datasets**: every write is a Lance version. | Many small versions over time. | `compact_files` / `cleanup_old_versions` with D5. |
 | G-L5 | **Switching a running install to ADB is manual**: `import-lancedb` then edit `a3t/a3t-platform-db` (`backend: adb`) and restart FlowR. Writes between the import and the restart go to the embedded copy. | Plan a short write freeze for the switch. | An import mode that follows FlowR writes, or a switch flow. |
-| G-L6 | **FlowR's own state** (`clawdflow.lance`: workflows, resources, executions, queue) is not on ADB yet. | Clustered FlowR still needs shared state. | Next table family (ARCHITECTURE §15). |
+| G-L6 | **FlowR's own state**: the registry (workflows, resources) and `agent:*` state (configs, sessions) are on ADB with `FLOWR_REGISTRY_ADB` (W2c); executions, queue, checkpoints, settings and non-runtime triggers stay local. | Execution history is per FlowR. | When FlowR clusters. |
 | G-L7 | `call:rotate`'s knowledge-graph database (`a3t-kg.lance`) stays embedded. | — | When needed. |
+
+## Runtimes on ADB (MVP W2)
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| W2-L1 | **Shared-registry writes aren't transactions**: a state `set` and a workflow `register` are delete + insert (two log records); two FlowRs writing one key race, last write wins; `incr` isn't atomic. | A reader can briefly miss a key mid-write. Fine for one console plus runtimes that own their keys. | An ADB upsert action (one effect). |
+| W2-L2 | **Reads go to ADB every time** (no cache): each `resources().get` / `workflows().get` is a Flight `do_get` with a filter (full scan of a small table). | A few ms per lookup in-cluster. | Cache with invalidation from a `table` subscription. |
+| W2-L3 | **Replies carry the run output as JSON text** (`output_json`): ADB topic messages hold AQL scalars, so the MCP `publish` tool stringifies nested values. | Consumers `fromjson` it. | Object / list literals in AQL `PUBLISH`. |
+| W2-L4 | **One runtime pod per deployment**: the subscription is per deployment (kept in ADB under `runtime:<ns>/<name>:triggers`), so two replicas would both read it and run each request twice. | Isolated canvases have one Sandbox pod, so fine today. | Consumer groups (competing consumers) on a subscription. |
+| W2-L5 | **Shared placement** (`mode: shared`, a `Runtime` pool) isn't routed: only isolated canvases get a runtime that takes work from their topic. | Shared canvases still run on the console. | Pool runtimes subscribing to each placed canvas's topic. |
+| W2-L6 | **Chat isn't relayed**: the console's chat runs agents in the console; deployed canvases take work only from their topic (`a3t/canvas-dispatch`, or any `PUBLISH` to `canvas.<ns>.<name>`). No token streaming from a runtime. | Chat with a deployed agent still runs in the console. | Chat relay over topics (request topic + reply topic with partial tokens). |
+| W2-L7 | **A runtime's run history is local to its pod** (executions stay local, decision W2c); the reply and ADB memory are what survive a pod. | Runs on a deleted pod are only visible through replies / memory. | With G-L6. |
+| W2-L8 | **Switching the console back off the shared registry** (unset `FLOWR_REGISTRY_ADB`) returns it to its local registry as of the switch; changes made since live only in ADB. | Copy back by hand if needed. | A switch-back that copies `flowr_*` tables to local. |
+| W2-L9 | **Runtime pods' inbound API**: they run FlowR EE with the console's policy hook / OIDC settings via the controller's `A3T_RUNTIME_ENV_*`, but nothing calls them; a runtime's `/message` endpoint can still write the shared registry for a caller with a valid token. | Same trust as the console. | A runtime mode that serves only `/health`. |
 
 ## Outside ADB (FlowR / A3T), found while testing
 

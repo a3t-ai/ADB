@@ -14,7 +14,7 @@
 | Subscriptions (topics, scope feeds, SSE + MCP) | Built (stage E), on vc-dev |
 | Agent memory in `call:a3t:agent`, `adb_topic` trigger | Built (stage F), on vc-dev |
 | Platform tables on ADB, Flight, Settings switch | Built (stage G), rolling out |
-| **FlowR runtimes** (pods the a3t-controller deploys) | **Not connected.** The runtime pod gets `A3T_FLOW` / `A3T_SESSION_MODE`, but nothing in FlowR reads them: a runtime starts empty (no flow, no resources, no ADB). The controller image (`a3t-controller:dev`) was hand-loaded on the node and lost when the node ran out of disk; there is no build target for it. |
+| **FlowR runtimes** (pods the a3t-controller deploys) | **Built (W2), rolling out** — see W2 below. Was: not connected. The runtime pod gets `A3T_FLOW` / `A3T_SESSION_MODE`, but nothing in FlowR reads them: a runtime starts empty (no flow, no resources, no ADB). The controller image (`a3t-controller:dev`) was hand-loaded on the node and lost when the node ran out of disk; there is no build target for it. |
 | Embeddings / vector recall | Missing (L1): `RECALL … LIKE` finds nothing; agents get "newest 5 facts" |
 
 ## Workstreams, in order
@@ -44,3 +44,35 @@ within M2: it is the gap agents notice.
   (platform tables); executions and the queue stay local to each FlowR.
 - **W4 — ADB embeds text itself with a small local CPU model** (bge-small class, 384
   dims), no external calls; an OpenAI-compatible endpoint can be configured later.
+
+## W2 as built (26 Oct)
+
+- **Shared registry (W2c).** `FLOWR_REGISTRY_ADB=<ADB http url>` (optional
+  `FLOWR_REGISTRY_ADB_FLIGHT`) puts a FlowR's workflows, resource types, resources and
+  `agent:*` state (agent configs, chat sessions, session index) on ADB platform tables
+  `flowr_workflows`, `flowr_resource_types`, `flowr_resources`, `flowr_state` (same
+  columns as the local LanceDB). A console seeds an empty shared registry from its
+  local one on first boot; a runtime never seeds. Code:
+  `flowr-ce/src/shared_registry.rs`, `init_storage`. EE only (`adb-platform`).
+- **Runtime boot (W2b).** The controller gives each isolated canvas's Sandbox pod
+  `A3T_CANVAS=<ns>/<name>`, `A3T_FLOW`, and its own `A3T_RUNTIME_ENV_<NAME>` variables
+  as `<NAME>` (so `A3T_RUNTIME_ENV_FLOWR_REGISTRY_ADB=…` reaches every runtime);
+  `A3T_RUNTIME_IMAGE` is the default runtime image. At boot a runtime creates (or
+  restores) trigger `runtime-<ns>-<name>`: `adb_topic` on `canvas.<ns>.<name>` →
+  `A3T_FLOW`, through the ADB resource `A3T_ADB_RESOURCE` (default
+  `a3t/agent-memory`). Its `_triggers` key lives in ADB as
+  `runtime:<ns>/<name>:triggers`, so a new pod resumes the acked subscription.
+- **Requests and replies.** Work is a message on `canvas.<ns>.<name>`; with
+  `_reply_topic` set, the runtime publishes `{request_id, status, output_json, error,
+  instance_id, canvas}` there when the run ends. `a3t/canvas-dispatch` does a round
+  trip from the console; `a3t/runtime-echo` is a flow to deploy for it.
+- **Gate:** `tests/runtime-e2e.mjs` (in `check-all.sh`): shared registry, topic work,
+  replies, memory, SIGKILL + new empty pod resumes, A3T's dispatch flow — 12 checks.
+- **Limits:** W2-L1…L9 in `limitations.md`.
+
+### vc-dev configuration
+
+| Where | Setting |
+|---|---|
+| `deploy/flowr` (console) | `FLOWR_REGISTRY_ADB=http://adb.a3t.svc.cluster.local:3000` |
+| `deploy/a3t-controller` | image `ghcr.io/srirammails/a3t-controller:<date>` (`deploy.sh release controller`); `A3T_RUNTIME_IMAGE=ghcr.io/srirammails/flowr:<ee tag>`; `A3T_RUNTIME_ENV_FLOWR_REGISTRY_ADB`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_POLICY_HOOK=cedar`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_AUTHN=oidc`, `A3T_RUNTIME_ENV_FLOWR_SECURITY_OIDC_ISSUER` |

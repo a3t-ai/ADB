@@ -56,6 +56,7 @@ if [ $QUICK = 0 ]; then
     step "subscriptions crash (10 kills)" node "$ROOT/tests/subscriptions-crash.mjs" --adb "$ADB" --rounds 10
     if [ -d "$DEV/flowr-system/flowr-ce" ]; then
         step "topic trigger (2 FlowR)" node "$ROOT/tests/topic-trigger.mjs" --adb "$ADB" --flowr "$FLOWR"
+        step "runtime e2e (shared registry)" node "$ROOT/tests/runtime-e2e.mjs" --adb "$ADB" --flowr "$FLOWR"
         if [ -d "$LANCEDB" ]; then
             step "platform differential" node "$ROOT/tests/platform-differential.mjs" --adb "$ADB" --flowr "$FLOWR" \
                 --lancedb "$LANCEDB" --flows "$DEV/flowr-system/a3t/backend/flows"
