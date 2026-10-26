@@ -74,6 +74,18 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | F-L6 | **Topic trigger flows run without a caller** (`principal: None`, the runtime service). | Cedar policies for those runs apply to the service principal. | Give triggers an owner principal (as agents have). |
 | F-L7 | `a3t/backend/resources/a3t-resources.yaml` is gitignored; its ADB URLs were updated to `http://adb:3000` locally only. | A fresh A3T install from another checkout still points at `clawdb`. | Commit a template without secrets. |
 
+## Platform tables (stage G)
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| G-L1 | **ADB Flight is unauthenticated** (no handshake / token). | Anything that can reach port 3001 can read and write A3T's platform tables. Fine inside the cluster network; not for exposure. | With ADB auth (M4 tenancy). |
+| G-L2 | **Every platform column is UTF-8**, as in A3T's embedded LanceDB; no vector search (`call:lancedb` `search` is unsupported on both backends). | Same as today. | When A3T needs typed / vector platform columns. |
+| G-L3 | **Platform writes are synchronous and serialised with memory writes** (one sequencer). | Fine for registry traffic; a heavy writer would queue behind memory writes. | Separate partition for platform tables (M3 placement). |
+| G-L4 | **No compaction of platform datasets**: every write is a Lance version. | Many small versions over time. | `compact_files` / `cleanup_old_versions` with D5. |
+| G-L5 | **Switching a running install to ADB is manual**: `import-lancedb` then edit `a3t/a3t-platform-db` (`backend: adb`) and restart FlowR. Writes between the import and the restart go to the embedded copy. | Plan a short write freeze for the switch. | An import mode that follows FlowR writes, or a switch flow. |
+| G-L6 | **FlowR's own state** (`clawdflow.lance`: workflows, resources, executions, queue) is not on ADB yet. | Clustered FlowR still needs shared state. | Next table family (ARCHITECTURE §15). |
+| G-L7 | `call:rotate`'s knowledge-graph database (`a3t-kg.lance`) stays embedded. | — | When needed. |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |
