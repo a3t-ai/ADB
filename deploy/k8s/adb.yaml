@@ -47,6 +47,16 @@ spec:
               value: info,lance=warn
             - name: ADB_DATA_DIR
               value: /data/adb
+            # W3: with a token, HTTP (all but /health) and Flight need
+            # Authorization: Bearer. Create it once:
+            #   kubectl -n a3t create secret generic adb-auth --from-literal=token=$(openssl rand -hex 32)
+            # FlowR gets the same Secret as ADB_AUTH_TOKEN (+ ADB_AUTH_URLS).
+            - name: ADB_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: adb-auth
+                  key: token
+                  optional: true
           volumeMounts:
             - name: adb-data
               mountPath: /data/adb
