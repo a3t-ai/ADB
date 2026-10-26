@@ -9,8 +9,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
 | L1 | **No embeddings are ever stored.** AQL `STORE` has no embedding input and the durable path writes `embedding: None`; only `SemanticBackend::store_with_embedding` (unused by AQL) keeps one, in memory. | `RECALL … LIKE $vec` finds nothing; vector recall is not implemented end to end. | M2 hybrid recall (risk D4): embedding on STORE, Lance vector index. |
-| L2 | **Key uniqueness not enforced** (D3 S4). A second `STORE` with an existing key replaces the record. | MCP `remember` with an existing key silently overwrites. Needs a decision on the MCP behaviour before changing. | Carried C item, before the D gate. |
-| L3 | **TTL expiry is a read filter only.** No timer commits the `Expire` effect (D2 §4). | Expired rows are hidden correctly but never logged, so subscribers / CQs won't see expiry events; rows stay until forget. | Carried C item; needed by stage E. |
 | L4 | **No optimistic concurrency** on UPDATE (`version` in `Patch` is always 0; supersede reads the current version under the sequencer lock instead). | Fine with one writer per partition; breaks with concurrent writers or replicas. | M3 (replication) / sequencer validation. |
 | L5 | **Records that shared a key across memory types before schema v3 were already one Lance row.** The v2→v3 migration keeps the survivor under the type it was last written as; the overwritten one can't be recovered. | Only data written before 25 Oct. vc-dev had one record and migrated cleanly. | None — note for anyone migrating an old data dir. |
 | L6 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record**, not the linked ones. `RECALL … WHERE … FOLLOW LINKS` works. | AQL users must use the `RECALL` form. | Executor LOOKUP path; with the M2 query rework. |
@@ -60,7 +58,8 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | With CQ watch sets (M2). |
 | E-L8 | **A patch / forget delivery looks up the record's scope and kind in Lance**; if compaction ever removes all its rows, the change is skipped. | Only matters once compaction exists (D5 / M2). | Carry scope in `Patch` / `Forget` effects. |
 | E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. FlowR has no topic *trigger* yet. | Agents poll; flows can't start on a message. | FlowR wiring (stage F). |
-| E-L10 | **No subscriber timers** (topic message TTL is a read filter like L3; expiry isn't delivered). | Subscribers aren't told a message expired. | With L3 (timer `Expire`). |
+| E-L10 | **Topic messages' TTL is a read filter only**: the expiry timer (L3, fixed) commits `Expire` for memory records, not for `event` rows. | Subscribers aren't told a message expired. | Expire events with compaction (W5). |
+| E-L11 | **The expiry timer scans for due rows every second** (a Lance scan with `ttl_at IS NOT NULL`). | Cost grows with TTL'd rows awaiting expiry. | A timer wheel fed by STORE … TTL and seeded at open. |
 
 ## FlowR wiring (stage F)
 
@@ -119,3 +118,5 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | Procedural `ORDER BY` / `RETURN` ignored | `18f7a25` (D4.2) |
 | `UPDATE` overwrote facts in place (no history) | `4003984` (D4.3) |
 | `FORGET` missed values only in old versions (D2 T5) | `b367ac4` (D4.4a) |
+| L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |
+| L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |
