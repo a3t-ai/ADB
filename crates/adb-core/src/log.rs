@@ -274,6 +274,17 @@ pub enum Effect {
     UpdateSubCursor { sub_id: RecordId, cursor: LogOffset },
     /// `UNSUBSCRIBE` / `UNWATCH`.
     Unregister { id: RecordId },
+    /// Platform tables (stage G, ARCHITECTURE §15.1): FlowR / A3T registry tables,
+    /// each its own Lance dataset with UTF-8 columns, `call:lancedb` semantics.
+    /// Create `table` with these columns, if it doesn't exist.
+    TableCreate { table: String, columns: Vec<String> },
+    /// Append rows (field → string value); creates the table from the first row's
+    /// fields if it doesn't exist.
+    TableInsert { table: String, rows: Vec<serde_json::Map<String, serde_json::Value>> },
+    /// Set `values` (column → SQL expression) on the rows matching `filter` (SQL).
+    TableUpdate { table: String, filter: String, values: Vec<(String, String)> },
+    /// Delete the rows matching `filter` (SQL).
+    TableDelete { table: String, filter: String },
 }
 
 /// One committed transaction on one partition.

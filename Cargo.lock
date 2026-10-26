@@ -136,6 +136,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "adb-platform"
+version = "0.1.0"
+dependencies = [
+ "adb-core",
+ "arrow-array",
+ "arrow-schema",
+ "futures",
+ "lance",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adb-sequencer"
 version = "0.1.0"
 dependencies = [
