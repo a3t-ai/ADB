@@ -1,0 +1,21 @@
+[package]
+name = "g1-wire"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Spike G1 (stage G): HTTP + JSON vs Arrow Flight for A3T platform-table calls.
+[workspace]
+
+[dependencies]
+arrow-array = "58"
+arrow-schema = "58"
+arrow-json = "58"
+arrow-flight = "58"
+tonic = "0.14"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+futures = "0.3"
+bytes = "1"
