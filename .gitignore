@@ -1,2 +1,5 @@
 target/
 .cargo/config.toml
+
+# Platform database copies for local gate runs: may hold real user data, never commit
+tests/fixtures/
