@@ -15,6 +15,10 @@
  *   - after a SIGKILL and a restart on a NEW empty data dir, resume its
  *     subscription (kept in ADB) and run the request published while it was down.
  *
+ * ADB runs with ADB_AUTH_TOKEN (W3), and the FlowRs with the same token for its
+ * URLs (ADB_AUTH_URLS), so every path — Flight, MCP, topic triggers — is checked
+ * with auth on.
+ *
  * Then the console runs A3T's own test flow `a3t/canvas-dispatch` (flowr-system/a3t/
  * backend/flows/test/canvas_dispatch.yaml) against the runtime, as a user would.
  *
@@ -62,8 +66,11 @@ function start(bin, argv, env) {
   return child;
 }
 
+const TOKEN = `t-${process.pid}-${Date.now()}`;
+const authed = { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` };
+
 async function aql(url, query) {
-  const r = await (await fetch(`${url}/query`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query }) })).json();
+  const r = await (await fetch(`${url}/query`, { method: 'POST', headers: authed, body: JSON.stringify({ query }) })).json();
   if (!r.success) throw new Error(`${query}: ${JSON.stringify(r)}`);
   return r.data.data;
 }
@@ -71,7 +78,7 @@ async function aql(url, query) {
 let rpcId = 1;
 async function adbTool(url, name, toolArgs) {
   const r = await (await fetch(`${url}/mcp`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: authed,
     body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method: 'tools/call', params: { name, arguments: toolArgs } }),
   })).json();
   const text = r.result?.content?.[0]?.text ?? '';
@@ -129,7 +136,10 @@ function flowOutput(text) {
 }
 
 let adbUrl, flightUrl;
-const registryEnv = () => ({ FLOWR_REGISTRY_ADB: adbUrl, FLOWR_REGISTRY_ADB_FLIGHT: flightUrl });
+const registryEnv = () => ({
+  FLOWR_REGISTRY_ADB: adbUrl, FLOWR_REGISTRY_ADB_FLIGHT: flightUrl,
+  ADB_AUTH_TOKEN: TOKEN, ADB_AUTH_URLS: `${adbUrl},${flightUrl}`,
+});
 
 async function startFlowr(dataDir, env) {
   const port = await freePort();
@@ -179,8 +189,10 @@ try {
   adbUrl = `http://127.0.0.1:${adbPort}`;
   const flightPort = await freePort();
   flightUrl = `http://127.0.0.1:${flightPort}`;
-  const adbProc = start(args.adb, ['--data-dir', join(tmp, 'adb'), 'serve-http', '--port', String(adbPort), '--flight-port', String(flightPort)], {});
+  const adbProc = start(args.adb, ['--data-dir', join(tmp, 'adb'), 'serve-http', '--port', String(adbPort), '--flight-port', String(flightPort)], { ADB_AUTH_TOKEN: TOKEN });
   await waitHealthy(adbUrl, 'ADB', adbProc);
+  const open = await fetch(`${adbUrl}/query`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'RECALL FROM SEMANTIC ALL' }) });
+  check('ADB refuses a request without the token (401)', open.status === 401, String(open.status));
 
   // Console: resource + flow, into the shared registry.
   const C = await startFlowr(join(tmp, 'console'), {});
@@ -188,8 +200,7 @@ try {
   await flowrTool(C.url, 'create_resource', { namespace: 'a3t', name: 'agent-memory-mcp', type_ref: 'mcp', config: { url: `${adbUrl}/mcp/sse`, transport: 'sse' } });
   await flowrTool(C.url, 'create_flow', { yaml: ECHO });
   if (DISPATCH) await flowrTool(C.url, 'create_flow', { yaml: DISPATCH });
-  const tables = await (await fetch(`${adbUrl}/health`)).ok;
-  check('console is up on the shared registry', tables);
+  check('console is up on the shared registry (Flight with the token)', true);
 
   // Runtime, as the controller starts it.
   let R = await startRuntime(join(tmp, 'runtime-1'));

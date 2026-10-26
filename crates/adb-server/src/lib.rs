@@ -11,9 +11,13 @@
 //! | `POST /mcp` | MCP over streamable HTTP (JSON responses) |
 //! | `GET /mcp/sse`, `POST /mcp/message?sessionId=…` | MCP over HTTP+SSE (no `sessionId`: reply in the body) |
 //! | `GET /subscriptions/{id}/events?from=N` | A subscription's deliveries as SSE (stage E): `event: delivery`, `id: <offset>`; reconnect with `Last-Event-ID` to resume; `event: heartbeat` with the tip when idle |
+//!
+//! With `ADB_AUTH_TOKEN` set, every endpoint but `/health` needs
+//! `Authorization: Bearer <token>` ([`auth`]).
 
+pub mod auth;
 pub mod flight;
-pub use flight::serve_flight;
+pub use flight::{serve_flight, serve_flight_with_token};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -50,8 +54,21 @@ impl AppState {
     }
 }
 
-/// The full router.
+/// The full router, with the token from `ADB_AUTH_TOKEN` if set.
 pub fn router(engine: Arc<dyn Engine>) -> Router {
+    router_with_token(engine, auth::token_from_env())
+}
+
+/// The full router; with `token`, every endpoint but `/health` requires it.
+pub fn router_with_token(engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> Router {
+    let mut r = routes(engine);
+    if let Some(t) = token {
+        r = r.layer(axum::middleware::from_fn(move |req, next| auth::require_token(Arc::clone(&t), req, next)));
+    }
+    r.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+}
+
+fn routes(engine: Arc<dyn Engine>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/query", post(query))
@@ -60,14 +77,13 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
         .route("/subscriptions/:id/events", get(subscription_events))
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(AppState::new(engine))
 }
 
 /// Bind and serve until the process ends.
 pub async fn serve(addr: SocketAddr, engine: Arc<dyn Engine>) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("ADB listening on http://{}", listener.local_addr()?);
+    tracing::info!(auth = auth::token_from_env().is_some(), "ADB listening on http://{}", listener.local_addr()?);
     axum::serve(listener, router(engine)).await
 }
 

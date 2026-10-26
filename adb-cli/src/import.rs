@@ -18,7 +18,21 @@ use tonic::transport::Channel;
 
 const CHUNK: usize = 500;
 
-type Client = FlightServiceClient<Channel>;
+type Client = FlightServiceClient<tonic::service::interceptor::InterceptedService<Channel, Bearer>>;
+
+/// `authorization: Bearer $ADB_AUTH_TOKEN` on every call, when the target ADB has
+/// a token (W3).
+#[derive(Clone)]
+struct Bearer(Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>);
+
+impl tonic::service::Interceptor for Bearer {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(v) = &self.0 {
+            req.metadata_mut().insert("authorization", v.clone());
+        }
+        Ok(req)
+    }
+}
 
 async fn action(c: &mut Client, kind: &str, body: Value) -> Result<Value, String> {
     let mut s = c
@@ -43,7 +57,14 @@ fn utf8(batch: &RecordBatch) -> Result<RecordBatch, String> {
 
 pub async fn import(path: &Path, flight: &str, replace: bool) -> Result<(), String> {
     let channel = Channel::from_shared(flight.to_string()).map_err(|e| e.to_string())?.connect().await.map_err(|e| format!("connect {flight}: {e}"))?;
-    let mut c = FlightServiceClient::new(channel).max_encoding_message_size(64 << 20).max_decoding_message_size(64 << 20);
+    let bearer = std::env::var("ADB_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("Bearer {t}").parse().map_err(|_| "ADB_AUTH_TOKEN is not a valid header value".to_string()))
+        .transpose()?;
+    let mut c = FlightServiceClient::with_interceptor(channel, Bearer(bearer))
+        .max_encoding_message_size(64 << 20)
+        .max_decoding_message_size(64 << 20);
     let existing: Vec<String> = serde_json::from_value(action(&mut c, "list_tables", json!({})).await?).unwrap_or_default();
     let mut tables: Vec<String> = std::fs::read_dir(path)
         .map_err(|e| format!("{}: {e}", path.display()))?

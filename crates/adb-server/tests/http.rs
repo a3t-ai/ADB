@@ -174,3 +174,27 @@ async fn mcp_over_sse() {
         .send().await.unwrap().status().as_u16();
     assert_eq!(st, 404);
 }
+
+/// W3 / G-L1: with a token, every endpoint but /health needs `Authorization:
+/// Bearer <token>`.
+#[tokio::test]
+async fn token_guards_everything_but_health() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let app = adb_server::router_with_token(Arc::new(LocalEngine::default()), Some(Arc::from("s3cret")));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let c = reqwest::Client::new();
+
+    assert_eq!(c.get(format!("{base}/health")).send().await.unwrap().status(), 200, "health stays open");
+    let q = json!({"query": r#"STORE INTO WORKING (task = "t1")"#});
+    assert_eq!(c.post(format!("{base}/query")).json(&q).send().await.unwrap().status(), 401);
+    assert_eq!(c.post(format!("{base}/query")).bearer_auth("wrong").json(&q).send().await.unwrap().status(), 401);
+    let mcp = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    assert_eq!(c.post(format!("{base}/mcp")).json(&mcp).send().await.unwrap().status(), 401);
+    assert_eq!(c.get(format!("{base}/mcp/sse")).send().await.unwrap().status(), 401);
+
+    let r = c.post(format!("{base}/query")).bearer_auth("s3cret").json(&q).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(c.post(format!("{base}/mcp")).bearer_auth("s3cret").json(&mcp).send().await.unwrap().status(), 200);
+}

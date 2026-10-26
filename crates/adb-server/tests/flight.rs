@@ -112,3 +112,36 @@ async fn platform_tables_and_aql_over_flight() {
     assert_eq!(r["data"]["data"]["records"][0]["data"]["task"], "flight");
     server.abort();
 }
+
+/// W3 / G-L1: with a token, a Flight call without `authorization: Bearer <token>`
+/// is refused (unauthenticated); with it, it runs.
+#[tokio::test]
+async fn flight_token_is_required_when_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let engine: Arc<dyn Engine> = Arc::new(engine);
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let server = tokio::spawn(async move {
+        adb_server::serve_flight_with_token(addr, engine, Some(Arc::from("s3cret"))).await.unwrap();
+    });
+    let channel = loop {
+        if let Ok(c) = Channel::from_shared(format!("http://{addr}")).unwrap().connect().await {
+            break c;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let mut open = FlightServiceClient::new(channel.clone());
+    let e = action(&mut open, "list_tables", json!({})).await.unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unauthenticated, "{e}");
+
+    let mut authed = FlightServiceClient::with_interceptor(channel, |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", "Bearer s3cret".parse().unwrap());
+        Ok(req)
+    });
+    let r = authed
+        .do_action(tonic::Request::new(arrow_flight::Action { r#type: "list_tables".into(), body: b"{}".to_vec().into() }))
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    server.abort();
+}

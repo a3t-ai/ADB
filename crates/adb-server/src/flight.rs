@@ -41,10 +41,16 @@ const MAX_MESSAGE: usize = 64 << 20;
 
 /// Serve Flight on `addr` until the process ends.
 pub async fn serve_flight(addr: SocketAddr, engine: Arc<dyn Engine>) -> std::io::Result<()> {
-    tracing::info!("ADB Flight on grpc://{addr}");
+    serve_flight_with_token(addr, engine, crate::auth::token_from_env()).await
+}
+
+/// [`serve_flight`] with an explicit token (`None`: open).
+pub async fn serve_flight_with_token(addr: SocketAddr, engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> std::io::Result<()> {
+    tracing::info!(auth = token.is_some(), "ADB Flight on grpc://{addr}");
     let svc = FlightServiceServer::new(AdbFlight { engine })
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE);
+    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth(token));
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve(addr)
