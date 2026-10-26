@@ -93,8 +93,9 @@ async function startFlowr(name, dataDir) {
   return { name, url, child, dataDir };
 }
 
+let adbFlightUrl;
 async function setup(f, adbUrl) {
-  await flowrTool(f.url, 'create_resource', { namespace: 'default', name: 'adb', type_ref: 'adb', config: { url: adbUrl } });
+  await flowrTool(f.url, 'create_resource', { namespace: 'default', name: 'adb', type_ref: 'adb', config: { url: adbUrl, flight_url: adbFlightUrl } });
   await flowrTool(f.url, 'create_flow', { yaml: flowYaml(f.name) });
   const r = await fetch(`${f.url}/triggers`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -137,7 +138,9 @@ async function waitHandled(adbUrl, instance, want) {
 try {
   const adbPort = await freePort();
   const adbUrl = `http://127.0.0.1:${adbPort}`;
-  start(args.adb, ['--data-dir', join(tmp, 'adb'), 'serve-http', '--port', String(adbPort)], {}, 'adb');
+  const flightPort = await freePort();
+  adbFlightUrl = `http://127.0.0.1:${flightPort}`;
+  start(args.adb, ['--data-dir', join(tmp, 'adb'), 'serve-http', '--port', String(adbPort), '--flight-port', String(flightPort)], {}, 'adb');
   await waitHealthy(adbUrl, 'ADB');
   let A = await startFlowr('A', join(tmp, 'flowr-a'));
   const B = await startFlowr('B', join(tmp, 'flowr-b'));

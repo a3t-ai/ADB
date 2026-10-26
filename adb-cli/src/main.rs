@@ -16,6 +16,8 @@ use std::sync::Arc;
 use adb_executor::{Engine, LocalEngine};
 use adb_mcp::McpServer;
 use clap::{Parser, Subcommand};
+
+mod import;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -53,6 +55,18 @@ enum Commands {
         #[arg(long, default_value_t = 3001)]
         flight_port: u16,
     },
+    /// Copy an embedded LanceDB directory (A3T's a3t-platform.lance) into a running
+    /// ADB's platform tables over Arrow Flight
+    ImportLancedb {
+        /// The LanceDB directory (holding <table>.lance datasets)
+        path: std::path::PathBuf,
+        /// ADB's Flight endpoint
+        #[arg(long, default_value = "http://127.0.0.1:3001")]
+        flight: String,
+        /// Replace the rows of tables ADB already has (default: skip them)
+        #[arg(long)]
+        replace: bool,
+    },
     /// Execute one AQL statement and print the result as JSON
     Query {
         /// The AQL statement
@@ -63,6 +77,10 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // A client command: no engine of its own.
+    if let Some(Commands::ImportLancedb { path, flight, replace }) = &cli.command {
+        return import::import(path, flight, *replace).await.map_err(|e| e.into());
+    }
     let command = cli.command.unwrap_or(Commands::Serve { http: false, host: [0, 0, 0, 0].into(), port: 3000, flight_port: 3001 });
 
     // Logs always go to stderr: stdout carries MCP messages in stdio mode.
@@ -113,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 s = shutdown_signal() => tracing::info!(signal = s, "ADB shutting down"),
             }
         }
+        Commands::ImportLancedb { .. } => unreachable!("handled before the engine opens"),
         Commands::Query { query } => match engine.query(&query, None).await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
             Err(e) => {

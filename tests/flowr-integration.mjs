@@ -136,11 +136,12 @@ const callTool = (tool, toolArgs) => run({ test_type: 'mcp_call', tool, argument
 try {
   // ---------------------------------------------------------------- start
   let adbUrl = args['adb-url'];
-  let adbChild, adbArgv;
+  let adbChild, adbArgv, flightPort;
   if (!adbUrl) {
     const port = await freePort();
     adbUrl = `http://127.0.0.1:${port}`;
-    adbArgv = ['serve', '--http', '--host', '127.0.0.1', '--port', String(port)];
+    flightPort = await freePort();
+    adbArgv = ['serve', '--http', '--host', '127.0.0.1', '--port', String(port), '--flight-port', String(flightPort)];
     if (args['adb-data-dir']) adbArgv = ['--data-dir', args['adb-data-dir'], ...adbArgv];
     adbChild = start(args.adb, adbArgv, {}, 'adb');
   }
@@ -153,6 +154,8 @@ try {
   await waitHealthy(adbUrl, 'ADB');
   await waitHealthy(flowrUrl, 'FlowR');
   const adbForFlowr = args['adb-url-for-flowr'] ?? adbUrl;
+  // ADB's Flight endpoint (call:adb's wire): ours when we spawned ADB, else --adb-flight-url or ADB's default port.
+  const adbFlightForFlowr = args['adb-flight-url'] ?? (flightPort ? `http://127.0.0.1:${flightPort}` : adbForFlowr.replace(/:\d+$/, ':3001'));
   console.log(`ADB ${adbUrl} · FlowR ${flowrUrl}\n`);
 
   // ---------------------------------------------------------------- set up, as A3T's resources.yaml does
@@ -196,7 +199,9 @@ try {
   // ---------------------------------------------------------------- ADB resource + driver (call:adb)
   r = await flowr('create_resource', {
     namespace: 'a3t', name: 'adb', type_ref: 'adb', description: 'ADB agent memory',
-    config: { url: 'http://127.0.0.1:1' }, // wrong on purpose; fixed by the edit below
+    // Wrong on purpose (nothing listens on port 1); fixed by the edit below. call:adb
+    // talks Flight (ADB stage G), so the resource names the Flight endpoint too.
+    config: { url: 'http://127.0.0.1:1', flight_url: 'http://127.0.0.1:1' },
   });
   check('create adb resource', !r.isError, r.text);
   r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'RECALL FROM WORKING LIMIT 5' });
@@ -204,7 +209,7 @@ try {
 
   // Edit the config as the Resources page does: registry PUT with the new config.
   const put = await fetch(`${flowrUrl}/registry/resources/a3t/adb`, {
-    method: 'PUT', headers: { 'content-type': 'application/json', ...auth }, body: JSON.stringify({ url: adbForFlowr, scope: 'private' }),
+    method: 'PUT', headers: { 'content-type': 'application/json', ...auth }, body: JSON.stringify({ url: adbForFlowr, flight_url: adbFlightForFlowr, scope: 'private' }),
   });
   check('edit adb resource config (registry PUT)', put.ok, `HTTP ${put.status} ${await put.text()}`);
 
