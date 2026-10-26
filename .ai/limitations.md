@@ -29,7 +29,8 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | P5 | **Stats count by loading every current row** (`count_current`). | `stats` cost grows with data. | Keep counts in `_meta`, or a Lance count query. |
 | P6 | **`FORGET` on SEMANTIC / PROCEDURAL scans all superseded versions** of the type to honour D2 T5; PROCEDURAL builds one view per old version. | Forget cost grows with history size. | With compaction (history pruned) or a pushed-down history filter. |
 | P7 | **Only `id` has a scalar index**; filters on `lineage_id`, `subject_id`, `kind`, `memory` scan. | KEY lookups by lineage and edge reads scan the table. | Add BTree / bitmap indexes maintained by the MemWAL (D5). |
-| P8 | **Concurrent writes don't share a disk sync** (no pending overlay); every write waits for its own group commit. | Write latency under concurrency. | Carried C item. |
+| P8 | **Writes hold the sequencer while their record is synced**, so a write waits for its own `fdatasync`; the WAL still group-commits what queues behind the lock. Measured 26 Oct (debug build, local disk): ~2.6 ms per write sequential, ~1,000 writes/s with 16 concurrent writers. | Fine for MVP traffic. | Release the sequencer before the sync with a pending overlay (later writes see in-flight ones), if a workload needs more. |
+| P10 | **Startup scans every current row twice** (hydrate + subscription registry) after Lance and the WAL open: 6.9 s with 4,000 episodes in the debug build, most of it opening the store. | Slow restarts of big partitions (the crash test takes ~95 s for 20 restarts). | Compaction (W5) and a persisted live-key / registry snapshot. |
 | P9 | **Release builds take ~40 min from clean** (fat LTO, 4 jobs in the pod). | Slow deploy loop after a cache wipe. | Thin LTO for dev images, or a build node. |
 
 ## Scope cut for now
