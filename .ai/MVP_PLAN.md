@@ -34,11 +34,13 @@
 W0–W2 make the MVP's *connectivity* real; W3 hardens it; W4–W7 are M2. W4 first
 within M2: it is the gap agents notice.
 
-## Decisions coming up (asked when the workstream starts)
+## Decisions (26 Oct, user: as recommended)
 
-- **W2b:** how a runtime finds its flow and resources — from A3T's platform tables on
-  ADB directly (recommended: the runtime needs only an ADB URL and its canvas id), or
-  from the console FlowR's registry API.
-- **W2c:** how much of FlowR's state moves to ADB for the MVP (runtimes' executions /
-  sessions only, or the console FlowR's too).
-- **W4:** who computes embeddings, which model, and the dimension.
+- **W2b — runtimes run through ADB.** A runtime pod boots with ADB's URL and its
+  canvas / deployment id, reads its flow and resources from ADB, gets its work from a
+  per-deployment ADB topic that the console publishes to (the `adb_topic` trigger), and
+  keeps memory and results in ADB. Runtimes are stateless and share one ADB.
+- **W2c — FlowR's registry (workflows, resources) and agent sessions move to ADB**
+  (platform tables); executions and the queue stay local to each FlowR.
+- **W4 — ADB embeds text itself with a small local CPU model** (bge-small class, 384
+  dims), no external calls; an OpenAI-compatible endpoint can be configured later.
