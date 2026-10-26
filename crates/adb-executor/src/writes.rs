@@ -112,6 +112,16 @@ pub fn unique_keys(memory: MemoryType) -> bool {
     matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
 }
 
+/// Whether a STORE must check its key: a key the caller chose (`key` / `id`, or
+/// PROCEDURAL's `pattern_id`). Without one the planner made a fresh ULID, which
+/// can't collide — and checking means waiting for the applier and scanning Lance.
+fn caller_keyed(memory: MemoryType, payload: &serde_json::Value) -> bool {
+    unique_keys(memory)
+        && (payload.get("key").is_some()
+            || payload.get("id").is_some()
+            || (memory == MemoryType::Procedural && payload.get("pattern_id").is_some()))
+}
+
 fn key_exists(memory: MemoryType, key: &str) -> AdbError {
     AdbError::KeyExists { memory_type: format!("{memory:?}").to_uppercase(), key: key.to_string() }
 }
@@ -146,7 +156,7 @@ impl Writes for DirectWrites {
         in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord> {
         check_scope(memory_type, in_scope, false)?;
-        if unique_keys(memory_type) {
+        if caller_keyed(memory_type, &payload) {
             let id = Adb::store_id(memory_type, key, &payload);
             if backend_has(&self.0, memory_type, &id).await? {
                 return Err(key_exists(memory_type, &id));
@@ -226,18 +236,42 @@ pub struct DurableWrites<L: Log> {
     subs: Arc<Registry>,
     /// Platform tables (stage G), applied synchronously.
     platform: Option<Arc<adb_platform::PlatformStore>>,
+    /// The live keys of SEMANTIC / EPISODIC / PROCEDURAL (D3 S4 key check), with
+    /// their TTL: built from Lance at open, kept by the writes below under the
+    /// sequencer lock. Checking a key in Lance instead costs a read per STORE.
+    live: std::sync::Mutex<LiveKeys>,
 }
 
+pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
+
 impl<L: Log + 'static> DurableWrites<L> {
+    fn key_taken(&self, memory: Memory, key: &str, now: CommitTs) -> bool {
+        let live = self.live.lock().unwrap();
+        live.get(&(memory, key.to_string())).is_some_and(|ttl| ttl.is_none_or(|t| t > now))
+    }
+
+    fn keys_gone(&self, effects: &[Effect]) {
+        let mut live = self.live.lock().unwrap();
+        for e in effects {
+            if let Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } = e {
+                live.remove(&(*memory, lineage_id.0.clone()));
+            }
+        }
+    }
     /// Replay `log` into `adb`, bring `store` up to the log's end, then accept new
     /// writes on top of both.
     pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>, store: Option<Arc<PartitionStore>>) -> AdbResult<(Self, ReplayStats)> {
+        let mut live = LiveKeys::new();
         let stats = match &store {
             // Stage D3: no full log replay. Lance catches up from the log's tail, then
             // the in-memory tier is rebuilt from Lance's current rows.
             Some(s) => {
+                let t = std::time::Instant::now();
                 let store_caught_up = catch_up(s, seq.log()).await?;
-                let hydrated_rows = hydrate(&adb, s).await?;
+                let caught_up_in = t.elapsed();
+                let (hydrated_rows, keys) = hydrate(&adb, s).await?;
+                live = keys;
+                tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
                 let last_offset = seq.log().last_offset();
                 let last_commit_ts = match last_offset.0 {
                     0 => None,
@@ -258,7 +292,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             Some(s) => Registry::load(s, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?,
             None => Registry::default(),
         };
-        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None }, stats))
+        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live) }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -350,6 +384,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let effects: Vec<Effect> =
             due.into_iter().map(|(memory, key)| Effect::Expire { memory, lineage_id: RecordId(key) }).collect();
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        self.keys_gone(&effects);
         // WORKING / TOOLS live in memory too: drop them there as replay would.
         for effect in &effects {
             if let Effect::Expire { memory, .. } = effect {
@@ -483,19 +518,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let ts = seq.begin();
         let id = RecordId(Adb::store_id(memory_type, key, &payload));
         // Checked under the sequencer lock, so two STOREs of one key can't both pass.
-        if unique_keys(memory_type) {
+        if caller_keyed(memory_type, &payload) {
             let taken = match self.in_lance(memory_type) {
-                Some(store) => {
-                    // Every earlier record is in Lance first.
-                    if let Some(b) = self.barrier() {
-                        b.wait_for_committed().await;
-                    }
-                    store
-                        .current_version(memory_type.into(), &id.0, ts)
-                        .await
-                        .map_err(|e| AdbError::Internal(format!("store: {e}")))?
-                        .is_some()
-                }
+                Some(_) => self.key_taken(memory_type.into(), &id.0, ts),
                 None => time::at(ts.to_datetime(), backend_has(&self.adb, memory_type, &id.0)).await?,
             };
             if taken {
@@ -516,6 +541,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             _ => Effect::PutEntity(new.clone()),
         };
         let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        if unique_keys(memory_type) && self.store.is_some() {
+            self.live.lock().unwrap().insert((memory_type.into(), new.lineage_id.0.clone()), new.data.ttl_at);
+        }
         let stored = match self.in_lance(memory_type) {
             // Lance is the only copy (D4.4a): answer with the record as the
             // memory type's backend shapes it, without keeping it in memory.
@@ -581,6 +609,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let effects: Vec<Effect> =
             ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        self.keys_gone(&effects);
         let mut removed = 0;
         if self.in_lance(memory_type).is_some() {
             removed = ids.len() as u64;
@@ -737,10 +766,17 @@ pub struct ReplayStats {
 /// rows (stage D3), so startup needs only the log's tail, not all of it. WORKING is
 /// put in place as rebuilt; TOOLS re-runs its `store` at the commit time (the backend
 /// shapes the payload into its own struct). Everything else stays in Lance (D4.4a).
-pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<u64> {
+/// Also returns the live keys of SEMANTIC / EPISODIC / PROCEDURAL (from the same
+/// scan), for the D3 S4 key check.
+pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<(u64, LiveKeys)> {
     let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
     let now = CommitTs::from_datetime(time::now());
     let rows = store.current(None, now).await.map_err(store_err)?;
+    let live: LiveKeys = rows
+        .iter()
+        .filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool) && unique_keys(r.data.memory.into()))
+        .map(|r| ((r.data.memory, r.key().to_string()), r.data.ttl_at))
+        .collect();
     // Only the hot tier: SEMANTIC / EPISODIC / PROCEDURAL records and every link
     // are read from Lance (D4.4a).
     let records: Vec<_> = rows
@@ -770,7 +806,7 @@ pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<u64> {
             }
         }
     }
-    Ok(records.len() as u64)
+    Ok((records.len() as u64, live))
 }
 
 /// Rebuild `adb` from every record in `log`, in order.
