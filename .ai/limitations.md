@@ -101,6 +101,24 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | W2-L10 | **Agent Sandbox doesn't roll a pod when its Sandbox template changes** (new image, env): the old pod keeps running (or failing) until it is deleted. | After changing the runtime image / `A3T_RUNTIME_ENV_*` / a Runtime CR's image, delete the `cv-*` / `rt-*` pods. | Controller stamps a template hash and replaces the pod (or Sandbox) when it changes. |
 | W2-L9 | **Runtime pods' inbound API**: they run FlowR EE with the console's policy hook / OIDC settings via the controller's `A3T_RUNTIME_ENV_*`, but nothing calls them; a runtime's `/message` endpoint can still write the shared registry for a caller with a valid token. | Same trust as the console. | A runtime mode that serves only `/health`. |
 
+## AQL / Graph (links)
+
+What links give today (26 Oct): typed, weighted, directed edges between records of any
+memory type; `LINK`, `UPDATE LINK`, `UNLINK` (v0.7), versioned, forgotten with their
+records, delivered to subscribers; one-hop reads `WITH LINKS ALL | TYPE`, `FOLLOW LINKS
+TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| GR-1 | **`FOLLOW LINKS … DEPTH n` is parsed but ignored**: ADB always stops at one hop (a→b→c→d, DEPTH 1–3 all return `b`). A bug against the grammar. | No multi-hop traversal. | Breadth-first, cycle-safe, capped (e.g. 5), each record once. Small, no grammar change. |
+| GR-2 | **Outgoing links only**: no "who links *to* this record". | Reverse questions need the link stored the other way. | AQL addition, e.g. `FOLLOW LINKS TYPE "t" INBOUND`; edge targets are already stored (`object_id`). |
+| GR-3 | **No conditions on links** beyond `TYPE`: no `weight > x`, no order by weight, no edge properties. | Can't prefer strong links. | AQL addition: `MIN_WEIGHT w` on `FOLLOW` / `WITH LINKS`, results by link weight. |
+| GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | Only if a use case needs it (post-MVP). |
+| GR-5 | **N+1 reads**: one Lance scan per record and per link (P4). | Slow on hubs with many links. | One join over edge rows with the DataFusion query engine (W7). |
+| GR-6 | **Agents don't use links**: FlowR's memory phase never follows them into the prompt. | Links help AQL users, not chat agents. | Link weight as a ranking signal in hybrid recall (W4 T10), related facts pulled in. |
+| GR-7 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record** (L6). | Use `RECALL … WHERE … FOLLOW LINKS`. | With GR-1. |
+| GR-8 | **The WASM playground's built `pkg/` predates v0.6 / v0.7** (source updated; no wasm-pack here). | The browser playground rejects the new statements. | `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
+
 ## Recall (W4)
 
 | # | Limitation | Effect | Revisit |
