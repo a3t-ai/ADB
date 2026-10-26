@@ -270,9 +270,9 @@ impl EpisodicBackend {
         // Apply ORDER BY
         if let Some(ref order_by) = modifiers.order_by {
             results.sort_by(|a, b| {
-                let a_val = a.data.get(&order_by.field);
-                let b_val = b.data.get(&order_by.field);
-                let cmp = compare_json_values(a_val, b_val);
+                let a_val = a.order_value(&order_by.field);
+                let b_val = b.order_value(&order_by.field);
+                let cmp = compare_json_values(a_val.as_ref(), b_val.as_ref());
                 if order_by.ascending {
                     cmp
                 } else {

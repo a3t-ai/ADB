@@ -447,7 +447,8 @@ impl Backend for ProceduralBackend {
         // insertion order, which differs after a restart.
         if let Some(ref order_by) = modifiers.order_by {
             results.sort_by(|a, b| {
-                let cmp = match (a.data.get(&order_by.field), b.data.get(&order_by.field)) {
+                let (va, vb) = (a.order_value(&order_by.field), b.order_value(&order_by.field));
+                let cmp = match (va.as_ref(), vb.as_ref()) {
                     (Some(a), Some(b)) => crate::semantic::compare_json_values(a, b),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,

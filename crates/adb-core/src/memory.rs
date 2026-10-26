@@ -188,6 +188,22 @@ pub struct MemoryRecord {
 }
 
 impl MemoryRecord {
+    /// The value `ORDER BY field` sorts on: the payload's `field`, else the
+    /// record's own `created_at` / `accessed_at` (also `updated_at`) as epoch
+    /// microseconds, or `version` — so `ORDER BY created_at DESC` (the MCP guide's
+    /// recency query) works on records that don't carry the field themselves.
+    pub fn order_value(&self, field: &str) -> Option<serde_json::Value> {
+        if let Some(v) = self.data.get(field) {
+            return Some(v.clone());
+        }
+        match field.strip_prefix("metadata.").unwrap_or(field) {
+            "created_at" => Some(self.metadata.created_at.timestamp_micros().into()),
+            "accessed_at" | "updated_at" => Some(self.metadata.accessed_at.timestamp_micros().into()),
+            "version" => Some(self.metadata.version.into()),
+            _ => None,
+        }
+    }
+
     /// Create a new memory record
     pub fn new(
         id: impl Into<String>,

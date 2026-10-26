@@ -533,3 +533,27 @@ async fn store_refuses_a_key_in_use() {
     seed(&mem).await;
     check(&mem, "in-memory").await;
 }
+
+/// `ORDER BY created_at` sorts on the record's own commit time when the payload
+/// has no such field (the MCP guide's recency query), live and after a restart.
+#[tokio::test]
+async fn order_by_created_at_uses_the_records_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = |v: Value| -> Vec<String> { v["data"]["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect() };
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        for k in ["o1", "o2", "o3"] {
+            engine.query(&format!(r#"STORE INTO SEMANTIC (key = "{k}", content = "renews {k}")"#), None).await.unwrap();
+            engine.query(&format!(r#"STORE INTO EPISODIC (key = "{k}", content = "event {k}")"#), None).await.unwrap();
+        }
+        for m in ["SEMANTIC", "EPISODIC"] {
+            let r = engine.query(&format!("RECALL FROM {m} ALL ORDER BY created_at DESC"), None).await.unwrap();
+            assert_eq!(ids(r), ["o3", "o2", "o1"], "{m} newest first");
+        }
+        let r = engine.query(r#"RECALL FROM SEMANTIC WHERE content CONTAINS "renews" ORDER BY created_at ASC LIMIT 2"#, None).await.unwrap();
+        assert_eq!(ids(r), ["o1", "o2"]);
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let r = engine.query("RECALL FROM SEMANTIC ALL ORDER BY created_at DESC", None).await.unwrap();
+    assert_eq!(ids(r), ["o3", "o2", "o1"], "after a restart");
+}

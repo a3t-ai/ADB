@@ -140,9 +140,9 @@ impl WorkingBackend {
         // Apply ORDER BY
         if let Some(order_by) = &modifiers.order_by {
             records.sort_by(|a, b| {
-                let va = a.get(&order_by.field);
-                let vb = b.get(&order_by.field);
-                let cmp = compare_json_values(va, vb);
+                let va = a.order_value(&order_by.field);
+                let vb = b.order_value(&order_by.field);
+                let cmp = compare_json_values(va.as_ref(), vb.as_ref());
                 if order_by.ascending {
                     cmp
                 } else {
