@@ -101,6 +101,10 @@ pub enum Operation {
     Forget,
     /// Create a link between records
     Link,
+    /// Change the weight / type of existing links (AQL v0.7 UPDATE LINK)
+    UpdateLink,
+    /// Remove links (AQL v0.7 UNLINK)
+    Unlink,
 }
 
 impl std::fmt::Display for Operation {
@@ -114,6 +118,8 @@ impl std::fmt::Display for Operation {
             Self::Update => write!(f, "UPDATE"),
             Self::Forget => write!(f, "FORGET"),
             Self::Link => write!(f, "LINK"),
+            Self::UpdateLink => write!(f, "UPDATE LINK"),
+            Self::Unlink => write!(f, "UNLINK"),
         }
     }
 }
@@ -198,6 +204,12 @@ pub struct LinkData {
     pub link_type: String,
     /// Link weight
     pub weight: f32,
+    /// UPDATE LINK / UNLINK: only links of this type (`None`: every type)
+    pub type_filter: Option<String>,
+    /// UPDATE LINK: the new weight; LINK: the weight as written (`None`: no WEIGHT)
+    pub set_weight: Option<f32>,
+    /// UPDATE LINK: the new type
+    pub set_type: Option<String>,
 }
 
 impl StepPlan {
@@ -283,6 +295,11 @@ impl StepPlan {
         }
     }
 
+    /// UPDATE LINK (`unlink` false) or UNLINK (`unlink` true) over `link_data`'s ends.
+    pub fn link_edit(link_data: LinkData, unlink: bool) -> Self {
+        Self { operation: if unlink { Operation::Unlink } else { Operation::UpdateLink }, ..Self::link(link_data) }
+    }
+
     /// Create a new link plan
     pub fn link(link_data: LinkData) -> Self {
         Self {
@@ -319,7 +336,7 @@ impl serde::Serialize for LinkData {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("LinkData", 6)?;
+        let mut state = serializer.serialize_struct("LinkData", 9)?;
         state.serialize_field("from_type", &format!("{:?}", self.from_type))?;
         // Serialize from_predicate conditions as structured data
         state.serialize_field("from_conditions", &predicate_to_conditions(&self.from_predicate))?;
@@ -328,6 +345,9 @@ impl serde::Serialize for LinkData {
         state.serialize_field("to_conditions", &predicate_to_conditions(&self.to_predicate))?;
         state.serialize_field("link_type", &self.link_type)?;
         state.serialize_field("weight", &self.weight)?;
+        state.serialize_field("type_filter", &self.type_filter)?;
+        state.serialize_field("set_weight", &self.set_weight)?;
+        state.serialize_field("set_type", &self.set_type)?;
         state.end()
     }
 }

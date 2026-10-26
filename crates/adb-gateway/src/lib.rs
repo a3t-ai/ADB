@@ -171,8 +171,9 @@ pub trait Lineages: Send + Sync {
 #[async_trait::async_trait]
 impl Lineages for PartitionStore {
     async fn lineage(&self, memory: Memory, key: &str) -> Option<(String, Kind)> {
-        // Tombstoned and superseded versions too: a forget is applied by now.
-        let filter = format!("lineage_id = {} AND {RECORD_KINDS}", sql_str(&row_id(memory, key)));
+        // Tombstoned and superseded versions too: a forget is applied by now. Edges
+        // too: UNLINK forgets an edge's own lineage (AQL v0.7).
+        let filter = format!("lineage_id = {} AND ({RECORD_KINDS} OR kind = 'edge')", sql_str(&row_id(memory, key)));
         self.scan(Some(&filter)).await.ok()?.into_iter().next().map(|r| (r.data.scope, r.data.kind))
     }
 }
@@ -244,7 +245,12 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
             Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
                 let Some((scope, kind)) = lineages.lineage(*memory, &lineage_id.0).await else { continue };
                 Change {
-                    op: if matches!(effect, Effect::Forget { .. }) { "forget" } else { "expire" }.into(),
+                    op: match (effect, kind) {
+                        (Effect::Forget { .. }, Kind::Edge) => "unlink",
+                        (Effect::Forget { .. }, _) => "forget",
+                        _ => "expire",
+                    }
+                    .into(),
                     memory: Some(*memory),
                     kind,
                     id: lineage_id.0.clone(),

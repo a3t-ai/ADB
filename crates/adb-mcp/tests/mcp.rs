@@ -50,7 +50,7 @@ async fn tool_list_has_clawdb_and_llm_tools() {
     let s = server();
     let r = s.handle(req(1, "tools/list", json!({}))).await.unwrap().result.unwrap();
     let names: Vec<&str> = r["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for t in ["aql_query", "store_memory", "recall_memory", "get_stats", "remember", "recall", "forget", "link"] {
+    for t in ["aql_query", "store_memory", "recall_memory", "get_stats", "remember", "recall", "forget", "link", "unlink"] {
         assert!(names.contains(&t), "missing tool {t}");
     }
 }
@@ -171,4 +171,30 @@ async fn llm_tools_take_a_named_scope() {
     assert_eq!(v["data"]["count"], json!(2), "{v}");
     let (_, v) = call(&s, "forget", json!({"key": "f2", "memory_type": "SEMANTIC", "scope": "agent:1"})).await;
     assert_eq!(v["data"]["count"], json!(0), "forget in another scope: {v}");
+}
+
+/// `link` again with the same type sets the weight; `unlink` removes the link and
+/// keeps both memories (AQL v0.7).
+#[tokio::test]
+async fn link_twice_reweights_and_unlink_removes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = McpServer::new(Arc::new(engine));
+    call(&s, "remember", json!({"content": "restarting fixes OOM", "key": "fix"})).await;
+    call(&s, "remember", json!({"content": "inc", "key": "inc", "memory_type": "episodic"})).await;
+    let ends = json!({"from_type": "SEMANTIC", "from_key": "fix", "to_type": "EPISODIC", "to_key": "inc", "link_type": "applied_to"});
+    for w in [0.5, 0.8] {
+        let mut a = ends.clone();
+        a["weight"] = json!(w);
+        let (err, v) = call(&s, "link", a).await;
+        assert!(!err, "{v}");
+    }
+    let (_, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "fix" WITH LINKS ALL"#})).await;
+    let links = v["data"]["records"][0]["data"]["links"].as_array().cloned().unwrap_or_default();
+    assert_eq!(links.len(), 1, "{v}");
+    assert!((links[0]["weight"].as_f64().unwrap() - 0.8).abs() < 1e-6, "{v}");
+    let (err, v) = call(&s, "unlink", ends).await;
+    assert!(!err && v["data"]["count"] == json!(1), "{v}");
+    let (_, v) = call(&s, "recall", json!({"memory_type": "EPISODIC"})).await;
+    assert_eq!(v["data"]["count"], json!(1), "the memories stay: {v}");
 }

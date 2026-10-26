@@ -81,7 +81,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "link",
-            "description": "Link two memories, e.g. a fix (PROCEDURAL) applied to an incident (EPISODIC). Both are found by their key.",
+            "description": "Link two memories, e.g. a fix (PROCEDURAL) applied to an incident (EPISODIC). Both are found by their key. Linking the same two memories with the same link_type again sets that link's weight.",
             "inputSchema": { "type": "object", "properties": {
                 "from_type": with_desc(&mt, "Memory type of the source"),
                 "from_key": { "type": "string" },
@@ -90,6 +90,17 @@ pub fn tool_list() -> Value {
                 "link_type": { "type": "string", "description": "Relationship, e.g. \"applied_to\"" },
                 "weight": { "type": "number", "description": "Strength 0–1 (optional)" }
             }, "required": ["from_type", "from_key", "to_type", "to_key", "link_type"] }
+        },
+        {
+            "name": "unlink",
+            "description": "Remove the link between two memories (only links of `link_type`, if given); both memories stay.",
+            "inputSchema": { "type": "object", "properties": {
+                "from_type": with_desc(&mt, "Memory type of the source"),
+                "from_key": { "type": "string" },
+                "to_type": with_desc(&mt, "Memory type of the target"),
+                "to_key": { "type": "string" },
+                "link_type": { "type": "string", "description": "Only this relationship (optional; default: every link between them)" }
+            }, "required": ["from_type", "from_key", "to_type", "to_key"] }
         },
         {
             "name": "subscribe",

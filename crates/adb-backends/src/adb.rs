@@ -340,6 +340,55 @@ impl Adb {
             .await
     }
 
+    /// The links from any of `from_ids` to any of `to_ids` (of `link_type`, if given).
+    pub async fn links_between(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+    ) -> AdbResult<Vec<Link>> {
+        let mut out = Vec::new();
+        for from in from_ids {
+            for l in self.links.get_links_from(from_type, from, link_type).await? {
+                if l.to_type == to_type && to_ids.contains(&l.to_id) {
+                    out.push(l);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// AQL v0.7 UPDATE LINK: set the weight and/or type of those links. Returns how many.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_links(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+        weight: Option<f32>,
+        new_type: Option<&str>,
+    ) -> AdbResult<u64> {
+        let links = self.links_between(from_type, from_ids, to_type, to_ids, link_type).await?;
+        Ok(links.iter().filter(|l| self.links.set_link(&l.id, new_type, weight)).count() as u64)
+    }
+
+    /// AQL v0.7 UNLINK: remove those links; the records stay. Returns how many.
+    pub async fn unlink(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+    ) -> AdbResult<u64> {
+        let links = self.links_between(from_type, from_ids, to_type, to_ids, link_type).await?;
+        Ok(links.iter().filter(|l| self.links.remove_link(&l.id)).count() as u64)
+    }
+
     /// Get links from a record
     pub async fn get_links_from(
         &self,

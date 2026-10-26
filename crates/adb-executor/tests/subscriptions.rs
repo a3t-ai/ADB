@@ -236,3 +236,59 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
     let mem = LocalEngine::default();
     assert!(mem.query(r#"STORE INTO SEMANTIC (k = 1) IN SCOPE "team:x""#, None).await.is_err(), "in-memory engine refuses IN SCOPE");
 }
+
+/// AQL v0.7: UPDATE LINK makes a new version of the edge, UNLINK tombstones it;
+/// a repeated LINK of the same type updates the weight. All of it survives a
+/// restart and reaches a scope subscriber; the records at either end stay. The
+/// in-memory engine gives the same answers.
+#[tokio::test]
+async fn link_update_and_unlink() {
+    let links = |v: &Value| -> Vec<(String, f64)> {
+        v["data"]["records"][0]["data"]["links"].as_array().cloned().unwrap_or_default().iter()
+            .map(|l| (l["link_type"].as_str().unwrap().to_string(), (l["weight"].as_f64().unwrap() * 100.0).round() / 100.0))
+            .collect()
+    };
+    async fn script(engine: &LocalEngine) {
+        for aql in [
+            r#"STORE INTO SEMANTIC (key = "a", concept = "a")"#,
+            r#"STORE INTO EPISODIC (key = "e", concept = "e")"#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "evidence" WEIGHT 0.5"#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "evidence" WEIGHT 0.6"#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "mentions" WEIGHT 0.2"#,
+            r#"UPDATE LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "evidence" (type = "proof", weight = 0.9)"#,
+        ] {
+            q(engine, aql).await;
+        }
+    }
+    let with_links = r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL"#;
+    let dir = tempfile::tempdir().unwrap();
+    let sub;
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        sub = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default" KINDS edge"#).await;
+        script(&engine).await;
+        let mut l = links(&q(&engine, with_links).await);
+        l.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(l, [("mentions".to_string(), 0.2), ("proof".to_string(), 0.9)], "one evidence link, retyped and reweighted");
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let mut l = links(&q(&engine, with_links).await);
+    l.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(l, [("mentions".to_string(), 0.2), ("proof".to_string(), 0.9)], "after a restart");
+    let r = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "mentions""#).await;
+    assert_eq!(r["data"]["count"], 1, "{r}");
+    let r = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e""#).await;
+    assert_eq!(r["data"]["count"], 1, "{r}");
+    assert!(links(&q(&engine, with_links).await).is_empty());
+    assert_eq!(q(&engine, r#"RECALL FROM EPISODIC WHERE key = "e""#).await["data"]["count"], 1, "the records stay");
+    let gw = engine.gateway().unwrap();
+    let ops: Vec<String> = drain(&gw, &sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| c.op.clone())).collect();
+    assert_eq!(ops, ["link", "supersede", "link", "supersede", "unlink", "unlink"], "LINK, re-LINK, LINK, UPDATE LINK, UNLINK ×2");
+
+    let mem = LocalEngine::default();
+    script(&mem).await;
+    let mut l = links(&q(&mem, with_links).await);
+    l.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(l, [("mentions".to_string(), 0.2), ("proof".to_string(), 0.9)], "in-memory engine");
+    assert_eq!(q(&mem, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e""#).await["data"]["count"], 2);
+}

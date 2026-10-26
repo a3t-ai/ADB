@@ -59,6 +59,19 @@ impl Planner {
             Statement::Update(u) => Ok(ExecutionPlan::Single(self.plan_update(u)?)),
             Statement::Forget(f) => self.plan_forget(f),
             Statement::Link(l) => Ok(ExecutionPlan::Single(self.plan_link(l)?)),
+            // AQL v0.7 — change or remove existing links
+            Statement::UpdateLink(u) => {
+                let mut d = self.link_ends(u.from_type, &u.from_conditions, u.to_type, &u.to_conditions, "UPDATE LINK")?;
+                d.type_filter = u.link_type.clone();
+                d.set_weight = u.weight;
+                d.set_type = u.new_type.clone();
+                Ok(ExecutionPlan::Single(StepPlan::link_edit(d, false)))
+            }
+            Statement::Unlink(u) => {
+                let mut d = self.link_ends(u.from_type, &u.from_conditions, u.to_type, &u.to_conditions, "UNLINK")?;
+                d.type_filter = u.link_type.clone();
+                Ok(ExecutionPlan::Single(StepPlan::link_edit(d, true)))
+            }
             // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
             Statement::Subscribe(s) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
                 target: match &s.target {
@@ -328,6 +341,35 @@ impl Planner {
     }
 
     /// Plan a link statement
+    /// The ends UPDATE LINK and UNLINK address, as `LinkData` (no type or weight yet).
+    fn link_ends(
+        &self,
+        from: aql_parser::ast::MemoryType,
+        from_conditions: &[aql_parser::ast::Condition],
+        to: aql_parser::ast::MemoryType,
+        to_conditions: &[aql_parser::ast::Condition],
+        verb: &str,
+    ) -> PlanResult<LinkData> {
+        let from_type = convert_memory_type(from)
+            .map_err(|_| PlanError::InvalidMemoryType(format!("ALL cannot be used as {verb} source memory type")))?;
+        let to_type = convert_memory_type(to)
+            .map_err(|_| PlanError::InvalidMemoryType(format!("ALL cannot be used as {verb} target memory type")))?;
+        let conditions = |c: &[aql_parser::ast::Condition]| -> PlanResult<CorePredicate> {
+            Ok(CorePredicate::Where { conditions: c.iter().map(convert_condition).collect::<PlanResult<Vec<_>>>()? })
+        };
+        Ok(LinkData {
+            from_type,
+            from_predicate: conditions(from_conditions)?,
+            to_type,
+            to_predicate: conditions(to_conditions)?,
+            link_type: String::new(),
+            weight: 1.0,
+            type_filter: None,
+            set_weight: None,
+            set_type: None,
+        })
+    }
+
     fn plan_link(&self, stmt: &LinkStmt) -> PlanResult<StepPlan> {
         let from_type = convert_memory_type(stmt.from_type).map_err(|_| {
             PlanError::InvalidMemoryType("ALL cannot be used as LINK source memory type".to_string())
@@ -359,6 +401,10 @@ impl Planner {
             to_predicate,
             link_type: stmt.link_type.clone(),
             weight: stmt.weight.unwrap_or(1.0),
+            type_filter: None,
+            // As written: a repeated LINK without WEIGHT keeps the link's weight.
+            set_weight: stmt.weight,
+            set_type: None,
         };
 
         Ok(StepPlan::link(link_data))

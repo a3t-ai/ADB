@@ -1,0 +1,16 @@
+[package]
+name = "adb-embed"
+version.workspace = true
+edition.workspace = true
+description = "ADB's local text embeddings (W4): bge-small-en-v1.5 on ONNX Runtime, CPU"
+
+[dependencies]
+# ONNX Runtime is fetched at build time (pyke's prebuilt binaries); the model is a
+# directory of files, loaded from disk (no Hugging Face access at runtime).
+fastembed = { version = "7.5", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
+half.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

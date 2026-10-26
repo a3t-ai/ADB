@@ -160,6 +160,30 @@ impl LinkStore {
         link
     }
 
+    /// Change a link's type and/or weight (AQL v0.7 UPDATE LINK). False if unknown.
+    pub fn set_link(&self, link_id: &str, link_type: Option<&str>, weight: Option<f32>) -> bool {
+        let Some(old) = self.by_id.get(link_id).map(|l| l.value().clone()) else { return false };
+        let mut new = old.clone();
+        if let Some(t) = link_type {
+            new.link_type = t.to_string();
+        }
+        if let Some(w) = weight {
+            new.weight = w;
+        }
+        self.unindex_link(&old);
+        self.index_link(&new);
+        self.by_id.insert(link_id.to_string(), new);
+        true
+    }
+
+    /// Remove one link (AQL v0.7 UNLINK). False if unknown.
+    pub fn remove_link(&self, link_id: &str) -> bool {
+        let Some((_, link)) = self.by_id.remove(link_id) else { return false };
+        self.unindex_link(&link);
+        self.link_count.fetch_sub(1, Ordering::SeqCst);
+        true
+    }
+
     pub fn type_stats(&self) -> HashMap<String, usize> {
         self.by_type
             .iter()

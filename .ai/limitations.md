@@ -125,6 +125,8 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | Procedural `ORDER BY` / `RETURN` ignored | `18f7a25` (D4.2) |
 | `UPDATE` overwrote facts in place (no history) | `4003984` (D4.3) |
 | `FORGET` missed values only in old versions (D2 T5) | `b367ac4` (D4.4a) |
+| Links couldn't be changed or removed (LINK again added a parallel link) | 26 Oct: AQL v0.7 `UPDATE LINK` / `UNLINK`, re-LINK updates the weight; MCP `unlink`; subscribers get `supersede` / `unlink` of kind `edge` |
+| `ORDER BY created_at` ignored on SEMANTIC (sorted on payload fields only) | `9bcec26` |
 | L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |
 | E-L6: every row had scope `tenant:default` | W3 (26 Oct): `IN SCOPE` on STORE / RECALL / LOOKUP / UPDATE / FORGET, MCP `scope` |
 | L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |

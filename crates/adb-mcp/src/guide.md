@@ -37,6 +37,9 @@ Rules of thumb:
 - Store a `key` field on records you will want to update, link or forget later.
   A key is unique per memory type: `STORE` with a key in use fails with
   `key_exists` (use `UPDATE`, or the `remember` tool, which updates it).
+- Links: `LINK` the same two records with the same `TYPE` again to change its weight;
+  `UPDATE LINK FROM … TO … [TYPE "t"] WEIGHT 0.9` or `(weight = 0.9, type = "new")`
+  changes links in place; `UNLINK FROM … TO … [TYPE "t"]` removes them (records stay).
 - `IN SCOPE "team:billing"` (or `"agent:42"`) puts a SEMANTIC / EPISODIC /
   PROCEDURAL record in a named scope, or limits a read, update or forget to it:
   `RECALL FROM SEMANTIC IN SCOPE "team:billing" WHERE account = "acct-9"`.

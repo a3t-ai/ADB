@@ -111,6 +111,7 @@ impl McpServer {
             "recall" => self.run(recall(&args)).await,
             "forget" => self.run(forget(&args)).await,
             "link" => self.run(link(&args)).await,
+            "unlink" => self.run(unlink(&args)).await,
             "subscribe" => self.run(subscribe(&args)).await,
             "publish" => self.run(publish(&args)).await,
             "ack" => self.run(ack(&args)).await,
@@ -356,12 +357,24 @@ fn link(args: &Value) -> Result<String, String> {
     Ok(q)
 }
 
+/// `UNLINK FROM <t> WHERE key = … TO <t> WHERE key = … [TYPE …]` (AQL v0.7).
+fn unlink(args: &Value) -> Result<String, String> {
+    let from_t = memory_type(args, "from_type", None)?;
+    let to_t = memory_type(args, "to_type", None)?;
+    let s = |n: &str| args.get(n).and_then(Value::as_str).ok_or(format!("Missing required: {n}"));
+    let mut q = format!("UNLINK FROM {from_t} WHERE key = {} TO {to_t} WHERE key = {}", quote(s("from_key")?), quote(s("to_key")?));
+    if let Some(t) = args.get("link_type").and_then(Value::as_str) {
+        q.push_str(&format!(" TYPE {}", quote(t)));
+    }
+    Ok(q)
+}
+
 fn resource_list() -> Value {
     json!({ "resources": [
         { "uri": GUIDE_URI, "name": "How to use ADB memory", "mimeType": "text/markdown",
           "description": "Memory types, tools and AQL in brief — read this first" },
         { "uri": GRAMMAR_URI, "name": "AQL grammar", "mimeType": "text/plain",
-          "description": "The full AQL grammar (pest), v0.5 plus v0.6 draft" }
+          "description": "The full AQL grammar (pest), v0.5 plus the v0.6 / v0.7 drafts" }
     ]})
 }
 

@@ -41,7 +41,7 @@ FLOWR="$FLOWR_TARGET/debug/flowr-ce"
 
 step "build adb" bash -c "cd '$ROOT' && cargo build -p adb-cli"
 step "rust tests (workspace)" bash -c "cd '$ROOT' && cargo test --workspace --no-fail-fast"
-step "AQL conformance (116)" bash -c "
+step "AQL conformance (all suites)" bash -c "
     port=\$(python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1])')
     ADB_DATA_DIR='$scratch/conf' RUST_LOG=warn '$ADB' serve-http --port \$port --flight-port 0 & pid=\$!
     for i in \$(seq 1 100); do curl -sf http://127.0.0.1:\$port/health >/dev/null && break; sleep 0.2; done

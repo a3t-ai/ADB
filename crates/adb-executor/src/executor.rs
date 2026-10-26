@@ -133,6 +133,8 @@ impl Executor {
             Operation::Update => self.execute_update(step).await?,
             Operation::Forget => self.execute_forget(step).await?,
             Operation::Link => self.execute_link(step).await?,
+            Operation::UpdateLink => self.execute_link_edit(step, false).await?,
+            Operation::Unlink => self.execute_link_edit(step, true).await?,
         };
 
         let mut result = result;
@@ -595,7 +597,7 @@ impl Executor {
                         .map(|l| {
                             serde_json::json!({
                                 "link_type": l.link_type,
-                                "to_type": format!("{:?}", l.to_type),
+                                "to_type": serde_json::to_value(l.to_type).unwrap_or_default(),
                                 "to_id": l.to_id,
                                 "weight": l.weight
                             })
@@ -648,7 +650,7 @@ impl Executor {
                         .map(|l| {
                             serde_json::json!({
                                 "link_type": l.link_type,
-                                "to_type": format!("{:?}", l.to_type),
+                                "to_type": serde_json::to_value(l.to_type).unwrap_or_default(),
                                 "to_id": l.to_id,
                                 "weight": l.weight
                             })
@@ -808,10 +810,9 @@ impl Executor {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ExecutorError::MissingData("link_type".to_string()))?;
 
-        let weight = data
-            .get("weight")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0) as f32;
+        // `None` when the LINK has no WEIGHT: 1.0 for a new link, unchanged for an
+        // existing one (AQL v0.7 §3).
+        let weight = data.get("set_weight").and_then(|v| v.as_f64()).map(|w| w as f32);
 
         // Parse target memory type
         let to_type_str = data
@@ -867,6 +868,37 @@ impl Executor {
         }
 
         Ok(QueryResult::count(link_count, start.elapsed().as_millis() as u64))
+    }
+
+    /// AQL v0.7 UPDATE LINK (`unlink` false) / UNLINK: the links between the
+    /// matched records, of `type_filter` if given. No matching records → 0, as
+    /// UPDATE and FORGET with no match.
+    async fn execute_link_edit(&self, step: &StepPlan, unlink: bool) -> ExecutorResult<QueryResult> {
+        let start = Instant::now();
+        let data = step.data.as_ref().ok_or_else(|| ExecutorError::MissingData("link data".to_string()))?;
+        let to_type = match data.get("to_type").and_then(|v| v.as_str()) {
+            Some("Working") => MemoryType::Working,
+            Some("Tools") => MemoryType::Tools,
+            Some("Procedural") => MemoryType::Procedural,
+            Some("Semantic") => MemoryType::Semantic,
+            Some("Episodic") => MemoryType::Episodic,
+            other => return Err(ExecutorError::InvalidOperation(format!("Invalid target memory type: {other:?}"))),
+        };
+        let to_predicate = self.build_predicate_from_conditions(data.get("to_conditions"))?;
+        let type_filter = data.get("type_filter").and_then(|v| v.as_str());
+        let ids = |records: Vec<adb_core::MemoryRecord>| records.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let from_ids = ids(self.reads.lookup(step.memory_type, &step.predicate).await?);
+        let to_ids = ids(self.reads.lookup(to_type, &to_predicate).await?);
+        let n = if from_ids.is_empty() || to_ids.is_empty() {
+            0
+        } else if unlink {
+            self.writes.unlink(step.memory_type, &from_ids, to_type, &to_ids, type_filter).await?
+        } else {
+            let weight = data.get("set_weight").and_then(|v| v.as_f64()).map(|w| w as f32);
+            let new_type = data.get("set_type").and_then(|v| v.as_str());
+            self.writes.update_links(step.memory_type, &from_ids, to_type, &to_ids, type_filter, weight, new_type).await?
+        };
+        Ok(QueryResult::count(n, start.elapsed().as_millis() as u64))
     }
 
     /// Build a predicate from serialized conditions array

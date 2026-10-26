@@ -70,8 +70,32 @@ pub trait Writes: Send + Sync {
         to_type: MemoryType,
         to_id: &str,
         link_type: &str,
-        weight: f32,
+        weight: Option<f32>,
     ) -> AdbResult<Link>;
+
+    /// AQL v0.7 UPDATE LINK: set the weight and/or type of the links from any of
+    /// `from_ids` to any of `to_ids` (of `link_type`, if given). Returns how many.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_links(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+        weight: Option<f32>,
+        new_type: Option<&str>,
+    ) -> AdbResult<u64>;
+
+    /// AQL v0.7 UNLINK: remove those links; the records stay. Returns how many.
+    async fn unlink(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+    ) -> AdbResult<u64>;
 
     /// `PUBLISH TOPIC`: a committed `event` row (stage E). Returns its id and offset.
     async fn publish(&self, _topic: &str, _payload: serde_json::Value, _ttl: Option<Duration>) -> AdbResult<(String, u64)> {
@@ -131,6 +155,25 @@ async fn backend_has(adb: &Adb, memory: MemoryType, id: &str) -> AdbResult<bool>
     Ok(!adb.lookup(memory, &Predicate::key("id", id)).await?.is_empty())
 }
 
+fn needs_table(verb: &str) -> AdbError {
+    AdbError::UnsupportedOperation(format!("{verb} (needs the Lance table: a durable engine)"))
+}
+
+/// The next version of edge `cur` with a new type and/or weight. Its ends go back
+/// to the writer's ids (`qualified` adds the memory types again).
+fn edge_version(cur: &adb_store::StoredRow, link_type: Option<&str>, weight: Option<f32>, id: RecordId) -> NewRow {
+    let mut data = cur.data.clone();
+    data.subject_id = data.subject_id.as_deref().map(|s| adb_store::key_of(s).to_string());
+    data.object_id = data.object_id.as_deref().map(|o| adb_store::key_of(o).to_string());
+    if let Some(t) = link_type {
+        data.link_type = Some(t.to_string());
+    }
+    if let Some(w) = weight {
+        data.weight = Some(w);
+    }
+    NewRow { id, lineage_id: RecordId(cur.key().to_string()), version: cur.version + 1, data }
+}
+
 fn needs_log() -> AdbError {
     AdbError::UnsupportedOperation("subscriptions need a durable engine (start ADB with --data-dir)".into())
 }
@@ -182,9 +225,34 @@ impl Writes for DirectWrites {
         to_type: MemoryType,
         to_id: &str,
         link_type: &str,
-        weight: f32,
+        weight: Option<f32>,
     ) -> AdbResult<Link> {
-        self.0.link(from_type, from_id, to_type, to_id, link_type, weight).await
+        // AQL v0.7: the same link again (same ends, same type) sets its weight.
+        let (from, to) = ([from_id.to_string()], [to_id.to_string()]);
+        if let Some(existing) = self.0.links_between(from_type, &from, to_type, &to, Some(link_type)).await?.into_iter().next() {
+            if weight.is_some() {
+                self.0.update_links(from_type, &from, to_type, &to, Some(link_type), weight, None).await?;
+            }
+            return Ok(Link { weight: weight.unwrap_or(existing.weight), ..existing });
+        }
+        self.0.link(from_type, from_id, to_type, to_id, link_type, weight.unwrap_or(1.0)).await
+    }
+
+    async fn update_links(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+        weight: Option<f32>,
+        new_type: Option<&str>,
+    ) -> AdbResult<u64> {
+        self.0.update_links(from_type, from_ids, to_type, to_ids, link_type, weight, new_type).await
+    }
+
+    async fn unlink(&self, from_type: MemoryType, from_ids: &[String], to_type: MemoryType, to_ids: &[String], link_type: Option<&str>) -> AdbResult<u64> {
+        self.0.unlink(from_type, from_ids, to_type, to_ids, link_type).await
     }
 }
 
@@ -245,6 +313,34 @@ pub struct DurableWrites<L: Log> {
 pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
 
 impl<L: Log + 'static> DurableWrites<L> {
+    /// The current edges from any of `from_ids` to any of `to_ids` (of `link_type`,
+    /// if given), after every earlier record is in Lance.
+    #[allow(clippy::too_many_arguments)]
+    async fn edges_between(
+        &self,
+        store: &PartitionStore,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+        ts: CommitTs,
+    ) -> AdbResult<Vec<adb_store::StoredRow>> {
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let targets: std::collections::HashSet<String> = to_ids.iter().map(|t| adb_store::row_id(to_type.into(), t)).collect();
+        let mut out = Vec::new();
+        for from in from_ids {
+            let edges = store
+                .edges_from(from_type.into(), from, link_type, ts)
+                .await
+                .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            out.extend(edges.into_iter().filter(|e| e.data.object_id.as_ref().is_some_and(|o| targets.contains(o))));
+        }
+        Ok(out)
+    }
+
     fn key_taken(&self, memory: Memory, key: &str, now: CommitTs) -> bool {
         let live = self.live.lock().unwrap();
         live.get(&(memory, key.to_string())).is_some_and(|ttl| ttl.is_none_or(|t| t > now))
@@ -629,10 +725,29 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         to_type: MemoryType,
         to_id: &str,
         link_type: &str,
-        weight: f32,
+        weight: Option<f32>,
     ) -> AdbResult<Link> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
+        // AQL v0.7: the same link again (same ends, same type) sets its weight —
+        // a new version of that edge, not a parallel one.
+        if let Some(store) = &self.store {
+            let existing = self
+                .edges_between(store, from_type, &[from_id.to_string()], to_type, &[to_id.to_string()], Some(link_type), ts)
+                .await?;
+            if let Some(cur) = existing.into_iter().next() {
+                if weight.is_none() {
+                    // Nothing to change.
+                    return crate::reads::to_link(&cur).ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
+                }
+                let new = edge_version(&cur, None, weight, seq.new_id(ts));
+                let effect = Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: new.clone() };
+                let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+                self.to_store(&record, seq.log()).await;
+                return crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0))
+                    .ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
+            }
+        }
         let id = seq.new_id(ts);
         let to: Memory = to_type.into();
         let mut data = row(from_type, Kind::Edge, serde_json::json!({ "to_memory": to }));
@@ -642,7 +757,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         data.predicate = Some("link".into());
         data.object_id = Some(to_id.into());
         data.link_type = Some(link_type.into());
-        data.weight = Some(weight);
+        data.weight = Some(weight.unwrap_or(1.0));
         let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
         let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
         // With a table, links are read from its edge rows only (D4.1, D4.4a).
@@ -653,6 +768,50 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         self.to_store(&record, seq.log()).await;
         Ok(link)
+    }
+
+    async fn update_links(
+        &self,
+        from_type: MemoryType,
+        from_ids: &[String],
+        to_type: MemoryType,
+        to_ids: &[String],
+        link_type: Option<&str>,
+        weight: Option<f32>,
+        new_type: Option<&str>,
+    ) -> AdbResult<u64> {
+        let Some(store) = &self.store else { return Err(needs_table("UPDATE LINK")) };
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let edges = self.edges_between(store, from_type, from_ids, to_type, to_ids, link_type, ts).await?;
+        if edges.is_empty() {
+            return Ok(0);
+        }
+        let effects: Vec<Effect> = edges
+            .iter()
+            .map(|cur| Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: edge_version(cur, new_type, weight, seq.new_id(ts)) })
+            .collect();
+        let n = effects.len() as u64;
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(n)
+    }
+
+    async fn unlink(&self, from_type: MemoryType, from_ids: &[String], to_type: MemoryType, to_ids: &[String], link_type: Option<&str>) -> AdbResult<u64> {
+        let Some(store) = &self.store else { return Err(needs_table("UNLINK")) };
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let edges = self.edges_between(store, from_type, from_ids, to_type, to_ids, link_type, ts).await?;
+        if edges.is_empty() {
+            return Ok(0);
+        }
+        // An edge's own lineage: FORGET of it tombstones every version of the edge.
+        let effects: Vec<Effect> =
+            edges.iter().map(|e| Effect::Forget { memory: e.data.memory, lineage_id: RecordId(e.key().to_string()) }).collect();
+        let n = effects.len() as u64;
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(n)
     }
 
     async fn publish(&self, topic: &str, payload: serde_json::Value, ttl: Option<Duration>) -> AdbResult<(String, u64)> {
