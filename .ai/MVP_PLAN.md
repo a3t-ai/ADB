@@ -94,3 +94,10 @@ new template. The `worker` Runtime CR pinned `flowr:2026-08-08-ee` (gone from GH
 | P8 shared fsync | Measured instead: the WAL already group-commits; ~1,000 writes/s with 16 writers in debug. Pending overlay deferred (P8) | — |
 
 Open from W3: keys per (scope, memory) (E-L12), topic-message expiry events (E-L10).
+
+Rolled 26 Oct ~21:08: `adb:2026-10-26-w3`, `flowr:2026-10-26-ee5` (console and runtime
+image), `a3t-controller:2026-10-26-d`. Auth is wired but **off until the Secret
+`adb-auth` exists** (every reference is `optional`): ADB `ADB_AUTH_TOKEN`; console
+`ADB_AUTH_TOKEN` + `ADB_AUTH_URLS`; runtimes via `A3T_RUNTIME_SECRET_ENV_ADB_AUTH_TOKEN`
+and `A3T_RUNTIME_ENV_ADB_AUTH_URLS`. The user creates the Secret (the auto-mode
+classifier blocks secret writes), then restarts adb, flowr and the runtime pods.
