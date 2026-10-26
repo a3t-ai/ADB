@@ -54,11 +54,11 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | E-L3 | **An abandoned subscription pins the log** (purge keeps everything after the oldest cursor, up to the 100k-record cap). | Up to 100k extra log records kept per partition. | Subscription idle TTL / auto-expiry. |
 | E-L4 | **Every `ACK` is a log record.** | Log volume with many subscribers acking often. | Batch cursors (one effect, many subscriptions) or gateway-held cursors (spec open question). |
 | E-L5 | **No authorization at registration or delivery** (ADB has no credentials yet). | Anyone who can reach ADB can subscribe to any topic or scope. | §14.4 auth, with the SaaS control plane. |
-| E-L6 | **Every row has scope `tenant:default`**, so `SUBSCRIBE SCOPE` can only mean "everything". | Scope subscriptions can't be narrowed by team / agent yet. | Named scopes on STORE (`IN SCOPE …`). |
 | E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | With CQ watch sets (M2). |
 | E-L8 | **A patch / forget delivery looks up the record's scope and kind in Lance**; if compaction ever removes all its rows, the change is skipped. | Only matters once compaction exists (D5 / M2). | Carry scope in `Patch` / `Forget` effects. |
 | E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. FlowR has no topic *trigger* yet. | Agents poll; flows can't start on a message. | FlowR wiring (stage F). |
 | E-L10 | **Topic messages' TTL is a read filter only**: the expiry timer (L3, fixed) commits `Expire` for memory records, not for `event` rows. | Subscribers aren't told a message expired. | Expire events with compaction (W5). |
+| E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | Scope in the row id (schema v4) with tenancy (M4). |
 | E-L11 | **The expiry timer scans for due rows every second** (a Lance scan with `ttl_at IS NOT NULL`). | Cost grows with TTL'd rows awaiting expiry. | A timer wheel fed by STORE … TTL and seeded at open. |
 
 ## FlowR wiring (stage F)
@@ -119,4 +119,5 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | `UPDATE` overwrote facts in place (no history) | `4003984` (D4.3) |
 | `FORGET` missed values only in old versions (D2 T5) | `b367ac4` (D4.4a) |
 | L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |
+| E-L6: every row had scope `tenant:default` | W3 (26 Oct): `IN SCOPE` on STORE / RECALL / LOOKUP / UPDATE / FORGET, MCP `scope` |
 | L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |
