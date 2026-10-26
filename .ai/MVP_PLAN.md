@@ -82,3 +82,15 @@ workflows, 28 resources, 32 agent-state rows); `a3t-controller:2026-10-26-b`.
 The Agent Sandbox controller doesn't replace a sandbox pod that failed (the 25 Oct
 evictions): delete the failed `cv-*` / `rt-worker` pods once so they come back on the
 new template. The `worker` Runtime CR pinned `flowr:2026-08-08-ee` (gone from GHCR); patched to the ee4 image.
+
+## W3 as built (26 Oct)
+
+| Item | What | Commit |
+|---|---|---|
+| L2 key uniqueness | `STORE` with a key in use in SEMANTIC / EPISODIC / PROCEDURAL fails with `key_exists`; WORKING / TOOLS replace (user, 26 Oct). MCP `remember` on a used key updates it (user); `store_memory` refuses. Checked from an in-memory live-key index (a Lance read per STORE cost 60 ms in debug) | `cd87d12`, `4a7f706` |
+| L3 TTL expiry | The durable engine's 1 s timer commits `Expire` for records whose TTL passed; subscribers get `expire` | `cd87d12` |
+| E-L6 named scopes | `IN SCOPE "team:billing"` on STORE / RECALL / LOOKUP / UPDATE / FORGET (SEMANTIC, EPISODIC, PROCEDURAL; refused elsewhere); `SUBSCRIBE SCOPE` narrows; MCP `scope` | `c4feb00` |
+| G-L1 auth | `ADB_AUTH_TOKEN`: HTTP (all but `/health`) and Flight need `Authorization: Bearer`; FlowR sends `ADB_AUTH_TOKEN` only to `ADB_AUTH_URLS` prefixes; runtimes get it by `secretKeyRef` (`A3T_RUNTIME_SECRET_ENV_*`) | `c4261ba`, flowr `90a933d` |
+| P8 shared fsync | Measured instead: the WAL already group-commits; ~1,000 writes/s with 16 writers in debug. Pending overlay deferred (P8) | — |
+
+Open from W3: keys per (scope, memory) (E-L12), topic-message expiry events (E-L10).
