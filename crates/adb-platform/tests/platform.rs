@@ -63,12 +63,19 @@ async fn call_lancedb_semantics() {
     assert!(s.query("nope", None, 10).await.is_err());
     assert!(s.validate(&Effect::TableDelete { table: "nope".into(), filter: "id = 'x'".into() }).await.is_err());
     assert!(s.validate(&Effect::TableInsert { table: "../etc".into(), rows: vec![] }).await.is_err());
-    assert_eq!(s.applied_offset().await, 5);
+    assert!(s.validate(&insert("template_registry", json!([{"id": "t9", "colour": "teal"}]))).await.is_err(), "unknown column");
+    assert!(s.validate(&Effect::TableUpdate { table: "template_registry".into(), filter: "id = 't2'".into(), values: vec![("colour".into(), "'x'".into())] }).await.is_err());
+    assert!(s.validate(&Effect::TableDelete { table: "template_registry".into(), filter: "id = = 'x'".into() }).await.is_err(), "bad filter");
+    // A row without some columns is fine: they are null.
+    s.apply(&rec(6, vec![insert("template_registry", json!([{"id": "t4", "org_id": "org-default"}]))])).await.unwrap();
+    assert_eq!(select(&s, "template_registry", Some("id = 't4'")).await[0].get("name"), None);
+    s.apply(&rec(7, vec![Effect::TableDelete { table: "template_registry".into(), filter: "id = 't4'".into() }])).await.unwrap();
+    assert_eq!(s.applied_offset().await, 7);
 
     // Reopen: everything is there; applied records are skipped.
     drop(s);
     let s = PlatformStore::open(dir.path()).await.unwrap();
-    assert_eq!(s.applied_offset().await, 5);
+    assert_eq!(s.applied_offset().await, 7);
     assert_eq!(ids(&select(&s, "template_registry", None).await), ["t2", "t3"]);
     assert!(!s.apply(&rec(2, vec![insert("template_registry", json!([{"id": "dup"}]))])).await.unwrap());
 }

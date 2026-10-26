@@ -13,6 +13,7 @@ adb-log = { path = "../adb-log" }
 adb-sequencer = { path = "../adb-sequencer" }
 adb-store = { path = "../adb-store" }
 adb-gateway = { path = "../adb-gateway" }
+adb-platform = { path = "../adb-platform" }
 datafusion.workspace = true
 aql-parser.workspace = true
 tokio.workspace = true

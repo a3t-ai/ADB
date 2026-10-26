@@ -12,6 +12,9 @@
 //! | `GET /mcp/sse`, `POST /mcp/message?sessionId=…` | MCP over HTTP+SSE (no `sessionId`: reply in the body) |
 //! | `GET /subscriptions/{id}/events?from=N` | A subscription's deliveries as SSE (stage E): `event: delivery`, `id: <offset>`; reconnect with `Last-Event-ID` to resume; `event: heartbeat` with the tip when idle |
 
+pub mod flight;
+pub use flight::serve_flight;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;

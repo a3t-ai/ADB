@@ -21,7 +21,7 @@ use adb_store::{PartitionStore, StoreConfig};
 use crate::apply::ApplyBarrier;
 use adb_gateway::Gateway;
 use crate::reads::{DirectReads, LanceReads, Reads};
-use crate::writes::{DurableWrites, ReplayStats, SINGLE_PARTITION};
+use crate::writes::{DurableWrites, ReplayStats, Writes, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
 
 /// What every API surface needs from the database.
@@ -39,6 +39,17 @@ pub trait Engine: Send + Sync {
     fn gateway(&self) -> Option<Arc<Gateway>> {
         None
     }
+
+    /// Platform tables (stage G) for reads, for engines with a log.
+    fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
+        None
+    }
+
+    /// A platform-table write (`Table*` effect), committed through the log and
+    /// applied before it returns. Returns its log offset.
+    async fn platform_write(&self, _effect: adb_core::log::Effect) -> Result<u64, String> {
+        Err("platform tables need a durable engine (start ADB with --data-dir)".into())
+    }
 }
 
 /// The engine backed by today's in-memory backends (`adb-backends`).
@@ -49,12 +60,14 @@ pub struct LocalEngine {
     /// and the barrier its reads wait on.
     store: Option<(Arc<PartitionStore>, Option<Arc<ApplyBarrier>>)>,
     gateway: Option<Arc<Gateway>>,
+    /// Platform tables (stage G) and the writes that commit them.
+    platform: Option<(Arc<adb_platform::PlatformStore>, Arc<dyn Writes>)>,
 }
 
 impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor, store: None, gateway: None }
+        Self { adb, executor, store: None, gateway: None, platform: None }
     }
 }
 
@@ -74,8 +87,10 @@ impl LocalEngine {
                 .await
                 .map_err(|e| e.to_string())?,
         );
-        let (writes, stats) =
+        let (mut writes, stats) =
             DurableWrites::open(Arc::clone(&adb), seq, Some(Arc::clone(&store))).await.map_err(|e| e.to_string())?;
+        let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
+        writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
         let barrier = writes.barrier();
         let gateway = barrier.as_ref().map(|b| {
             let log: Arc<dyn adb_log::Log> = wal;
@@ -83,8 +98,9 @@ impl LocalEngine {
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });
         let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()));
-        let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: Some((store, barrier)), gateway }, stats))
+        let writes: Arc<dyn Writes> = Arc::new(writes);
+        let executor = Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), reads);
+        Ok((Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)) }, stats))
     }
 
     /// The log in `dir` replayed into the in-memory backends, with no Lance table:
@@ -99,7 +115,7 @@ impl LocalEngine {
             DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
         let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: None, gateway: None }, stats))
+        Ok((Self { adb, executor, store: None, gateway: None, platform: None }, stats))
     }
 }
 
@@ -121,6 +137,17 @@ impl Engine for LocalEngine {
 
     fn gateway(&self) -> Option<Arc<Gateway>> {
         self.gateway.clone()
+    }
+
+    fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
+        self.platform.as_ref().map(|(p, _)| Arc::clone(p))
+    }
+
+    async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
+        match &self.platform {
+            Some((_, writes)) => writes.platform(effect).await.map_err(|e| e.to_string()),
+            None => Err("platform tables need a durable engine (start ADB with --data-dir)".into()),
+        }
     }
 
     async fn stats(&self) -> Result<Value, String> {

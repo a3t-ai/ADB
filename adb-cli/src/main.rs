@@ -1,8 +1,9 @@
 //! `adb` — the ADB command-line interface.
 //!
 //! - `adb serve` — MCP over stdio (Claude Code, Claude Desktop)
-//! - `adb serve --http [--host 0.0.0.0] [--port 3000]` — REST + MCP over HTTP/SSE,
-//!   a drop-in for ClawDB's server (A3T); `adb serve-http` is the same
+//! - `adb serve --http [--host 0.0.0.0] [--port 3000] [--flight-port 3001]` — REST +
+//!   MCP over HTTP/SSE, a drop-in for ClawDB's server (A3T), plus Arrow Flight for
+//!   FlowR's `call:adb` (platform tables, AQL); `adb serve-http` is the same
 //! - `adb query "<AQL>"` — run one statement and print the JSON result
 //!
 //! With `--data-dir <dir>` (or `ADB_DATA_DIR`) every write goes to a write-ahead log
@@ -38,6 +39,9 @@ enum Commands {
         host: IpAddr,
         #[arg(short, long, default_value_t = 3000)]
         port: u16,
+        /// Arrow Flight port (FlowR's `call:adb`, platform tables); 0 = off
+        #[arg(long, default_value_t = 3001)]
+        flight_port: u16,
     },
     /// Run the HTTP server (same as `serve --http`)
     ServeHttp {
@@ -45,6 +49,9 @@ enum Commands {
         host: IpAddr,
         #[arg(short, long, default_value_t = 3000)]
         port: u16,
+        /// Arrow Flight port (FlowR's `call:adb`, platform tables); 0 = off
+        #[arg(long, default_value_t = 3001)]
+        flight_port: u16,
     },
     /// Execute one AQL statement and print the result as JSON
     Query {
@@ -56,7 +63,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Serve { http: false, host: [0, 0, 0, 0].into(), port: 3000 });
+    let command = cli.command.unwrap_or(Commands::Serve { http: false, host: [0, 0, 0, 0].into(), port: 3000, flight_port: 3001 });
 
     // Logs always go to stderr: stdout carries MCP messages in stdio mode.
     tracing_subscriber::registry()
@@ -90,9 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 s = shutdown_signal() => tracing::info!(signal = s, "ADB shutting down"),
             }
         }
-        Commands::Serve { http: true, host, port } | Commands::ServeHttp { host, port } => {
+        Commands::Serve { http: true, host, port, flight_port } | Commands::ServeHttp { host, port, flight_port } => {
+            // Arrow Flight next to HTTP (stage G): FlowR's native wire.
+            let flight = async {
+                match flight_port {
+                    0 => std::future::pending().await,
+                    p => adb_server::serve_flight(SocketAddr::new(host, p), Arc::clone(&engine)).await,
+                }
+            };
             tokio::select! {
-                r = adb_server::serve(SocketAddr::new(host, port), engine) => r?,
+                r = adb_server::serve(SocketAddr::new(host, port), Arc::clone(&engine)) => r?,
+                r = flight => r?,
                 // Acknowledged writes are already durable (acked after fsync); returning
                 // drops the engine, which drains and syncs the log.
                 s = shutdown_signal() => tracing::info!(signal = s, "ADB shutting down"),

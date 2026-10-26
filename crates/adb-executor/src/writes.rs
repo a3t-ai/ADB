@@ -90,6 +90,12 @@ pub trait Writes: Send + Sync {
     async fn unsubscribe(&self, _subscription: &str) -> AdbResult<bool> {
         Err(needs_log())
     }
+
+    /// A platform-table write (stage G): one `Table*` effect, committed and applied
+    /// before it returns. Returns its log offset.
+    async fn platform(&self, _effect: Effect) -> AdbResult<u64> {
+        Err(AdbError::UnsupportedOperation("platform tables need a durable engine (start ADB with --data-dir)".into()))
+    }
 }
 
 /// Subscriptions follow the committed log (E9).
@@ -186,6 +192,8 @@ pub struct DurableWrites<L: Log> {
     applier: Option<Applier>,
     /// Live subscriptions (stage E), following registrations as they commit.
     subs: Arc<Registry>,
+    /// Platform tables (stage G), applied synchronously.
+    platform: Option<Arc<adb_platform::PlatformStore>>,
 }
 
 impl<L: Log + 'static> DurableWrites<L> {
@@ -218,7 +226,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             Some(s) => Registry::load(s, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?,
             None => Registry::default(),
         };
-        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs) }, stats))
+        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -289,6 +297,32 @@ impl<L: Log + 'static> DurableWrites<L> {
         &self.subs
     }
 
+    /// Serve platform tables from `platform` (stage G): first apply every log record
+    /// above its applied offset (a crash may have cut one short). Returns how many.
+    pub async fn attach_platform(&mut self, platform: Arc<adb_platform::PlatformStore>) -> AdbResult<u64> {
+        let seq = self.seq.lock().await;
+        let mut from = LogOffset(platform.applied_offset().await + 1);
+        let mut applied = 0;
+        loop {
+            let batch = match seq.log().read(from, 1024).await {
+                Ok(b) => b,
+                // Purged below what the platform store has: nothing to catch up.
+                Err(LogError::Purged { oldest, .. }) if oldest.0 <= from.0 => break,
+                Err(e) => return Err(log_err(e)),
+            };
+            let Some(last) = batch.last().map(|r| r.offset) else { break };
+            for r in &batch {
+                if platform.apply(r).await.map_err(|e| AdbError::Internal(format!("platform: {e}")))? {
+                    applied += 1;
+                }
+            }
+            from = last.next();
+        }
+        drop(seq);
+        self.platform = Some(platform);
+        Ok(applied)
+    }
+
     /// The read barrier for Lance reads (stage D3.7), if there is a table.
     pub fn barrier(&self) -> Option<Arc<ApplyBarrier>> {
         self.applier.as_ref().map(|a| Arc::clone(a.barrier()))
@@ -317,6 +351,11 @@ impl<L: Log + 'static> DurableWrites<L> {
                     // Keep what subscribers haven't acked, up to RETAIN_MAX behind the
                     // tip (E3); never above Lance's durable offset.
                     let mut floor = d.next();
+                    // Platform tables apply synchronously; after a crash they catch up
+                    // from the log, so it keeps what they haven't applied.
+                    if let Some(p) = &self.platform {
+                        floor = LogOffset(floor.0.min(p.applied_offset().await + 1));
+                    }
                     if let Some(cursor) = self.subs.min_cursor() {
                         let cap = record.offset.0.saturating_sub(RETAIN_MAX);
                         floor = LogOffset(floor.0.min(cursor.max(cap) + 1));
@@ -566,6 +605,19 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.subs.apply(&record);
         self.to_store(&record, seq.log()).await;
         Ok(true)
+    }
+
+    async fn platform(&self, effect: Effect) -> AdbResult<u64> {
+        let platform = self.platform.as_ref().ok_or_else(|| AdbError::UnsupportedOperation("this engine has no platform tables".into()))?;
+        let perr = |e: adb_platform::PlatformError| AdbError::QueryError(e.to_string());
+        let mut seq = self.seq.lock().await;
+        // A logged effect must apply: check the table and its name first.
+        platform.validate(&effect).await.map_err(perr)?;
+        let ts = seq.begin();
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        platform.apply(&record).await.map_err(perr)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(record.offset.0)
     }
 }
 

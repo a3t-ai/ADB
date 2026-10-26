@@ -16,8 +16,18 @@ tracing.workspace = true
 uuid.workspace = true
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+# Arrow Flight: FlowR's native call:adb wire (stage G; spike G1)
+adb-core = { path = "../adb-core" }
+adb-platform = { path = "../adb-platform" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-cast = "58"
+arrow-ipc = "58"
+arrow-flight = "58"
+tonic = "0.14"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+tempfile.workspace = true

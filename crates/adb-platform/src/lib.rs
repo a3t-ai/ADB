@@ -92,6 +92,26 @@ pub fn rows_to_batch(rows: &[serde_json::Map<String, Value>]) -> RecordBatch {
     RecordBatch::try_new(schema, cols).expect("columns match the schema")
 }
 
+/// `rows` as a batch of an existing table's (all-UTF-8) schema: columns a row lacks
+/// are null. `validate` has refused fields the table doesn't have.
+fn rows_to_table_batch(schema: SchemaRef, rows: &[serde_json::Map<String, Value>]) -> RecordBatch {
+    let cols = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let v: Vec<Option<String>> = rows
+                .iter()
+                .map(|r| r.get(f.name()).map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }))
+                .collect();
+            Arc::new(StringArray::from(v)) as Arc<dyn Array>
+        })
+        .collect();
+    RecordBatch::try_new(schema, cols).expect("columns match the schema")
+}
+
 /// FlowR's `batches_to_json`: UTF-8 columns as JSON fields, nulls left out.
 pub fn batches_to_json(batches: &[RecordBatch]) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -111,6 +131,14 @@ pub fn batches_to_json(batches: &[RecordBatch]) -> Vec<Value> {
         }
     }
     rows
+}
+
+/// A filter that parses and names real columns: Lance only parses it when the scan
+/// is planned, so plan one (no data is read).
+async fn check_filter(ds: &Dataset, filter: &str) -> PlatformResult<()> {
+    let mut scan = ds.scan();
+    scan.filter(filter).map_err(lance)?;
+    scan.explain_plan(false).await.map(|_| ()).map_err(lance)
 }
 
 impl PlatformStore {
@@ -172,13 +200,38 @@ impl PlatformStore {
         Ok(Arc::new(Schema::from(ds.schema())))
     }
 
-    /// Check a write before it is logged: a logged effect must apply.
+    /// Check a write before it is logged: a logged effect must apply, or catch-up
+    /// would fail on it forever. Unknown tables (for update / delete), bad names,
+    /// unknown columns and filters that don't parse are refused here.
     pub async fn validate(&self, effect: &Effect) -> PlatformResult<()> {
+        let bad = |m: String| Err(PlatformError::Lance(m));
         match effect {
-            Effect::TableCreate { table, .. } | Effect::TableInsert { table, .. } => check_name(table),
-            Effect::TableUpdate { table, .. } | Effect::TableDelete { table, .. } => {
+            Effect::TableCreate { table, .. } => check_name(table),
+            Effect::TableInsert { table, rows } => {
                 check_name(table)?;
-                self.dataset(table).await.map(|_| ()).ok_or_else(|| PlatformError::NoTable(table.clone()))
+                if let Some(ds) = self.dataset(table).await {
+                    let schema = Schema::from(ds.schema());
+                    for r in rows {
+                        if let Some(k) = r.keys().find(|k| schema.field_with_name(k).is_err()) {
+                            return bad(format!("table {table} has no column {k}"));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Effect::TableUpdate { table, filter, values } => {
+                check_name(table)?;
+                let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
+                let schema = Schema::from(ds.schema());
+                if let Some((c, _)) = values.iter().find(|(c, _)| schema.field_with_name(c).is_err()) {
+                    return bad(format!("table {table} has no column {c}"));
+                }
+                check_filter(&ds, filter).await
+            }
+            Effect::TableDelete { table, filter } => {
+                check_name(table)?;
+                let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
+                check_filter(&ds, filter).await
             }
             _ => Ok(()),
         }
@@ -241,7 +294,11 @@ impl PlatformStore {
                 if rows.is_empty() {
                     return Ok(());
                 }
-                let batch = rows_to_batch(rows);
+                // A new table takes the first row's fields; an existing one its schema.
+                let batch = match self.dataset(&table).await {
+                    Some(ds) => rows_to_table_batch(Arc::new(Schema::from(ds.schema())), rows),
+                    None => rows_to_batch(rows),
+                };
                 let schema = batch.schema();
                 let mode = if current.is_some() { WriteMode::Append } else { WriteMode::Create };
                 let params = WriteParams { mode, ..Default::default() };
