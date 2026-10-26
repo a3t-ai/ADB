@@ -101,6 +101,12 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | W2-L10 | **Agent Sandbox doesn't roll a pod when its Sandbox template changes** (new image, env): the old pod keeps running (or failing) until it is deleted. | After changing the runtime image / `A3T_RUNTIME_ENV_*` / a Runtime CR's image, delete the `cv-*` / `rt-*` pods. | Controller stamps a template hash and replaces the pod (or Sandbox) when it changes. |
 | W2-L9 | **Runtime pods' inbound API**: they run FlowR EE with the console's policy hook / OIDC settings via the controller's `A3T_RUNTIME_ENV_*`, but nothing calls them; a runtime's `/message` endpoint can still write the shared registry for a caller with a valid token. | Same trust as the console. | A runtime mode that serves only `/health`. |
 
+## Recall (W4)
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| W4-L1 | **One embedding model, fixed: bge-small-en-v1.5, 384 dims** (baked into the image; `ADB_EMBED_MODEL_DIR` swaps the files, not the size). The table's `embedding` column has one fixed dimension. | No larger / multilingual / hosted models (e.g. 768 / 1024 / 1536 dims, OpenAI-compatible endpoints). | **User, 26 Oct:** choose the embedding provider and its size in **ADB settings** (A3T Settings → ADB): local model or provider endpoint, dimension recorded in `_meta`; changing it re-embeds into a new column / table in the background. Not needed for the MVP. |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |

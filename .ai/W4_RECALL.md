@@ -62,5 +62,5 @@ of messages ago.
   is the fallback.
 - **CPU on the node** (4 cores shared): embedding a large backfill competes with
   queries — the backfill runs at low concurrency.
-- **English only** (bge-small-en). A multilingual model (multilingual-e5-small, also
-  384) is a config swap later, with a re-embed.
+- **English only, one size** (bge-small-en, 384). Pluggable providers of any size,
+  chosen in ADB settings, are W4-L1 in `limitations.md` (user, 26 Oct: later).
