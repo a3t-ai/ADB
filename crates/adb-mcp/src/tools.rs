@@ -50,6 +50,7 @@ pub fn tool_list() -> Value {
             "name": "remember",
             "description": "Remember something. Stores `content` (plus optional fields) in memory. Default memory type SEMANTIC (facts); use EPISODIC for events, PROCEDURAL for how-tos, WORKING for the current task.",
             "inputSchema": { "type": "object", "properties": {
+                "scope": { "type": "string", "description": "Named scope, e.g. \"team:billing\" or \"agent:42\" (optional; SEMANTIC, EPISODIC, PROCEDURAL). Without it, recall and forget cover every scope." },
                 "content": { "type": "string", "description": "What to remember, in plain words" },
                 "memory_type": with_desc(&mt, "Where to store it (default SEMANTIC)"),
                 "key": { "type": "string", "description": "A stable key, so you can update, link or forget it later (optional). Remembering a key again updates that memory (a new version)." },
@@ -61,6 +62,7 @@ pub fn tool_list() -> Value {
             "name": "recall",
             "description": "Recall memories. Matches `contains` against the remembered content and `filter` against fields; newest first.",
             "inputSchema": { "type": "object", "properties": {
+                "scope": { "type": "string", "description": "Named scope, e.g. \"team:billing\" or \"agent:42\" (optional; SEMANTIC, EPISODIC, PROCEDURAL). Without it, recall and forget cover every scope." },
                 "memory_type": with_desc(&mt, "Where to look (default SEMANTIC)"),
                 "contains": { "type": "string", "description": "Text the content must contain (optional)" },
                 "filter": { "type": "object", "description": "Field = value conditions (optional)" },
@@ -71,6 +73,7 @@ pub fn tool_list() -> Value {
             "name": "forget",
             "description": "Forget memories that match a key or field conditions.",
             "inputSchema": { "type": "object", "properties": {
+                "scope": { "type": "string", "description": "Named scope, e.g. \"team:billing\" or \"agent:42\" (optional; SEMANTIC, EPISODIC, PROCEDURAL). Without it, recall and forget cover every scope." },
                 "memory_type": with_desc(&mt, "Where to forget from"),
                 "key": { "type": "string", "description": "Forget the record with this key (optional)" },
                 "filter": { "type": "object", "description": "Field = value conditions (optional)" }

@@ -154,3 +154,21 @@ async fn remember_updates_a_key_in_use_and_store_refuses_it() {
     let (err, v) = call(&s, "store_memory", json!({"memory_type": "SEMANTIC", "data": {"key": "acme", "content": "x"}})).await;
     assert!(err && v.to_string().contains("key_exists"), "{v}");
 }
+
+/// `scope` on remember / recall / forget is a named scope (`IN SCOPE`).
+#[tokio::test]
+async fn llm_tools_take_a_named_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = McpServer::new(Arc::new(engine));
+    for (key, scope) in [("f1", "agent:1"), ("f2", "agent:2")] {
+        let (err, v) = call(&s, "remember", json!({"content": format!("fact {key}"), "key": key, "scope": scope})).await;
+        assert!(!err, "{v}");
+    }
+    let (_, v) = call(&s, "recall", json!({"scope": "agent:1"})).await;
+    assert_eq!(v["data"]["count"], json!(1), "{v}");
+    let (_, v) = call(&s, "recall", json!({})).await;
+    assert_eq!(v["data"]["count"], json!(2), "{v}");
+    let (_, v) = call(&s, "forget", json!({"key": "f2", "memory_type": "SEMANTIC", "scope": "agent:1"})).await;
+    assert_eq!(v["data"]["count"], json!(0), "forget in another scope: {v}");
+}

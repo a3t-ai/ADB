@@ -177,6 +177,8 @@ pub struct StoreData {
     pub scope: Scope,
     /// Namespace
     pub namespace: Option<String>,
+    /// Named scope (`IN SCOPE`)
+    pub in_scope: Option<String>,
     /// TTL
     pub ttl: Option<Duration>,
 }
@@ -300,11 +302,12 @@ impl serde::Serialize for StoreData {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StoreData", 5)?;
+        let mut state = serializer.serialize_struct("StoreData", 6)?;
         state.serialize_field("key", &self.key)?;
         state.serialize_field("payload", &self.payload)?;
         state.serialize_field("scope", &format!("{:?}", self.scope))?;
         state.serialize_field("namespace", &self.namespace)?;
+        state.serialize_field("in_scope", &self.in_scope)?;
         state.serialize_field("ttl_ms", &self.ttl.map(|d| d.as_millis() as u64))?;
         state.end()
     }

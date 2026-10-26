@@ -35,6 +35,12 @@ Rules of thumb:
 - `LOOKUP` needs a key or pattern and is not valid on `WORKING` (use `SCAN` or `RECALL`).
 - `PIPELINE` needs a `TIMEOUT`: `PIPELINE p TIMEOUT 80ms RECALL … | RECALL …`.
 - Store a `key` field on records you will want to update, link or forget later.
+  A key is unique per memory type: `STORE` with a key in use fails with
+  `key_exists` (use `UPDATE`, or the `remember` tool, which updates it).
+- `IN SCOPE "team:billing"` (or `"agent:42"`) puts a SEMANTIC / EPISODIC /
+  PROCEDURAL record in a named scope, or limits a read, update or forget to it:
+  `RECALL FROM SEMANTIC IN SCOPE "team:billing" WHERE account = "acct-9"`.
+  Without it, reads see every scope. The tools take it as `scope`.
 
 ## Topics and subscriptions
 

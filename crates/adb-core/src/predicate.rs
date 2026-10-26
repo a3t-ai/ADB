@@ -514,6 +514,10 @@ pub struct Modifiers {
     /// Window for SCAN
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
+    /// Named scope (`IN SCOPE "team:billing"`, AQL v0.6): the memory boundary a
+    /// statement reads or writes. Separate from `scope` (private / shared / cluster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_scope: Option<String>,
     /// Include links with results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_links: Option<WithLinks>,

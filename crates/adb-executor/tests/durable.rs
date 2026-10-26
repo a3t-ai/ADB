@@ -288,7 +288,7 @@ async fn log_is_purged_below_lances_durable_offset() {
     {
         let (_adb, w, _) = open().await;
         for i in 1..=n {
-            Writes::store(&w, adb_core::MemoryType::Episodic, &format!("e{i}"), serde_json::json!({"bid_id": format!("e{i}"), "i": i}), adb_core::Scope::Private, None, None)
+            Writes::store(&w, adb_core::MemoryType::Episodic, &format!("e{i}"), serde_json::json!({"bid_id": format!("e{i}"), "i": i}), adb_core::Scope::Private, None, None, None)
                 .await
                 .unwrap();
             if i % 50 == 0 {
@@ -311,7 +311,7 @@ async fn log_is_purged_below_lances_durable_offset() {
     assert_eq!(stats.records, n);
     let now = adb_core::log::CommitTs::from_datetime(chrono::Utc::now());
     assert_eq!(w.store().unwrap().count_current(adb_core::log::Memory::Episodic, now).await.unwrap(), n);
-    Writes::store(&w, adb_core::MemoryType::Episodic, "after", serde_json::json!({"bid_id": "after"}), adb_core::Scope::Private, None, None)
+    Writes::store(&w, adb_core::MemoryType::Episodic, "after", serde_json::json!({"bid_id": "after"}), adb_core::Scope::Private, None, None, None)
         .await
         .unwrap();
     assert_eq!(w.durable_offset().await, LogOffset(n + 1));

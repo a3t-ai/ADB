@@ -33,6 +33,7 @@ use adb_sequencer::Sequencer;
 use adb_store::PartitionStore;
 
 use crate::apply::{Applier, ApplyBarrier};
+use crate::reads::check_scope;
 use adb_gateway::{sub_value, Registry, SubSpec};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -54,11 +55,13 @@ pub trait Writes: Send + Sync {
         scope: Scope,
         namespace: Option<&str>,
         ttl: Option<Duration>,
+        in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord>;
 
-    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64>;
+    /// `in_scope`: only records in that named scope (`IN SCOPE`); `None`: every scope.
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64>;
 
-    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64>;
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64>;
 
     async fn link(
         &self,
@@ -140,7 +143,9 @@ impl Writes for DirectWrites {
         scope: Scope,
         namespace: Option<&str>,
         ttl: Option<Duration>,
+        in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord> {
+        check_scope(memory_type, in_scope, false)?;
         if unique_keys(memory_type) {
             let id = Adb::store_id(memory_type, key, &payload);
             if backend_has(&self.0, memory_type, &id).await? {
@@ -150,11 +155,13 @@ impl Writes for DirectWrites {
         self.0.store_with_options(memory_type, key, payload, scope, namespace, ttl).await
     }
 
-    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64> {
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64> {
+        check_scope(memory_type, in_scope, false)?;
         self.0.update(memory_type, predicate, data).await
     }
 
-    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64> {
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
+        check_scope(memory_type, in_scope, false)?;
         self.0.forget(memory_type, predicate).await
     }
 
@@ -273,8 +280,9 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// from Lance for the types it owns, with the backends' own matching code over
     /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches superseded versions, so
     /// a value surviving only in an old version is forgotten too (D2 T5).
-    async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool) -> AdbResult<Vec<String>> {
+    async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
         let at = ts.to_datetime();
+        check_scope(memory, in_scope, self.in_lance(memory).is_some())?;
         let Some(store) = self.in_lance(memory) else {
             return match forget {
                 true => time::at(at, self.adb.forget_targets(memory, predicate)).await,
@@ -286,13 +294,16 @@ impl<L: Log + 'static> DurableWrites<L> {
             b.wait_for_committed().await;
         }
         let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
-        let view = crate::reads::current_view(store, memory, predicate, ts).await?;
+        let view = crate::reads::current_view(store, memory, predicate, ts, in_scope).await?;
         let mut ids = match forget {
             true => time::at(at, view.forget_targets(predicate)).await?,
             false => time::at(at, view.update_targets(predicate)).await?,
         };
         if forget && supersedes(memory) {
-            let old = store.superseded(memory.into()).await.map_err(store_err)?;
+            let mut old = store.superseded(memory.into()).await.map_err(store_err)?;
+            if let Some(s) = in_scope {
+                old.retain(|r| r.data.scope == s);
+            }
             if memory == MemoryType::Procedural {
                 // Procedural ids come from the payload: one view per version.
                 for r in &old {
@@ -465,7 +476,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         scope: Scope,
         namespace: Option<&str>,
         ttl: Option<Duration>,
+        in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord> {
+        check_scope(memory_type, in_scope, self.in_lance(memory_type).is_some())?;
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let id = RecordId(Adb::store_id(memory_type, key, &payload));
@@ -492,6 +505,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let mut data = row(memory_type, kind_of(memory_type), payload);
         data.visibility = scope.into();
         data.namespace = namespace.map(String::from);
+        if let Some(s) = in_scope {
+            data.scope = s.to_string();
+        }
         data.ttl_at = ttl.map(|d| CommitTs(ts.0 + d.as_micros() as i64));
         let new = NewRow { id: id.clone(), lineage_id: id, version: 1, data };
         let effect = match memory_type {
@@ -510,10 +526,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         Ok(stored)
     }
 
-    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value) -> AdbResult<u64> {
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
-        let ids = self.targets(memory_type, predicate, ts, false).await?;
+        let ids = self.targets(memory_type, predicate, ts, false, in_scope).await?;
         if ids.is_empty() {
             return Ok(0);
         }
@@ -555,10 +571,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         Ok(n)
     }
 
-    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate) -> AdbResult<u64> {
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
-        let ids = self.targets(memory_type, predicate, ts, true).await?;
+        let ids = self.targets(memory_type, predicate, ts, true, in_scope).await?;
         if ids.is_empty() {
             return Ok(0);
         }

@@ -180,3 +180,59 @@ async fn ttl_expiry_is_committed_and_delivered() {
     let r = q(&engine, "RECALL FROM SEMANTIC ALL").await.to_string();
     assert!(r.contains("stays") && r.contains("back") && !r.contains("short-lived"), "{r}");
 }
+
+/// Named scopes (AQL v0.6 `IN SCOPE`, E-L6): STORE writes the row's scope; RECALL /
+/// LOOKUP / UPDATE / FORGET with IN SCOPE see only that scope (without it, every
+/// scope); SUBSCRIBE SCOPE narrows to it; the scope survives a restart. IN SCOPE is
+/// refused, not ignored, where it can't be honoured.
+#[tokio::test]
+async fn named_scopes_partition_reads_writes_and_subscriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = |v: &Value| -> Vec<String> {
+        let mut k: Vec<String> = v["data"]["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+        k.sort();
+        k
+    };
+    let sales_sub;
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        let gw = engine.gateway().unwrap();
+        sales_sub = subscribe(&engine, r#"SUBSCRIBE SCOPE "team:sales""#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "a", topic = "billing") IN SCOPE "team:billing""#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "b", topic = "sales") IN SCOPE "team:sales""#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "c", topic = "none")"#).await;
+        q(&engine, r#"STORE INTO EPISODIC (key = "e", topic = "sales") IN SCOPE "team:sales""#).await;
+
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:billing" ALL"#).await), ["a"]);
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC ALL"#).await), ["a", "b", "c"], "no IN SCOPE: every scope");
+        assert_eq!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:sales" KEY id = "b""#).await), ["b"]);
+        assert!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:billing" KEY id = "b""#).await).is_empty());
+
+        // UPDATE / FORGET only touch their scope.
+        let u = q(&engine, r#"UPDATE INTO SEMANTIC WHERE topic = "sales" (seen = true) IN SCOPE "team:billing""#).await;
+        assert_eq!(u["data"]["count"], 0, "{u}");
+        let f = q(&engine, r#"FORGET FROM SEMANTIC WHERE topic = "billing" IN SCOPE "team:sales""#).await;
+        assert_eq!(f["data"]["count"], 0, "{f}");
+        let f = q(&engine, r#"FORGET FROM SEMANTIC WHERE topic = "billing" IN SCOPE "team:billing""#).await;
+        assert_eq!(f["data"]["count"], 1, "{f}");
+
+        // The scope subscription sees only its scope's records.
+        let ids: Vec<String> = drain(&gw, &sales_sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect();
+        assert_eq!(ids, ["put:b", "put:e"], "SUBSCRIBE SCOPE team:sales");
+
+        // Refused, not ignored.
+        for bad in [
+            r#"STORE INTO WORKING (step = 1) IN SCOPE "team:sales""#,
+            r#"RECALL FROM WORKING IN SCOPE "team:sales" ALL"#,
+            r#"RECALL FROM SEMANTIC IN SCOPE "team sales" ALL"#,
+        ] {
+            assert!(engine.query(bad, None).await.is_err(), "{bad} should be refused");
+        }
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales" ALL"#).await), ["b"], "scope survives a restart");
+    assert_eq!(keys(&q(&engine, r#"RECALL FROM EPISODIC IN SCOPE "team:sales" ALL"#).await), ["e"]);
+
+    let mem = LocalEngine::default();
+    assert!(mem.query(r#"STORE INTO SEMANTIC (k = 1) IN SCOPE "team:x""#, None).await.is_err(), "in-memory engine refuses IN SCOPE");
+}

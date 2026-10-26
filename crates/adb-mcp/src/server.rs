@@ -296,7 +296,13 @@ fn remember(args: &Value) -> Result<String, String> {
     if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
         q.push_str(&format!(" NAMESPACE {}", quote(ns)));
     }
+    q.push_str(&in_scope(args));
     Ok(q)
+}
+
+/// ` IN SCOPE "…"` from an optional `scope` argument (a named scope, AQL v0.6).
+fn in_scope(args: &Value) -> String {
+    args.get("scope").and_then(Value::as_str).map(|s| format!(" IN SCOPE {}", quote(s))).unwrap_or_default()
 }
 
 /// `remember` on a key in use: `UPDATE INTO <type> WHERE key = … (content, fields)`.
@@ -305,7 +311,7 @@ fn remember_update(args: &Value, key: &str) -> Result<String, String> {
     let content = args.get("content").and_then(Value::as_str).ok_or("Missing required: content")?;
     let mut fields = obj(args, "fields");
     fields.insert("content".into(), json!(content));
-    Ok(format!("UPDATE INTO {mt} WHERE key = {} {}", quote(key), payload(&fields)?))
+    Ok(format!("UPDATE INTO {mt} WHERE key = {} {}{}", quote(key), payload(&fields)?, in_scope(args)))
 }
 
 fn recall(args: &Value) -> Result<String, String> {
@@ -319,7 +325,7 @@ fn recall(args: &Value) -> Result<String, String> {
     }
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10);
     let filter = if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) };
-    Ok(format!("RECALL FROM {mt}{filter} LIMIT {limit}"))
+    Ok(format!("RECALL FROM {mt}{filter} LIMIT {limit}{}", in_scope(args)))
 }
 
 fn forget(args: &Value) -> Result<String, String> {
@@ -331,7 +337,7 @@ fn forget(args: &Value) -> Result<String, String> {
     if filter.is_empty() {
         return Err("forget needs a key or a filter (refusing to forget everything)".into());
     }
-    Ok(format!("FORGET FROM {mt}{}", where_eq(&filter)?))
+    Ok(format!("FORGET FROM {mt}{}{}", where_eq(&filter)?, in_scope(args)))
 }
 
 fn link(args: &Value) -> Result<String, String> {

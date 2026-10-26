@@ -279,6 +279,7 @@ impl Planner {
             payload,
             scope: modifiers.scope.unwrap_or(self.default_scope),
             namespace: modifiers.namespace.clone().or_else(|| self.default_namespace.clone()),
+            in_scope: modifiers.in_scope.clone(),
             ttl: modifiers.ttl,
         };
 
@@ -480,6 +481,7 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         min_confidence: mods.min_confidence,
         scope: mods.scope.map(convert_scope),
         namespace: mods.namespace.clone(),
+        in_scope: mods.in_scope.clone(),
         ttl: mods.ttl,
         aggregate: mods.aggregate.as_ref().map(|aggs| {
             aggs.iter().map(convert_aggregate).collect()
