@@ -96,7 +96,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | W2-L6 | **Chat isn't relayed**: the console's chat runs agents in the console; deployed canvases take work only from their topic (`a3t/canvas-dispatch`, or any `PUBLISH` to `canvas.<ns>.<name>`). No token streaming from a runtime. | Chat with a deployed agent still runs in the console. | Chat relay over topics (request topic + reply topic with partial tokens). |
 | W2-L7 | **A runtime's run history is local to its pod** (executions stay local, decision W2c); the reply and ADB memory are what survive a pod. | Runs on a deleted pod are only visible through replies / memory. | With G-L6. |
 | W2-L8 | **Switching the console back off the shared registry** (unset `FLOWR_REGISTRY_ADB`) returns it to its local registry as of the switch; changes made since live only in ADB. | Copy back by hand if needed. | A switch-back that copies `flowr_*` tables to local. |
-| W2-L10 | **Agent Sandbox doesn't roll a pod when its Sandbox template changes** (new image, env): the old pod keeps running (or failing) until it is deleted. | After changing the runtime image / `A3T_RUNTIME_ENV_*` / a Runtime CR's image, delete the `cv-*` / `rt-*` pods. | Controller stamps a template hash and replaces the pod (or Sandbox) when it changes. |
 | W2-L9 | **Runtime pods' inbound API**: they run FlowR EE with the console's policy hook / OIDC settings via the controller's `A3T_RUNTIME_ENV_*`, but nothing calls them; a runtime's `/message` endpoint can still write the shared registry for a caller with a valid token. | Same trust as the console. | A runtime mode that serves only `/health`. |
 
 ## AQL / Graph (links)
@@ -148,6 +147,7 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | `FORGET` missed values only in old versions (D2 T5) | `b367ac4` (D4.4a) |
 | Links couldn't be changed or removed (LINK again added a parallel link) | 26 Oct: AQL v0.7 `UPDATE LINK` / `UNLINK`, re-LINK updates the weight; MCP `unlink`; subscribers get `supersede` / `unlink` of kind `edge` |
 | `ORDER BY created_at` ignored on SEMANTIC (sorted on payload fields only) | `9bcec26` |
+| W2-L10: Sandbox pods kept their old template | flowr `a3t-controller`: template hash annotation; a changed hash recreates the Sandbox |
 | L1: no embeddings; `RECALL … LIKE` found nothing | W4 (`d82f05d`): local bge-small embeddings on write, in the log; backfill; hybrid ranking; MCP `recall` `like` |
 | F-L1: agents got the newest 5 facts | W4: `RECALL … LIKE $message` with `memory_config.semantic.{limit, min_confidence}` |
 | L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |
