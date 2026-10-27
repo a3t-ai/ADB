@@ -94,4 +94,10 @@ SIGKILL at every step recovers (the crash harness from D/R11).
   single-threaded runtimes).
 - **Spike**: 10k row versions rewritten in 1.38 s (debug), disk 8.7 → 2.2 MB, the
   forgotten secret in 4 files before and none after.
-- Limits: W5-L1…L6.
+- **Platform tables (W5-L4)**: `PlatformStore::compact` rewrites fragments with
+  deleted rows (A3T DELETEs, rows an UPDATE replaced) and removes every old version,
+  under the platform write lock; nightly, when a table gains 256 versions, and in the
+  admin `compact`. Compaction's own Lance commits are recorded in `_applied.json`
+  (with a `compacting` marker settled by `open` after a crash), so crash recovery's
+  version counting doesn't mistake them for applied effects.
+- Limits: W5-L1…L7.

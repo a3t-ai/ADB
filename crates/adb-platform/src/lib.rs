@@ -14,6 +14,12 @@
 //! crash between a commit and that rewrite, a table whose version is ahead of the
 //! file already holds the effect: it is counted, not applied twice (an update or
 //! delete re-run later in the log could touch rows inserted after it).
+//!
+//! Compaction (W5-L4) rewrites each table without its deleted rows and removes its
+//! old versions, so platform data deleted in A3T leaves the disk. It commits
+//! versions that are no effect: it runs under the write lock, records the table it
+//! is compacting in `_applied.json` first, and afterwards records the table's new
+//! version; `open` settles a table left marked by a crash at its latest version.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -51,7 +57,26 @@ fn lance(e: impl std::fmt::Display) -> PlatformError {
 struct Applied {
     offset: u64,
     versions: BTreeMap<String, u64>,
+    /// Each table's version after its last compaction (W5-L4).
+    #[serde(default)]
+    compacted: BTreeMap<String, u64>,
+    /// The table being compacted: its new versions hold no effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compacting: Option<String>,
 }
+
+/// What a platform compaction did (W5-L4).
+#[derive(Debug, Clone, Default)]
+pub struct PlatformCompactStats {
+    pub tables: usize,
+    pub fragments_removed: usize,
+    pub old_versions: u64,
+    pub bytes_removed: u64,
+    pub took: std::time::Duration,
+}
+
+/// Versions a table may gain before it is compacted outside the nightly run.
+pub const COMPACT_AFTER_VERSIONS: u64 = 256;
 
 /// One partition's platform tables.
 pub struct PlatformStore {
@@ -60,6 +85,8 @@ pub struct PlatformStore {
     applied: Mutex<Applied>,
     /// Open datasets, refreshed after each write; reads clone the `Arc`.
     tables: RwLock<HashMap<String, Arc<Dataset>>>,
+    /// Held by scans while they read files; compaction takes it to delete old ones.
+    files: RwLock<()>,
 }
 
 /// A table name usable as a directory name.
@@ -145,17 +172,26 @@ impl PlatformStore {
     pub async fn open(root: impl Into<PathBuf>) -> PlatformResult<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(|e| PlatformError::Io(e.to_string()))?;
-        let applied = match std::fs::read(root.join("_applied.json")) {
+        let mut applied: Applied = match std::fs::read(root.join("_applied.json")) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| PlatformError::Io(format!("_applied.json: {e}")))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Applied::default(),
             Err(e) => return Err(PlatformError::Io(e.to_string())),
         };
-        let store = Self { root, applied: Mutex::new(applied), tables: RwLock::new(HashMap::new()) };
+        let interrupted = applied.compacting.take();
+        let store = Self { root, applied: Mutex::new(Applied::default()), tables: RwLock::new(HashMap::new()), files: RwLock::new(()) };
         for name in store.list_tables()? {
             if let Ok(ds) = Dataset::open(&store.uri(&name)).await {
+                // A compaction a crash interrupted: its commits (if any) are no effects.
+                if interrupted.as_deref() == Some(name.as_str()) {
+                    applied.versions.insert(name.clone(), ds.version().version);
+                }
                 store.tables.write().await.insert(name, Arc::new(ds));
             }
         }
+        if interrupted.is_some() {
+            store.save(&applied)?;
+        }
+        *store.applied.lock().await = applied;
         Ok(store)
     }
 
@@ -185,6 +221,7 @@ impl PlatformStore {
 
     /// Rows of `table` matching `filter` (Lance SQL), at most `limit`.
     pub async fn query(&self, table: &str, filter: Option<&str>, limit: usize) -> PlatformResult<Vec<RecordBatch>> {
+        let _files = self.files.read().await;
         let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.to_string()))?;
         let mut scan = ds.scan();
         if let Some(f) = filter.filter(|f| !f.trim().is_empty()) {
@@ -348,6 +385,54 @@ impl PlatformStore {
         applied.versions.insert(table.clone(), ds.version().version);
         self.tables.write().await.insert(table, Arc::new(ds));
         Ok(())
+    }
+
+    /// Whether a table has gained more than [`COMPACT_AFTER_VERSIONS`] versions since
+    /// its last compaction.
+    pub async fn compaction_due(&self) -> bool {
+        let applied = self.applied.lock().await;
+        applied.versions.iter().any(|(t, v)| v.saturating_sub(applied.compacted.get(t).copied().unwrap_or(0)) > COMPACT_AFTER_VERSIONS)
+    }
+
+    /// Compact every table (W5-L4): rewrite fragments with deleted rows (A3T's
+    /// DELETEs, and the rows an UPDATE replaced) and small fragments, then remove
+    /// every old version and the files only they used. Writes wait for it.
+    pub async fn compact(&self) -> PlatformResult<PlatformCompactStats> {
+        let started = std::time::Instant::now();
+        let mut applied = self.applied.lock().await;
+        let mut stats = PlatformCompactStats::default();
+        for table in self.list_tables()? {
+            let Some(ds) = self.dataset(&table).await else { continue };
+            let mut ds = (*ds).clone();
+            applied.compacting = Some(table.clone());
+            self.save(&applied)?;
+            let options = lance::dataset::optimize::CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                num_threads: Some(1),
+                ..Default::default()
+            };
+            let compacted = lance::dataset::optimize::compact_files(&mut ds, options, None).await;
+            // Whatever it committed, the latest version is now the applied one.
+            ds.checkout_latest().await.map_err(lance)?;
+            let version = ds.version().version;
+            applied.versions.insert(table.clone(), version);
+            applied.compacting = None;
+            self.save(&applied)?;
+            let ds = Arc::new(ds);
+            self.tables.write().await.insert(table.clone(), Arc::clone(&ds));
+            stats.fragments_removed += compacted.map_err(lance)?.fragments_removed;
+            let removed = {
+                let _files = self.files.write().await;
+                ds.cleanup_old_versions(chrono::TimeDelta::zero(), Some(true), Some(false)).await.map_err(lance)?
+            };
+            applied.compacted.insert(table.clone(), version);
+            self.save(&applied)?;
+            stats.tables += 1;
+            stats.old_versions += removed.old_versions;
+            stats.bytes_removed += removed.bytes_removed;
+        }
+        stats.took = started.elapsed();
+        Ok(stats)
     }
 
     /// Rewrite `_applied.json` atomically (temp file, fsync, rename).

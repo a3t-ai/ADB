@@ -458,6 +458,27 @@ impl<L: Log + 'static> DurableWrites<L> {
         self.compact_now().await
     }
 
+    /// Compact the platform tables (W5-L4): deleted rows and old versions leave the
+    /// disk. `None` without platform tables.
+    pub async fn compact_platform(&self) -> AdbResult<Option<adb_platform::PlatformCompactStats>> {
+        let Some(p) = &self.platform else { return Ok(None) };
+        let stats = p.compact().await.map_err(|e| AdbError::Internal(format!("platform compaction: {e}")))?;
+        tracing::info!(
+            tables = stats.tables, fragments_removed = stats.fragments_removed, old_versions = stats.old_versions,
+            bytes_removed = stats.bytes_removed, took = ?stats.took, "platform tables compacted"
+        );
+        Ok(Some(stats))
+    }
+
+    /// Whether a platform table gained more than 256 versions since its last
+    /// compaction (W5-L4).
+    pub async fn platform_compaction_due(&self) -> bool {
+        match &self.platform {
+            Some(p) => p.compaction_due().await,
+            None => false,
+        }
+    }
+
     /// Whether compaction is due on size: more than 16 MemWAL generations (W5).
     pub async fn compaction_due(&self) -> bool {
         match &self.store {

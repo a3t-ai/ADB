@@ -149,3 +149,65 @@ async fn replay_after_a_crash_between_commit_and_checkpoint() {
         assert_eq!(got, want, "crash after record {k}'s commit");
     }
 }
+
+/// Every file under `dir` that contains `needle`.
+fn files_with(dir: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if std::fs::read(&p).unwrap().windows(needle.len()).any(|w| w == needle) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// W5-L4: compaction removes deleted and updated-away rows from disk (all old
+/// versions too), keeps the live ones, and later writes still apply — also after a
+/// compaction a crash interrupted.
+#[tokio::test]
+async fn compaction_erases_deleted_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    s.apply(&rec(1, vec![insert("users", json!([
+        {"id": "u1", "email": "a@x", "hash": "secret-hash-one"},
+        {"id": "u2", "email": "b@x", "hash": "keep-hash-two"},
+    ]))])).await.unwrap();
+    s.apply(&rec(2, vec![insert("users", json!([{"id": "u3", "email": "c@x", "hash": "old-hash-three"}]))])).await.unwrap();
+    s.apply(&rec(3, vec![Effect::TableUpdate { table: "users".into(), filter: "id = 'u3'".into(), values: vec![("hash".into(), "'new-hash-three'".into())] }])).await.unwrap();
+    s.apply(&rec(4, vec![Effect::TableDelete { table: "users".into(), filter: "id = 'u1'".into() }])).await.unwrap();
+    assert!(!files_with(dir.path(), b"secret-hash-one").is_empty(), "a delete is logical before compaction");
+
+    let st = s.compact().await.unwrap();
+    assert_eq!(st.tables, 1);
+    assert!(st.old_versions > 0, "{st:?}");
+    assert_eq!(files_with(dir.path(), b"secret-hash-one"), Vec::<std::path::PathBuf>::new(), "deleted row erased");
+    assert_eq!(files_with(dir.path(), b"old-hash-three"), Vec::<std::path::PathBuf>::new(), "updated-away value erased");
+    let live = select(&s, "users", None).await;
+    assert_eq!(ids(&live), ["u2", "u3"]);
+    assert_eq!(live[1]["hash"], "new-hash-three");
+
+    // Writes after it apply (compaction's versions aren't mistaken for effects).
+    s.apply(&rec(5, vec![insert("users", json!([{"id": "u4", "email": "d@x", "hash": "h4"}]))])).await.unwrap();
+    s.apply(&rec(6, vec![Effect::TableDelete { table: "users".into(), filter: "id = 'u2'".into() }])).await.unwrap();
+    assert_eq!(ids(&select(&s, "users", None).await), ["u3", "u4"]);
+
+    // A crash during a compaction: `_applied.json` still names the table, Lance has
+    // moved on. Reopen settles it, and the next write applies.
+    s.compact().await.unwrap();
+    drop(s);
+    let path = dir.path().join("_applied.json");
+    let mut a: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let v = a["versions"]["users"].as_u64().unwrap();
+    a["versions"]["users"] = json!(v - 1);
+    a["compacting"] = json!("users");
+    std::fs::write(&path, serde_json::to_vec(&a).unwrap()).unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    s.apply(&rec(7, vec![insert("users", json!([{"id": "u5", "email": "e@x", "hash": "h5"}]))])).await.unwrap();
+    assert_eq!(ids(&select(&s, "users", None).await), ["u3", "u4", "u5"]);
+}

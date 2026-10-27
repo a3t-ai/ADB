@@ -146,6 +146,12 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                     tracing::warn!(error = %e, "compaction failed; retrying later");
                 }
             }
+            // W5-L4: the platform tables, nightly and on their version count.
+            if night || (ticks % 60 == 30 && w.platform_compaction_due().await) {
+                if let Err(e) = w.compact_platform().await {
+                    tracing::warn!(error = %e, "platform compaction failed; retrying later");
+                }
+            }
             match w.expire_due().await {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
@@ -253,10 +259,16 @@ impl Engine for LocalEngine {
 
     async fn compact(&self) -> Result<Value, String> {
         let Some(w) = &self.durable else { return Err("compaction needs a durable engine (start ADB with --data-dir)".into()) };
+        let platform = w.compact_platform().await.map_err(|e| e.to_string())?.map(|p| {
+            json!({
+                "tables": p.tables, "fragments_removed": p.fragments_removed, "old_versions": p.old_versions,
+                "bytes_removed": p.bytes_removed, "took_ms": p.took.as_millis() as u64,
+            })
+        });
         match w.compact().await.map_err(|e| e.to_string())? {
             Some(s) => Ok(json!({
                 "total": s.total, "kept": s.kept, "bytes_before": s.bytes_before, "bytes_after": s.bytes_after,
-                "took_ms": s.took.as_millis() as u64,
+                "took_ms": s.took.as_millis() as u64, "platform": platform,
             })),
             None => Err("no table to compact".into()),
         }

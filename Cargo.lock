@@ -163,6 +163,7 @@ dependencies = [
  "adb-core",
  "arrow-array",
  "arrow-schema",
+ "chrono",
  "futures",
  "lance",
  "serde",

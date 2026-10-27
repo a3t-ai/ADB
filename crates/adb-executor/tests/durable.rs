@@ -610,3 +610,27 @@ async fn forget_erases_from_disk_before_it_returns() {
     assert_eq!(engine.query(r#"RECALL FROM EPISODIC WHERE key = "e1""#, None).await.unwrap()["data"]["count"], 1);
     assert!(files_with(dir.path(), secret).is_empty());
 }
+
+/// W5-L4: a platform-table DELETE leaves the table's files at the next compaction
+/// (here the admin one); the rest of the table and later writes are unaffected.
+#[tokio::test]
+async fn compaction_erases_deleted_platform_rows() {
+    use adb_core::log::Effect;
+    let dir = tempfile::tempdir().unwrap();
+    let secret = "pbkdf2-SECRET-HASH-0001";
+    let row = |id: &str, hash: &str| serde_json::json!({"id": id, "hash": hash}).as_object().unwrap().clone();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    engine.query(r#"STORE INTO SEMANTIC (key = "k", content = "a fact")"#, None).await.unwrap();
+    engine.platform_write(Effect::TableInsert { table: "users".into(), rows: vec![row("u1", secret), row("u2", "other")] }).await.unwrap();
+    engine.platform_write(Effect::TableDelete { table: "users".into(), filter: "id = 'u1'".into() }).await.unwrap();
+    let platform = dir.path().join("platform");
+    assert!(!files_with(&platform, secret).is_empty(), "a delete is logical until compaction");
+    let r = engine.compact().await.unwrap();
+    assert_eq!(r["platform"]["tables"], 1, "{r}");
+    assert_eq!(files_with(&platform, secret), Vec::<String>::new());
+    engine.platform_write(Effect::TableInsert { table: "users".into(), rows: vec![row("u3", "h3")] }).await.unwrap();
+    let rows = adb_platform::batches_to_json(&engine.platform().unwrap().query("users", None, 10).await.unwrap());
+    let mut ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, ["u2", "u3"]);
+}

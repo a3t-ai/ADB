@@ -11,7 +11,7 @@
 //! | `do_action("create_table")` | `{"table", "columns"?: [..] \| "schema"?: {col: type}}` | `{"created", "exists", "table"}` |
 //! | `do_action("update")` | `{"table", "filter", "values": {col: value}}` | `{"updated": true, "offset"}` |
 //! | `do_action("delete")` | `{"table", "filter"}` | `{"deleted": true, "offset"}` |
-//! | `do_action("compact")` | `{}` | `{"total", "kept", "bytes_before", "bytes_after", "took_ms"}` (W5) |
+//! | `do_action("compact")` | `{}` | `{"total", "kept", "bytes_before", "bytes_after", "took_ms", "platform": {…}}` (W5, W5-L4) |
 //! | `do_action("list_tables")` | `{}` | `["table", …]` |
 //! | `do_action("aql")` | `{"query", "variables"?}` | the `POST /query` result (`{success, data, …}`) |
 //!
@@ -273,7 +273,7 @@ impl FlightService for AdbFlight {
             ("create_table", "Create a platform table: {table, columns? | schema?}"),
             ("update", "Set values on matching rows: {table, filter, values}"),
             ("delete", "Delete matching rows: {table, filter}"),
-            ("compact", "Compact the memory table now: drop forgotten / expired data and old history (W5)"),
+            ("compact", "Compact the memory table and platform tables now: drop forgotten / expired / deleted data and old history (W5)"),
             ("list_tables", "Platform table names"),
             ("replace_table", "Replace a table with an empty one: {table, columns}"),
             ("aql", "Run AQL: {query, variables?} → the POST /query result"),
