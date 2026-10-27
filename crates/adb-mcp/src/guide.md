@@ -25,6 +25,7 @@ through the shortcut tools.
 STORE INTO SEMANTIC (key = "acct-9-renewal", content = "Renewal due 1 Nov", account = "acct-9")
 RECALL FROM SEMANTIC WHERE account = "acct-9" ORDER BY created_at DESC LIMIT 5
 RECALL FROM EPISODIC WHERE content CONTAINS "outage" LIMIT 10
+RECALL FROM SEMANTIC LIKE $q MIN_CONFIDENCE 0.6 LIMIT 5      -- $q = "when does acme renew?" (variables)
 LINK FROM PROCEDURAL WHERE key = "oom-fix" TO EPISODIC WHERE key = "inc-001" TYPE "applied_to" WEIGHT 0.9
 FORGET FROM WORKING WHERE task = "draft"
 ```

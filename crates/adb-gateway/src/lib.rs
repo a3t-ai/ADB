@@ -260,6 +260,8 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                     value: None,
                 }
             }
+            // A vector attached to a row is not a change of its content.
+            Effect::Embed { .. } => continue,
             // Registrations and cursors are not changes anyone subscribes to.
             Effect::Register(_) | Effect::UpdateSubCursor { .. } | Effect::Unregister { .. } => continue,
             // Platform tables (stage G) aren't memory: no subscription sees them.

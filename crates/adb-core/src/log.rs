@@ -288,6 +288,10 @@ pub enum Effect {
     /// Replace the whole table — its columns and rows — in one step (copying a
     /// platform database across backends, FlowR's switch).
     TableReplace { table: String, columns: Vec<String>, rows: Vec<serde_json::Map<String, serde_json::Value>> },
+    /// Set the embedding of row `id` (its current version) in place, without a new
+    /// version (MVP W4): the backfill of rows stored before there was a model, and
+    /// an in-place `Patch` of EPISODIC `content`. The vector travels in the log (§9.1).
+    Embed { memory: Memory, id: RecordId, embedding: Vec<f16> },
 }
 
 /// One committed transaction on one partition.

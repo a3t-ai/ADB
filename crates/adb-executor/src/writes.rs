@@ -308,6 +308,9 @@ pub struct DurableWrites<L: Log> {
     /// their TTL: built from Lance at open, kept by the writes below under the
     /// sequencer lock. Checking a key in Lance instead costs a read per STORE.
     live: std::sync::Mutex<LiveKeys>,
+    /// Embeds `content` on STORE / UPDATE and in the backfill (MVP W4); `None`: no
+    /// vectors (records are then found by filters and text only).
+    embedder: Option<Arc<adb_embed::Embedder>>,
 }
 
 pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
@@ -339,6 +342,59 @@ impl<L: Log + 'static> DurableWrites<L> {
             out.extend(edges.into_iter().filter(|e| e.data.object_id.as_ref().is_some_and(|o| targets.contains(o))));
         }
         Ok(out)
+    }
+
+    pub fn set_embedder(&mut self, embedder: Option<Arc<adb_embed::Embedder>>) {
+        self.embedder = embedder;
+    }
+
+    /// The f16 vector of `text` for the log, or `None` (no model, no text, or the
+    /// model failed — logged; the backfill tries again).
+    async fn vector_of(&self, text: Option<String>) -> Option<Vec<half::f16>> {
+        let (e, t) = (self.embedder.as_ref()?, text?);
+        match e.embed(vec![t]).await {
+            Ok(mut v) => Some(adb_embed::to_f16(&v.remove(0))),
+            Err(e) => {
+                tracing::warn!(error = %e, "embedding failed; the backfill will retry");
+                None
+            }
+        }
+    }
+
+    /// Embed current SEMANTIC / EPISODIC / PROCEDURAL rows that have text but no
+    /// vector — written before there was a model, or whose embedding failed — and
+    /// commit the vectors as `Embed` effects, at most `batch` rows per call (MVP W4
+    /// T7). Embedding runs outside the sequencer; a row superseded or forgotten in
+    /// between just gets a vector it no longer needs. Returns how many.
+    pub async fn embed_backfill(&self, batch: usize) -> AdbResult<u64> {
+        let (Some(store), Some(embedder)) = (&self.store, &self.embedder) else { return Ok(0) };
+        let now = CommitTs::from_datetime(time::now());
+        let filter = format!(
+            "{} AND memory IN ('semantic', 'episodic', 'procedural') AND tombstone = false AND superseded_by IS NULL AND embedding IS NULL",
+            adb_store::RECORD_KINDS
+        );
+        let rows = store.scan(Some(&filter)).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        let todo: Vec<(adb_store::StoredRow, String)> = rows
+            .into_iter()
+            .filter(|r| r.is_current(now))
+            .filter_map(|r| crate::reads::embed_text(r.data.memory.into(), &r.data.value).map(|t| (r, t)))
+            .take(batch)
+            .collect();
+        if todo.is_empty() {
+            return Ok(0);
+        }
+        let vectors = embedder.embed(todo.iter().map(|(_, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+        let effects: Vec<Effect> = todo
+            .iter()
+            .zip(vectors)
+            .map(|((r, _), v)| Effect::Embed { memory: r.data.memory, id: RecordId(adb_store::key_of(&r.id).to_string()), embedding: adb_embed::to_f16(&v) })
+            .collect();
+        let n = effects.len() as u64;
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(n)
     }
 
     fn key_taken(&self, memory: Memory, key: &str, now: CommitTs) -> bool {
@@ -388,7 +444,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             Some(s) => Registry::load(s, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?,
             None => Registry::default(),
         };
-        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live) }, stats))
+        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -610,6 +666,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord> {
         check_scope(memory_type, in_scope, self.in_lance(memory_type).is_some())?;
+        // Embedded before the sequencer, so the model doesn't serialise writes (T4).
+        let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
+            true => self.vector_of(crate::reads::embed_text(memory_type, &payload)).await,
+            false => None,
+        };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let id = RecordId(Adb::store_id(memory_type, key, &payload));
@@ -629,6 +690,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if let Some(s) = in_scope {
             data.scope = s.to_string();
         }
+        data.embedding = vector;
         data.ttl_at = ttl.map(|d| CommitTs(ts.0 + d.as_micros() as i64));
         let new = NewRow { id: id.clone(), lineage_id: id, version: 1, data };
         let effect = match memory_type {
@@ -651,6 +713,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     }
 
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64> {
+        // New `content` gets a new vector (T5), embedded before the sequencer.
+        let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
+            true => self.vector_of(data.get("content").and_then(|c| c.as_str()).map(String::from)).await,
+            false => None,
+        };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let ids = self.targets(memory_type, predicate, ts, false, in_scope).await?;
@@ -675,16 +742,24 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                     .await
                     .map_err(|e| AdbError::Internal(format!("store: {e}")))?
                     .ok_or_else(|| AdbError::Internal(format!("{memory_type:?} {key}: no current version in Lance")))?;
-                effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: next_version(&cur, &fields, seq.new_id(ts)) });
+                let mut new = next_version(&cur, &fields, seq.new_id(ts));
+                if vector.is_some() {
+                    new.data.embedding = vector.clone();
+                }
+                effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new });
             }
             let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
             self.to_store(&record, seq.log()).await;
             return Ok(effects.len() as u64);
         }
-        let effects: Vec<Effect> = ids
+        let mut effects: Vec<Effect> = ids
             .iter()
             .map(|id| Effect::Patch { memory: memory_type.into(), id: RecordId(id.clone()), fields: fields.clone(), version: 0 })
             .collect();
+        // EPISODIC patches in place: its new vector rides along in the same record.
+        if let Some(v) = &vector {
+            effects.extend(ids.iter().map(|id| Effect::Embed { memory: memory_type.into(), id: RecordId(id.clone()), embedding: v.clone() }));
+        }
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         // Apply exactly what was logged, so live and replayed updates agree.
         let n = match self.in_lance(memory_type) {
@@ -1026,6 +1101,11 @@ fn next_version(cur: &adb_store::StoredRow, fields: &serde_json::Map<String, ser
     }
     if let Some(c) = fields.get("content").and_then(|v| v.as_str()) {
         data.text = Some(c.to_string());
+    }
+    // The embedded text changed: the old vector no longer describes it (the caller
+    // or the backfill embeds the new one).
+    if ["content", "pattern", "steps"].iter().any(|f| fields.contains_key(*f)) {
+        data.embedding = None;
     }
     // `ttl_at` is carried over as is: UPDATE doesn't extend a TTL (D2 T6).
     NewRow { id, lineage_id: RecordId(cur.key().to_string()), version: cur.version + 1, data }

@@ -191,6 +191,13 @@ impl Executor {
     fn bind_variables_in_step(&self, step: &StepPlan, bindings: &HashMap<String, Value>) -> StepPlan {
         let mut bound_step = step.clone();
         bound_step.predicate = self.bind_variables_in_predicate(&step.predicate, bindings);
+        // `LIKE $q` (MVP W4): the reads rank against `$q`'s value (text or a vector).
+        if let Predicate::Like { embedding_var } = &step.predicate {
+            let name = embedding_var.trim_start_matches('$');
+            if let Some(v) = bindings.get(name).or_else(|| bindings.get(embedding_var)) {
+                bound_step.modifiers.like_query = Some(v.to_json());
+            }
+        }
         bound_step
     }
 

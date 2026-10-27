@@ -53,6 +53,10 @@ impl Reads for DirectReads {
 
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref(), false)?;
+        if matches!(predicate, Predicate::Like { .. }) {
+            // The in-memory backends hold no vectors: refuse rather than match all.
+            return Err(AdbError::UnsupportedOperation("LIKE (relevance recall needs a durable engine: start ADB with --data-dir)".into()));
+        }
         self.0.recall_with_modifiers(memory, predicate, modifiers).await
     }
 
@@ -97,6 +101,8 @@ pub struct LanceReads {
     /// Waits for the background applier, so reads see every write that returned
     /// before them (stage D3.7). `None` = the table is written synchronously.
     barrier: Option<Arc<ApplyBarrier>>,
+    /// Embeds the text of `LIKE $q` (MVP W4); `None`: only vectors can be passed.
+    embedder: Option<Arc<adb_embed::Embedder>>,
 }
 
 /// A throwaway backend over some of the table's rows, answering with the backend's
@@ -195,6 +201,22 @@ pub fn check_scope(memory: MemoryType, in_scope: Option<&str>, durable: bool) ->
     Ok(())
 }
 
+/// The text ADB embeds for a record (D3 S3 / W4 T3): `content`; for PROCEDURAL
+/// without it, `pattern` and `steps`.
+pub fn embed_text(memory: MemoryType, value: &serde_json::Value) -> Option<String> {
+    let s = |k: &str| value.get(k).and_then(|v| v.as_str()).filter(|t| !t.trim().is_empty());
+    if let Some(c) = s("content") {
+        return Some(c.to_string());
+    }
+    if memory == MemoryType::Procedural {
+        let parts: Vec<&str> = [s("pattern"), s("steps")].into_iter().flatten().collect();
+        if !parts.is_empty() {
+            return Some(parts.join(". "));
+        }
+    }
+    None
+}
+
 pub fn lance_owned(memory: MemoryType) -> bool {
     matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
 }
@@ -228,7 +250,88 @@ pub(crate) async fn current_view(
 
 impl LanceReads {
     pub fn new(adb: Arc<Adb>, store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { adb, store, barrier }
+        Self { adb, store, barrier, embedder: None }
+    }
+
+    pub fn with_embedder(mut self, embedder: Option<Arc<adb_embed::Embedder>>) -> Self {
+        self.embedder = embedder;
+        self
+    }
+
+    /// `RECALL FROM <memory> LIKE $q …` (MVP W4): the current rows passing the
+    /// statement's filters (`IN SCOPE`, `NAMESPACE`, TTL), ranked by
+    /// [`crate::rank`] against `$q` — text (embedded here, and matched as words) or
+    /// a vector — cut by `MIN_CONFIDENCE` (cosine) and `LIMIT` (default 10). An
+    /// explicit `ORDER BY` reorders the selected records.
+    async fn similar(&self, memory: MemoryType, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+        let query = modifiers.like_query.as_ref().ok_or_else(|| AdbError::QueryError("LIKE $q: the variable has no value (pass it in `variables`)".into()))?;
+        let (query_text, query_vec) = match query {
+            serde_json::Value::String(t) => {
+                let embedded = match &self.embedder {
+                    Some(e) => Some(e.embed(vec![t.clone()]).await.map_err(AdbError::EmbeddingError)?.remove(0)),
+                    None => None,
+                };
+                (Some(t.clone()), embedded)
+            }
+            serde_json::Value::Array(xs) => {
+                let v: Option<Vec<f32>> = xs.iter().map(|x| x.as_f64().map(|f| f as f32)).collect();
+                (None, Some(v.ok_or_else(|| AdbError::QueryError("LIKE $q: a vector is a list of numbers".into()))?))
+            }
+            other => return Err(AdbError::QueryError(format!("LIKE $q: text or a vector, not {other}"))),
+        };
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
+        let now = CommitTs::from_datetime(time::now());
+        let m: Memory = memory.into();
+        let kinds = ["entity", "fact", "episode", "tool"].map(lit).to_vec();
+        let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").in_list(kinds, false));
+        if let Some(s) = &modifiers.in_scope {
+            filter = filter.and(col("scope").eq(lit(s.clone())));
+        }
+        let mut rows = self.store.current_expr(Some(filter), now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        if let Some(ns) = &modifiers.namespace {
+            rows.retain(|r| r.data.namespace.as_ref() == Some(ns));
+        }
+        let vectors: Vec<Option<Vec<f32>>> =
+            rows.iter().map(|r| r.data.embedding.as_ref().map(|e| e.iter().map(|x| x.to_f32()).collect())).collect();
+        let texts: Vec<Option<String>> = rows.iter().map(|r| embed_text(r.data.memory.into(), &r.data.value)).collect();
+        let candidates: Vec<crate::rank::Candidate> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| crate::rank::Candidate { embedding: vectors[i].as_deref(), text: texts[i].as_deref(), at: r.commit_ts })
+            .collect();
+        let ranked = crate::rank::rank(&candidates, query_vec.as_deref(), query_text.as_deref(), modifiers.min_confidence, now);
+        let limit = modifiers.limit.unwrap_or(10);
+        let mut out: Vec<MemoryRecord> = ranked
+            .into_iter()
+            .take(limit)
+            .map(|r| {
+                let mut rec = to_record(&rows[r.index]);
+                rec.metadata.confidence = r.similarity;
+                rec
+            })
+            .collect();
+        if let Some(order) = &modifiers.order_by {
+            out.sort_by(|a, b| {
+                let (x, y) = (a.order_value(&order.field), b.order_value(&order.field));
+                let c = match (x.as_ref(), y.as_ref()) {
+                    (Some(x), Some(y)) => x.to_string().cmp(&y.to_string()),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                if order.ascending { c } else { c.reverse() }
+            });
+        }
+        if let Some(fields) = &modifiers.return_fields {
+            for r in out.iter_mut() {
+                if let serde_json::Value::Object(m) = &mut r.data {
+                    m.retain(|k, _| fields.iter().any(|f| f == k || f == "*"));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The memory types served from Lance.
@@ -271,6 +374,12 @@ impl Reads for LanceReads {
 
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref(), true)?;
+        if matches!(predicate, Predicate::Like { .. }) {
+            if !Self::serves(memory) {
+                return Err(AdbError::UnsupportedOperation(format!("LIKE on {memory:?} (supported on SEMANTIC, EPISODIC and PROCEDURAL)")));
+            }
+            return self.similar(memory, modifiers).await;
+        }
         if !Self::serves(memory) {
             return self.adb.recall_with_modifiers(memory, predicate, modifiers).await;
         }

@@ -225,3 +225,39 @@ async fn durable_offset_follows_the_memwal_and_survives_a_crash() {
     assert!(store.durable_offset().await.unwrap() >= durable);
     store.close().await.unwrap();
 }
+
+/// MVP W4: a table written with another embedding dimension (768 before the model
+/// was chosen) is rewritten at open for the configured one: every row version —
+/// history, tombstones, links — and the applied offset survive, the old table is
+/// kept as a backup, and vectors of the new size are stored from then on.
+#[tokio::test]
+async fn a_table_of_another_embedding_dimension_is_rewritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = CommitTs(T0 + 1_000_000_000);
+    let at = |dim| StoreConfig { embedding_dim: dim, ..cfg(dir.path(), 10_000) };
+    let before;
+    {
+        let store = PartitionStore::open(&at(8), PartitionId(0)).await.unwrap();
+        for r in story() {
+            store.apply(&r).await.unwrap();
+        }
+        before = ids(&store.scan(None).await.unwrap());
+        store.close().await.unwrap();
+    }
+    let store = PartitionStore::open(&at(4), PartitionId(0)).await.unwrap();
+    assert_eq!(ids(&store.scan(None).await.unwrap()), before, "every row version is kept");
+    assert_eq!(store.applied_offset().await.unwrap(), LogOffset(5));
+    let acme = store.current_version(Memory::Semantic, "acme", now).await.unwrap().unwrap();
+    assert_eq!(acme.data.value["content"], "Acme renews on 15 Nov");
+    assert!(dir.path().join("p0/memory.dim8.bak").exists(), "the old table is kept");
+    // New rows carry vectors of the new size.
+    let mut d = data(Memory::Semantic, Kind::Entity, json!({"key": "v", "content": "with a vector"}));
+    d.embedding = Some([0.1f32, 0.2, 0.3, 0.4].iter().map(|x| half::f16::from_f32(*x)).collect());
+    store.apply(&rec(6, vec![Effect::PutEntity(new("v", "v", 1, d))])).await.unwrap();
+    let v = store.current_version(Memory::Semantic, "v", now).await.unwrap().unwrap();
+    assert_eq!(v.data.embedding.as_ref().map(|e| e.len()), Some(4));
+    store.close().await.unwrap();
+    // Opening again at the same dimension changes nothing.
+    let store = PartitionStore::open(&at(4), PartitionId(0)).await.unwrap();
+    assert_eq!(store.applied_offset().await.unwrap(), LogOffset(6));
+}

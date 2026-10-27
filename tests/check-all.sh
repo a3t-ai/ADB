@@ -18,6 +18,8 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BUILD_DIR/target-adb}"
 FLOWR_TARGET="${FLOWR_TARGET:-$BUILD_DIR/target-flowr-ce}"
 LANCEDB="${ADB_CHECK_LANCEDB:-$ROOT/tests/fixtures/a3t-platform.lance}"
 QUICK=0; [ "${1:-}" = "--quick" ] && QUICK=1
+# The embedding model (W4), so the gates run relevance recall too (fetched once).
+export ADB_EMBED_MODEL_DIR="${ADB_EMBED_MODEL_DIR:-$("$ROOT/tests/fetch-model.sh")}"
 
 pass=(); fail=()
 step() {

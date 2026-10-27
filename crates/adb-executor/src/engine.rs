@@ -76,13 +76,21 @@ impl Drop for LocalEngine {
 
 /// How often the expiry timer commits the `Expire`s that came due (D2 §4).
 const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+/// Rows the embedding backfill embeds per tick (MVP W4 T7), and how many ticks it
+/// rests once nothing is left (new rows are embedded on write).
+const BACKFILL_BATCH: usize = 64;
+const BACKFILL_IDLE_TICKS: u32 = 60;
 
-/// The expiry timer: every tick, `expire_due` on `writes` while it exists. Holds
+/// The maintenance timer: every tick, `expire_due`, and the embedding backfill
+/// while it finds work (then once a minute), on `writes` while it exists. Holds
 /// only a weak reference, so it never keeps the log (and its directory lock) open.
 fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(EXPIRE_TICK);
+        // The first tick after one interval, not at once: a just-opened engine is
+        // often closed again right away (tests, `adb import`).
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + EXPIRE_TICK, EXPIRE_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut backfill_rest = 0u32;
         loop {
             tick.tick().await;
             let Some(w) = writes.upgrade() else { return };
@@ -90,6 +98,18 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
                 Err(e) => tracing::warn!(error = %e, "TTL expiry failed; retrying next tick"),
+            }
+            if backfill_rest > 0 {
+                backfill_rest -= 1;
+                continue;
+            }
+            match w.embed_backfill(BACKFILL_BATCH).await {
+                Ok(0) => backfill_rest = BACKFILL_IDLE_TICKS,
+                Ok(n) => tracing::info!(embedded = n, "embedding backfill"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "embedding backfill failed; retrying in a minute");
+                    backfill_rest = BACKFILL_IDLE_TICKS;
+                }
             }
         }
     })
@@ -128,7 +148,9 @@ impl LocalEngine {
             let lineages: Arc<dyn adb_gateway::Lineages> = Arc::clone(&store) as Arc<dyn adb_gateway::Lineages>;
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });
-        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()));
+        let embedder = adb_embed::Embedder::shared();
+        writes.set_embedder(embedder.clone());
+        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()).with_embedder(embedder));
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
         let writes: Arc<dyn Writes> = durable;
@@ -275,6 +297,9 @@ pub fn wire_record(r: &MemoryRecord) -> Value {
     meta.insert("version".into(), json!(m.version));
     if let Some(ttl) = m.ttl {
         meta.insert("ttl_ms".into(), json!(ttl.as_millis() as u64));
+    }
+    if let Some(c) = m.confidence {
+        meta.insert("confidence".into(), json!(c));
     }
     json!({
         "id": r.id,

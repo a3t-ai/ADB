@@ -8,6 +8,7 @@ mod executor;
 mod result;
 pub mod apply;
 pub mod reads;
+pub mod rank;
 pub mod writes;
 
 pub use error::{ExecutorError, ExecutorResult};

@@ -151,12 +151,21 @@ impl LocalWal {
     pub fn open(partition: PartitionId, config: WalConfig) -> LogResult<Self> {
         fs::create_dir_all(&config.dir).map_err(io)?;
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("LOCK")).map_err(io)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(LogError::Io(format!("{} is in use by another ADB process", config.dir.display())));
+        // A log closed a moment ago in this process can still be held by a
+        // background task finishing its step (expiry, embedding backfill): wait a
+        // little before calling it in use.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(LogError::Io(format!("{} is in use by another ADB process", config.dir.display())));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
         }
         let mut segments: Vec<u64> = fs::read_dir(&config.dir)
             .map_err(io)?

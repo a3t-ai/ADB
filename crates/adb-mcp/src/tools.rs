@@ -60,10 +60,13 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "recall",
-            "description": "Recall memories. Matches `contains` against the remembered content and `filter` against fields; newest first.",
+            "description": "Recall memories. With `like`: the memories most relevant to that text (by meaning and words), each with a `confidence` (0-1); cut by `min_confidence` and `limit`. Without it: `contains` matches the content, `filter` matches fields; newest first.",
             "inputSchema": { "type": "object", "properties": {
                 "scope": { "type": "string", "description": "Named scope, e.g. \"team:billing\" or \"agent:42\" (optional; SEMANTIC, EPISODIC, PROCEDURAL). Without it, recall and forget cover every scope." },
                 "memory_type": with_desc(&mt, "Where to look (default SEMANTIC)"),
+                "like": { "type": "string", "description": "Rank by relevance to this text, e.g. the user's question (optional; not with contains / filter)" },
+                "min_confidence": { "type": "number", "description": "With `like`: drop memories less similar than this (0-1, optional)" },
+                "namespace": { "type": "string", "description": "Namespace (optional)" },
                 "contains": { "type": "string", "description": "Text the content must contain (optional)" },
                 "filter": { "type": "object", "description": "Field = value conditions (optional)" },
                 "limit": { "type": "integer", "description": "Maximum results (default 10)" }

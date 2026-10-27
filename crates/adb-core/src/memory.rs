@@ -117,6 +117,10 @@ pub struct Metadata {
     pub ttl: Option<Duration>,
     /// Record version (for optimistic concurrency)
     pub version: u64,
+    /// `RECALL … LIKE`: the cosine similarity of this record to the query (0–1),
+    /// what `MIN_CONFIDENCE` compares against (AQL v0.5 §14). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 impl Metadata {
@@ -130,6 +134,7 @@ impl Metadata {
             namespace: None,
             ttl: None,
             version: 1,
+            confidence: None,
         }
     }
 
@@ -360,6 +365,9 @@ impl MemoryRecord {
             meta.insert("accessed_at".to_string(), serde_json::Value::String(self.metadata.accessed_at.to_rfc3339()));
             if let Some(ttl) = self.metadata.ttl {
                 meta.insert("ttl".to_string(), serde_json::json!(ttl.as_millis() as u64));
+            }
+            if let Some(c) = self.metadata.confidence {
+                meta.insert("confidence".to_string(), serde_json::json!(c));
             }
             map.insert("metadata".to_string(), serde_json::Value::Object(meta));
             map.insert("data".to_string(), self.data.clone());

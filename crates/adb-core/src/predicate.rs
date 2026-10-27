@@ -514,6 +514,10 @@ pub struct Modifiers {
     /// Window for SCAN
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
+    /// `LIKE $q`: the bound value of `$q` — text (ADB embeds it) or a vector —
+    /// set by the executor when it binds variables (MVP W4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub like_query: Option<serde_json::Value>,
     /// Named scope (`IN SCOPE "team:billing"`, AQL v0.6): the memory boundary a
     /// statement reads or writes. Separate from `scope` (private / shared / cluster).
     #[serde(default, skip_serializing_if = "Option::is_none")]

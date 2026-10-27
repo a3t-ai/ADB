@@ -108,7 +108,7 @@ impl McpServer {
                 Err(e) => Err(format!("Stats failed: {e}")),
             },
             "remember" => self.remember(&args).await,
-            "recall" => self.run(recall(&args)).await,
+            "recall" => self.recall(&args).await,
             "forget" => self.run(forget(&args)).await,
             "link" => self.run(link(&args)).await,
             "unlink" => self.run(unlink(&args)).await,
@@ -164,6 +164,15 @@ impl McpServer {
             }
             other => other.map_err(|e| format!("Query failed: {e}\nAQL: {aql}")),
         }
+    }
+
+    /// `recall`: with `like`, relevance recall (`RECALL … LIKE $q`, the text passed
+    /// as a variable, MVP W4); otherwise filters and `contains`.
+    async fn recall(&self, args: &Value) -> Result<Value, String> {
+        let aql = recall(args)?;
+        let Some(like) = args.get("like").and_then(Value::as_str) else { return self.run(Ok(aql)).await };
+        let vars: HashMap<String, Value> = [("q".to_string(), json!(like))].into();
+        self.engine.query(&aql, Some(&vars)).await.map_err(|e| format!("Query failed: {e}\nAQL: {aql}"))
     }
 
     async fn run(&self, aql: Result<String, String>) -> Result<Value, String> {
@@ -325,6 +334,21 @@ fn recall(args: &Value) -> Result<String, String> {
         conds.push(format!("{} = {}", tools::field(&k)?, literal(&v)));
     }
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10);
+    if args.get("like").and_then(Value::as_str).is_some() {
+        // Relevance (AQL v0.5 §6 / §14): LIKE ranks, MIN_CONFIDENCE and LIMIT cut;
+        // `contains` and `filter` don't combine with it (one predicate per statement).
+        if !conds.is_empty() {
+            return Err("recall: `like` ranks by relevance and can't be combined with `contains` / `filter`".into());
+        }
+        let mut q = format!("RECALL FROM {mt} LIKE $q");
+        if let Some(c) = args.get("min_confidence").and_then(Value::as_f64) {
+            q.push_str(&format!(" MIN_CONFIDENCE {c:?}"));
+        }
+        if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
+            q.push_str(&format!(" NAMESPACE {}", quote(ns)));
+        }
+        return Ok(format!("{q} LIMIT {limit}{}", in_scope(args)));
+    }
     let filter = if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) };
     Ok(format!("RECALL FROM {mt}{filter} LIMIT {limit}{}", in_scope(args)))
 }

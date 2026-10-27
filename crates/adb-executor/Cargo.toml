@@ -12,6 +12,8 @@ aql-planner = { path = "../aql-planner" }
 adb-log = { path = "../adb-log" }
 adb-sequencer = { path = "../adb-sequencer" }
 adb-store = { path = "../adb-store" }
+adb-embed = { path = "../adb-embed" }
+half.workspace = true
 adb-gateway = { path = "../adb-gateway" }
 adb-platform = { path = "../adb-platform" }
 datafusion.workspace = true

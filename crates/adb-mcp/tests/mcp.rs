@@ -198,3 +198,24 @@ async fn link_twice_reweights_and_unlink_removes() {
     let (_, v) = call(&s, "recall", json!({"memory_type": "EPISODIC"})).await;
     assert_eq!(v["data"]["count"], json!(1), "the memories stay: {v}");
 }
+
+/// MVP W4: `recall` with `like` ranks by relevance and reports a confidence.
+/// Needs the model (`ADB_EMBED_MODEL_DIR`); skipped without it.
+#[tokio::test]
+async fn recall_like_ranks_by_relevance() {
+    if !std::env::var("ADB_EMBED_MODEL_DIR").is_ok_and(|d| std::path::Path::new(&d).join("model.onnx").exists()) {
+        return eprintln!("no ADB_EMBED_MODEL_DIR; skipped");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = McpServer::new(Arc::new(engine));
+    for (k, c) in [("renewal", "Acme's contract renews on 1 November"), ("oom", "The payments pod runs out of memory"), ("vpn", "Restart the VPN client to reconnect")] {
+        call(&s, "remember", json!({"content": c, "key": k})).await;
+    }
+    let (err, v) = call(&s, "recall", json!({"like": "when is the acme renewal", "limit": 2})).await;
+    assert!(!err, "{v}");
+    assert_eq!(v["data"]["records"][0]["id"], json!("renewal"), "{v}");
+    assert!(v["data"]["records"][0]["metadata"]["confidence"].as_f64().unwrap() > 0.5, "{v}");
+    let (err, _) = call(&s, "recall", json!({"like": "x", "contains": "y"})).await;
+    assert!(err, "like with contains is refused");
+}

@@ -35,6 +35,10 @@ use crate::rows::{decode, encode, qualified, row_id, StoredRow};
 use crate::schema::{memory_schema, META_ID, RECORD_KINDS};
 use crate::{StoreError, StoreResult};
 
+/// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
+/// deployment (D3 S5); a table of another dimension is rewritten at open.
+pub const DEFAULT_EMBEDDING_DIM: i32 = 384;
+
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     /// Directory (or object-store URI) holding `p{partition}/memory.lance`.
@@ -49,7 +53,7 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), embedding_dim: 768, memtable_rows: 10_000, wal_flush: Duration::from_secs(1) }
+        Self { root: root.into(), embedding_dim: DEFAULT_EMBEDDING_DIM, memtable_rows: 10_000, wal_flush: Duration::from_secs(1) }
     }
 }
 
@@ -119,8 +123,65 @@ impl PartitionStore {
     /// Open (creating if needed) the partition's table and become its writer.
     pub async fn open(cfg: &StoreConfig, partition: PartitionId) -> StoreResult<Self> {
         configure_lance_runtime();
-        let schema = memory_schema(cfg.embedding_dim);
         let dir = cfg.root.join(format!("p{}", partition.0)).join("memory.lance");
+        let staged = dir.with_file_name("memory.rewrite.lance");
+        // A rewrite (below) that stopped between its two renames: finish it.
+        if !dir.exists() && staged.exists() {
+            std::fs::rename(&staged, &dir).map_err(|e| StoreError::Decode(format!("finishing the table rewrite: {e}")))?;
+        }
+        if dir.exists() {
+            let ds = Dataset::open(&dir.to_string_lossy()).await.map_err(lance)?;
+            if let Some(found) = embedding_dim_of(&ds) {
+                if found != cfg.embedding_dim {
+                    drop(ds);
+                    Box::pin(Self::rewrite_dim(cfg, partition, found)).await?;
+                }
+            }
+        }
+        Self::open_at(cfg, partition, &dir).await
+    }
+
+    /// The table's embedding column has `from` dimensions and the model `cfg`'s:
+    /// rewrite every row (history, tombstones and `_meta` too) into a new table of
+    /// `cfg.embedding_dim`, then swap it in; the old table stays beside it as
+    /// `memory.dim<from>.bak`. Vectors of the old size are dropped (they can't be
+    /// read by the new model; the backfill embeds the text again). Crash-safe: the
+    /// new table is complete and closed before the renames, and `open` finishes an
+    /// interrupted swap.
+    async fn rewrite_dim(cfg: &StoreConfig, partition: PartitionId, from: i32) -> StoreResult<()> {
+        let dir = cfg.root.join(format!("p{}", partition.0)).join("memory.lance");
+        let staged = dir.with_file_name("memory.rewrite.lance");
+        let old = Self::open_at(&StoreConfig { embedding_dim: from, ..cfg.clone() }, partition, &dir).await?;
+        let mut rows = old.scan(None).await?;
+        old.close().await?;
+        for r in rows.iter_mut() {
+            r.data.embedding = None;
+            if r.id == META_ID {
+                if let serde_json::Value::Object(v) = &mut r.data.value {
+                    v.insert("embedding_dim".into(), cfg.embedding_dim.into());
+                }
+            }
+        }
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
+        }
+        Self::create(&staged.to_string_lossy(), &memory_schema(cfg.embedding_dim), cfg.embedding_dim).await?;
+        let new = Self::open_at(cfg, partition, &staged).await?;
+        let batch = encode(&rows, &new.schema, new.dim)?;
+        new.writer.put(vec![batch]).await.map_err(lance)?;
+        new.close().await?;
+        let backup = dir.with_file_name(format!("memory.dim{from}.bak"));
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
+        }
+        std::fs::rename(&dir, &backup).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
+        std::fs::rename(&staged, &dir).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
+        tracing::info!(rows = rows.len(), from, to = cfg.embedding_dim, backup = %backup.display(), "memory table rewritten for the embedding model's dimension");
+        Ok(())
+    }
+
+    async fn open_at(cfg: &StoreConfig, partition: PartitionId, dir: &std::path::Path) -> StoreResult<Self> {
+        let schema = memory_schema(cfg.embedding_dim);
         let uri = dir.to_string_lossy().to_string();
         if !dir.exists() {
             Self::create(&uri, &schema, cfg.embedding_dim).await?;
@@ -393,6 +454,8 @@ impl PartitionStore {
                         }
                         if let Some(c) = fields.get("content").and_then(|v| v.as_str()) {
                             cur.data.text = Some(c.to_string());
+                            // The vector described the old text; an `Embed` may follow.
+                            cur.data.embedding = None;
                         }
                         cur.version += 1;
                         // Last write (D2 T7); commit_ts stays the STORE's, so annotating an
@@ -407,6 +470,13 @@ impl PartitionStore {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
+                    }
+                }
+                Effect::Embed { memory, id, embedding } => {
+                    if let Some(mut cur) = self.row(&out, &row_id(*memory, &id.0)).await? {
+                        cur.data.embedding = Some(embedding.clone());
+                        cur.log_offset = off;
+                        out.insert(cur.id.clone(), cur);
                     }
                 }
                 Effect::UpdateSubCursor { sub_id, cursor } => {
@@ -528,5 +598,13 @@ impl PartitionStore {
     /// Flush and release the writer.
     pub async fn close(self) -> StoreResult<()> {
         self.writer.close().await.map_err(lance)
+    }
+}
+
+/// The dimension of a table's `embedding` column (`None`: no such column).
+fn embedding_dim_of(ds: &Dataset) -> Option<i32> {
+    match ds.schema().field("embedding")?.data_type() {
+        arrow_schema::DataType::FixedSizeList(_, n) => Some(n),
+        _ => None,
     }
 }

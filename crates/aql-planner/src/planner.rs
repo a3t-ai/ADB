@@ -528,6 +528,7 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         scope: mods.scope.map(convert_scope),
         namespace: mods.namespace.clone(),
         in_scope: mods.in_scope.clone(),
+        like_query: None,
         ttl: mods.ttl,
         aggregate: mods.aggregate.as_ref().map(|aggs| {
             aggs.iter().map(convert_aggregate).collect()

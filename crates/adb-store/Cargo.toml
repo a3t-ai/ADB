@@ -6,6 +6,7 @@ license.workspace = true
 description = "ADB storage: Lance tables and the MemWAL applier (ARCHITECTURE.md §9, §16)"
 
 [dependencies]
+tracing.workspace = true
 adb-core.workspace = true
 lance.workspace = true
 lance-index.workspace = true

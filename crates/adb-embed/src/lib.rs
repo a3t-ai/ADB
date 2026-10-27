@@ -52,6 +52,12 @@ impl Embedder {
         Ok(Self { model: Mutex::new(model) })
     }
 
+    /// The process's embedder, loaded once ([`Embedder::from_env`]).
+    pub fn shared() -> Option<Arc<Self>> {
+        static SHARED: std::sync::OnceLock<Option<Arc<Embedder>>> = std::sync::OnceLock::new();
+        SHARED.get_or_init(Self::from_env).clone()
+    }
+
     /// The embedder this process should use: `None` when `ADB_EMBED=off`, or when
     /// the model directory is missing (logged; ADB then runs without vectors).
     pub fn from_env() -> Option<Arc<Self>> {
