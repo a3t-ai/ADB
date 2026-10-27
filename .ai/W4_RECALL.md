@@ -64,3 +64,18 @@ of messages ago.
   queries — the backfill runs at low concurrency.
 - **English only, one size** (bge-small-en, 384). Pluggable providers of any size,
   chosen in ADB settings, are W4-L1 in `limitations.md` (user, 26 Oct: later).
+
+## As built (27 Oct)
+
+| Step | State |
+|---|---|
+| 1 Embedder | `adb-embed`: fastembed 7 / ONNX Runtime (static), model from `ADB_EMBED_MODEL_DIR` (image: `/models/bge-small-en-v1.5`, baked by `deploy.sh`; `tests/fetch-model.sh`) |
+| 2 Schema / write path | 384-dim column; tables of another dimension rewritten at open (backup kept); STORE / UPDATE embed before the sequencer; `Embed` log effect |
+| 3 Backfill | Maintenance ticker, 64 rows per tick while there is work, then once a minute |
+| 4 Search | Brute force over the filtered current rows (W4-L2); cosine + BM25, weighted RRF (text 0.2), recency ×0.8–1.0 |
+| 5 Query surface | `RECALL … LIKE $q` (text or vector) `MIN_CONFIDENCE` `LIMIT`, `metadata.confidence`; MCP `recall` `like` / `min_confidence` |
+| 6 Eval | `tests/recall-eval.mjs` in `check-all.sh`: hybrid recall@1 0.95, recall@5 1.00, MRR 0.97 (text only 0.64 / 0.93 / 0.75) |
+| 7 Agents | FlowR memory phase: `LIKE $message`, `memory_config.semantic.{limit, min_confidence}`; A3T tier editor fields; FlowR integration checks the fact reaches the prompt past newer ones |
+| 8 Release | pending |
+
+Limits: W4-L1…L6 in `limitations.md`. ADB's memory limit raised to 2 GiB.

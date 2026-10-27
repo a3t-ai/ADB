@@ -82,7 +82,9 @@ spec:
               cpu: 100m
               memory: 128Mi
             limits:
-              memory: 1Gi
+              # W4: the embedding model and ONNX Runtime (~550 MB idle, ~700 MB peak
+              # measured on the debug build) plus Lance's cache.
+              memory: 2Gi
       volumes:
         - name: adb-data
           hostPath:

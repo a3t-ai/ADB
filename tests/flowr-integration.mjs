@@ -294,6 +294,23 @@ do:
   const text = JSON.stringify(reply ?? r.text);
   check('agent recalls a fact from ADB into its prompt', !r.isError && text.includes('favourite colour is teal'), r.text.slice(0, 600));
   check('only its own namespace', !text.includes('purple'), text.slice(0, 600));
+  // MVP W4: relevance, not recency. Eight unrelated facts stored after it would push
+  // "teal" out of the newest five; LIKE $q still brings it, and the tier limit holds.
+  for (const [k, c] of [['f1', 'Invoices go out on the third'], ['f2', 'The VPN client needs a restart after updates'],
+    ['f3', 'Lunch is catered on Tuesdays'], ['f4', 'The printer needs a badge'], ['f5', 'Backups run nightly at 2am'],
+    ['f6', 'The office opens at 7am'], ['f7', 'Parking is on level -2'], ['f8', 'Laptops are replaced every three years']]) {
+    await adbQ(`STORE INTO SEMANTIC (key = "${k}", content = "${c}") NAMESPACE "f-test"`);
+  }
+  if (process.env.ADB_EMBED_MODEL_DIR) {
+    r = await ask('f-s1b', 'Which colour do I like best?');
+    const t2 = JSON.stringify(flowOutput(r.text) ?? r.text);
+    check('W4: the relevant fact reaches the prompt past newer ones', t2.includes('favourite colour is teal'), t2.slice(0, 600));
+    r = await ask('f-s1c', 'Which colour do I like best?', { memory_config: { semantic: { limit: 1 } } });
+    const t3 = JSON.stringify(flowOutput(r.text) ?? r.text);
+    check('W4: memory_config.semantic.limit caps the facts', t3.includes('teal') && !t3.includes('Invoices') && !t3.includes('printer'), t3.slice(0, 600));
+  } else {
+    console.log('  (no ADB_EMBED_MODEL_DIR: W4 relevance checks skipped)');
+  }
   const turns = await adbQ('RECALL FROM WORKING WHERE session_id = "f-s1" NAMESPACE "f-test"');
   check('the user turn is stored in WORKING', turns?.records?.[0]?.data?.content === 'What is my favourite colour?', JSON.stringify(turns));
   const eps = await adbQ('RECALL FROM EPISODIC WHERE session_id = "f-s1" NAMESPACE "f-test"');

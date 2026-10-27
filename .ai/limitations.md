@@ -8,7 +8,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| L1 | **No embeddings are ever stored.** AQL `STORE` has no embedding input and the durable path writes `embedding: None`; only `SemanticBackend::store_with_embedding` (unused by AQL) keeps one, in memory. | `RECALL … LIKE $vec` finds nothing; vector recall is not implemented end to end. | M2 hybrid recall (risk D4): embedding on STORE, Lance vector index. |
 | L4 | **No optimistic concurrency** on UPDATE (`version` in `Patch` is always 0; supersede reads the current version under the sequencer lock instead). | Fine with one writer per partition; breaks with concurrent writers or replicas. | M3 (replication) / sequencer validation. |
 | L5 | **Records that shared a key across memory types before schema v3 were already one Lance row.** The v2→v3 migration keeps the survivor under the type it was last written as; the overwritten one can't be recovered. | Only data written before 25 Oct. vc-dev had one record and migrated cleanly. | None — note for anyone migrating an old data dir. |
 | L6 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record**, not the linked ones. `RECALL … WHERE … FOLLOW LINKS` works. | AQL users must use the `RECALL` form. | Executor LOOKUP path; with the M2 query rework. |
@@ -66,7 +65,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| F-L1 | **SEMANTIC recall is "newest 5 facts in the namespace"**, not relevance. | A busy namespace pushes older relevant facts out of the prompt. | M2 hybrid recall (vector + FTS). |
 | F-L2 | **Procedures have no namespace** (ADB's procedural backend ignores it) and are matched in FlowR (token overlap), since `PATTERN` needs a bound variable. | Every agent with PROCEDURAL reads sees every procedure. | With L7 / M2. |
 | F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | Reflection / summarisation (M2 lifecycle). |
 | F-L4 | **`adb_topic` triggers can only be created through the API / `create_trigger`** — A3T's Triggers page lists webhook and cron. | No UI to set one up yet. | A3T UI. |
@@ -123,6 +121,11 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
+| W4-L2 | **Relevance recall scans its candidates** (brute force): every `LIKE` loads the current rows passing the filters, with their vectors, and ranks them in Rust; no ANN (IVF_RQ) or inverted (BM25) index yet. | Fine below ~10k rows per memory type and filter (S8); slower above. | Lance IVF_RQ + inverted index past the threshold, with the W7 query engine. |
+| W4-L3 | **Word matching is crude**: English stop words and suffix stripping (no real stemmer, no synonyms); BM25 statistics are computed over the candidate set per query. | Words only back up meaning (weight 0.2). | A proper analyzer with the inverted index (W4-L2). |
+| W4-L4 | **The evaluation set is small and synthetic** (93 facts, 42 queries, English); the weights were set on it. | Real agent memory may rank differently. | Grow it from real (anonymised) A3T queries. |
+| W4-L5 | **PROCEDURAL `LIKE` returns raw payloads** (not the backend's procedure nodes, L7) and embeds `content` or `pattern` + `steps`. | Procedure fields as stored. | With L7. |
+| W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | Calibrate per model (W4-L1). |
 | W4-L1 | **One embedding model, fixed: bge-small-en-v1.5, 384 dims** (baked into the image; `ADB_EMBED_MODEL_DIR` swaps the files, not the size). The table's `embedding` column has one fixed dimension. | No larger / multilingual / hosted models (e.g. 768 / 1024 / 1536 dims, OpenAI-compatible endpoints). | **User, 26 Oct:** choose the embedding provider and its size in **ADB settings** (A3T Settings → ADB): local model or provider endpoint, dimension recorded in `_meta`; changing it re-embeds into a new column / table in the background. Not needed for the MVP. |
 
 ## Outside ADB (FlowR / A3T), found while testing
@@ -145,6 +148,8 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | `FORGET` missed values only in old versions (D2 T5) | `b367ac4` (D4.4a) |
 | Links couldn't be changed or removed (LINK again added a parallel link) | 26 Oct: AQL v0.7 `UPDATE LINK` / `UNLINK`, re-LINK updates the weight; MCP `unlink`; subscribers get `supersede` / `unlink` of kind `edge` |
 | `ORDER BY created_at` ignored on SEMANTIC (sorted on payload fields only) | `9bcec26` |
+| L1: no embeddings; `RECALL … LIKE` found nothing | W4 (`d82f05d`): local bge-small embeddings on write, in the log; backfill; hybrid ranking; MCP `recall` `like` |
+| F-L1: agents got the newest 5 facts | W4: `RECALL … LIKE $message` with `memory_config.semantic.{limit, min_confidence}` |
 | L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |
 | E-L6: every row had scope `tenant:default` | W3 (26 Oct): `IN SCOPE` on STORE / RECALL / LOOKUP / UPDATE / FORGET, MCP `scope` |
 | L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |

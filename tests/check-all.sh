@@ -56,6 +56,7 @@ fi
 if [ $QUICK = 0 ]; then
     step "crash durability (20 kills)" node "$ROOT/tests/crash-durability.mjs" --adb "$ADB" --rounds 20
     step "subscriptions crash (10 kills)" node "$ROOT/tests/subscriptions-crash.mjs" --adb "$ADB" --rounds 10
+    step "recall eval (W4)" node "$ROOT/tests/recall-eval.mjs" --adb "$ADB" --model "$ADB_EMBED_MODEL_DIR"
     if [ -d "$DEV/flowr-system/flowr-ce" ]; then
         step "topic trigger (2 FlowR)" node "$ROOT/tests/topic-trigger.mjs" --adb "$ADB" --flowr "$FLOWR"
         step "runtime e2e (shared registry)" node "$ROOT/tests/runtime-e2e.mjs" --adb "$ADB" --flowr "$FLOWR"

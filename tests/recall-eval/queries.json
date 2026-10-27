@@ -1,0 +1,255 @@
+[
+ {
+  "query": "When is the Acme deal up for renewal?",
+  "relevant": [
+   "acme-renewal"
+  ]
+ },
+ {
+  "query": "Who looks after the Acme customer?",
+  "relevant": [
+   "acme-owner"
+  ]
+ },
+ {
+  "query": "How many licenses does Acme have?",
+  "relevant": [
+   "acme-plan"
+  ]
+ },
+ {
+  "query": "Is Acme unhappy about anything?",
+  "relevant": [
+   "acme-churn-risk"
+  ]
+ },
+ {
+  "query": "What price reduction did we offer Beta?",
+  "relevant": [
+   "beta-discount"
+  ]
+ },
+ {
+  "query": "Which customer owes us money?",
+  "relevant": [
+   "initech-invoice"
+  ]
+ },
+ {
+  "query": "Where must Umbrella's data be stored?",
+  "relevant": [
+   "umbrella-region"
+  ]
+ },
+ {
+  "query": "How big will Hooli get?",
+  "relevant": [
+   "hooli-expansion"
+  ]
+ },
+ {
+  "query": "Who wants our security compliance report?",
+  "relevant": [
+   "wayne-security"
+  ]
+ },
+ {
+  "query": "Why did the payment service crash?",
+  "relevant": [
+   "inc-4471"
+  ]
+ },
+ {
+  "query": "How did we fix the out-of-memory problem in payments?",
+  "relevant": [
+   "inc-4471-fix"
+  ]
+ },
+ {
+  "query": "Why was checkout slow?",
+  "relevant": [
+   "inc-4502"
+  ]
+ },
+ {
+  "query": "People couldn't log in because of a certificate",
+  "relevant": [
+   "inc-4519"
+  ]
+ },
+ {
+  "query": "How do I undo a broken deployment?",
+  "relevant": [
+   "runbook-rollback"
+  ]
+ },
+ {
+  "query": "What do I do if the on-call person doesn't respond?",
+  "relevant": [
+   "oncall-escalation"
+  ]
+ },
+ {
+  "query": "How long are database backups kept?",
+  "relevant": [
+   "backup-schedule"
+  ]
+ },
+ {
+  "query": "How much holiday do I get?",
+  "relevant": [
+   "vacation-days"
+  ]
+ },
+ {
+  "query": "Can I keep my unused days off for next year?",
+  "relevant": [
+   "vacation-carry"
+  ]
+ },
+ {
+  "query": "How long can new parents stay at home?",
+  "relevant": [
+   "parental-leave"
+  ]
+ },
+ {
+  "query": "How often can I work from home?",
+  "relevant": [
+   "remote-policy"
+  ]
+ },
+ {
+  "query": "Do I need approval before buying something expensive?",
+  "relevant": [
+   "expense-limit"
+  ]
+ },
+ {
+  "query": "What is the maximum hotel price?",
+  "relevant": [
+   "hotel-cap"
+  ]
+ },
+ {
+  "query": "When do I get a new computer?",
+  "relevant": [
+   "laptop-refresh"
+  ]
+ },
+ {
+  "query": "When do I get paid?",
+  "relevant": [
+   "payday"
+  ]
+ },
+ {
+  "query": "Can I download a report as a spreadsheet?",
+  "relevant": [
+   "feature-export-csv"
+  ]
+ },
+ {
+  "query": "What is the API rate limit?",
+  "relevant": [
+   "feature-api-limit"
+  ]
+ },
+ {
+  "query": "What happens when a webhook fails?",
+  "relevant": [
+   "feature-webhooks"
+  ]
+ },
+ {
+  "query": "How much is the Pro plan?",
+  "relevant": [
+   "pricing-pro"
+  ]
+ },
+ {
+  "query": "Does the phone app work without internet?",
+  "relevant": [
+   "mobile-app"
+  ]
+ },
+ {
+  "query": "How do I access internal tools remotely?",
+  "relevant": [
+   "vpn"
+  ]
+ },
+ {
+  "query": "Where do I find the shared passwords?",
+  "relevant": [
+   "password-manager"
+  ]
+ },
+ {
+  "query": "Who owns the CI pipelines?",
+  "relevant": [
+   "team-platform"
+  ]
+ },
+ {
+  "query": "Who is in charge of finance?",
+  "relevant": [
+   "cfo"
+  ]
+ },
+ {
+  "query": "What are the steps of the engineering hiring process?",
+  "relevant": [
+   "interview-process"
+  ]
+ },
+ {
+  "query": "INC-4502",
+  "relevant": [
+   "inc-4502",
+   "inc-4502-fix"
+  ]
+ },
+ {
+  "query": "SKU-912",
+  "relevant": [
+   "sku-912"
+  ]
+ },
+ {
+  "query": "Okta",
+  "relevant": [
+   "initech-sso"
+  ]
+ },
+ {
+  "query": "JobRad",
+  "relevant": [
+   "bike"
+  ]
+ },
+ {
+  "query": "Torstrasse",
+  "relevant": [
+   "office-address"
+  ]
+ },
+ {
+  "query": "Pleo",
+  "relevant": [
+   "expense-tool"
+  ]
+ },
+ {
+  "query": "pg_ctl promote",
+  "relevant": [
+   "runbook-db-failover"
+  ]
+ },
+ {
+  "query": "Cloudflare",
+  "relevant": [
+   "dns-provider"
+  ]
+ }
+]

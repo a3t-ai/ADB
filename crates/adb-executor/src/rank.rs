@@ -4,7 +4,7 @@
 //! `IN SCOPE`, `NAMESPACE`, TTL). Two lists are ranked over them — cosine similarity
 //! of the stored vectors to the query vector, and BM25 of the query text over the
 //! rows' `text` (stop words dropped, light stemming) — and fused by weighted
-//! reciprocal rank (k = 60; meaning counts more than words), so neither score needs
+//! reciprocal rank (k = 60; meaning counts 5× words), so neither score needs
 //! calibrating against the other. Ties go to the higher similarity; a mild recency
 //! factor favours newer rows. Brute force: fine below ~10k candidates (S8); an ANN / inverted index
 //! for bigger partitions is W4-L2.
@@ -20,9 +20,12 @@ const HALF_LIFE_DAYS: f32 = 30.0;
 /// How much recency can move a score (the rest is relevance).
 const RECENCY_WEIGHT: f32 = 0.2;
 /// Weights of the two lists in the fusion: meaning first, words to back it up
-/// (exact names, codes, rare terms the model blurs).
+/// (exact names and codes; the only list when rows have no vector yet). Set on the
+/// evaluation set (tests/recall-eval, 26 Oct): 0.1–0.2 matched vector-only
+/// (MRR 0.97, recall@5 1.00); 0.6 dropped MRR to 0.91; linear score fusion was no
+/// better at its best and worse above α = 0.1.
 const VECTOR_WEIGHT: f32 = 1.0;
-const TEXT_WEIGHT: f32 = 0.6;
+const TEXT_WEIGHT: f32 = 0.2;
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
 
@@ -53,15 +56,17 @@ pub fn rank(candidates: &[Candidate<'_>], query_vec: Option<&[f32]>, query_text:
         })
         .collect();
     let vector_rank = ranks(&similarity.iter().map(|s| s.filter(|s| *s > 0.0)).collect::<Vec<_>>());
-    let text_rank = match query_text {
-        Some(q) => ranks(&bm25(q, &candidates.iter().map(|c| c.text.unwrap_or("")).collect::<Vec<_>>())),
+    let text_scores = match query_text {
+        Some(q) => bm25(q, &candidates.iter().map(|c| c.text.unwrap_or("")).collect::<Vec<_>>()),
         None => vec![None; candidates.len()],
     };
+    let text_rank = ranks(&text_scores);
     let mut out: Vec<Ranked> = (0..candidates.len())
         .filter(|&i| min_similarity.is_none_or(|m| similarity[i].is_some_and(|s| s >= m)))
         .filter_map(|i| {
-            let rrf = vector_rank[i].map(|r| VECTOR_WEIGHT / (RRF_K + r as f32)).unwrap_or(0.0)
-                + text_rank[i].map(|r| TEXT_WEIGHT / (RRF_K + r as f32)).unwrap_or(0.0);
+            let (vw, tw) = weights();
+            let rrf = vector_rank[i].map(|r| vw / (RRF_K + r as f32)).unwrap_or(0.0)
+                + text_rank[i].map(|r| tw / (RRF_K + r as f32)).unwrap_or(0.0);
             (rrf > 0.0).then(|| {
                 let age_days = ((now.0 - candidates[i].at.0).max(0) as f32) / 86_400_000_000.0;
                 let recency = 0.5f32.powf(age_days / HALF_LIFE_DAYS);
@@ -76,6 +81,17 @@ pub fn rank(candidates: &[Candidate<'_>], query_vec: Option<&[f32]>, query_text:
             .then(a.index.cmp(&b.index))
     });
     out
+}
+
+/// The fusion weights: hybrid, or one list alone for the evaluation set
+/// (`ADB_RECALL_MODE=vector | text`, tests/recall-eval).
+fn weights() -> (f32, f32) {
+    static MODE: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("ADB_RECALL_MODE").as_deref() {
+        Ok("vector") => (1.0, 0.0),
+        Ok("text") => (0.0, 1.0),
+        _ => (VECTOR_WEIGHT, TEXT_WEIGHT),
+    })
 }
 
 /// 1-based ranks of the `Some` scores, highest first; `None` stays unranked.
