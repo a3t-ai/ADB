@@ -101,3 +101,9 @@ image), `a3t-controller:2026-10-26-d`. Auth is wired but **off until the Secret
 `ADB_AUTH_TOKEN` + `ADB_AUTH_URLS`; runtimes via `A3T_RUNTIME_SECRET_ENV_ADB_AUTH_TOKEN`
 and `A3T_RUNTIME_ENV_ADB_AUTH_URLS`. The user creates the Secret (the auto-mode
 classifier blocks secret writes), then restarts adb, flowr and the runtime pods.
+
+Rolled 27 Oct: `adb:2026-10-27-w4` (W4 + AQL v0.7 links + ORDER BY fix; memory limit
+2 GiB; the 768-dim table was rewritten to 384, 15 rows, backup kept; backfill embedded
+the 3 facts with content; RSS ~370 MB, peak ~500 MB), `flowr:2026-10-27-ee6` (console
+and runtimes; agents recall by relevance), `a3t-controller:2026-10-27-e` (template
+hash: all 5 sandboxes recreated on ee6 with no manual deletes).
