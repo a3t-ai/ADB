@@ -61,7 +61,7 @@ SIGKILL at every step recovers (the crash harness from D/R11).
 
 ## Decisions (27 Oct, user: as recommended)
 
-1. History retention **90 days**. 2. Compaction on **thresholds + nightly 03:00** + on demand. 3. FORGET **gone from disk within 24 h**.
+1. History retention **90 days**. 2. Compaction on **thresholds + nightly 03:00** + on demand. 3. FORGET **gone from disk immediately** (user, 27 Oct, changed from 24 h): FORGET returns only after the forgotten rows are physically removed from the table, old versions and the log.
 
 ### The questions as asked
 
