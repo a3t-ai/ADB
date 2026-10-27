@@ -92,6 +92,18 @@ impl Executor {
         Ok(result)
     }
 
+    /// Execute a parsed statement with request-level variables (a `WATCH`'s query,
+    /// MVP W6).
+    pub async fn execute_statement(
+        &self,
+        stmt: &aql_parser::ast::Statement,
+        variables: &HashMap<String, serde_json::Value>,
+    ) -> ExecutorResult<QueryResult> {
+        let plan = self.planner.plan(stmt)?;
+        let bindings: HashMap<String, Value> = variables.iter().map(|(k, v)| (k.clone(), Value::from(v))).collect();
+        self.execute_plan_with(&plan, bindings).await
+    }
+
     /// Execute a pre-planned query
     pub async fn execute_plan(&self, plan: &ExecutionPlan) -> ExecutorResult<QueryResult> {
         self.execute_plan_with(plan, HashMap::new()).await

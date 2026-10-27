@@ -479,6 +479,45 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
     }
 
+    /// Commit a `WATCH` registration (MVP W6): a `cq` row holding the spec. Returns
+    /// the watch id and the registration's offset.
+    pub async fn register_watch(&self, spec: serde_json::Value) -> AdbResult<(String, u64)> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let id = seq.new_id(ts);
+        let mut data = row(MemoryType::Working, Kind::Cq, spec);
+        data.key = None;
+        data.text = None;
+        data.subject_id = Some(id.0.clone());
+        let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id.clone(), version: 1, data });
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok((id.0, record.offset.0))
+    }
+
+    /// Commit an `UNWATCH`.
+    pub async fn unregister_watch(&self, id: &str) -> AdbResult<()> {
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let effect = Effect::Unregister { id: RecordId(id.to_string()) };
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(())
+    }
+
+    /// The registered watches (`cq` rows): id and spec.
+    pub async fn watches(&self) -> AdbResult<Vec<(String, serde_json::Value)>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let rows = store
+            .current(Some("kind = 'cq'"), CommitTs::from_datetime(time::now()))
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        Ok(rows.into_iter().map(|r| (r.id, r.data.value)).collect())
+    }
+
     /// Whether compaction is due on size: more than 16 MemWAL generations (W5).
     pub async fn compaction_due(&self) -> bool {
         match &self.store {

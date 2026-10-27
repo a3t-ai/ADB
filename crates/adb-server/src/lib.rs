@@ -11,6 +11,7 @@
 //! | `POST /mcp` | MCP over streamable HTTP (JSON responses) |
 //! | `GET /mcp/sse`, `POST /mcp/message?sessionId=…` | MCP over HTTP+SSE (no `sessionId`: reply in the body) |
 //! | `GET /subscriptions/{id}/events?from=N` | A subscription's deliveries as SSE (stage E): `event: delivery`, `id: <offset>`; reconnect with `Last-Event-ID` to resume; `event: heartbeat` with the tip when idle |
+//! | `GET /watches/{id}/events?from=N` | A continuous query's frames as SSE (W6): `event: diff` / `reset`, `id: <offset>`; `from` / `Last-Event-ID` = the last frame applied |
 //!
 //! With `ADB_AUTH_TOKEN` set, every endpoint but `/health` needs
 //! `Authorization: Bearer <token>` ([`auth`]).
@@ -77,6 +78,7 @@ fn routes(engine: Arc<dyn Engine>) -> Router {
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
         .route("/subscriptions/:id/events", get(subscription_events))
+        .route("/watches/:id/events", get(watch_events))
         .with_state(AppState::new(engine))
 }
 
@@ -140,6 +142,57 @@ async fn subscription_events(
                 Err(e) => vec![Ok(Event::default().event("error").data(serde_json::json!({ "error": e.to_string() }).to_string()))],
             };
             Some((futures::stream::iter(events), None))
+        }
+    })
+    .flatten();
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+// ---------------------------------------------------------------- watches (W6)
+
+/// `GET /watches/{id}/events?from=<offset>` — a continuous query's frames as SSE:
+/// `event: diff` / `reset`, `id: <offset>`. `from` (or `Last-Event-ID`) is the offset
+/// of the last frame the client applied (the `WATCH` snapshot's at first); without
+/// one, or past the buffer, the stream starts with a `reset` (W6 decision 2).
+async fn watch_events(
+    State(s): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(p): Query<EventsParams>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(w) = s.engine.watcher() else {
+        return (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({ "error": "watches need a durable engine (start ADB with --data-dir)" })))
+            .into_response();
+    };
+    if !w.contains(&id) {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("unknown watch {id}") }))).into_response();
+    }
+    let last = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    let from = p.from.or(last);
+    use futures::StreamExt as _;
+    let stream = futures::stream::unfold(Some(from), move |state| {
+        let w = w.clone();
+        let id = id.clone();
+        async move {
+            let from = state?;
+            match w.next(&id, from, 100, Duration::from_secs(15)).await {
+                Ok(frames) if frames.is_empty() => {
+                    let hb = serde_json::json!({ "offset": from });
+                    Some((futures::stream::iter(vec![Ok::<_, Infallible>(Event::default().event("heartbeat").data(hb.to_string()))]), Some(from)))
+                }
+                Ok(frames) => {
+                    let next = frames.last().map(|f| f.offset);
+                    let evs: Vec<Result<Event, Infallible>> = frames
+                        .iter()
+                        .map(|f| Ok(Event::default().event(f.kind).id(f.offset.to_string()).data(serde_json::to_string(f).unwrap_or_default())))
+                        .collect();
+                    Some((futures::stream::iter(evs), Some(next)))
+                }
+                Err(e) => Some((
+                    futures::stream::iter(vec![Ok(Event::default().event("error").data(serde_json::json!({ "error": e.to_string() }).to_string()))]),
+                    None,
+                )),
+            }
         }
     })
     .flatten();

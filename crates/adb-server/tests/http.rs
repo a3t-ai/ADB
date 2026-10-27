@@ -198,3 +198,56 @@ async fn token_guards_everything_but_health() {
     assert_eq!(r.status(), 200);
     assert_eq!(c.post(format!("{base}/mcp")).bearer_auth("s3cret").json(&mcp).send().await.unwrap().status(), 200);
 }
+
+/// W6: `GET /watches/{id}/events` — a reset without `from`, then diffs; `from` the
+/// snapshot's offset resumes with the diffs after it.
+#[tokio::test]
+async fn watch_events_over_sse() {
+    async fn sse_event(stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin), buf: &mut String) -> (String, Value) {
+        loop {
+            if let Some(pos) = buf.find("\n\n") {
+                let block: String = buf.drain(..pos + 2).collect();
+                let (mut event, mut data) = (String::new(), String::new());
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        event = v.trim().to_string();
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data.push_str(v.trim());
+                    }
+                }
+                if event == "diff" || event == "reset" {
+                    return (event, serde_json::from_str(&data).unwrap());
+                }
+                continue;
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next()).await.unwrap().unwrap().unwrap();
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let app = adb_server::router_with_token(Arc::new(engine), None);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+
+    let (st, v) = post(&format!("{base}/query"), json!({"query": r#"WATCH RECALL FROM SEMANTIC WHERE topic = "x" DEBOUNCE 50ms"#})).await;
+    assert_eq!(st, 200, "{v}");
+    let id = v["data"]["data"]["cq_id"].as_str().unwrap().to_string();
+    let offset = v["data"]["data"]["offset"].as_u64().unwrap();
+    assert_eq!(reqwest::get(format!("{base}/watches/nope/events")).await.unwrap().status().as_u16(), 404);
+
+    let mut fresh = reqwest::get(format!("{base}/watches/{id}/events")).await.unwrap().bytes_stream();
+    let mut resumed = reqwest::get(format!("{base}/watches/{id}/events?from={offset}")).await.unwrap().bytes_stream();
+    let (mut b1, mut b2) = (String::new(), String::new());
+    let (event, frame) = sse_event(&mut fresh, &mut b1).await;
+    assert_eq!((event.as_str(), frame["offset"].as_u64()), ("reset", Some(offset)), "{frame}");
+    let (st, v) = post(&format!("{base}/query"), json!({"query": r#"STORE INTO SEMANTIC (key = "a", topic = "x")"#})).await;
+    assert_eq!(st, 200, "{v}");
+    for stream in [(&mut fresh, &mut b1), (&mut resumed, &mut b2)] {
+        let (event, frame) = sse_event(stream.0, stream.1).await;
+        assert_eq!(event, "diff", "{frame}");
+        assert_eq!(frame["added"][0]["id"], "a", "{frame}");
+    }
+}

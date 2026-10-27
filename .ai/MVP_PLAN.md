@@ -107,3 +107,16 @@ Rolled 27 Oct: `adb:2026-10-27-w4` (W4 + AQL v0.7 links + ORDER BY fix; memory l
 the 3 facts with content; RSS ~370 MB, peak ~500 MB), `flowr:2026-10-27-ee6` (console
 and runtimes; agents recall by relevance), `a3t-controller:2026-10-27-e` (template
 hash: all 5 sandboxes recreated on ee6 with no manual deletes).
+
+Rolled 27 Oct: `adb:2026-10-27-w5` (W5 compaction, immediate physical FORGET; see
+`W5_LIFECYCLE.md`). The pre-W4 backup `memory.dim768.bak` goes at the first
+compaction (a FORGET, the nightly run or the admin `compact`).
+
+## W5-L4 and W6 (27 Oct)
+
+- **W5-L4** (`be59f8c`): platform tables compacted — deleted rows and old versions
+  leave disk nightly, after 256 versions of a table, and in the admin `compact`.
+- **W6 `WATCH` v1** (`W6_WATCH.md`, user: as recommended): re-run on match with
+  debounce, durable registrations with resume / `reset`, idle watches dropped after
+  24 h; AQL `WATCH` / `UNWATCH`, `GET /watches/{id}/events` (SSE), MCP `watch` /
+  `watch_changes` / `unwatch`. Limits W6-L1…L7.

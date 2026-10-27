@@ -144,6 +144,32 @@ pub fn tool_list() -> Value {
             }, "required": ["subscription", "offset"] }
         },
         {
+            "name": "watch",
+            "description": "Keep a query's result current: returns its result now (`{cq_id, offset, result}`); read what changes with `watch_changes`. Takes RECALL, LOOKUP, SCAN or LOAD.",
+            "inputSchema": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "The AQL read, e.g. RECALL FROM SEMANTIC WHERE topic = \"billing\" LIMIT 20" },
+                "variables": { "type": "object", "description": "Values for $name variables in the query (optional)" },
+                "debounce_ms": { "type": "integer", "description": "Wait this long after a change before re-running, 50-500 (default 100)" }
+            }, "required": ["query"] }
+        },
+        {
+            "name": "watch_changes",
+            "description": "A watch's next frames, waiting up to `wait_seconds`: `diff` (added / removed / changed records) or `reset` (the whole result). Pass the returned `from` on the next call; start with the `offset` `watch` returned.",
+            "inputSchema": { "type": "object", "properties": {
+                "cq_id": { "type": "string" },
+                "from": { "type": "integer", "description": "Offset of the last frame you applied (without it: a reset)" },
+                "max": { "type": "integer", "description": "Most frames to return (default 20)" },
+                "wait_seconds": { "type": "integer", "description": "How long to wait for a frame (default 10, at most 30)" }
+            }, "required": ["cq_id"] }
+        },
+        {
+            "name": "unwatch",
+            "description": "Stop a watch. Watches nobody reads for 24 h stop by themselves.",
+            "inputSchema": { "type": "object", "properties": {
+                "cq_id": { "type": "string" }
+            }, "required": ["cq_id"] }
+        },
+        {
             "name": "unsubscribe",
             "description": "Stop a subscription.",
             "inputSchema": { "type": "object", "properties": {
@@ -251,4 +277,21 @@ mod tests {
         assert!(memory_type(&json!({"t": "ALL; FORGET"}), "t", None).is_err());
         assert_eq!(memory_type(&json!({}), "t", Some("EPISODIC")).unwrap(), "EPISODIC");
     }
+}
+
+/// `watch`: `WATCH <query> [DEBOUNCE <n>ms]` (MVP W6).
+pub fn watch(args: &Value) -> Result<String, String> {
+    let query = args.get("query").and_then(Value::as_str).ok_or("Missing required: query")?.trim();
+    let query = query.strip_prefix("WATCH ").or_else(|| query.strip_prefix("watch ")).unwrap_or(query);
+    let mut aql = format!("WATCH {query}");
+    if let Some(ms) = args.get("debounce_ms").and_then(Value::as_u64) {
+        aql.push_str(&format!(" DEBOUNCE {ms}ms"));
+    }
+    Ok(aql)
+}
+
+/// `unwatch`: `UNWATCH "<cq_id>"`.
+pub fn unwatch(args: &Value) -> Result<String, String> {
+    let id = args.get("cq_id").and_then(Value::as_str).ok_or("Missing required: cq_id")?;
+    Ok(format!("UNWATCH {}", quote(id)))
 }

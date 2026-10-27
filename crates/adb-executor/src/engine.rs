@@ -51,6 +51,11 @@ pub trait Engine: Send + Sync {
         Err("platform tables need a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// Continuous queries (MVP W6), for engines with a log.
+    fn watcher(&self) -> Option<Arc<adb_cq::Watcher>> {
+        None
+    }
+
     /// W5 compaction now (admin): `{total, kept, bytes_before, bytes_after, took_ms}`.
     async fn compact(&self) -> Result<Value, String> {
         Err("compaction needs a durable engine (start ADB with --data-dir)".into())
@@ -71,6 +76,8 @@ pub struct LocalEngine {
     expiry: Option<tokio::task::JoinHandle<()>>,
     /// The durable writes, for compaction on demand (W5).
     durable: Option<Arc<DurableWrites<Arc<LocalWal>>>>,
+    /// Continuous queries (W6) and the task keeping them current.
+    watcher: Option<(Arc<adb_cq::Watcher>, tokio::task::JoinHandle<()>)>,
 }
 
 impl Drop for LocalEngine {
@@ -78,7 +85,38 @@ impl Drop for LocalEngine {
         if let Some(t) = &self.expiry {
             t.abort();
         }
+        if let Some((_, t)) = &self.watcher {
+            t.abort();
+        }
     }
+}
+
+/// Runs watched queries for the watcher (W6) and commits its idle `UNWATCH`es.
+struct WatchRunner {
+    executor: Executor,
+    durable: Arc<DurableWrites<Arc<LocalWal>>>,
+}
+
+#[async_trait]
+impl adb_cq::Runner for WatchRunner {
+    async fn run(&self, spec: &adb_cq::WatchSpec) -> Result<Value, String> {
+        let r = self.executor.execute_statement(&spec.statement, &spec.variables).await.map_err(|e| e.to_string())?;
+        Ok(to_wire(&r))
+    }
+
+    async fn unwatch(&self, cq_id: &str) -> Result<(), String> {
+        self.durable.unregister_watch(cq_id).await.map_err(|e| e.to_string())
+    }
+}
+
+/// `WATCH` / `UNWATCH` (W6) if `aql` is one: they are handled by the engine, which
+/// owns the watcher, not the executor.
+fn watch_statement(aql: &str) -> Option<aql_parser::ast::Statement> {
+    let first = aql.trim_start().split(|c: char| c.is_whitespace()).next()?;
+    if !first.eq_ignore_ascii_case("WATCH") && !first.eq_ignore_ascii_case("UNWATCH") {
+        return None;
+    }
+    aql_parser::parse(aql).ok()
 }
 
 /// Open the partition log in `dir/p0`. A log this process just closed can still be
@@ -176,7 +214,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
 impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None }
+        Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None, watcher: None }
     }
 }
 
@@ -201,6 +239,7 @@ impl LocalEngine {
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
         writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
         let barrier = writes.barrier();
+        let watch_log: Arc<dyn adb_log::Log> = Arc::clone(&wal) as Arc<dyn adb_log::Log>;
         let gateway = barrier.as_ref().map(|b| {
             let log: Arc<dyn adb_log::Log> = wal;
             let lineages: Arc<dyn adb_gateway::Lineages> = Arc::clone(&store) as Arc<dyn adb_gateway::Lineages>;
@@ -213,8 +252,36 @@ impl LocalEngine {
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
         let durable_handle = Arc::clone(&durable);
         let writes: Arc<dyn Writes> = durable;
-        let executor = Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), reads);
-        Ok((Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry, durable: Some(durable_handle) }, stats))
+        let executor = Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), Arc::clone(&reads));
+        // W6: the watcher re-runs watched queries through an executor of its own and
+        // reloads the registered watches.
+        let watcher = match &barrier {
+            Some(b) => {
+                let runner = Arc::new(WatchRunner {
+                    executor: Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), reads),
+                    durable: Arc::clone(&durable_handle),
+                });
+                let applied = b.watch();
+                let from = *applied.borrow();
+                let watcher = adb_cq::Watcher::new(watch_log, applied, runner, from);
+                for (id, value) in durable_handle.watches().await.map_err(|e| e.to_string())? {
+                    let added = match serde_json::from_value::<adb_cq::WatchSpec>(value) {
+                        Ok(spec) => watcher.add(&id, spec).await.map(|_| ()).map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    if let Err(e) = added {
+                        tracing::warn!(cq = %id, error = %e, "watch not restored");
+                    }
+                }
+                let task = adb_cq::Watcher::spawn(&watcher);
+                Some((watcher, task))
+            }
+            None => None,
+        };
+        Ok((
+            Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry, durable: Some(durable_handle), watcher },
+            stats,
+        ))
     }
 
     /// The log in `dir` replayed into the in-memory backends, with no Lance table:
@@ -229,7 +296,48 @@ impl LocalEngine {
             DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
         let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None }, stats))
+        Ok((Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None, watcher: None }, stats))
+    }
+}
+
+impl LocalEngine {
+    /// `WATCH` (register, snapshot) and `UNWATCH` (W6).
+    async fn watch(&self, stmt: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
+        use aql_parser::ast::{StartPosition, Statement};
+        let started = std::time::Instant::now();
+        let (Some((watcher, _)), Some(durable)) = (&self.watcher, &self.durable) else {
+            return Err("WATCH / UNWATCH need a durable engine (start ADB with --data-dir)".into());
+        };
+        let value = match stmt {
+            Statement::Watch(w) => {
+                if let StartPosition::Offset(n) = w.start {
+                    return Err(format!(
+                        "WATCH … FROM OFFSET {n}: a new watch starts now; resume an existing one by its id (GET /watches/{{id}}/events?from=, MCP watch_changes)"
+                    ));
+                }
+                let spec = adb_cq::WatchSpec::new(*w.query, variables.cloned().unwrap_or_default(), w.debounce)?;
+                // Refuse a query that fails before anything is committed.
+                self.executor.execute_statement(&spec.statement, &spec.variables).await.map_err(|e| e.to_string())?;
+                let (id, _) = durable.register_watch(serde_json::to_value(&spec).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
+                match watcher.add(&id, spec).await {
+                    Ok(frame) => serde_json::to_value(&frame).map_err(|e| e.to_string())?,
+                    Err(e) => {
+                        let _ = durable.unregister_watch(&id).await;
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            Statement::Unwatch(u) => {
+                let existed = watcher.contains(&u.query_id);
+                if existed {
+                    durable.unregister_watch(&u.query_id).await.map_err(|e| e.to_string())?;
+                    watcher.remove(&u.query_id);
+                }
+                json!({ "cq_id": u.query_id, "unwatched": existed })
+            }
+            _ => unreachable!("watch_statement returns WATCH / UNWATCH only"),
+        };
+        Ok(to_wire(&QueryResult::subscription(value, started.elapsed().as_millis() as u64)))
     }
 }
 
@@ -242,6 +350,9 @@ impl Default for LocalEngine {
 #[async_trait]
 impl Engine for LocalEngine {
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
+        if let Some(stmt) = watch_statement(aql) {
+            return self.watch(stmt, variables).await;
+        }
         let result = match variables {
             Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
             _ => self.executor.execute(aql).await,
@@ -255,6 +366,10 @@ impl Engine for LocalEngine {
 
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
         self.platform.as_ref().map(|(p, _)| Arc::clone(p))
+    }
+
+    fn watcher(&self) -> Option<Arc<adb_cq::Watcher>> {
+        self.watcher.as_ref().map(|(w, _)| Arc::clone(w))
     }
 
     async fn compact(&self) -> Result<Value, String> {

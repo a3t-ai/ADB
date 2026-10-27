@@ -60,4 +60,16 @@ subscriber of a topic sees the same messages in the same order.
 In AQL: `SUBSCRIBE TOPIC "orders"`, `PUBLISH TOPIC "orders" (order_id = "o-1")`,
 `ACK "<id>" OFFSET 42`, `UNSUBSCRIBE "<id>"`.
 
+## Watching a query
+
+To keep a result current instead of re-asking:
+
+- `watch` with an AQL read (`RECALL`, `LOOKUP`, `SCAN` or `LOAD`) → `{cq_id, offset, result}`.
+- `watch_changes` with `cq_id` and `from` = that `offset` waits for frames: `diff`
+  (`added`, `removed`, `changed` records; `order` for ordered queries) or `reset`
+  (the whole `result`). Pass the returned `from` back next time.
+- `unwatch` when done; a watch nobody reads for 24 h stops by itself.
+
+In AQL: `WATCH RECALL FROM SEMANTIC WHERE topic = "billing" DEBOUNCE 200ms`, `UNWATCH "<cq_id>"`.
+
 The full grammar is the resource `adb://aql/grammar`.

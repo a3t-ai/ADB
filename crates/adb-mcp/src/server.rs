@@ -117,6 +117,9 @@ impl McpServer {
             "ack" => self.run(ack(&args)).await,
             "unsubscribe" => self.run(unsubscribe(&args)).await,
             "next_events" => self.next_events(&args).await,
+            "watch" => self.watch(&args).await,
+            "watch_changes" => self.watch_changes(&args).await,
+            "unwatch" => self.run(tools::unwatch(&args)).await,
             other => Err(format!("Unknown tool: {other}")),
         };
         Ok(match result {
@@ -143,6 +146,29 @@ impl McpServer {
         let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
         let batch = gw.next(sub, from, max, std::time::Duration::from_secs(wait)).await.map_err(|e| e.to_string())?;
         serde_json::to_value(batch).map_err(|e| e.to_string())
+    }
+
+    /// `watch`: `WATCH <query>` (MVP W6) — the snapshot frame `{cq_id, offset, result}`.
+    async fn watch(&self, args: &Value) -> Result<Value, String> {
+        let aql = tools::watch(args)?;
+        let vars: Option<HashMap<String, Value>> = args
+            .get("variables")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        let r = self.engine.query(&aql, vars.as_ref()).await.map_err(|e| format!("Query failed: {e}\nAQL: {aql}"))?;
+        Ok(r["data"].clone())
+    }
+
+    /// A watch's next frames (W6), waiting up to `wait_seconds` for one.
+    async fn watch_changes(&self, args: &Value) -> Result<Value, String> {
+        let w = self.engine.watcher().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
+        let id = args.get("cq_id").and_then(Value::as_str).ok_or("Missing required: cq_id")?;
+        let from = args.get("from").and_then(Value::as_u64);
+        let max = args.get("max").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+        let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
+        let frames = w.next(id, from, max, std::time::Duration::from_secs(wait)).await.map_err(|e| e.to_string())?;
+        let next = frames.last().map(|f| f.offset).or(from);
+        Ok(json!({ "frames": frames, "from": next }))
     }
 
     /// Run AQL built by a shortcut tool.
@@ -194,7 +220,7 @@ fn initialize(params: Option<&Value>) -> Value {
             "prompts": { "listChanged": false }
         },
         "serverInfo": { "name": "adb", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "ADB is agent memory. Use remember / recall / forget / link for everyday memory, subscribe / publish / next_events / ack for topics shared between agents, or aql_query for anything in AQL. Read adb://guide/memory first."
+        "instructions": "ADB is agent memory. Use remember / recall / forget / link for everyday memory, subscribe / publish / next_events / ack for topics shared between agents, watch / watch_changes to keep a query's result current, or aql_query for anything in AQL. Read adb://guide/memory first."
     })
 }
 

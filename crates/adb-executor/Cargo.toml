@@ -15,6 +15,7 @@ adb-store = { path = "../adb-store" }
 adb-embed = { path = "../adb-embed" }
 half.workspace = true
 chrono.workspace = true
+adb-cq = { path = "../adb-cq" }
 adb-gateway = { path = "../adb-gateway" }
 adb-platform = { path = "../adb-platform" }
 datafusion.workspace = true

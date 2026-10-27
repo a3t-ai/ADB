@@ -137,6 +137,18 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W5-L5 | **`FORGET FROM ALL` compacts once per memory type that matched.** | Slower than one compaction. | One compaction per statement. |
 | W5-L6 | **Compaction doesn't change the size threshold logic for tombstones**: thresholds are MemWAL generations > 16 only (tombstone share isn't measured). | Many expirations wait for the nightly run. | Count tombstones in `_meta`. |
 
+## Continuous queries (W6)
+
+| # | Limitation | Effect | Fix |
+|---|---|---|---|
+| W6-L1 | **Every write to a watched memory type (and scope) re-runs the watch** after its debounce: the watch set ignores `WHERE`, and nothing is maintained incrementally. | One query per watch per debounce window while its memory type is written; many watches on a busy type cost CPU. | `WHERE` pre-filter on put values; incremental filter / count classes with the query engine (W7). |
+| W6-L2 | **Frames are buffered in memory** (last 1,000 per watch). | After an ADB restart, or past the buffer, a resuming client gets a `reset` (full result), not the diffs. | Fine for MVP; persist frames only if clients need it. |
+| W6-L3 | **A frame's `offset` is a lower bound under concurrent writes**: the result holds every record up to it, and may hold a few just after (they then cause an empty or smaller next diff). | Exact at quiet times; converges under load. | Reads at an exact offset (snapshot reads, W7). |
+| W6-L4 | **FORGET and watches**: frames buffered in ADB are scrubbed when the watcher reaches the `Forget` (milliseconds); clients that already received a record keep their copy until the `removed` diff. | Never on disk; clients must apply `removed`. | — |
+| W6-L5 | **No per-tenant limits, metering or per-watch permissions**: anyone with the ADB token can watch anything. | Fine on one trusted node. | Tenancy limits with the cluster gateway (M4). |
+| W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed (1 s timer, W3), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
+| W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). The AQL conformance suites don't cover `WATCH` (ADB tests do). | — | Cross-partition watches (spec v2); a v0.6 conformance suite. |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |

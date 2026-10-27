@@ -67,6 +67,18 @@ dependencies = [
 [[package]]
 name = "adb-cq"
 version = "0.1.0"
+dependencies = [
+ "adb-core",
+ "adb-log",
+ "aql-parser",
+ "async-trait",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "adb-embed"
@@ -84,6 +96,7 @@ version = "0.1.0"
 dependencies = [
  "adb-backends",
  "adb-core",
+ "adb-cq",
  "adb-embed",
  "adb-gateway",
  "adb-log",

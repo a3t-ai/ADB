@@ -50,7 +50,7 @@ async fn tool_list_has_clawdb_and_llm_tools() {
     let s = server();
     let r = s.handle(req(1, "tools/list", json!({}))).await.unwrap().result.unwrap();
     let names: Vec<&str> = r["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for t in ["aql_query", "store_memory", "recall_memory", "get_stats", "remember", "recall", "forget", "link", "unlink"] {
+    for t in ["aql_query", "store_memory", "recall_memory", "get_stats", "remember", "recall", "forget", "link", "unlink", "watch", "watch_changes", "unwatch"] {
         assert!(names.contains(&t), "missing tool {t}");
     }
 }
@@ -218,4 +218,25 @@ async fn recall_like_ranks_by_relevance() {
     assert!(v["data"]["records"][0]["metadata"]["confidence"].as_f64().unwrap() > 0.5, "{v}");
     let (err, _) = call(&s, "recall", json!({"like": "x", "contains": "y"})).await;
     assert!(err, "like with contains is refused");
+}
+
+/// `watch` → snapshot; `watch_changes` from its offset → the diff; `unwatch` (W6).
+#[tokio::test]
+async fn watch_tools_follow_a_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = McpServer::new(Arc::new(engine));
+    let (err, v) = call(&s, "watch", json!({"query": r#"RECALL FROM SEMANTIC WHERE account = "acme""#, "debounce_ms": 50})).await;
+    assert!(!err, "{v}");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    let (id, offset) = (v["cq_id"].as_str().unwrap().to_string(), v["offset"].as_u64().unwrap());
+    let (err, v) = call(&s, "remember", json!({"content": "Acme renews on 1 Nov", "key": "acme", "fields": {"account": "acme"}})).await;
+    assert!(!err, "{v}");
+    let (err, v) = call(&s, "watch_changes", json!({"cq_id": id, "from": offset, "wait_seconds": 5})).await;
+    assert!(!err, "{v}");
+    assert_eq!(v["frames"][0]["type"], "diff", "{v}");
+    assert_eq!(v["frames"][0]["added"][0]["id"], "acme", "{v}");
+    assert!(v["from"].as_u64().unwrap() > offset);
+    let (err, v) = call(&s, "unwatch", json!({"cq_id": id})).await;
+    assert!(!err && v["data"]["unwatched"] == json!(true), "{v}");
 }
