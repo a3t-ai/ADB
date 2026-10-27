@@ -79,6 +79,8 @@ struct State {
 struct Job {
     offset: LogOffset,
     frame: Vec<u8>,
+    /// Start a new segment with this frame (W5).
+    roll: bool,
     done: oneshot::Sender<LogResult<LogOffset>>,
 }
 
@@ -89,6 +91,9 @@ pub struct LocalWal {
     state: Arc<Mutex<State>>,
     jobs: Option<mpsc::Sender<Job>>,
     writer: Option<JoinHandle<()>>,
+    /// Readers hold it shared while they read segment files; `rewrite_closed`
+    /// holds it exclusively while it swaps a rewritten segment and its index in.
+    files: parking_lot::RwLock<()>,
     /// Held open (and exclusively locked) while the log is open.
     _lock: File,
 }
@@ -151,21 +156,13 @@ impl LocalWal {
     pub fn open(partition: PartitionId, config: WalConfig) -> LogResult<Self> {
         fs::create_dir_all(&config.dir).map_err(io)?;
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("LOCK")).map_err(io)?;
-        // A log closed a moment ago in this process can still be held by a
-        // background task finishing its step (expiry, embedding backfill): wait a
-        // little before calling it in use.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(LogError::Io(format!("{} is in use by another ADB process", config.dir.display())));
-                }
-                Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
-            }
+        // Fails fast: a caller that may be reopening a log it just closed retries
+        // asynchronously (`Locked`), so the closing tasks can finish meanwhile —
+        // sleeping here would block them on a single-threaded runtime.
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(LogError::Locked(config.dir.display().to_string())),
+            Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
         }
         let mut segments: Vec<u64> = fs::read_dir(&config.dir)
             .map_err(io)?
@@ -249,12 +246,44 @@ impl LocalWal {
                 .map_err(io)?
         };
 
-        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), _lock: lock })
+        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), files: parking_lot::RwLock::new(()), _lock: lock })
     }
 
     /// Number of `fdatasync` calls so far.
     pub fn syncs(&self) -> u64 {
         self.state.lock().syncs
+    }
+}
+
+impl LocalWal {
+    async fn append_job(&self, record: LogRecord, roll: bool) -> LogResult<LogOffset> {
+        if record.partition != self.partition {
+            return Err(LogError::WrongPartition { log: self.partition, got: record.partition });
+        }
+        let frame = encode(&record)?;
+        let (done, wait) = oneshot::channel();
+        {
+            let mut s = self.state.lock();
+            if let Some(e) = &s.failed {
+                return Err(LogError::Io(format!("log failed earlier: {e}")));
+            }
+            if record.epoch < s.epoch {
+                return Err(LogError::StaleEpoch { current: s.epoch, got: record.epoch });
+            }
+            let expected = s.last.next();
+            if record.offset != expected {
+                return Err(LogError::OutOfOrder { expected, got: record.offset });
+            }
+            s.epoch = record.epoch;
+            s.last = record.offset;
+            // Sent under the lock, so the writer sees appends in offset order.
+            self.jobs
+                .as_ref()
+                .expect("open log")
+                .send(Job { offset: record.offset, frame, done, roll })
+                .map_err(|_| LogError::Io("WAL writer stopped".into()))?;
+        }
+        wait.await.map_err(|_| LogError::Io("WAL writer stopped".into()))?
     }
 }
 
@@ -286,7 +315,7 @@ fn writer_loop(
         let mut written = Vec::with_capacity(batch.len());
         let result = (|| -> LogResult<()> {
             for job in &batch {
-                if size > 0 && size + job.frame.len() as u64 > config.segment_bytes {
+                if size > 0 && (job.roll || size + job.frame.len() as u64 > config.segment_bytes) {
                     file.sync_data().map_err(io)?;
                     segment = job.offset.0;
                     file = OpenOptions::new()
@@ -347,36 +376,15 @@ impl Log for LocalWal {
     }
 
     async fn append(&self, record: LogRecord) -> LogResult<LogOffset> {
-        if record.partition != self.partition {
-            return Err(LogError::WrongPartition { log: self.partition, got: record.partition });
-        }
-        let frame = encode(&record)?;
-        let (done, wait) = oneshot::channel();
-        {
-            let mut s = self.state.lock();
-            if let Some(e) = &s.failed {
-                return Err(LogError::Io(format!("log failed earlier: {e}")));
-            }
-            if record.epoch < s.epoch {
-                return Err(LogError::StaleEpoch { current: s.epoch, got: record.epoch });
-            }
-            let expected = s.last.next();
-            if record.offset != expected {
-                return Err(LogError::OutOfOrder { expected, got: record.offset });
-            }
-            s.epoch = record.epoch;
-            s.last = record.offset;
-            // Sent under the lock, so the writer sees appends in offset order.
-            self.jobs
-                .as_ref()
-                .expect("open log")
-                .send(Job { offset: record.offset, frame, done })
-                .map_err(|_| LogError::Io("WAL writer stopped".into()))?;
-        }
-        wait.await.map_err(|_| LogError::Io("WAL writer stopped".into()))?
+        self.append_job(record, false).await
+    }
+
+    async fn append_on_new_segment(&self, record: LogRecord) -> LogResult<LogOffset> {
+        self.append_job(record, true).await
     }
 
     async fn read(&self, from: LogOffset, max: usize) -> LogResult<Vec<LogRecord>> {
+        let _files = self.files.read();
         let entries = {
             let s = self.state.lock();
             if from < s.first {
@@ -405,6 +413,71 @@ impl Log for LocalWal {
 
     fn durable_offset(&self) -> LogOffset {
         self.state.lock().durable
+    }
+
+    async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize> {
+        // The closed segments and their index entries (the last segment is the
+        // writer's: never rewritten).
+        let closed: Vec<(u64, LogOffset, Vec<Entry>)> = {
+            let s = self.state.lock();
+            let n = s.segments.len().saturating_sub(1);
+            let mut out = Vec::new();
+            for (k, &seg) in s.segments[..n].iter().enumerate() {
+                let next = s.segments[k + 1];
+                let from = LogOffset(seg.max(s.first.0));
+                if from.0 >= next {
+                    continue;
+                }
+                let start = (from.0 - s.first.0) as usize;
+                let len = (next - from.0) as usize;
+                out.push((seg, from, s.index[start..(start + len).min(s.index.len())].to_vec()));
+            }
+            out
+        };
+        let mut changed = 0;
+        for (seg, from, entries) in closed {
+            let path = segment_path(&self.dir, seg);
+            let mut records = Vec::with_capacity(entries.len());
+            {
+                let file = File::open(&path).map_err(io)?;
+                for e in &entries {
+                    let mut payload = vec![0u8; e.len as usize];
+                    file.read_exact_at(&mut payload, e.pos + HEADER as u64).map_err(io)?;
+                    records.push(decode(&payload)?);
+                }
+            }
+            let hits = records.iter_mut().map(|r| redact(r)).filter(|changed| *changed).count();
+            if hits == 0 {
+                continue;
+            }
+            changed += hits;
+            // The rewritten segment, complete and synced, then swapped in with its index.
+            let tmp = path.with_extension("wal.rewrite");
+            let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp).map_err(io)?;
+            let mut new_entries = Vec::with_capacity(records.len());
+            let mut pos = 0u64;
+            for r in &records {
+                let frame = encode(r)?;
+                file.write_all(&frame).map_err(io)?;
+                new_entries.push(Entry { segment: seg, pos, len: (frame.len() - HEADER) as u32 });
+                pos += frame.len() as u64;
+            }
+            file.sync_all().map_err(io)?;
+            drop(file);
+            let _files = self.files.write();
+            fs::rename(&tmp, &path).map_err(io)?;
+            sync_dir(&self.dir)?;
+            let mut s = self.state.lock();
+            if from >= s.first {
+                let start = (from.0 - s.first.0) as usize;
+                for (k, e) in new_entries.into_iter().enumerate() {
+                    if let Some(slot) = s.index.get_mut(start + k) {
+                        *slot = e;
+                    }
+                }
+            }
+        }
+        Ok(changed)
     }
 
     async fn purge_below(&self, offset: LogOffset) -> LogResult<()> {
@@ -477,6 +550,25 @@ mod tests {
         let got = wal.read(LogOffset(1), 100).await.unwrap();
         assert_eq!(got, (1..=10).map(record).collect::<Vec<_>>());
         wal.append(record(11)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_on_new_segment_lets_everything_before_it_be_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = open(dir.path(), 64 * 1024 * 1024);
+        for i in 1..=5 {
+            wal.append(record(i)).await.unwrap();
+        }
+        wal.append_on_new_segment(record(6)).await.unwrap();
+        wal.append(record(7)).await.unwrap();
+        wal.purge_below(LogOffset(6)).await.unwrap();
+        assert!(matches!(wal.read(LogOffset(5), 1).await, Err(LogError::Purged { .. })), "records before the roll are gone");
+        assert_eq!(wal.read(LogOffset(6), 10).await.unwrap().len(), 2);
+        let segments = std::fs::read_dir(dir.path()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".wal")).count();
+        assert_eq!(segments, 1);
+        drop(wal);
+        let wal = open(dir.path(), 64 * 1024 * 1024);
+        assert_eq!(wal.last_offset(), LogOffset(7), "reopens after the roll");
     }
 
     #[tokio::test]
@@ -608,7 +700,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = open(dir.path(), 1 << 20);
         let second = LocalWal::open(PartitionId(5), WalConfig::new(dir.path()));
-        assert!(matches!(second, Err(LogError::Io(ref m)) if m.contains("in use")), "{second:?}");
+        assert!(matches!(second, Err(LogError::Locked(_))), "{second:?}");
         drop(first);
         assert!(LocalWal::open(PartitionId(5), WalConfig::new(dir.path())).is_ok());
     }

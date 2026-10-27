@@ -115,12 +115,15 @@ async fn scope_subscription_sees_record_changes_with_filters() {
     }
     let ops = |b: &Batch| b.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect::<Vec<_>>();
     let a = drain(&gw, &all, None).await;
+    // Drained after FORGET e1: its put, its patch and the link to it were redacted
+    // from the log by the FORGET (W5, immediate erasure) — a lagging subscriber
+    // never sees forgotten content; it gets the forget itself.
     assert_eq!(
         ops(&a),
-        ["put:acme", "put:beta", "put:e1", "patch:e1", "supersede:acme", &format!("link:{}", a.deliveries[5].changes[0].id), "forget:e1"],
-        "every record change in the scope, no topic messages"
+        ["put:acme", "put:beta", "supersede:acme", "forget:e1"],
+        "every record change in the scope, no topic messages, nothing of the forgotten e1"
     );
-    assert_eq!(a.deliveries[4].changes[0].version, Some(2));
+    assert_eq!(a.deliveries[2].changes[0].version, Some(2));
     let f = drain(&gw, &facts, None).await;
     assert_eq!(ops(&f), ["put:acme", "supersede:acme"], "KINDS entity WHERE concept = acme");
     let p = drain(&gw, &paid, None).await;
@@ -128,9 +131,9 @@ async fn scope_subscription_sees_record_changes_with_filters() {
     assert_eq!(p.deliveries[0].changes[0].value.as_ref().unwrap()["n"], 1);
 
     // FROM OFFSET replays from that offset; UNSUBSCRIBE ends the subscription.
-    let from = a.deliveries[3].offset;
+    let from = a.deliveries[2].offset;
     let replay = subscribe(&engine, &format!(r#"SUBSCRIBE SCOPE "tenant:default" FROM OFFSET {from}"#)).await;
-    assert_eq!(offsets(&drain(&gw, &replay, None).await), offsets(&a)[3..].to_vec());
+    assert_eq!(offsets(&drain(&gw, &replay, None).await), offsets(&a)[2..].to_vec());
     let r = q(&engine, &format!(r#"UNSUBSCRIBE "{replay}""#)).await;
     assert_eq!(r["data"]["unsubscribed"], true);
     assert!(gw.next(&replay, None, 10, Duration::ZERO).await.is_err(), "an unsubscribed id is unknown");

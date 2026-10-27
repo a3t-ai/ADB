@@ -12,7 +12,7 @@ pub use filter::predicate_filter;
 pub use lance;
 pub use rows::{key_of, qualified, row_id, StoredRow};
 pub use schema::{memory_schema, META_ID, RECORD_KINDS};
-pub use store::{configure_lance_runtime, sql_str, PartitionStore, StoreConfig, DEFAULT_EMBEDDING_DIM};
+pub use store::{configure_lance_runtime, sql_str, CompactStats, PartitionStore, StoreConfig, DEFAULT_EMBEDDING_DIM};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

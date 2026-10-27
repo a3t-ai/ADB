@@ -31,6 +31,12 @@ const READS: &[&str] = &[
     r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#,
 ];
 
+/// Log records `WRITES` makes: one per write, plus the marker each FORGET's
+/// compaction puts on a new segment (W5).
+fn log_records() -> u64 {
+    (WRITES.len() + WRITES.iter().filter(|q| q.starts_with("FORGET")).count()) as u64
+}
+
 /// A query result without timing fields.
 fn stable(mut v: Value) -> Value {
     if let Some(m) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) {
@@ -69,7 +75,7 @@ async fn restart_rebuilds_identical_state() {
     assert!(working.contains(r#""step":5"#), "{working}");
 
     let (engine, replayed) = LocalEngine::durable(dir.path()).await.unwrap();
-    assert_eq!(replayed.records, WRITES.len() as u64, "one log record per write");
+    assert_eq!(replayed.records, log_records(), "one log record per write, plus FORGETs' markers");
     let after = snapshot(&engine).await;
     for (i, (b, a)) in before.iter().zip(&after).enumerate() {
         assert_eq!(b, a, "read {i} ({}) differs after restart", READS.get(i).unwrap_or(&"stats"));
@@ -79,7 +85,7 @@ async fn restart_rebuilds_identical_state() {
     engine.query(r#"STORE INTO WORKING (task = "t3", step = 1)"#, None).await.unwrap();
     drop(engine);
     let (engine, replayed) = LocalEngine::durable(dir.path()).await.unwrap();
-    assert_eq!(replayed.records, WRITES.len() as u64 + 1);
+    assert_eq!(replayed.records, log_records() + 1);
     assert_eq!(engine.stats().await.unwrap()["working"], 2);
 }
 
@@ -146,7 +152,7 @@ async fn lance_table_mirrors_the_engine() {
         }
     }
     let (applied, rows) = lance_view(dir.path()).await;
-    assert_eq!(applied, WRITES.len() as u64, "every log record applied");
+    assert_eq!(applied, log_records(), "every log record applied");
     let s = summary(&rows);
     // working t1 (t2 forgotten), semantic acme, episodic e1 (e2 forgotten),
     // procedural oom-fix, tools search, two edges.
@@ -174,10 +180,10 @@ async fn lance_catches_up_from_the_log() {
     std::fs::remove_dir_all(dir.path().join("store")).unwrap();
     {
         let (_engine, stats) = LocalEngine::durable(dir.path()).await.unwrap();
-        assert_eq!(stats.store_caught_up, WRITES.len() as u64);
+        assert_eq!(stats.store_caught_up, log_records());
     }
     let (applied, after) = lance_view(dir.path()).await;
-    assert_eq!(applied, WRITES.len() as u64);
+    assert_eq!(applied, log_records());
     assert_eq!(summary(&before), summary(&after));
 }
 
@@ -556,4 +562,51 @@ async fn order_by_created_at_uses_the_records_time() {
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let r = engine.query("RECALL FROM SEMANTIC ALL ORDER BY created_at DESC", None).await.unwrap();
     assert_eq!(ids(r), ["o3", "o2", "o1"], "after a restart");
+}
+
+/// Every file under `dir` that contains `needle`.
+fn files_with(dir: &std::path::Path, needle: &str) -> Vec<String> {
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { walk(&p, out) } else { out.push(p) }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    files
+        .into_iter()
+        .filter(|p| std::fs::read(p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes())))
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
+/// W5 (user, 27 Oct): FORGET is physical before it returns — the forgotten value is
+/// in no file under the data directory (table, versions, MemWAL, log), while the
+/// rest of memory, its history and links survive, also across a restart.
+#[tokio::test]
+async fn forget_erases_from_disk_before_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = "SECRET-card-4111-1111-1111-1111";
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        engine.query(r#"STORE INTO SEMANTIC (key = "keep", content = "the office opens at 7am")"#, None).await.unwrap();
+        engine.query(&format!(r#"STORE INTO SEMANTIC (key = "card", content = "{secret}")"#), None).await.unwrap();
+        engine.query(&format!(r#"UPDATE INTO SEMANTIC WHERE key = "card" (note = "{secret} v2")"#), None).await.unwrap();
+        engine.query(r#"STORE INTO EPISODIC (key = "e1", content = "called the bank")"#, None).await.unwrap();
+        engine.query(r#"LINK FROM SEMANTIC WHERE key = "keep" TO EPISODIC WHERE key = "e1" TYPE "related" WEIGHT 0.5"#, None).await.unwrap();
+        assert!(!files_with(dir.path(), secret).is_empty(), "written to disk first (else this proves nothing)");
+        let r = engine.query(r#"FORGET FROM SEMANTIC WHERE key = "card""#, None).await.unwrap();
+        assert_eq!(r["data"]["count"], 1, "{r}");
+        assert_eq!(files_with(dir.path(), secret), Vec::<String>::new(), "gone from every file when FORGET returns");
+        let r = engine.query(r#"RECALL FROM SEMANTIC WHERE key = "keep" WITH LINKS ALL"#, None).await.unwrap();
+        assert_eq!(r["data"]["records"][0]["data"]["links"].as_array().map(|l| l.len()), Some(1), "{r}");
+        // Writes go on after the compaction.
+        engine.query(r#"STORE INTO SEMANTIC (key = "after", content = "written after the erase")"#, None).await.unwrap();
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let r = engine.query("RECALL FROM SEMANTIC ALL", None).await.unwrap().to_string();
+    assert!(r.contains("7am") && r.contains("after the erase") && !r.contains("SECRET"), "{r}");
+    assert_eq!(engine.query(r#"RECALL FROM EPISODIC WHERE key = "e1""#, None).await.unwrap()["data"]["count"], 1);
+    assert!(files_with(dir.path(), secret).is_empty());
 }

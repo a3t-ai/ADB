@@ -75,18 +75,30 @@ pub struct PartitionStore {
     /// The store's root directory (`sync_to_disk`).
     root: std::path::PathBuf,
     partition: PartitionId,
-    base: Arc<Dataset>,
-    writer: ShardWriter,
-    cache: Arc<dyn DatasetCache>,
+    cfg: StoreConfig,
+    /// The table and its writer. Reads and applies share it; W5 compaction takes it
+    /// exclusively to swap in the rewritten table (`None` only during that swap).
+    state: tokio::sync::RwLock<Option<Inner>>,
     schema: SchemaRef,
     dim: i32,
     memtable_rows: usize,
     /// `_meta`'s applied offset, read once on open and advanced by `apply`, so
     /// applying a record doesn't scan the table just to check it.
     applied: std::sync::atomic::AtomicU64,
+}
+
+/// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
+struct Inner {
+    base: Arc<Dataset>,
+    writer: ShardWriter,
+    cache: Arc<dyn DatasetCache>,
     /// Log offset of each put since open, to map the MemWAL's durable batch count
     /// back to a log offset (`durable_offset`).
     puts: std::sync::Mutex<PutLedger>,
+}
+
+fn open_state(g: &Option<Inner>) -> &Inner {
+    g.as_ref().expect("the partition store is open")
 }
 
 /// Puts since open, numbered like the MemWAL writer numbers batches (R11 / R12).
@@ -129,6 +141,11 @@ impl PartitionStore {
         if !dir.exists() && staged.exists() {
             std::fs::rename(&staged, &dir).map_err(|e| StoreError::Decode(format!("finishing the table rewrite: {e}")))?;
         }
+        // A compaction that stopped after moving the old table aside: drop it.
+        let trash = dir.with_file_name("memory.compacted.trash");
+        if dir.exists() && trash.exists() {
+            std::fs::remove_dir_all(&trash).map_err(|e| StoreError::Decode(format!("dropping the compacted table: {e}")))?;
+        }
         if dir.exists() {
             let ds = Dataset::open(&dir.to_string_lossy()).await.map_err(lance)?;
             if let Some(found) = embedding_dim_of(&ds) {
@@ -142,20 +159,125 @@ impl PartitionStore {
     }
 
     /// The table's embedding column has `from` dimensions and the model `cfg`'s:
-    /// rewrite every row (history, tombstones and `_meta` too) into a new table of
-    /// `cfg.embedding_dim`, then swap it in; the old table stays beside it as
-    /// `memory.dim<from>.bak`. Vectors of the old size are dropped (they can't be
-    /// read by the new model; the backfill embeds the text again). Crash-safe: the
-    /// new table is complete and closed before the renames, and `open` finishes an
-    /// interrupted swap.
+    /// rewrite every row (history, tombstones and `_meta` too) into a table of
+    /// `cfg.embedding_dim`; the old table stays beside it as `memory.dim<from>.bak`.
+    /// Vectors of the old size are dropped (the backfill embeds the text again).
     async fn rewrite_dim(cfg: &StoreConfig, partition: PartitionId, from: i32) -> StoreResult<()> {
+        let stats = Self::rewrite_table(cfg, partition, from, &Some, Some(format!("memory.dim{from}.bak"))).await?;
+        tracing::info!(rows = stats.kept, from, to = cfg.embedding_dim, "memory table rewritten for the embedding model's dimension");
+        Ok(())
+    }
+
+    /// W5 compaction, offline (the table must not be open): rewrite the table
+    /// keeping only what may stay — no tombstoned rows (forgotten, expired by the
+    /// timer, unlinked, unsubscribed), no rows past their TTL, no versions
+    /// superseded more than `history` ago — and delete the old table, so forgotten
+    /// data is physically gone (L10). The MemWAL generations go with it.
+    pub async fn compact_offline(cfg: &StoreConfig, partition: PartitionId, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
+        let keep = compaction_row(history, now);
+        Self::rewrite_table(cfg, partition, cfg.embedding_dim, &keep, None).await
+    }
+
+    /// W5 compaction on the open table: the same rewrite as [`Self::compact_offline`],
+    /// swapped in under the exclusive lock (reads wait for the whole rewrite: the
+    /// lock is held throughout).
+    /// The caller pauses writes (the sequencer) and makes sure every committed record
+    /// is applied first. The old table, its versions and MemWAL files, and any
+    /// rewrite backups (`memory.dim*.bak`) are deleted: forgotten data is gone.
+    pub async fn compact(&self, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
+        let started = std::time::Instant::now();
+        let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
+        let staged = dir.with_file_name("memory.rewrite.lance");
+        let trash = dir.with_file_name("memory.compacted.trash");
+        let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
+        let mut g = self.state.write().await;
+        let bytes_before = dir_size(&dir);
+        let all = Self::scan_in(open_state(&g), None).await?;
+        let total = all.len();
+        let keep = compaction_row(history, now);
+        let rows: Vec<StoredRow> = all.into_iter().filter_map(&keep).collect();
+        // The new table, complete and closed, beside the old one.
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged).map_err(err)?;
+        }
+        Self::create(&staged.to_string_lossy(), &self.schema, self.dim).await?;
+        let new = Self::open_inner(&self.cfg, self.partition, &staged).await?;
+        for chunk in rows.chunks(10_000) {
+            new.writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
+        }
+        new.writer.close().await.map_err(lance)?;
+        // Close the current writer before the directories move: its WAL path is the
+        // table's. From here the store is closed; any failure reopens what is there.
+        let old = g.take().expect("the partition store is open");
+        let swapped = async {
+            old.writer.close().await.map_err(lance)?;
+            if trash.exists() {
+                std::fs::remove_dir_all(&trash).map_err(err)?;
+            }
+            std::fs::rename(&dir, &trash).map_err(err)?;
+            std::fs::rename(&staged, &dir).map_err(err)?;
+            StoreResult::Ok(())
+        }
+        .await;
+        if !dir.exists() && staged.exists() {
+            let _ = std::fs::rename(&staged, &dir);
+        }
+        let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
+        Self::reset_ledger(&inner, self.applied.load(std::sync::atomic::Ordering::SeqCst)).await?;
+        *g = Some(inner);
+        drop(g);
+        swapped?;
+        std::fs::remove_dir_all(&trash).map_err(err)?;
+        for e in std::fs::read_dir(dir.parent().unwrap_or(&dir)).map_err(err)?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("memory.dim") && name.ends_with(".bak") {
+                std::fs::remove_dir_all(e.path()).map_err(err)?;
+            }
+        }
+        Ok(CompactStats { total, kept: rows.len(), bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
+    }
+
+    /// MemWAL generations (sealed memtables) not yet compacted away: a W5 threshold.
+    pub async fn generation_count(&self) -> StoreResult<usize> {
+        let g = self.state.read().await;
+        Ok(open_state(&g).writer.manifest().await.map_err(lance)?.map(|m| m.sstables.len()).unwrap_or(0))
+    }
+
+    /// Put `rows` into the table (chunks of 10k), outside the log: rewrites only.
+    async fn put_rows(&self, rows: &[StoredRow]) -> StoreResult<()> {
+        let g = self.state.read().await;
+        for chunk in rows.chunks(10_000) {
+            open_state(&g).writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the partition's table (read at `from` dimensions) into a fresh one of
+    /// `cfg.embedding_dim` with the rows `keep` accepts, then swap it in. With
+    /// `backup`, the old table is renamed to it; without, it is deleted (and the
+    /// disk synced). Crash-safe: the new table is complete and closed before the
+    /// renames, and `open` finishes an interrupted swap.
+    async fn rewrite_table(
+        cfg: &StoreConfig,
+        partition: PartitionId,
+        from: i32,
+        keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync),
+        backup: Option<String>,
+    ) -> StoreResult<CompactStats> {
+        let started = std::time::Instant::now();
         let dir = cfg.root.join(format!("p{}", partition.0)).join("memory.lance");
         let staged = dir.with_file_name("memory.rewrite.lance");
+        let err = |e: std::io::Error| StoreError::Decode(format!("table rewrite: {e}"));
+        let bytes_before = dir_size(&dir);
         let old = Self::open_at(&StoreConfig { embedding_dim: from, ..cfg.clone() }, partition, &dir).await?;
-        let mut rows = old.scan(None).await?;
+        let all = old.scan(None).await?;
         old.close().await?;
+        let total = all.len();
+        let mut rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
         for r in rows.iter_mut() {
-            r.data.embedding = None;
+            if from != cfg.embedding_dim {
+                r.data.embedding = None;
+            }
             if r.id == META_ID {
                 if let serde_json::Value::Object(v) = &mut r.data.value {
                     v.insert("embedding_dim".into(), cfg.embedding_dim.into());
@@ -163,24 +285,69 @@ impl PartitionStore {
             }
         }
         if staged.exists() {
-            std::fs::remove_dir_all(&staged).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
+            std::fs::remove_dir_all(&staged).map_err(err)?;
         }
         Self::create(&staged.to_string_lossy(), &memory_schema(cfg.embedding_dim), cfg.embedding_dim).await?;
         let new = Self::open_at(cfg, partition, &staged).await?;
-        let batch = encode(&rows, &new.schema, new.dim)?;
-        new.writer.put(vec![batch]).await.map_err(lance)?;
+        new.put_rows(&rows).await?;
         new.close().await?;
-        let backup = dir.with_file_name(format!("memory.dim{from}.bak"));
-        if backup.exists() {
-            std::fs::remove_dir_all(&backup).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
+        match &backup {
+            Some(name) => {
+                let b = dir.with_file_name(name);
+                if b.exists() {
+                    std::fs::remove_dir_all(&b).map_err(err)?;
+                }
+                std::fs::rename(&dir, &b).map_err(err)?;
+                std::fs::rename(&staged, &dir).map_err(err)?;
+            }
+            None => {
+                let trash = dir.with_file_name("memory.compacted.trash");
+                if trash.exists() {
+                    std::fs::remove_dir_all(&trash).map_err(err)?;
+                }
+                std::fs::rename(&dir, &trash).map_err(err)?;
+                std::fs::rename(&staged, &dir).map_err(err)?;
+                std::fs::remove_dir_all(&trash).map_err(err)?;
+            }
         }
-        std::fs::rename(&dir, &backup).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
-        std::fs::rename(&staged, &dir).map_err(|e| StoreError::Decode(format!("table rewrite: {e}")))?;
-        tracing::info!(rows = rows.len(), from, to = cfg.embedding_dim, backup = %backup.display(), "memory table rewritten for the embedding model's dimension");
-        Ok(())
+        Ok(CompactStats { total, kept: rows.len(), bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
     }
 
     async fn open_at(cfg: &StoreConfig, partition: PartitionId, dir: &std::path::Path) -> StoreResult<Self> {
+        let inner = Self::open_inner(cfg, partition, dir).await?;
+        let store = Self {
+            root: cfg.root.clone(),
+            partition,
+            cfg: cfg.clone(),
+            state: tokio::sync::RwLock::new(Some(inner)),
+            schema: memory_schema(cfg.embedding_dim),
+            dim: cfg.embedding_dim,
+            memtable_rows: cfg.memtable_rows,
+            applied: std::sync::atomic::AtomicU64::new(0),
+        };
+        let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
+        let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
+        if meta.data.value.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0) < 3 {
+            store.qualify_row_ids(&meta).await?;
+        }
+        {
+            let g = store.state.read().await;
+            Self::reset_ledger(open_state(&g), applied).await?;
+        }
+        Ok(store)
+    }
+
+    /// Everything present after the writer's replay is WAL-durable: it is the base
+    /// of the batch numbering, and `applied` is durable already.
+    async fn reset_ledger(inner: &Inner, applied: u64) -> StoreResult<()> {
+        let st = inner.writer.memtable_stats().await.map_err(lance)?;
+        *inner.puts.lock().unwrap() = PutLedger { base: st.global_offset + st.batch_count, first: 0, offsets: Default::default(), durable_at_open: applied };
+        Ok(())
+    }
+
+    /// Open the table in `dir` (creating it if needed) and become its writer.
+    async fn open_inner(cfg: &StoreConfig, partition: PartitionId, dir: &std::path::Path) -> StoreResult<Inner> {
         let schema = memory_schema(cfg.embedding_dim);
         let uri = dir.to_string_lossy().to_string();
         if !dir.exists() {
@@ -207,29 +374,8 @@ impl PartitionStore {
             .with_max_memtable_batches(1_000_000)
             .with_max_unflushed_memtable_bytes(8 << 30);
         let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
-        let store = Self {
-            root: cfg.root.clone(),
-            partition,
-            base,
-            writer,
-            cache: Arc::new(SsTableCache::new(64)),
-            schema,
-            dim: cfg.embedding_dim,
-            memtable_rows: cfg.memtable_rows,
-            applied: std::sync::atomic::AtomicU64::new(0),
-            puts: std::sync::Mutex::new(PutLedger::default()),
-        };
-        let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
-        let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
-        if meta.data.value.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0) < 3 {
-            store.qualify_row_ids(&meta).await?;
-        }
-        // Everything present after the writer's replay is WAL-durable: it is the base
-        // of the batch numbering, and `applied` is durable already.
-        let st = store.writer.memtable_stats().await.map_err(lance)?;
-        *store.puts.lock().unwrap() = PutLedger { base: st.global_offset + st.batch_count, first: 0, offsets: Default::default(), durable_at_open: applied };
-        Ok(store)
+        let _ = schema;
+        Ok(Inner { base, writer, cache: Arc::new(SsTableCache::new(64)), puts: std::sync::Mutex::new(PutLedger::default()) })
     }
 
     /// Schema v2 → v3: rewrite every record and edge row under its memory-qualified id
@@ -266,7 +412,8 @@ impl PartitionStore {
         let applied = self.applied.load(std::sync::atomic::Ordering::SeqCst);
         out.push(StoredRow::meta(applied, meta.commit_ts, meta.epoch, serde_json::json!({ "embedding_dim": self.dim })));
         let batch = encode(&out, &self.schema, self.dim)?;
-        self.writer.put(vec![batch]).await.map_err(lance)?;
+        let g = self.state.read().await;
+        open_state(&g).writer.put(vec![batch]).await.map_err(lance)?;
         Ok(())
     }
 
@@ -290,7 +437,12 @@ impl PartitionStore {
 
     /// Every row version matching `filter` (Lance SQL), newest per id, `_meta` included.
     pub async fn scan(&self, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
-        let mut scanner = self.scanner().await?;
+        let g = self.state.read().await;
+        Self::scan_in(open_state(&g), filter).await
+    }
+
+    async fn scan_in(inner: &Inner, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
+        let mut scanner = Self::scanner(inner).await?;
         if let Some(f) = filter {
             scanner = scanner.filter(f).map_err(lance)?;
         }
@@ -302,7 +454,8 @@ impl PartitionStore {
     /// parser can't express: Lance's json_* functions on `value` (stage D3.6).
     /// Filtering happens after the LSM picks the newest version of each row.
     pub async fn scan_expr(&self, filter: Option<Expr>) -> StoreResult<Vec<StoredRow>> {
-        let mut scanner = self.scanner().await?;
+        let g = self.state.read().await;
+        let mut scanner = Self::scanner(open_state(&g)).await?;
         if let Some(f) = filter {
             scanner = scanner.filter_expr(f);
         }
@@ -321,18 +474,18 @@ impl PartitionStore {
     }
 
     /// An LSM scanner over memtable + flushed generations + base table.
-    async fn scanner(&self) -> StoreResult<LsmScanner> {
-        let manifest = self.writer.manifest().await.map_err(lance)?;
-        let mut snap = ShardSnapshot::new(self.writer.shard_id());
+    async fn scanner(inner: &Inner) -> StoreResult<LsmScanner> {
+        let manifest = inner.writer.manifest().await.map_err(lance)?;
+        let mut snap = ShardSnapshot::new(inner.writer.shard_id());
         if let Some(m) = &manifest {
             snap = snap.with_current_generation(m.current_generation);
             for t in &m.sstables {
                 snap = snap.with_sstable(t.generation, t.path.clone());
             }
         }
-        Ok(LsmScanner::new(self.base.clone(), vec![snap], vec!["id".into()])
-            .with_in_memory_memtables(self.writer.shard_id(), self.writer.in_memory_memtable_refs().await.map_err(lance)?)
-            .with_sstable_cache(self.cache.clone()))
+        Ok(LsmScanner::new(inner.base.clone(), vec![snap], vec!["id".into()])
+            .with_in_memory_memtables(inner.writer.shard_id(), inner.writer.in_memory_memtable_refs().await.map_err(lance)?)
+            .with_sstable_cache(inner.cache.clone()))
     }
 
     /// The current view (D2 §3) at `now`, without `_meta`.
@@ -421,6 +574,8 @@ impl PartitionStore {
         if record.offset <= self.applied_offset().await? {
             return Ok(false);
         }
+        let g = self.state.read().await;
+        let inner = open_state(&g);
         let ts = record.commit_ts;
         let (off, epoch) = (record.offset.0, record.epoch.0);
         // Rows this record writes, one per id (later effects see earlier ones).
@@ -438,7 +593,7 @@ impl PartitionStore {
                 }
                 Effect::Supersede { old, new } => {
                     let new = qualified(new);
-                    if let Some(mut prev) = self.row(&out, &row_id(new.data.memory, &old.0)).await? {
+                    if let Some(mut prev) = Self::row(inner, &out, &row_id(new.data.memory, &old.0)).await? {
                         prev.valid_to = Some(ts);
                         prev.superseded_by = Some(new.id.0.clone());
                         prev.log_offset = off;
@@ -447,7 +602,7 @@ impl PartitionStore {
                     out.insert(new.id.0.clone(), StoredRow::from_new(&new, ts, off, epoch));
                 }
                 Effect::Patch { memory, id, fields, .. } => {
-                    if let Some(mut cur) = self.row(&out, &row_id(*memory, &id.0)).await? {
+                    if let Some(mut cur) = Self::row(inner, &out, &row_id(*memory, &id.0)).await? {
                         match &mut cur.data.value {
                             serde_json::Value::Object(v) => v.extend(fields.clone()),
                             other => *other = serde_json::Value::Object(fields.clone()),
@@ -466,21 +621,21 @@ impl PartitionStore {
                     }
                 }
                 Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
-                    for mut r in self.lineage_and_edges(&out, &row_id(*memory, &lineage_id.0)).await? {
+                    for mut r in Self::lineage_and_edges(inner, &out, &row_id(*memory, &lineage_id.0)).await? {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
                     }
                 }
                 Effect::Embed { memory, id, embedding } => {
-                    if let Some(mut cur) = self.row(&out, &row_id(*memory, &id.0)).await? {
+                    if let Some(mut cur) = Self::row(inner, &out, &row_id(*memory, &id.0)).await? {
                         cur.data.embedding = Some(embedding.clone());
                         cur.log_offset = off;
                         out.insert(cur.id.clone(), cur);
                     }
                 }
                 Effect::UpdateSubCursor { sub_id, cursor } => {
-                    if let Some(mut sub) = self.row(&out, &sub_id.0).await? {
+                    if let Some(mut sub) = Self::row(inner, &out, &sub_id.0).await? {
                         if let serde_json::Value::Object(v) = &mut sub.data.value {
                             v.insert("cursor".into(), cursor.0.into());
                         }
@@ -489,7 +644,7 @@ impl PartitionStore {
                     }
                 }
                 Effect::Unregister { id } => {
-                    if let Some(mut r) = self.row(&out, &id.0).await? {
+                    if let Some(mut r) = Self::row(inner, &out, &id.0).await? {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
@@ -504,29 +659,29 @@ impl PartitionStore {
 
         let rows: Vec<StoredRow> = out.into_values().collect();
         let batch = encode(&rows, &self.schema, self.dim)?;
-        self.writer.put(vec![batch]).await.map_err(lance)?;
+        inner.writer.put(vec![batch]).await.map_err(lance)?;
         self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
-        self.puts.lock().unwrap().offsets.push_back(off);
-        if self.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
-            self.writer.force_seal_active().await.map_err(lance)?;
+        inner.puts.lock().unwrap().offsets.push_back(off);
+        if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
+            inner.writer.force_seal_active().await.map_err(lance)?;
         }
         Ok(true)
     }
 
     /// A row as this record has it so far, else as stored.
-    async fn row(&self, out: &BTreeMap<String, StoredRow>, id: &str) -> StoreResult<Option<StoredRow>> {
+    async fn row(inner: &Inner, out: &BTreeMap<String, StoredRow>, id: &str) -> StoreResult<Option<StoredRow>> {
         match out.get(id) {
             Some(r) => Ok(Some(r.clone())),
-            None => self.get(id).await,
+            None => Ok(Self::scan_in(inner, Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next()),
         }
     }
 
     /// Every version of a lineage, and every edge touching it (D2 §5).
-    async fn lineage_and_edges(&self, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
+    async fn lineage_and_edges(inner: &Inner, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
         let l = sql_str(lineage);
         let filter = format!("lineage_id = {l} OR subject_id = {l} OR object_id = {l}");
         let mut rows: BTreeMap<String, StoredRow> =
-            self.scan(Some(&filter)).await?.into_iter().map(|r| (r.id.clone(), r)).collect();
+            Self::scan_in(inner, Some(&filter)).await?.into_iter().map(|r| (r.id.clone(), r)).collect();
         for r in out.values() {
             let hit = r.lineage_id == lineage
                 || r.data.subject_id.as_deref() == Some(lineage)
@@ -541,7 +696,8 @@ impl PartitionStore {
     /// Batches the MemWAL has made durable, and the writer's batch numbering base
     /// (for mapping durable batches back to log offsets, D2 of the plan).
     pub async fn durable_batches(&self) -> StoreResult<(usize, usize)> {
-        let st = self.writer.memtable_stats().await.map_err(lance)?;
+        let g = self.state.read().await;
+        let st = open_state(&g).writer.memtable_stats().await.map_err(lance)?;
         Ok((st.durable_batch_count, st.global_offset))
     }
 
@@ -550,8 +706,10 @@ impl PartitionStore {
     /// below `durable_offset + 1` (stage D3.5). Maps the writer's durable batch count
     /// to the log offset of that put, as the R11 / R12 spikes validated.
     pub async fn durable_offset(&self) -> StoreResult<LogOffset> {
-        let durable = self.writer.memtable_stats().await.map_err(lance)?.durable_batch_count;
-        let mut p = self.puts.lock().unwrap();
+        let g = self.state.read().await;
+        let inner = open_state(&g);
+        let durable = inner.writer.memtable_stats().await.map_err(lance)?.durable_batch_count;
+        let mut p = inner.puts.lock().unwrap();
         if durable <= p.base {
             return Ok(LogOffset(p.durable_at_open));
         }
@@ -597,8 +755,63 @@ impl PartitionStore {
 
     /// Flush and release the writer.
     pub async fn close(self) -> StoreResult<()> {
-        self.writer.close().await.map_err(lance)
+        match self.state.into_inner() {
+            Some(inner) => inner.writer.close().await.map_err(lance),
+            None => Ok(()),
+        }
     }
+}
+
+/// What W5 compaction keeps of a row: `_meta`, and rows that are not tombstoned
+/// (forgotten, expired by the timer, unlinked, unsubscribed), not past their TTL,
+/// and not a version superseded more than `history` ago. A tombstoned lineage keeps
+/// one **stub** — its first row with the payload stripped (no value, text, vector or
+/// sealed fields) — so its id still resolves to its memory, kind and scope:
+/// subscribers get the `forget` / `unlink` event, and replay finds the tombstone.
+fn compaction_row(history: Duration, now: CommitTs) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
+    let horizon = CommitTs(now.0 - history.as_micros() as i64);
+    move |mut r: StoredRow| {
+        if r.id == META_ID {
+            return Some(r);
+        }
+        if r.tombstone {
+            if r.id != r.lineage_id {
+                return None;
+            }
+            r.data.value = serde_json::json!({});
+            r.data.text = None;
+            r.data.embedding = None;
+            r.data.sealed = None;
+            return Some(r);
+        }
+        let live = r.data.ttl_at.is_none_or(|t| t > now)
+            && !(r.superseded_by.is_some() && r.valid_to.is_some_and(|t| t < horizon));
+        live.then_some(r)
+    }
+}
+
+/// What a table rewrite did (W5).
+#[derive(Debug, Clone)]
+pub struct CompactStats {
+    /// Row versions read
+    pub total: usize,
+    /// Row versions kept
+    pub kept: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub took: std::time::Duration,
+}
+
+/// Bytes under `dir`.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            _ => e.metadata().map(|m| m.len()).unwrap_or(0),
+        })
+        .sum()
 }
 
 /// The dimension of a table's `embedding` column (`None`: no such column).

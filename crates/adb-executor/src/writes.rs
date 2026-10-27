@@ -155,6 +155,29 @@ async fn backend_has(adb: &Adb, memory: MemoryType, id: &str) -> AdbResult<bool>
     Ok(!adb.lookup(memory, &Predicate::key("id", id)).await?.is_empty())
 }
 
+/// Drop from `r` the effects that carry a forgotten row's content (W5): its puts,
+/// versions, patches and vectors, and the edges touching it. `Forget` effects and
+/// everything else stay. Returns whether anything was dropped.
+fn redact_record(r: &mut LogRecord, rows: &std::collections::HashSet<(Memory, String)>) -> bool {
+    let hit = |m: Memory, k: &str| rows.contains(&(m, k.to_string()));
+    let before = r.effects.len();
+    r.effects.retain(|e| match e {
+        Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) => {
+            !(hit(n.data.memory, &n.id.0) || hit(n.data.memory, &n.lineage_id.0))
+        }
+        Effect::Supersede { old, new } => !(hit(new.data.memory, &old.0) || hit(new.data.memory, &new.id.0) || hit(new.data.memory, &new.lineage_id.0)),
+        Effect::Patch { memory, id, .. } | Effect::Embed { memory, id, .. } => !hit(*memory, &id.0),
+        Effect::PutEdge(n) => {
+            let to = n.data.value.get("to_memory").and_then(|v| serde_json::from_value::<Memory>(v.clone()).ok());
+            let from_hit = n.data.subject_id.as_deref().is_some_and(|s| hit(n.data.memory, s));
+            let to_hit = matches!((to, n.data.object_id.as_deref()), (Some(t), Some(o)) if hit(t, o));
+            !(from_hit || to_hit)
+        }
+        _ => true,
+    });
+    r.effects.len() != before
+}
+
 fn needs_table(verb: &str) -> AdbError {
     AdbError::UnsupportedOperation(format!("{verb} (needs the Lance table: a durable engine)"))
 }
@@ -311,7 +334,21 @@ pub struct DurableWrites<L: Log> {
     /// Embeds `content` on STORE / UPDATE and in the backfill (MVP W4); `None`: no
     /// vectors (records are then found by filters and text only).
     embedder: Option<Arc<adb_embed::Embedder>>,
+    /// W5: FORGETs waiting for physical erasure, and those a compaction has covered;
+    /// concurrent FORGETs share one compaction.
+    erase_requested: std::sync::atomic::AtomicU64,
+    erase_done: std::sync::atomic::AtomicU64,
+    compactor: Mutex<()>,
+    /// Offset of the last record with platform-table effects (stage G). The log
+    /// must keep it until the platform tables have applied it.
+    platform_last: std::sync::atomic::AtomicU64,
+    /// Lineages forgotten since the last compaction: their payloads are redacted
+    /// from the log by the next one (W5).
+    forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
 }
+
+/// How long superseded versions (UPDATE history) are kept (W5, user 27 Oct).
+pub const HISTORY: Duration = Duration::from_secs(90 * 86_400);
 
 pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
 
@@ -342,6 +379,91 @@ impl<L: Log + 'static> DurableWrites<L> {
             out.extend(edges.into_iter().filter(|e| e.data.object_id.as_ref().is_some_and(|o| targets.contains(o))));
         }
         Ok(out)
+    }
+
+    /// The log offset below which the platform tables need nothing: they apply under
+    /// the sequencer before anything is purged, so normally no limit; only a failed
+    /// apply holds the log at what they have.
+    async fn platform_floor(&self) -> Option<LogOffset> {
+        let p = self.platform.as_ref()?;
+        let applied = p.applied_offset().await;
+        (applied < self.platform_last.load(std::sync::atomic::Ordering::SeqCst)).then(|| LogOffset(applied + 1))
+    }
+
+    /// W5 compaction: with writes paused and every committed record applied,
+    /// rewrite the table without what may go (forgotten, expired, unlinked, history
+    /// past [`HISTORY`]), then put an empty marker record on a new log segment and
+    /// purge the log below it — so forgotten payloads leave the log too. A
+    /// subscriber whose cursor is below the marker gets `cursor_expired` and
+    /// resubscribes (W5-L1). `None` without a table.
+    pub async fn compact_now(&self) -> AdbResult<Option<adb_store::CompactStats>> {
+        let Some(store) = &self.store else { return Ok(None) };
+        let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("compaction: {e}"));
+        let mut seq = self.seq.lock().await;
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        // Every row id (all versions) of the lineages forgotten since the last
+        // compaction: their effects are redacted from the log below.
+        let forgotten: std::collections::HashSet<(Memory, String)> = std::mem::take(&mut *self.forgotten.lock().unwrap());
+        let mut rows: std::collections::HashSet<(Memory, String)> = forgotten.clone();
+        if !forgotten.is_empty() {
+            let lineages: Vec<String> = forgotten.iter().map(|(m, k)| adb_store::sql_str(&adb_store::row_id(*m, k))).collect();
+            for chunk in lineages.chunks(500) {
+                let filter = format!("lineage_id IN ({})", chunk.join(", "));
+                for r in store.scan(Some(&filter)).await.map_err(store_err)? {
+                    rows.insert((r.data.memory, adb_store::key_of(&r.id).to_string()));
+                }
+            }
+        }
+        let stats = store.compact(HISTORY, CommitTs::from_datetime(time::now())).await.map_err(store_err)?;
+        let mut redacted = 0;
+        if !rows.is_empty() {
+            // Close the segment holding the newest records, then rewrite the closed
+            // ones without the forgotten payloads; offsets (and every subscriber's
+            // position) stay.
+            let ts = seq.begin();
+            let marker = seq.append_record_on_new_segment(ts, Vec::new()).await.map_err(log_err)?;
+            self.to_store(&marker, seq.log()).await;
+            let redact = |r: &mut LogRecord| redact_record(r, &rows);
+            redacted = seq.log().rewrite_closed(&redact).await.map_err(log_err)?;
+        }
+        tracing::info!(
+            kept = stats.kept, of = stats.total, took = ?stats.took,
+            disk_before = stats.bytes_before, disk_after = stats.bytes_after, log_records_redacted = redacted,
+            "compacted"
+        );
+        Ok(Some(stats))
+    }
+
+    /// After a FORGET: make sure a compaction that started after it has finished
+    /// (immediate physical erasure, W5, user 27 Oct). FORGETs arriving while one
+    /// runs wait for the next, which covers them all.
+    async fn erase(&self) -> AdbResult<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mine = self.erase_requested.fetch_add(1, SeqCst) + 1;
+        let _one_at_a_time = self.compactor.lock().await;
+        if self.erase_done.load(SeqCst) >= mine {
+            return Ok(());
+        }
+        let covering = self.erase_requested.load(SeqCst);
+        self.compact_now().await?;
+        self.erase_done.store(covering, SeqCst);
+        Ok(())
+    }
+
+    /// Compaction from the maintenance timer (thresholds, nightly) or an admin.
+    pub async fn compact(&self) -> AdbResult<Option<adb_store::CompactStats>> {
+        let _one_at_a_time = self.compactor.lock().await;
+        self.compact_now().await
+    }
+
+    /// Whether compaction is due on size: more than 16 MemWAL generations (W5).
+    pub async fn compaction_due(&self) -> bool {
+        match &self.store {
+            Some(s) => s.generation_count().await.is_ok_and(|n| n > 16),
+            None => false,
+        }
     }
 
     pub fn set_embedder(&mut self, embedder: Option<Arc<adb_embed::Embedder>>) {
@@ -444,7 +566,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             Some(s) => Registry::load(s, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?,
             None => Registry::default(),
         };
-        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None }, stats))
+        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default() }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -565,6 +687,13 @@ impl<L: Log + 'static> DurableWrites<L> {
                 Ok(b) => b,
                 // Purged below what the platform store has: nothing to catch up.
                 Err(LogError::Purged { oldest, .. }) if oldest.0 <= from.0 => break,
+                // Purged above it: the log drops a platform record only once the
+                // platform tables applied it (`platform_floor`), so the gap held
+                // nothing for them — go on from the oldest record kept.
+                Err(LogError::Purged { oldest, .. }) => {
+                    from = oldest;
+                    continue;
+                }
                 Err(e) => return Err(log_err(e)),
             };
             let Some(last) = batch.last().map(|r| r.offset) else { break };
@@ -608,10 +737,10 @@ impl<L: Log + 'static> DurableWrites<L> {
                     // Keep what subscribers haven't acked, up to RETAIN_MAX behind the
                     // tip (E3); never above Lance's durable offset.
                     let mut floor = d.next();
-                    // Platform tables apply synchronously; after a crash they catch up
-                    // from the log, so it keeps what they haven't applied.
-                    if let Some(p) = &self.platform {
-                        floor = LogOffset(floor.0.min(p.applied_offset().await + 1));
+                    // Platform tables apply synchronously; the log keeps a platform
+                    // record only if its apply failed (they catch up on the next open).
+                    if let Some(p) = self.platform_floor().await {
+                        floor = LogOffset(floor.0.min(p.0));
                     }
                     if let Some(cursor) = self.subs.min_cursor() {
                         let cap = record.offset.0.saturating_sub(RETAIN_MAX);
@@ -781,6 +910,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
+        self.forgotten.lock().unwrap().extend(ids.iter().map(|id| (Memory::from(memory_type), id.clone())));
         let mut removed = 0;
         if self.in_lance(memory_type).is_some() {
             removed = ids.len() as u64;
@@ -790,6 +920,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             }
         }
         self.to_store(&record, seq.log()).await;
+        drop(seq);
+        // Physically gone before FORGET returns (W5): table, versions, log.
+        if self.store.is_some() {
+            self.erase().await.map_err(|e| {
+                AdbError::Internal(format!("forgotten (hidden from every read), but not yet erased from disk: {e}; the next compaction erases it"))
+            })?;
+        }
         Ok(removed)
     }
 
@@ -973,6 +1110,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         platform.validate(&effect).await.map_err(perr)?;
         let ts = seq.begin();
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
         platform.apply(&record).await.map_err(perr)?;
         self.to_store(&record, seq.log()).await;
         Ok(record.offset.0)

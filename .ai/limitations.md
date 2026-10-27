@@ -15,7 +15,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update. Lineage creation time is in the history rows if needed. | Revisit if A3T needs first-creation time (add a column or read v1). |
 | L9 | **History is not readable through AQL** (no `AS OF` / `WITH HISTORY`), by design in D2 v1. The rows are kept. | Audit / time travel only by reading the table directly. | AQL v0.6 proposal (D2 §8). |
 | L11 | **Lance on local disk is not power-safe by itself** (risk K8): its local writer writes data files without fsync, and its local store has fsync off. ADB now `syncfs`es the store before every log purge, so purged records are on disk — but a power failure between purges can still leave Lance's newest version referring to unsynced data, and opening a damaged table has no recovery path (rebuild from the log only works while the log is complete). | Process crashes are safe (tested); power loss or a node reboot could need manual repair. Object storage is unaffected. | Ask Lance for fsync in its local writer (with the K7 report), or always run the store on object storage; add "open the last good version" recovery. |
-| L10 | **`FORGET` is logical only.** Tombstones hide rows at once, but rows stay in Lance until compaction, MemWAL WAL entries aren't GC'd, old Lance versions aren't cleaned, and log payloads aren't crypto-shredded (D2 §5 steps 3–4). | Erasure requests aren't physically complete yet. | M2 (compaction, physical forget, §14.3 crypto-shred). |
 
 ## Performance shortcuts (fine for dev-sized data)
 
@@ -128,6 +127,17 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | Calibrate per model (W4-L1). |
 | W4-L1 | **One embedding model, fixed: bge-small-en-v1.5, 384 dims** (baked into the image; `ADB_EMBED_MODEL_DIR` swaps the files, not the size). The table's `embedding` column has one fixed dimension. | No larger / multilingual / hosted models (e.g. 768 / 1024 / 1536 dims, OpenAI-compatible endpoints). | **User, 26 Oct:** choose the embedding provider and its size in **ADB settings** (A3T Settings → ADB): local model or provider endpoint, dimension recorded in `_meta`; changing it re-embeds into a new column / table in the background. Not needed for the MVP. |
 
+## Lifecycle (W5)
+
+| # | Limitation | Effect | Revisit |
+|---|---|---|---|
+| W5-L1 | **FORGET rewrites the whole table before it returns** (immediate erasure, user 27 Oct): reads and writes wait for it. Measured (debug): 0.33 s at 1k row versions, 1.4 s at 10k; release several times faster. Concurrent FORGETs share one rewrite. | FORGET latency, and a pause for everyone, grow with the table. Fine for MVP sizes. | Crypto-shredding (per-lineage keys; FORGET deletes a key) or in-place generation merges with Lance support, before large tenants. |
+| W5-L2 | **A forgotten record leaves a payload-free stub** (id, memory, kind, scope — no value, text or vector) so subscribers get its `forget` and replay finds the tombstone; the log keeps its `Forget` record. Stubs are never pruned. | The record's **key / id** stays as an identifier. Choose keys without personal data. | Prune stubs older than the log's retention. |
+| W5-L3 | **Only FORGET erases at once.** Expired rows, unlinked edges and topic messages go at the next compaction (thresholds, nightly 03:00 UTC); their payloads stay in the log until its normal purge. | TTL / unlink are housekeeping, not erasure. | — |
+| W5-L4 | **Platform tables aren't compacted yet** (G-L4): a DELETE in an A3T platform table is logical in its Lance dataset, and every write is a version. | Platform data deleted in A3T stays on disk in old versions. | `compact_files` + `cleanup_old_versions` per dataset with the nightly compaction. |
+| W5-L5 | **`FORGET FROM ALL` compacts once per memory type that matched.** | Slower than one compaction. | One compaction per statement. |
+| W5-L6 | **Compaction doesn't change the size threshold logic for tombstones**: thresholds are MemWAL generations > 16 only (tombstone share isn't measured). | Many expirations wait for the nightly run. | Count tombstones in `_meta`. |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |
@@ -149,6 +159,7 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | Links couldn't be changed or removed (LINK again added a parallel link) | 26 Oct: AQL v0.7 `UPDATE LINK` / `UNLINK`, re-LINK updates the weight; MCP `unlink`; subscribers get `supersede` / `unlink` of kind `edge` |
 | `ORDER BY created_at` ignored on SEMANTIC (sorted on payload fields only) | `9bcec26` |
 | W2-L10: Sandbox pods kept their old template | flowr `a3t-controller`: template hash annotation; a changed hash recreates the Sandbox |
+| L10: FORGET was logical only | W5 (27 Oct): FORGET compacts before it returns — table rewritten without the record (old table, versions and MemWAL files deleted), its payload redacted from the log (offsets and subscribers kept); the spike and `forget_erases_from_disk_before_it_returns` check no file holds it |
 | L1: no embeddings; `RECALL … LIKE` found nothing | W4 (`d82f05d`): local bge-small embeddings on write, in the log; backfill; hybrid ranking; MCP `recall` `like` |
 | F-L1: agents got the newest 5 facts | W4: `RECALL … LIKE $message` with `memory_config.semantic.{limit, min_confidence}` |
 | L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |

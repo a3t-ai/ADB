@@ -27,6 +27,10 @@ pub enum LogError {
     Purged { requested: LogOffset, oldest: LogOffset },
     #[error("log I/O: {0}")]
     Io(String),
+    /// Another `LocalWal` holds the directory (another ADB process, or a log being
+    /// closed in this one).
+    #[error("{0} is in use by another ADB process")]
+    Locked(String),
 }
 
 pub type LogResult<T> = Result<T, LogError>;
@@ -41,6 +45,13 @@ pub trait Log: Send + Sync {
     /// record is durable: only then may the write be acknowledged.
     async fn append(&self, record: LogRecord) -> LogResult<LogOffset>;
 
+    /// As [`Log::append`], starting a new segment with this record, so everything
+    /// before it can be purged whole (W5: erasing a forgotten record's payload).
+    /// Logs without segments just append.
+    async fn append_on_new_segment(&self, record: LogRecord) -> LogResult<LogOffset> {
+        self.append(record).await
+    }
+
     /// Up to `max` records from `from` (inclusive), in offset order.
     async fn read(&self, from: LogOffset, max: usize) -> LogResult<Vec<LogRecord>>;
 
@@ -53,6 +64,12 @@ pub trait Log: Send + Sync {
 
     /// Drop records below `offset` (retention below the applied offset, §11.3).
     async fn purge_below(&self, offset: LogOffset) -> LogResult<()>;
+
+    /// Rewrite the records of the closed segments (all but the one being appended
+    /// to) with `redact`, which returns whether it changed a record; offsets stay.
+    /// W5: a forgotten record's payload leaves the log without disturbing anyone's
+    /// position in it. Returns how many records changed.
+    async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize>;
 }
 
 /// A shared log: the sequencer appends while readers (stage E subscribers) read the
@@ -65,6 +82,14 @@ impl<L: Log + ?Sized> Log for std::sync::Arc<L> {
 
     async fn append(&self, record: LogRecord) -> LogResult<LogOffset> {
         (**self).append(record).await
+    }
+
+    async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize> {
+        (**self).rewrite_closed(redact).await
+    }
+
+    async fn append_on_new_segment(&self, record: LogRecord) -> LogResult<LogOffset> {
+        (**self).append_on_new_segment(record).await
     }
 
     async fn read(&self, from: LogOffset, max: usize) -> LogResult<Vec<LogRecord>> {
@@ -159,6 +184,12 @@ impl Log for MemLog {
             s.first = offset;
         }
         Ok(())
+    }
+
+    async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize> {
+        let mut s = self.state.lock();
+        let n = s.records.len().saturating_sub(1);
+        Ok(s.records[..n].iter_mut().map(|r| redact(r)).filter(|changed| *changed).count())
     }
 }
 

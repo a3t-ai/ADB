@@ -50,6 +50,11 @@ pub trait Engine: Send + Sync {
     async fn platform_write(&self, _effect: adb_core::log::Effect) -> Result<u64, String> {
         Err("platform tables need a durable engine (start ADB with --data-dir)".into())
     }
+
+    /// W5 compaction now (admin): `{total, kept, bytes_before, bytes_after, took_ms}`.
+    async fn compact(&self) -> Result<Value, String> {
+        Err("compaction needs a durable engine (start ADB with --data-dir)".into())
+    }
 }
 
 /// The engine backed by today's in-memory backends (`adb-backends`).
@@ -64,6 +69,8 @@ pub struct LocalEngine {
     platform: Option<(Arc<adb_platform::PlatformStore>, Arc<dyn Writes>)>,
     /// The TTL expiry timer (L3), stopped with the engine.
     expiry: Option<tokio::task::JoinHandle<()>>,
+    /// The durable writes, for compaction on demand (W5).
+    durable: Option<Arc<DurableWrites<Arc<LocalWal>>>>,
 }
 
 impl Drop for LocalEngine {
@@ -72,6 +79,33 @@ impl Drop for LocalEngine {
             t.abort();
         }
     }
+}
+
+/// Open the partition log in `dir/p0`. A log this process just closed can still be
+/// held for a moment by a background task finishing its step (the maintenance
+/// timer is aborted, but stops only when the runtime next polls it): retry for up
+/// to 10 s, yielding to the runtime between tries.
+async fn open_wal(dir: &std::path::Path) -> Result<LocalWal, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))) {
+            Err(adb_log::LogError::Locked(_)) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            other => return other.map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// The nightly compaction time (UTC), `ADB_COMPACT_AT` = "HH:MM" (default 03:00;
+/// "off" disables it — size thresholds still apply).
+fn compaction_hour() -> Option<(u32, u32)> {
+    let v = std::env::var("ADB_COMPACT_AT").unwrap_or_else(|_| "03:00".into());
+    if v.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let (h, m) = v.split_once(':')?;
+    Some((h.parse().ok().filter(|h| *h < 24)?, m.parse().ok().filter(|m| *m < 60)?))
 }
 
 /// How often the expiry timer commits the `Expire`s that came due (D2 §4).
@@ -91,9 +125,27 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + EXPIRE_TICK, EXPIRE_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut backfill_rest = 0u32;
+        let mut ticks = 0u64;
+        let nightly = compaction_hour();
+        let mut last_nightly = None;
         loop {
             tick.tick().await;
+            ticks += 1;
             let Some(w) = writes.upgrade() else { return };
+            // W5: compaction on size (checked each minute) and nightly.
+            let now = chrono::Utc::now();
+            let night = nightly.is_some_and(|(h, m)| {
+                use chrono::Timelike;
+                now.hour() == h && now.minute() == m && last_nightly != Some(now.date_naive())
+            });
+            if night || (ticks % 60 == 0 && w.compaction_due().await) {
+                if night {
+                    last_nightly = Some(now.date_naive());
+                }
+                if let Err(e) = w.compact().await {
+                    tracing::warn!(error = %e, "compaction failed; retrying later");
+                }
+            }
             match w.expire_due().await {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
@@ -118,7 +170,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
 impl LocalEngine {
     pub fn new(adb: Arc<Adb>) -> Self {
         let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor, store: None, gateway: None, platform: None, expiry: None }
+        Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None }
     }
 }
 
@@ -131,7 +183,7 @@ impl LocalEngine {
         let dir = dir.into();
         let adb = Arc::new(Adb::new());
         // Shared: the sequencer appends, subscribers read (stage E).
-        let wal = Arc::new(LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?);
+        let wal = Arc::new(open_wal(&dir).await?);
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
         let store = Arc::new(
             PartitionStore::open(&StoreConfig::new(dir.join("store")), SINGLE_PARTITION)
@@ -153,9 +205,10 @@ impl LocalEngine {
         let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()).with_embedder(embedder));
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
+        let durable_handle = Arc::clone(&durable);
         let writes: Arc<dyn Writes> = durable;
         let executor = Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), reads);
-        Ok((Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry }, stats))
+        Ok((Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry, durable: Some(durable_handle) }, stats))
     }
 
     /// The log in `dir` replayed into the in-memory backends, with no Lance table:
@@ -165,12 +218,12 @@ impl LocalEngine {
     pub async fn replay_only(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         let adb = Arc::new(Adb::new());
-        let wal = LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))).map_err(|e| e.to_string())?;
+        let wal = open_wal(&dir).await?;
         let (writes, stats) =
             DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
         let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
         let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: None, gateway: None, platform: None, expiry: None }, stats))
+        Ok((Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None }, stats))
     }
 }
 
@@ -196,6 +249,17 @@ impl Engine for LocalEngine {
 
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
         self.platform.as_ref().map(|(p, _)| Arc::clone(p))
+    }
+
+    async fn compact(&self) -> Result<Value, String> {
+        let Some(w) = &self.durable else { return Err("compaction needs a durable engine (start ADB with --data-dir)".into()) };
+        match w.compact().await.map_err(|e| e.to_string())? {
+            Some(s) => Ok(json!({
+                "total": s.total, "kept": s.kept, "bytes_before": s.bytes_before, "bytes_after": s.bytes_after,
+                "took_ms": s.took.as_millis() as u64,
+            })),
+            None => Err("no table to compact".into()),
+        }
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {

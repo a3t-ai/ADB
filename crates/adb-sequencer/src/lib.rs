@@ -142,6 +142,21 @@ impl<L: Log> Sequencer<L> {
         Ok(record)
     }
 
+    /// As [`Sequencer::append_record`], on a new log segment (W5: after a
+    /// compaction, so everything before it can be purged whole).
+    pub async fn append_record_on_new_segment(&mut self, commit_ts: CommitTs, effects: Vec<Effect>) -> LogResult<LogRecord> {
+        let record = LogRecord {
+            partition: self.log.partition(),
+            offset: self.log.last_offset().next(),
+            epoch: self.epoch,
+            commit_ts,
+            txn_id: None,
+            effects,
+        };
+        self.log.append_on_new_segment(record.clone()).await?;
+        Ok(record)
+    }
+
     /// Resume after replay: the clock continues after the last committed timestamp.
     pub fn resume_after(&mut self, last: CommitTs) {
         self.clock = CommitClock::after(last);

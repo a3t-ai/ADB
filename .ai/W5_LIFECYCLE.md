@@ -72,3 +72,26 @@ SIGKILL at every step recovers (the crash harness from D/R11).
    (b) thresholds only; (c) on demand only.
 3. **Erasure guarantee for FORGET** — (a) gone from disk at the next compaction, at
    most 24 h *(recommended)*; (b) immediately (compact on every FORGET — slow writes).
+
+## As built (27 Oct)
+
+- **Compactor** (`adb-store`): `PartitionStore::compact` (online: the table, writer
+  and cache sit behind a lock; compaction rewrites under it and swaps the new table
+  in; the old one, its versions, MemWAL files and any `memory.dim*.bak` are deleted)
+  and `compact_offline`. Keeps `_meta`, live rows, history younger than 90 days, and
+  one payload-free stub per forgotten lineage (W5-L2).
+- **Immediate FORGET** (`adb-executor`): FORGET logs its tombstones, then waits for a
+  compaction that started after it (coalesced); the compaction rolls the log to a new
+  segment and **redacts** the forgotten lineages' effects (puts, versions, patches,
+  vectors, links touching them) from the closed segments — offsets stay, so
+  subscribers keep their place and never see forgotten content. FORGET fails loudly
+  ("forgotten … but not yet erased") if erasure fails.
+- **Triggers**: > 16 MemWAL generations (checked each minute), nightly at
+  `ADB_COMPACT_AT` (default 03:00 UTC), and the Flight admin action `compact`.
+- **Fixes on the way**: the platform tables no longer hold the log back when they're
+  caught up (the regular log purge was capped by them); a WAL lock held by a
+  closing engine is retried asynchronously (a blocking retry deadlocked
+  single-threaded runtimes).
+- **Spike**: 10k row versions rewritten in 1.38 s (debug), disk 8.7 → 2.2 MB, the
+  forgotten secret in 4 files before and none after.
+- Limits: W5-L1…L6.
