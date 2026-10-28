@@ -93,3 +93,45 @@ vc-dev data and the 10k-row spike.
   `plan` (default) / `view` / `shadow`; LIKE candidates through it (vectors on).
   Shadow run of the AQL conformance suites: 140 / 140 pass, one difference (TOOLS
   `RETURN`, table above).
+- **28 Oct, step 4** (`c7846d4`): `adb-backends` deleted — no hot tier, views,
+  `DirectReads` / `DirectWrites` or `ADB_QUERY` modes; `LocalEngine::temporary`
+  (no `--data-dir`), `replay_only` replays a copy of the log into a fresh table.
+  All 10 gates pass.
+- **Step 5, measurements** (`tests/bench-reads.mjs`, debug build, 10k facts, 200
+  events, 200 WORKING items, 50 links; median ms; same build, `ADB_QUERY=view` =
+  the old path at `97e04ee`):
+
+  | Read | old view | new plan |
+  |---|---|---|
+  | LOOKUP KEY | 167 | 151 |
+  | RECALL WHERE (pushed down) | 223 | 222 |
+  | RECALL WHERE != (not pushed) | 675 | 651 |
+  | RECALL ALL ORDER BY LIMIT 10 | 786 | 767 |
+  | WITH LINKS (50 records) | 353 | 325 |
+  | FOLLOW LINKS | 853 | 596 |
+  | AGGREGATE COUNT | 211 | 221 |
+  | SCAN WORKING WINDOW | 2.5 | 241 |
+
+  Pushing the current view's timestamp tests into the scan made reads ~10 %
+  slower; they run on the decoded rows (`4c1b813`). Most of every read is the LSM
+  scan itself (W7-L1). WORKING lost its in-memory tier (W7-L3).
+
+  Release build (same bench, median ms): LOOKUP KEY 29, RECALL WHERE 40, `!=` 125,
+  ORDER BY LIMIT 10 158, WITH LINKS 73, FOLLOW LINKS 162, SCAN WORKING 46,
+  AGGREGATE 38. Rolled to vc-dev 28 Oct 09:28 as `adb:2026-10-28-w7`.
+- **Decision (28 Oct, user): index first.** Before the MVP gate, reads should cost
+  what they select (W7-L1, W7-L3): scalar indexes on `memory` / record id used by
+  the LSM scan, or one table per memory type — whichever a spike shows works with
+  the MemWAL LSM.
+- **Index spike (28 Oct, `adb-store/tests/index_spike.rs`, release, 10k facts):**
+  a scan costs ~1 ms (primary-key point lookup in the memtable) to ~12 ms (all 10k
+  rows), memtable or compacted; **5 flushed generations double or triple it** (each
+  is a separate scan, ~2–3 ms). BTree indexes on `memory` / `lineage_id`
+  maintained by the MemWAL: ≤ 10 % — not kept.
+- **Where an end-to-end read goes** (release, `tests/bench-reads.mjs`, debug
+  timings): the executor and decoding of small results cost < 1 ms. Store scans
+  cost 30–45 ms each in the bench, not 7–14 ms as in the spike: the bench writes
+  one record per STORE, so the MemWAL holds ~10k one-row batches. After one
+  compaction: LOOKUP KEY 29 → 21 ms, SCAN WORKING 46 → 20, WITH LINKS 73 → 35. A
+  read returning all 10k rows: scan ~50 ms, decode ~25 ms, AQL semantics in Rust
+  ~40 ms.

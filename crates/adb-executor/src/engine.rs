@@ -361,11 +361,15 @@ impl Engine for LocalEngine {
         if let Some(stmt) = watch_statement(aql) {
             return self.watch(stmt, variables).await;
         }
+        let started = std::time::Instant::now();
         let result = match variables {
             Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
             _ => self.executor.execute(aql).await,
         };
-        result.map(|r| to_wire(&r)).map_err(|e| e.to_string())
+        let executed = started.elapsed();
+        let wire = result.map(|r| to_wire(&r)).map_err(|e| e.to_string());
+        tracing::debug!(?executed, total = ?started.elapsed(), "query");
+        wire
     }
 
     fn gateway(&self) -> Option<Arc<Gateway>> {

@@ -20,10 +20,8 @@ should be picked up. Items fixed later move to the bottom with the commit.
 
 | # | Shortcut | Effect | Revisit |
 |---|---|---|---|
-| P1 | **Every Lance read builds a throwaway backend** from the matching rows and runs the old backend query code over it (`reads::View`). | CPU and allocation per read grow with the rows a filter can't exclude. | M2: queries as DataFusion plans over Arrow batches; then delete `adb-backends` (agreed 25 Oct). |
-| P2 | **Filter pushdown covers only** `=`, `<`, `<=`, `>`, `>=`, `IN` on top-level scalar fields, `id`, `data.x` and `KEY id`. Not pushed: `!=`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `metadata.*`, nested paths, variables, nulls, other `KEY` fields. | Those predicates load every current row of the memory type. | M2 query rework. |
-| P3 | **No pushdown at all for PROCEDURAL**: its conditions see the backend's node with defaults the payload may lack. | Each procedural read loads all procedures. | With L7 / M2. |
-| P4 | **`FOLLOW LINKS` / `WITH LINKS` do one Lance scan per record and one lookup per link** (N+1). | Slow on records with many links. | M2: one join over edge rows. |
+| P2 | **Filter pushdown covers only** `=`, `<`, `<=`, `>`, `>=`, `IN` on top-level scalar fields, `id`, `data.x` and `KEY id`; every condition is then checked exactly on the decoded rows (W7). Not pushed: `!=`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `metadata.*`, nested paths, variables, nulls, other `KEY` fields. | Those predicates decode every current row of the memory type (without vectors). | More operators in `adb_store::filter`. |
+| P3 | **No payload pushdown for PROCEDURAL and TOOLS**: their conditions see the shaped record (defaults the payload may lack). | Each read of them decodes all their rows. | Push down fields the shaping keeps as stored. |
 | P5 | **Stats count by loading every current row** (`count_current`). | `stats` cost grows with data. | Keep counts in `_meta`, or a Lance count query. |
 | P6 | **`FORGET` on SEMANTIC / PROCEDURAL scans all superseded versions** of the type to honour D2 T5; PROCEDURAL builds one view per old version. | Forget cost grows with history size. | With compaction (history pruned) or a pushed-down history filter. |
 | P7 | **Only `id` has a scalar index**; filters on `lineage_id`, `subject_id`, `kind`, `memory` scan. | KEY lookups by lineage and edge reads scan the table. | Add BTree / bitmap indexes maintained by the MemWAL (D5). |
@@ -36,7 +34,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | # | Item | Notes | Revisit |
 |---|---|---|---|
 | S1 | **One partition** (`PartitionId(0)`); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per memory type. | Not atomic across types. | M3 placement / multi-partition txns. |
-| S2 | **`adb-backends` not deleted**; it still provides the WORKING / TOOLS hot tier and the query code for views. | Agreed 25 Oct. | M2. |
 | S3 | ~~Lance R11/R12 crash tests not ported~~ — ported 25 Oct as `adb-store/tests/crash_recovery.rs` (SIGKILL mid-apply → table = model at `_meta`; `_meta` ≥ every claimed durable offset; fenced writer can't change the table). Still single node, local disk, no power-loss test. | — | M3 adds the Raft / multi-node variants (R6, R10). |
 | S4 | **Lance MemWAL bug parked** (K7, `lancebug.md`): generations sealed during WAL replay lack `_pk_index`, breaking LSM reads. ADB-driven seals avoid it. | Must stay on ADB-driven seals until fixed upstream. | File the report; re-check on each Lance upgrade. |
 | S5 | **CI deferred** (user, 24 Oct): build, workspace tests, AQL conformance, FlowR integration and the crash test run by hand before commits. | Easy to miss a regression. | Before M1 ends. |
@@ -110,7 +107,6 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | GR-2 | **Outgoing links only**: no "who links *to* this record". | Reverse questions need the link stored the other way. | AQL addition, e.g. `FOLLOW LINKS TYPE "t" INBOUND`; edge targets are already stored (`object_id`). |
 | GR-3 | **No conditions on links** beyond `TYPE`: no `weight > x`, no order by weight, no edge properties. | Can't prefer strong links. | AQL addition: `MIN_WEIGHT w` on `FOLLOW` / `WITH LINKS`, results by link weight. |
 | GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | Only if a use case needs it (post-MVP). |
-| GR-5 | **N+1 reads**: one Lance scan per record and per link (P4). | Slow on hubs with many links. | One join over edge rows with the DataFusion query engine (W7). |
 | GR-6 | **Agents don't use links**: FlowR's memory phase never follows them into the prompt. | Links help AQL users, not chat agents. | Link weight as a ranking signal in hybrid recall (W4 T10), related facts pulled in. |
 | GR-7 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record** (L6). | Use `RECALL … WHERE … FOLLOW LINKS`. | With GR-1. |
 | GR-8 | **The WASM playground's built `pkg/` predates v0.6 / v0.7** (source updated; no wasm-pack here). | The browser playground rejects the new statements. | `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
@@ -149,6 +145,15 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed (1 s timer, W3), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
 | W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). The AQL conformance suites don't cover `WATCH` (ADB tests do). | — | Cross-partition watches (spec v2); a v0.6 conformance suite. |
 
+## Query engine (W7)
+
+| # | Limitation | Effect | Fix |
+|---|---|---|---|
+| W7-L1 | **Every read scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a read costs about the same whatever it selects (debug, 10k facts: ~150 ms for a key lookup, ~220 ms for a pushed-down WHERE, ~650 ms for a `!=`; release figures in `W7_QUERY_ENGINE.md`). | Read latency grows with the partition, not the result. | Scalar indexes on `memory` / `lineage_id` used by the LSM scan (Lance), or one table per memory type. |
+| W7-L2 | **ORDER BY / LIMIT run after decoding** the candidates (no TopK in the scan). | `RECALL … ALL ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns (or a UDF) and a TopK plan. |
+| W7-L3 | **WORKING is read from the table like the rest** (the in-memory hot tier is gone): `SCAN FROM WORKING` costs a table scan (debug, 10k facts in the partition: 2.5 ms → ~240 ms). | Scratchpad reads are slower. | See W7_QUERY_ENGINE.md (decision pending). |
+| W7-L4 | **ADB without `--data-dir` writes to a temporary directory** (removed when it stops) instead of memory. | Needs disk; same engine as durable. | — |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |
@@ -177,3 +182,6 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | E-L6: every row had scope `tenant:default` | W3 (26 Oct): `IN SCOPE` on STORE / RECALL / LOOKUP / UPDATE / FORGET, MCP `scope` |
 | L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |
 | G-L4 / W5-L4: platform datasets never compacted (DELETE logical, a version per write) | W5-L4 (27 Oct): `PlatformStore::compact` (`compact_files` materialising deletions + `cleanup_old_versions`), nightly, after 256 versions, and in the admin `compact` |
+| P1: a throwaway backend per read | W7 (`97e04ee`): AQL reads as one DataFusion scan of an LSM snapshot, semantics once in `adb_executor::query` |
+| P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all edges of a result in one scan, targets in one scan per memory type |
+| S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |

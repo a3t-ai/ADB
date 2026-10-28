@@ -41,6 +41,7 @@ pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, v
     // superseded, closed or expired) is tested on the decoded rows — its timestamp
     // tests cost more in the scan (measured, W7).
     let filter = col("tombstone").eq(lit(false)).and(filter);
+    let started = std::time::Instant::now();
     let batches = store
         .query(move |ctx| async move {
             let df = ctx.table("memory").await?.filter(filter)?;
@@ -55,10 +56,12 @@ pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, v
         })
         .await
         .map_err(store_err)?;
+    let scanned = started.elapsed();
     let mut rows = Vec::new();
     for b in &batches {
         rows.extend(decode(b).map_err(store_err)?);
     }
+    tracing::debug!(?scanned, decoded = ?(started.elapsed() - scanned), rows = rows.len(), "query scan");
     // The pushed-down filter ran in the LSM; the view is re-checked on the decoded rows.
     rows.retain(|r| r.is_current(now) && r.data.kind != Kind::Meta);
     Ok(rows)

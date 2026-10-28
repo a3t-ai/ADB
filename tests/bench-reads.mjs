@@ -32,7 +32,7 @@ const port = await new Promise((res) => {
 });
 const dir = mkdtempSync(join(tmpdir(), "adb-bench-"));
 const server = spawn(ADB, ["serve-http", "--port", String(port), "--flight-port", "0"], {
-  env: { ...process.env, ADB_DATA_DIR: dir, ADB_EMBED: "off", RUST_LOG: "warn" },
+  env: { ...process.env, ADB_DATA_DIR: dir, ADB_EMBED: "off", RUST_LOG: process.env.RUST_LOG ?? "warn" },
   stdio: ["ignore", "inherit", "inherit"],
 });
 const url = `http://127.0.0.1:${port}`;
@@ -60,6 +60,13 @@ await seed(Array.from({ length: 200 }, (_, i) => `STORE INTO EPISODIC (key = "e$
 await seed(Array.from({ length: 200 }, (_, i) => `STORE INTO WORKING (key = "w${i}", priority = ${i % 10})`));
 await seed(Array.from({ length: 50 }, (_, i) => `LINK FROM SEMANTIC WHERE key = "f${i}" TO EPISODIC WHERE key = "e${i}" TYPE "about"`));
 console.log(`seeded ${ROWS} facts in ${((Date.now() - t0) / 1000).toFixed(1)} s (ADB_QUERY=${process.env.ADB_QUERY ?? "default"})`);
+if (process.argv.includes("--compact")) {
+  // FORGET compacts before it returns (W5): one throwaway record.
+  const t1 = Date.now();
+  await q(`STORE INTO SEMANTIC (key = "bench-throwaway", content = "x")`);
+  await q(`FORGET FROM SEMANTIC WHERE key = "bench-throwaway"`);
+  console.log(`compacted in ${((Date.now() - t1) / 1000).toFixed(1)} s`);
+}
 
 const reads = {
   "LOOKUP KEY": `LOOKUP FROM SEMANTIC KEY id = "f4242"`,
