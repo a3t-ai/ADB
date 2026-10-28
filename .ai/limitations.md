@@ -18,8 +18,35 @@ should be picked up. Items fixed later move to the bottom with the commit.
 
 ## Performance shortcuts (fine for dev-sized data)
 
+**Deferred (user, 28 Oct 2026):** no performance work until the feature matrix is
+complete; then start with W7-L5, W7-L1 and P11.
+
+Where reads stand (release, 10k facts in the partition, median ms; ADB via HTTP
+`tests/bench-reads.mjs` after a compaction, embedded LanceDB 0.40 in process after
+`optimize()`, Postgres 18.4 over localhost TCP with typed columns and B-tree indexes):
+
+| Read | ADB | LanceDB | LanceDB + scalar indexes | Postgres | Postgres, JSONB payload |
+|---|---|---|---|---|---|
+| LOOKUP KEY | 9.8 | 7.0 | 3.8 | 0.35 | 0.24 |
+| WHERE field = (pushed down) | 43 | 7.0 | 5.4 | 0.41 | 0.33 |
+| WHERE field != | 99 | 8.5 | 3.8 | 0.24 | 0.30 |
+| ORDER BY LIMIT 10 | 104 | 12.8 | 12.5 | 0.33 | 8.7 |
+| WITH LINKS (50 records) | 42 | 13.2 | 10.4 | 1.2 | 3.8 |
+| FOLLOW LINKS | 83 | 38.9 | 31.0 | 0.91 | 0.87 |
+| SCAN WORKING WINDOW | 19 | 9.9 | 5.9 | 0.27 | 0.32 |
+| AGGREGATE COUNT | 36 | 3.5 | 1.5 | 0.25 | 2.7 |
+
+The near-LanceDB reads (key, WORKING, FOLLOW) pay for the LSM merge, the current
+view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5, W7-L2).
+
 | # | Shortcut | Effect | Revisit |
 |---|---|---|---|
+| W7-L1 | **Every read scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a read costs about the same whatever it selects (debug, 10k facts: ~150 ms for a key lookup, ~220 ms for a pushed-down WHERE, ~650 ms for a `!=`; release figures in `W7_QUERY_ENGINE.md`). | Read latency grows with the partition, not the result. | Scalar indexes on `memory` / `lineage_id` used by the LSM scan (Lance), or one table per memory type. |
+| W7-L2 | **ORDER BY / LIMIT run after decoding** the candidates (no TopK in the scan). | `RECALL … ALL ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns (or a UDF) and a TopK plan. |
+| W7-L3 | **WORKING is read from the table like the rest** (the in-memory hot tier is gone): `SCAN FROM WORKING` costs a table scan — release, 10k facts in the partition: ~0.5 ms → 19 ms after a compaction, ~60 ms before. | Scratchpad reads are slower than in memory. | A WORKING cache, if agents need it. |
+| W7-L5 | **A payload `WHERE` parses every row's JSON in the scan** (`adb_json_scalar`), whatever it selects: ~40 ms at 10k facts in release. | Payload filters cost the same on small and large results. | Frequently filtered fields as columns, or a JSON index. |
+| W7-L6 | **Reads are fastest just after a compaction**: between compactions, small MemWAL batches and generations add ~2× (LOOKUP 24 vs 10 ms at 10k facts). Compaction runs after max(2,000, rows/4) writes. | Latency saw-tooths with the write rate. | Merge memtable batches in Lance; incremental compaction. |
+| P11 | **No cached index or page cache of ADB's own**: every read is a Lance scan, so even a key lookup costs milliseconds where Postgres answers from B-tree pages in memory in ~0.3 ms. The gap widens with data size, since scans grow with the partition and indexed lookups don't. | Reads ~30–300× slower than Postgres at 10k rows. | After W7-L5 / W7-L1: scalar indexes on the hot columns, then an in-memory index or row cache per partition if agents need sub-millisecond reads. |
 | P2 | **Filter pushdown covers only** `=`, `<`, `<=`, `>`, `>=`, `IN` on top-level scalar fields, `id`, `data.x` and `KEY id`; every condition is then checked exactly on the decoded rows (W7). Not pushed: `!=`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `metadata.*`, nested paths, variables, nulls, other `KEY` fields. | Those predicates decode every current row of the memory type (without vectors). | More operators in `adb_store::filter`. |
 | P3 | **No payload pushdown for PROCEDURAL and TOOLS**: their conditions see the shaped record (defaults the payload may lack). | Each read of them decodes all their rows. | Push down fields the shaping keeps as stored. |
 | P5 | **Stats count by loading every current row** (`count_current`). | `stats` cost grows with data. | Keep counts in `_meta`, or a Lance count query. |
@@ -147,13 +174,10 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 
 ## Query engine (W7)
 
+Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
+
 | # | Limitation | Effect | Fix |
 |---|---|---|---|
-| W7-L1 | **Every read scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a read costs about the same whatever it selects (debug, 10k facts: ~150 ms for a key lookup, ~220 ms for a pushed-down WHERE, ~650 ms for a `!=`; release figures in `W7_QUERY_ENGINE.md`). | Read latency grows with the partition, not the result. | Scalar indexes on `memory` / `lineage_id` used by the LSM scan (Lance), or one table per memory type. |
-| W7-L2 | **ORDER BY / LIMIT run after decoding** the candidates (no TopK in the scan). | `RECALL … ALL ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns (or a UDF) and a TopK plan. |
-| W7-L3 | **WORKING is read from the table like the rest** (the in-memory hot tier is gone): `SCAN FROM WORKING` costs a table scan — release, 10k facts in the partition: ~0.5 ms → 19 ms after a compaction, ~60 ms before. | Scratchpad reads are slower than in memory. | A WORKING cache, if agents need it. |
-| W7-L5 | **A payload `WHERE` parses every row's JSON in the scan** (`adb_json_scalar`), whatever it selects: ~40 ms at 10k facts in release. | Payload filters cost the same on small and large results. | Frequently filtered fields as columns, or a JSON index. |
-| W7-L6 | **Reads are fastest just after a compaction**: between compactions, small MemWAL batches and generations add ~2× (LOOKUP 24 vs 10 ms at 10k facts). Compaction runs after max(2,000, rows/4) writes. | Latency saw-tooths with the write rate. | Merge memtable batches in Lance; incremental compaction. |
 | W7-L4 | **ADB without `--data-dir` writes to a temporary directory** (removed when it stops) instead of memory. | Needs disk; same engine as durable. | — |
 
 ## Outside ADB (FlowR / A3T), found while testing
