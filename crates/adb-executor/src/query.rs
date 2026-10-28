@@ -367,11 +367,12 @@ async fn candidates(
 /// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap.
 pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
     let mut records = candidates(store, memory, predicate, modifiers, now).await?;
-    if let Predicate::Pattern { pattern_var, threshold } = predicate {
+    if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
         if memory != MemoryType::Procedural {
             return Ok(Vec::new());
         }
-        let query = pattern_var.trim_start_matches('$');
+        // The literal or bound value; an unbound `$name` matches its name (as before).
+        let query = text.as_deref().unwrap_or(pattern_var.trim_start_matches('$'));
         let threshold = threshold.unwrap_or(0.7);
         let mut scored: Vec<(f32, MemoryRecord)> = records
             .into_iter()

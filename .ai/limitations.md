@@ -64,7 +64,6 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 | S4 | **Lance MemWAL bug parked** (K7, `lancebug.md`): generations sealed during WAL replay lack `_pk_index`, breaking LSM reads. ADB-driven seals avoid it. | Must stay on ADB-driven seals until fixed upstream. | File the report; re-check on each Lance upgrade. |
 | S5 | **CI deferred** (user, 24 Oct): build, workspace tests, AQL conformance, FlowR integration and the crash test run by hand before commits. | Easy to miss a regression. | Before M1 ends. |
 | S6 | **`LocalEngine::replay_only` (test oracle) needs the complete log**; the log is purged below Lance's durable offset every 256 records. | Only usable in tests with < 256 records. | Fine as is; noted so nobody uses it on real data. |
-| S7 | **`PATTERN` needs a bound variable** (`PATTERN $var`); a string literal doesn't parse. | Pattern recall isn't covered by the differential test. | AQL grammar / test harness with variables. |
 | S8 | **Lance logs at INFO by default**, noisy at startup. | Log volume. | Set `RUST_LOG=info,lance=warn` in the manifest. |
 
 ## Subscriptions (stage E)
@@ -87,7 +86,7 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| F-L2 | **FlowR matches procedures itself** (token overlap), since `PATTERN` needs a bound variable (S7). Namespaces now separate procedures (W9). | FlowR does its own matching. | With S7 (W9.3). |
+| F-L2 | **FlowR matches procedures itself** (token overlap). ADB now takes `PATTERN "text"` and a bound `PATTERN $p` (W9.3); FlowR doesn't use it yet. | FlowR does its own matching. | Switch FlowR's procedure lookup to `PATTERN`. |
 | F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | Reflection / summarisation (M2 lifecycle). |
 | F-L4 | **`adb_topic` triggers can only be created through the API / `create_trigger`** — A3T's Triggers page lists webhook and cron. | No UI to set one up yet. | A3T UI. |
 | F-L5 | **`adb_topic` delivers to workflow targets only** (FlowR has no agent inbox). | Point the trigger at an agent's flow. | — |
@@ -216,3 +215,4 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 | S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |
 | G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |
 | L7 / W4-L5: PROCEDURAL kept only its node fields | W9.1: extra payload fields kept and matched (`WHERE`, `KEY` on any field); `LIKE` returns shaped procedures since W7 |
+| S7: `PATTERN` needed a variable (and ADB matched the variable's name) | W9.3: `PATTERN "text"` (AQL v0.7 grammar) and `$p` bound from request / pipeline variables |

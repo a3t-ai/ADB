@@ -449,9 +449,10 @@ fn convert_predicate(pred: &Predicate) -> PlanResult<CorePredicate> {
         Predicate::Like { variable } => Ok(CorePredicate::Like {
             embedding_var: variable.clone(),
         }),
-        Predicate::Pattern { variable, threshold } => Ok(CorePredicate::Pattern {
+        Predicate::Pattern { variable, threshold, text } => Ok(CorePredicate::Pattern {
             pattern_var: variable.clone(),
             threshold: *threshold,
+            text: text.clone(),
         }),
         Predicate::All => Ok(CorePredicate::All),
     }

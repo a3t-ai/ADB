@@ -22,10 +22,13 @@ pub enum Predicate {
     Key { field: String, value: Value },
     /// LIKE $embedding (similarity search)
     Like { embedding_var: String },
-    /// PATTERN $var THRESHOLD 0.7
+    /// PATTERN $var THRESHOLD 0.7, or PATTERN "text": `text` is the literal, or the
+    /// variable's bound value once the executor binds it (W9).
     Pattern {
         pattern_var: String,
         threshold: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// ALL (match everything)
     All,
@@ -59,6 +62,7 @@ impl Predicate {
         Self::Pattern {
             pattern_var: pattern_var.into(),
             threshold,
+            text: None,
         }
     }
 

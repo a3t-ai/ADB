@@ -636,3 +636,20 @@ async fn pipeline_timeout_is_a_hard_budget_when_enforced() {
     let adb_executor::ResultSet::Pipeline { steps } = &r.data else { panic!("pipeline result") };
     assert_eq!(steps.len(), 3);
 }
+
+/// S7 (W9): `PATTERN "text"` and `PATTERN $p` with `$p` bound both match
+/// procedures by their pattern text.
+#[tokio::test]
+async fn pattern_takes_a_literal_or_a_bound_variable() {
+    let adb = Mem::new().await;
+    adb.execute(r#"STORE INTO PROCEDURAL (key = "oom", pattern = "pod OOMKilled restart loop")"#).await.unwrap();
+    adb.execute(r#"STORE INTO PROCEDURAL (key = "disk", pattern = "node disk pressure eviction")"#).await.unwrap();
+    let ids = |r: QueryResult| r.get_records().unwrap().iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+    let r = adb.execute(r#"LOOKUP FROM PROCEDURAL PATTERN "pod OOMKilled restart" THRESHOLD 0.5"#).await.unwrap();
+    assert_eq!(ids(r), vec!["oom"]);
+
+    let vars = std::collections::HashMap::from([("p".to_string(), json!("node disk pressure"))]);
+    let r = adb.0.executor().execute_with_vars("LOOKUP FROM PROCEDURAL PATTERN $p THRESHOLD 0.5", &vars).await.unwrap();
+    assert_eq!(ids(r), vec!["disk"]);
+}
