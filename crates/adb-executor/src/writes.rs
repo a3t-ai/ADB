@@ -878,6 +878,20 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     ) -> AdbResult<Link> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
+        // Both ends must exist when the link commits (L4, W9): checked under the
+        // sequencer, after every earlier write is applied, so a FORGET racing this
+        // LINK can't leave it pointing at nothing.
+        if let Some(store) = &self.store {
+            if let Some(b) = self.barrier() {
+                b.wait_for_committed().await;
+            }
+            for (end, memory, id) in [("source", from_type, from_id), ("target", to_type, to_id)] {
+                let key = adb_core::Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.to_string()) };
+                if crate::query::read(store, memory, &key, &Default::default(), ts).await?.is_empty() {
+                    return Err(AdbError::QueryError(format!("LINK: the {end} record {memory:?} {id:?} doesn't exist (any more)")));
+                }
+            }
+        }
         // AQL v0.7: the same link again (same ends, same type) sets its weight —
         // a new version of that edge, not a parallel one.
         if let Some(store) = &self.store {

@@ -113,7 +113,7 @@ pub fn procedure_value(key: &str, data: &serde_json::Value, version: u32) -> ser
     });
     if let (Some(n), Some(d)) = (node.as_object_mut(), data.as_object()) {
         for (k, v) in d {
-            if k != "key" && !n.contains_key(k) {
+            if !n.contains_key(k) {
                 n.insert(k.clone(), v.clone());
             }
         }
@@ -224,8 +224,9 @@ pub fn matches(memory: MemoryType, r: &MemoryRecord, predicate: &Predicate) -> b
     match predicate {
         Predicate::All => true,
         Predicate::Where { conditions } => match memory {
-            // Conditions see the shaped node / tool record.
-            MemoryType::Procedural | MemoryType::Tools => evaluate_conditions(&r.data, conditions),
+            // Conditions see the shaped tool record; procedures (whose payload is
+            // kept, W9.1) as other records, so `metadata.*` works too.
+            MemoryType::Tools => evaluate_conditions(&r.data, conditions),
             _ => evaluate_conditions_on_record(r, conditions),
         },
         Predicate::Key { field, value } => {
