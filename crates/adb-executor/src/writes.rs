@@ -192,8 +192,13 @@ fn needs_log() -> AdbError {
 
 /// Default topic message TTL (E8).
 pub const DEFAULT_EVENT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-/// The most records the log keeps behind its tip for subscribers (E3).
+/// The most records the log keeps behind its tip for subscribers (E3), unless
+/// `ADB_LOG_RETAIN` says otherwise. Past it a subscriber gets a `reset` (W9).
 pub const RETAIN_MAX: u64 = 100_000;
+
+fn retain_max() -> u64 {
+    std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
+}
 
 fn log_err(e: LogError) -> AdbError {
     AdbError::Internal(format!("log: {e}"))
@@ -257,6 +262,9 @@ pub struct DurableWrites<L: Log> {
     /// Offset of the last record with platform-table effects (stage G). The log
     /// must keep it until the platform tables have applied it.
     platform_last: std::sync::atomic::AtomicU64,
+    /// The most records the log keeps behind its tip for subscribers (E3):
+    /// `ADB_LOG_RETAIN`, default [`RETAIN_MAX`].
+    retain_max: u64,
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
@@ -533,7 +541,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
         let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default() }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max() }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -544,11 +552,6 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// The Lance table, if any (tests and D3 reads).
     pub fn store(&self) -> Option<&Arc<PartitionStore>> {
         self.store.as_ref()
-    }
-
-    /// The table, when `memory`'s records live only there (stage D4.4a).
-    fn in_lance(&self, memory: MemoryType) -> Option<&Arc<PartitionStore>> {
-        self.store.as_ref().filter(|_| crate::reads::lance_owned(memory))
     }
 
     /// The records an UPDATE (`forget = false`) or FORGET matches, as lineage ids:
@@ -669,7 +672,7 @@ impl<L: Log + 'static> DurableWrites<L> {
                         tracing::warn!(error = %e, "store sync failed; log not purged");
                         return;
                     }
-                    // Keep what subscribers haven't acked, up to RETAIN_MAX behind the
+                    // Keep what subscribers haven't acked, up to `retain_max` behind the
                     // tip (E3); never above Lance's durable offset.
                     let mut floor = d.next();
                     // Platform tables apply synchronously; the log keeps a platform
@@ -678,7 +681,7 @@ impl<L: Log + 'static> DurableWrites<L> {
                         floor = LogOffset(floor.0.min(p.0));
                     }
                     if let Some(cursor) = self.subs.min_cursor() {
-                        let cap = record.offset.0.saturating_sub(RETAIN_MAX);
+                        let cap = record.offset.0.saturating_sub(self.retain_max);
                         floor = LogOffset(floor.0.min(cursor.max(cap) + 1));
                     }
                     if floor.0 <= 1 {
@@ -959,18 +962,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let tip = seq.log().last_offset().0;
         let cursor = match from {
             None => tip,
-            Some(n) => {
-                let n = n.max(1);
-                if n <= tip {
-                    if let Err(LogError::Purged { oldest, .. }) = seq.log().read(LogOffset(n), 1).await {
-                        return Err(AdbError::QueryError(format!(
-                            "cursor_expired: offset {n} is no longer retained; oldest available is {}",
-                            oldest.0
-                        )));
-                    }
-                }
-                n.min(tip + 1) - 1
-            }
+            // Past log retention the first read is a `reset` from the table (W9).
+            Some(n) => n.max(1).min(tip + 1) - 1,
         };
         let ts = seq.begin();
         let id = seq.new_id(ts);

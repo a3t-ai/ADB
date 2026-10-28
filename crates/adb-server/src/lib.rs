@@ -98,8 +98,10 @@ struct EventsParams {
 
 /// `GET /subscriptions/{id}/events` — deliveries as SSE (E1). Each delivery is an
 /// `event: delivery` with `id: <offset>`, so `Last-Event-ID` resumes after the last one
-/// received; idle periods send `event: heartbeat` with `{tip, next}`. An error (e.g.
-/// `cursor_expired`) is sent as `event: error` and ends the stream.
+/// received; idle periods send `event: heartbeat` with `{tip, next}`. A subscriber
+/// whose position left the log gets `event: reset` (the current rows, `id` = the
+/// offset they are as of) and then deliveries after it (W9). An error is sent as
+/// `event: error` and ends the stream.
 async fn subscription_events(
     State(s): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -126,16 +128,17 @@ async fn subscription_events(
         async move {
             let from = state?;
             let events: Vec<Result<Event, Infallible>> = match gw.next(&id, from, 100, Duration::from_secs(15)).await {
-                Ok(b) if b.deliveries.is_empty() => {
+                Ok(b) if b.deliveries.is_empty() && b.reset.is_none() => {
                     let hb = serde_json::json!({ "tip": b.tip, "next": b.next });
                     return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(Some(b.next))));
                 }
                 Ok(b) => {
                     let next = b.next;
-                    let evs: Vec<Result<Event, Infallible>> = b
-                        .deliveries
-                        .iter()
-                        .map(|d| Ok(Event::default().event("delivery").id(d.offset.to_string()).data(serde_json::to_string(d).unwrap_or_default())))
+                    let reset = b.reset.iter().map(|r| Ok(Event::default().event("reset").id(r.offset.to_string()).data(serde_json::to_string(r).unwrap_or_default())));
+                    let evs: Vec<Result<Event, Infallible>> = reset
+                        .chain(b.deliveries.iter().map(|d| {
+                            Ok(Event::default().event("delivery").id(d.offset.to_string()).data(serde_json::to_string(d).unwrap_or_default()))
+                        }))
                         .collect();
                     return Some((futures::stream::iter(evs), Some(Some(next))));
                 }

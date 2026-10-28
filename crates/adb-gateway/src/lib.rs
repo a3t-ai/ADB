@@ -21,7 +21,7 @@ use std::time::Duration;
 use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, Memory};
 use adb_core::{evaluate_conditions, Condition};
 use adb_log::{Log, LogError};
-use adb_store::{row_id, sql_str, PartitionStore, RECORD_KINDS};
+use adb_store::{key_of, row_id, sql_str, PartitionStore, StoredRow, RECORD_KINDS};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -162,10 +162,12 @@ pub struct Change {
     pub value: Option<serde_json::Value>,
 }
 
-/// Scope and kind of record `key` of `memory`, from any of its versions.
+/// Scope and kind of record `key` of `memory`, from any of its versions; and the
+/// current rows a subscription target covers (its `reset`, W9).
 #[async_trait::async_trait]
 pub trait Lineages: Send + Sync {
     async fn lineage(&self, memory: Memory, key: &str) -> Option<(String, Kind)>;
+    async fn current_rows(&self, target: &Target) -> Result<Vec<StoredRow>, String>;
 }
 
 #[async_trait::async_trait]
@@ -175,6 +177,59 @@ impl Lineages for PartitionStore {
         // too: UNLINK forgets an edge's own lineage (AQL v0.7).
         let filter = format!("lineage_id = {} AND ({RECORD_KINDS} OR kind = 'edge')", sql_str(&row_id(memory, key)));
         self.scan(Some(&filter)).await.ok()?.into_iter().next().map(|r| (r.data.scope, r.data.kind))
+    }
+
+    async fn current_rows(&self, target: &Target) -> Result<Vec<StoredRow>, String> {
+        let filter = match target {
+            Target::Scope(s) => format!("scope = {} AND ({RECORD_KINDS} OR kind IN ('edge', 'event'))", sql_str(s)),
+            Target::Topic(t) => format!("kind = 'event' AND subject_id = {}", sql_str(t)),
+        };
+        self.current(Some(&filter), CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
+    }
+}
+
+/// A current row as the change that would have created it (a `reset`'s content),
+/// with the unqualified ids live deliveries carry.
+fn row_change(r: &StoredRow) -> Change {
+    let d = &r.data;
+    let bare = |s: &Option<String>| s.as_deref().map(|s| key_of(s).to_string());
+    match d.kind {
+        Kind::Edge => Change {
+            op: "link".into(),
+            memory: Some(d.memory),
+            kind: Kind::Edge,
+            id: key_of(&r.id).to_string(),
+            version: None,
+            scope: d.scope.clone(),
+            topic: None,
+            value: Some(serde_json::json!({
+                "from": bare(&d.subject_id),
+                "to": bare(&d.object_id),
+                "to_memory": d.value.get("to_memory"),
+                "link_type": d.link_type,
+                "weight": d.weight,
+            })),
+        },
+        Kind::Event => Change {
+            op: "publish".into(),
+            memory: None,
+            kind: Kind::Event,
+            id: key_of(&r.id).to_string(),
+            version: None,
+            scope: d.scope.clone(),
+            topic: d.subject_id.clone(),
+            value: Some(d.value.clone()),
+        },
+        kind => Change {
+            op: "put".into(),
+            memory: Some(d.memory),
+            kind,
+            id: r.key().to_string(),
+            version: Some(r.version),
+            scope: d.scope.clone(),
+            topic: None,
+            value: Some(d.value.clone()),
+        },
     }
 }
 
@@ -299,9 +354,6 @@ fn matches(spec: &SubSpec, c: &Change) -> bool {
 pub enum GatewayError {
     #[error("unknown subscription {0}")]
     UnknownSubscription(String),
-    /// The log no longer holds `requested` (E3): re-subscribe from `oldest` or now.
-    #[error("cursor_expired: offset {requested} is no longer retained; oldest available is {oldest}")]
-    CursorExpired { requested: u64, oldest: u64 },
     #[error("log: {0}")]
     Log(String),
 }
@@ -315,6 +367,20 @@ pub struct Batch {
     pub next: u64,
     /// The applied tip when the read returned.
     pub tip: u64,
+    /// Set when the subscriber's position is no longer in the log (W9, spec §4.4
+    /// and reconciliation note 2): the current state replaces the missed changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<Reset>,
+}
+
+/// The current rows a subscription covers, as of `offset`: the subscriber drops what
+/// it holds for the target and takes these. Changes after `offset` follow as
+/// deliveries (some may repeat what the reset already shows: at-least-once).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reset {
+    pub partition: u32,
+    pub offset: u64,
+    pub changes: Vec<Change>,
 }
 
 /// Subscriber reads over one partition (in-process gateway, stage E).
@@ -351,8 +417,12 @@ impl Gateway {
                 let n = ((tip - next + 1) as usize).min(READ_BATCH);
                 let records = match self.log.read(LogOffset(next), n).await {
                     Ok(r) => r,
-                    Err(LogError::Purged { requested, oldest }) => {
-                        return Err(GatewayError::CursorExpired { requested: requested.0, oldest: oldest.0 })
+                    Err(LogError::Purged { .. }) => {
+                        // Past log retention: catch up from the table (W9).
+                        let rows = self.lineages.current_rows(&s.spec.target).await.map_err(GatewayError::Log)?;
+                        let changes = rows.iter().map(row_change).filter(|c| matches(&s.spec, c)).collect();
+                        let reset = Reset { partition: u32::from(self.log.partition().0), offset: tip, changes };
+                        return Ok(Batch { deliveries: Vec::new(), next: tip + 1, tip, reset: Some(reset) });
                     }
                     Err(e) => return Err(GatewayError::Log(e.to_string())),
                 };
@@ -370,12 +440,12 @@ impl Gateway {
                 }
             }
             if !out.is_empty() || tokio::time::Instant::now() >= deadline {
-                return Ok(Batch { deliveries: out, next, tip });
+                return Ok(Batch { deliveries: out, next, tip, reset: None });
             }
             // Nothing yet: wait for apply to move on, or the deadline.
             if tokio::time::timeout_at(deadline, applied.changed()).await.is_err() {
                 let tip = *applied.borrow();
-                return Ok(Batch { deliveries: Vec::new(), next, tip });
+                return Ok(Batch { deliveries: Vec::new(), next, tip, reset: None });
             }
         }
     }
