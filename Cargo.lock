@@ -34,6 +34,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "half",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -62,8 +63,12 @@ dependencies = [
 name = "adb-embed"
 version = "0.1.0"
 dependencies = [
+ "axum 0.7.9",
  "fastembed",
  "half",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -178,6 +183,7 @@ name = "adb-server"
 version = "0.1.0"
 dependencies = [
  "adb-core",
+ "adb-embed",
  "adb-executor",
  "adb-mcp",
  "adb-platform",
@@ -216,7 +222,6 @@ dependencies = [
  "lance-arrow",
  "lance-datafusion",
  "lance-index",
- "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -3698,6 +3703,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -6881,6 +6887,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]

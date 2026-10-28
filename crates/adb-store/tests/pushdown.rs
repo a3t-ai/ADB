@@ -138,7 +138,7 @@ async fn pushdown_is_a_superset_on_every_layer() {
     adb_store::configure_lance_runtime();
     let dir = tempfile::tempdir().unwrap();
     // 3-row memtables: the 10 rows span several flushed generations and the memtable.
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 3, wal_flush: Duration::from_millis(20) };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 3, wal_flush: Duration::from_millis(20), embedding_model: None };
     let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
     let rows = payloads();
     for (i, (id, v)) in rows.iter().enumerate() {

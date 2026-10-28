@@ -51,7 +51,7 @@ fn rec(offset: u64, effects: Vec<Effect>) -> LogRecord {
 }
 
 fn cfg(dir: &std::path::Path, memtable_rows: usize) -> StoreConfig {
-    StoreConfig { root: dir.to_path_buf(), embedding_dim: 4, memtable_rows, wal_flush: Duration::from_millis(50) }
+    StoreConfig { root: dir.to_path_buf(), embedding_dim: 4, memtable_rows, wal_flush: Duration::from_millis(50), embedding_model: None }
 }
 
 /// The D2 story: put, patch, supersede, link, forget.
@@ -193,7 +193,7 @@ async fn reads_span_sealed_generations() {
 #[tokio::test]
 async fn durable_offset_follows_the_memwal_and_survives_a_crash() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 8, wal_flush: Duration::from_millis(30) };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 8, wal_flush: Duration::from_millis(30), embedding_model: None };
     let put = |i: u64| {
         let d = data(Memory::Episodic, Kind::Episode, json!({"bid_id": format!("b{i}")}));
         rec(i, vec![Effect::PutEpisode(new(&format!("b{i}"), &format!("b{i}"), 1, d))])

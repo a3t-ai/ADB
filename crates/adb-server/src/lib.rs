@@ -74,6 +74,7 @@ fn routes(engine: Arc<dyn Engine>) -> Router {
         .route("/health", get(health))
         .route("/query", post(query))
         .route("/stats", get(stats))
+        .route("/admin/embedding", get(embedding).put(set_embedding))
         .route("/mcp", post(mcp_post).get(mcp_get))
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
@@ -251,6 +252,24 @@ async fn query(State(s): State<AppState>, Json(req): Json<QueryRequest>) -> (Sta
 }
 
 /// `GET /stats` — `{success, data: {working: n, episodic: n, …}}`.
+/// `GET /admin/embedding` — the embedding settings and progress (W9.10).
+async fn embedding(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.embedding().await, StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// `PUT /admin/embedding` — `{provider, model, dimension, url?, api_key_env?}`:
+/// checked with a sample embedding, saved, applied by restarting ADB (W9.10).
+async fn set_embedding(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.set_embedding(body).await, StatusCode::BAD_REQUEST)
+}
+
+fn respond(r: Result<Value, String>, on_error: StatusCode) -> (StatusCode, Json<QueryResponse>) {
+    match r {
+        Ok(data) => (StatusCode::OK, Json(QueryResponse { success: true, data: Some(data), error: None, execution_time_ms: None })),
+        Err(e) => (on_error, Json(QueryResponse { success: false, data: None, error: Some(e), execution_time_ms: None })),
+    }
+}
+
 async fn stats(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
     match s.engine.stats().await {
         Ok(data) => (

@@ -492,25 +492,35 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
     }
 
-    /// Embed current SEMANTIC / EPISODIC / PROCEDURAL rows that have text but no
-    /// vector — written before there was a model, or whose embedding failed — and
-    /// commit the vectors as `Embed` effects, at most `batch` rows per call (MVP W4
-    /// T7). Embedding runs outside the sequencer; a row superseded or forgotten in
-    /// between just gets a vector it no longer needs. Returns how many.
-    pub async fn embed_backfill(&self, batch: usize) -> AdbResult<u64> {
-        let (Some(store), Some(embedder)) = (&self.store, &self.embedder) else { return Ok(0) };
+    /// Current SEMANTIC / EPISODIC / PROCEDURAL rows with text to embed and no vector.
+    async fn unembedded(&self) -> AdbResult<Vec<(adb_store::StoredRow, String)>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
         let now = CommitTs::from_datetime(time::now());
         let filter = format!(
             "{} AND memory IN ('semantic', 'episodic', 'procedural') AND tombstone = false AND superseded_by IS NULL AND embedding IS NULL",
             adb_store::RECORD_KINDS
         );
         let rows = store.scan(Some(&filter)).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-        let todo: Vec<(adb_store::StoredRow, String)> = rows
+        Ok(rows
             .into_iter()
             .filter(|r| r.is_current(now))
             .filter_map(|r| crate::reads::embed_text(r.data.memory.into(), &r.data.value).map(|t| (r, t)))
-            .take(batch)
-            .collect();
+            .collect())
+    }
+
+    /// How many records still wait for a vector (W9.10: re-embedding progress).
+    pub async fn pending_embeddings(&self) -> AdbResult<u64> {
+        Ok(self.unembedded().await?.len() as u64)
+    }
+
+    /// Embed current SEMANTIC / EPISODIC / PROCEDURAL rows that have text but no
+    /// vector — written before there was a model, or whose embedding failed — and
+    /// commit the vectors as `Embed` effects, at most `batch` rows per call (MVP W4
+    /// T7). Embedding runs outside the sequencer; a row superseded or forgotten in
+    /// between just gets a vector it no longer needs. Returns how many.
+    pub async fn embed_backfill(&self, batch: usize) -> AdbResult<u64> {
+        let (Some(_), Some(embedder)) = (&self.store, &self.embedder) else { return Ok(0) };
+        let todo: Vec<(adb_store::StoredRow, String)> = self.unembedded().await?.into_iter().take(batch).collect();
         if todo.is_empty() {
             return Ok(0);
         }

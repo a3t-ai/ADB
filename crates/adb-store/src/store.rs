@@ -49,11 +49,18 @@ pub struct StoreConfig {
     pub memtable_rows: usize,
     /// MemWAL WAL flush interval.
     pub wal_flush: Duration,
+    /// The embedding model's name, kept in `_meta` (W9.10): a table whose vectors
+    /// came from another model has them cleared at open (the backfill re-embeds).
+    /// `None`: not checked.
+    pub embedding_model: Option<String>,
 }
+
+/// The model of tables whose `_meta` names none (written before W9.10).
+pub const DEFAULT_EMBEDDING_MODEL: &str = "bge-small-en-v1.5";
 
 impl StoreConfig {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), embedding_dim: DEFAULT_EMBEDDING_DIM, memtable_rows: 10_000, wal_flush: Duration::from_secs(1) }
+        Self { root: root.into(), embedding_dim: DEFAULT_EMBEDDING_DIM, memtable_rows: 10_000, wal_flush: Duration::from_secs(1), embedding_model: None }
     }
 }
 
@@ -159,7 +166,19 @@ impl PartitionStore {
                 }
             }
         }
-        Self::open_at(cfg, partition, &dir).await
+        let store = Self::open_at(cfg, partition, &dir).await?;
+        // W9.10: vectors from another model can't be compared with this one's.
+        if let Some(want) = &cfg.embedding_model {
+            let meta = store.get(META_ID).await?;
+            let had = meta.as_ref().and_then(|m| m.data.value.get("embedding_model")).and_then(|v| v.as_str()).unwrap_or(DEFAULT_EMBEDDING_MODEL).to_string();
+            if &had != want {
+                store.close().await?;
+                let stats = Self::rewrite_table(cfg, partition, cfg.embedding_dim, &Some, None, true).await?;
+                tracing::info!(rows = stats.kept, from = %had, to = %want, "embedding model changed: vectors cleared, the backfill embeds them again");
+                return Self::open_at(cfg, partition, &dir).await;
+            }
+        }
+        Ok(store)
     }
 
     /// The table's embedding column has `from` dimensions and the model `cfg`'s:
@@ -167,7 +186,7 @@ impl PartitionStore {
     /// `cfg.embedding_dim`; the old table stays beside it as `memory.dim<from>.bak`.
     /// Vectors of the old size are dropped (the backfill embeds the text again).
     async fn rewrite_dim(cfg: &StoreConfig, partition: PartitionId, from: i32) -> StoreResult<()> {
-        let stats = Self::rewrite_table(cfg, partition, from, &Some, Some(format!("memory.dim{from}.bak"))).await?;
+        let stats = Self::rewrite_table(cfg, partition, from, &Some, Some(format!("memory.dim{from}.bak")), true).await?;
         tracing::info!(rows = stats.kept, from, to = cfg.embedding_dim, "memory table rewritten for the embedding model's dimension");
         Ok(())
     }
@@ -179,7 +198,7 @@ impl PartitionStore {
     /// data is physically gone (L10). The MemWAL generations go with it.
     pub async fn compact_offline(cfg: &StoreConfig, partition: PartitionId, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
         let keep = compaction_row(history, now);
-        Self::rewrite_table(cfg, partition, cfg.embedding_dim, &keep, None).await
+        Self::rewrite_table(cfg, partition, cfg.embedding_dim, &keep, None, false).await
     }
 
     /// W5 compaction on the open table: the same rewrite as [`Self::compact_offline`],
@@ -247,6 +266,16 @@ impl PartitionStore {
         Ok(CompactStats { total, kept: rows.len(), bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
     }
 
+    /// What `_meta` records about the table besides offsets: its embedding size and
+    /// (W9.10) the model its vectors came from.
+    fn meta_extra(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({ "embedding_dim": self.dim });
+        if let Some(m) = &self.cfg.embedding_model {
+            v["embedding_model"] = m.clone().into();
+        }
+        v
+    }
+
     /// Whether enough small writes have piled up to compact (W7): more records
     /// applied since the last compaction than max(`min`, a quarter of the rows it
     /// kept), so a compaction's pause stays proportional to what it saves. Counts
@@ -282,6 +311,7 @@ impl PartitionStore {
         from: i32,
         keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync),
         backup: Option<String>,
+        clear_vectors: bool,
     ) -> StoreResult<CompactStats> {
         let started = std::time::Instant::now();
         let dir = cfg.root.join(format!("p{}", partition.0)).join("memory.lance");
@@ -294,12 +324,15 @@ impl PartitionStore {
         let total = all.len();
         let mut rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
         for r in rows.iter_mut() {
-            if from != cfg.embedding_dim {
+            if from != cfg.embedding_dim || clear_vectors {
                 r.data.embedding = None;
             }
             if r.id == META_ID {
                 if let serde_json::Value::Object(v) = &mut r.data.value {
                     v.insert("embedding_dim".into(), cfg.embedding_dim.into());
+                    if let Some(m) = &cfg.embedding_model {
+                        v.insert("embedding_model".into(), m.clone().into());
+                    }
                 }
             }
         }
@@ -434,7 +467,7 @@ impl PartitionStore {
             out.push(q);
         }
         let applied = self.applied.load(std::sync::atomic::Ordering::SeqCst);
-        out.push(StoredRow::meta(applied, meta.commit_ts, meta.epoch, serde_json::json!({ "embedding_dim": self.dim })));
+        out.push(StoredRow::meta(applied, meta.commit_ts, meta.epoch, self.meta_extra()));
         let batch = encode(&out, &self.schema, self.dim)?;
         let g = self.state.read().await;
         open_state(&g).writer.put(vec![batch]).await.map_err(lance)?;
@@ -651,7 +684,7 @@ impl PartitionStore {
             Self::rows_of(inner, &mut out, record).await?;
         }
         let (off, ts, epoch) = (last.offset.0, last.commit_ts, last.epoch.0);
-        out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, serde_json::json!({ "embedding_dim": self.dim })));
+        out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, self.meta_extra()));
 
         let rows: Vec<StoredRow> = out.into_values().collect();
         let batch = encode(&rows, &self.schema, self.dim)?;

@@ -48,7 +48,7 @@ fn rec(offset: u64, effects: Vec<Effect>) -> LogRecord {
 #[tokio::test]
 async fn query_sees_one_snapshot_newest_per_id() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 3, wal_flush: Duration::from_millis(20) };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 3, wal_flush: Duration::from_millis(20), embedding_model: None };
     let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
     let mut off = 0;
     for i in 0..8 {
@@ -120,7 +120,7 @@ async fn apply_many_matches_one_by_one() {
         rows.sort();
         rows
     };
-    let cfg = |d: &std::path::Path| StoreConfig { root: d.to_path_buf(), embedding_dim: 4, memtable_rows: 1000, wal_flush: Duration::from_millis(20) };
+    let cfg = |d: &std::path::Path| StoreConfig { root: d.to_path_buf(), embedding_dim: 4, memtable_rows: 1000, wal_flush: Duration::from_millis(20), embedding_model: None };
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let one = PartitionStore::open(&cfg(a.path()), PartitionId(0)).await.unwrap();
     for r in &log {

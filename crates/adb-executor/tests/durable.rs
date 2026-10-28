@@ -281,6 +281,7 @@ async fn log_is_purged_below_lances_durable_offset() {
         embedding_dim: 4,
         memtable_rows: 100,
         wal_flush: std::time::Duration::from_millis(20),
+        embedding_model: None,
     };
     let open = || async {
         let seq = Sequencer::new(LocalWal::open(PartitionId(0), wal_cfg.clone()).unwrap(), Epoch(1));

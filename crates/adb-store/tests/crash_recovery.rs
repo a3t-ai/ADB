@@ -30,7 +30,7 @@ const KEYS: u64 = 40;
 
 fn cfg(dir: &Path) -> StoreConfig {
     // Seal every 25 rows, so kills land during seals and flushed generations too.
-    StoreConfig { root: dir.to_path_buf(), embedding_dim: 4, memtable_rows: 25, wal_flush: Duration::from_millis(20) }
+    StoreConfig { root: dir.to_path_buf(), embedding_dim: 4, memtable_rows: 25, wal_flush: Duration::from_millis(20), embedding_model: None }
 }
 
 fn data(value: serde_json::Value) -> RowData {

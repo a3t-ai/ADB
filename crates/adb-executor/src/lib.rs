@@ -14,7 +14,7 @@ pub mod writes;
 
 pub use error::{ExecutorError, ExecutorResult};
 pub use executor::Executor;
-pub use engine::{Engine, LocalEngine};
+pub use engine::{request_restart, restart_requested, Engine, LocalEngine};
 pub use result::{QueryResult, ResultSet};
 pub use apply::ApplyBarrier;
 pub use reads::{LanceReads, Reads};

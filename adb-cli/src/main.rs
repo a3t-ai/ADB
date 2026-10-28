@@ -129,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Acknowledged writes are already durable (acked after fsync); returning
                 // drops the engine, which drains and syncs the log.
                 s = shutdown_signal() => tracing::info!(signal = s, "ADB shutting down"),
+                // New settings (W9.10): stop; the supervisor starts ADB again.
+                _ = adb_executor::restart_requested() => tracing::info!("ADB stopping to apply its new settings"),
             }
         }
         Commands::ImportLancedb { .. } => unreachable!("handled before the engine opens"),

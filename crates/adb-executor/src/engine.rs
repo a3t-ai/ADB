@@ -59,6 +59,51 @@ pub trait Engine: Send + Sync {
     async fn compact(&self) -> Result<Value, String> {
         Err("compaction needs a durable engine (start ADB with --data-dir)".into())
     }
+
+    /// The embedding settings (W9.10): `{settings, source, active, pending}`.
+    async fn embedding(&self) -> Result<Value, String> {
+        Err("embedding settings need a data directory (start ADB with --data-dir)".into())
+    }
+
+    /// Check new embedding settings (a sample embedding of the right size), save
+    /// them, and restart ADB to apply them (W9.10).
+    async fn set_embedding(&self, _settings: Value) -> Result<Value, String> {
+        Err("embedding settings need a data directory (start ADB with --data-dir)".into())
+    }
+}
+
+static RESTART: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Ask the server to stop so its supervisor starts it again with new settings
+/// (W9.10). Kubernetes restarts the container; elsewhere ADB must be started again.
+pub fn request_restart() {
+    RESTART.notify_one();
+}
+
+/// Resolves once [`request_restart`] was called.
+pub async fn restart_requested() {
+    RESTART.notified().await
+}
+
+/// The embedder for `settings` (none saved: the environment's local model), and
+/// the table's dimension and model name for it.
+fn embedder_for(settings: Option<&adb_embed::EmbedConfig>) -> (Option<Arc<adb_embed::Embedder>>, i32, Option<String>) {
+    let Some(c) = settings else { return (adb_embed::Embedder::shared(), adb_store::DEFAULT_EMBEDDING_DIM, None) };
+    let embedder = if adb_embed::Embedder::disabled() {
+        None
+    } else {
+        match adb_embed::Embedder::from_config(c) {
+            Ok(e) => {
+                tracing::info!(provider = ?c.provider, model = %c.model, dimension = c.dimension, "embeddings from ADB's settings");
+                Some(Arc::new(e))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "embedding settings unusable; running without vectors");
+                None
+            }
+        }
+    };
+    (embedder, c.dimension as i32, Some(c.model.clone()))
 }
 
 /// The engine: the partition log, its Lance table (the only copy of every memory
@@ -76,6 +121,10 @@ pub struct LocalEngine {
     durable: Option<Arc<DurableWrites<Arc<LocalWal>>>>,
     /// Continuous queries (W6) and the task keeping them current.
     watcher: Option<(Arc<adb_cq::Watcher>, tokio::task::JoinHandle<()>)>,
+    /// The data directory (W9.10: settings live there).
+    dir: std::path::PathBuf,
+    /// The embedder in use (W9.10: reported with the settings).
+    embedder: Option<Arc<adb_embed::Embedder>>,
     /// A temporary engine's directory, removed with it (dropped last).
     temp: Option<tempfile::TempDir>,
 }
@@ -250,11 +299,11 @@ impl LocalEngine {
         // Shared: the sequencer appends, subscribers read (stage E).
         let wal = Arc::new(open_wal(&dir).await?);
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
-        let store = Arc::new(
-            PartitionStore::open(&StoreConfig::new(dir.join("store")), SINGLE_PARTITION)
-                .await
-                .map_err(|e| e.to_string())?,
-        );
+        // W9.10: the embedding settings size the table's vectors.
+        let settings = adb_embed::EmbedConfig::load(&dir)?;
+        let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
+        let store_cfg = StoreConfig { embedding_dim, embedding_model, ..StoreConfig::new(dir.join("store")) };
+        let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
@@ -266,9 +315,8 @@ impl LocalEngine {
             let lineages: Arc<dyn adb_gateway::Lineages> = Arc::clone(&store) as Arc<dyn adb_gateway::Lineages>;
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });
-        let embedder = adb_embed::Embedder::shared();
         writes.set_embedder(embedder.clone());
-        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder));
+        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder.clone()));
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
         let durable_handle = Arc::clone(&durable);
@@ -300,7 +348,18 @@ impl LocalEngine {
             None => None,
         };
         Ok((
-            Self { executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry, durable: Some(durable_handle), watcher, temp: None },
+            Self {
+                executor,
+                store: Some((store, barrier)),
+                gateway,
+                platform: Some((platform, writes)),
+                expiry,
+                durable: Some(durable_handle),
+                watcher,
+                temp: None,
+                dir,
+                embedder,
+            },
             stats,
         ))
     }
@@ -412,6 +471,38 @@ impl Engine for LocalEngine {
             })),
             None => Err("no table to compact".into()),
         }
+    }
+
+    async fn embedding(&self) -> Result<Value, String> {
+        let saved = adb_embed::EmbedConfig::load(&self.dir)?;
+        let pending = match &self.durable {
+            Some(w) => w.pending_embeddings().await.map_err(|e| e.to_string())?,
+            None => 0,
+        };
+        Ok(json!({
+            "source": if saved.is_some() { "settings" } else { "default" },
+            "settings": saved.unwrap_or_default(),
+            "active": self.embedder.as_ref().map(|e| json!({ "model": e.model(), "dimension": e.dimension() })),
+            "pending": pending,
+        }))
+    }
+
+    async fn set_embedding(&self, settings: Value) -> Result<Value, String> {
+        if self.temp.is_some() {
+            return Err("embedding settings need a data directory (start ADB with --data-dir)".into());
+        }
+        let c: adb_embed::EmbedConfig = serde_json::from_value(settings).map_err(|e| format!("embedding settings: {e}"))?;
+        let e = Arc::new(adb_embed::Embedder::from_config(&c)?);
+        e.verify().await?;
+        let clears = self.embedder.as_ref().is_none_or(|a| a.model() != c.model || a.dimension() != c.dimension);
+        c.save(&self.dir)?;
+        tracing::info!(provider = ?c.provider, model = %c.model, dimension = c.dimension, "embedding settings saved; restarting to apply them");
+        // After this response has gone out.
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            request_restart();
+        });
+        Ok(json!({ "saved": c, "restart": true, "reembed": clears }))
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
