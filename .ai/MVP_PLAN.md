@@ -178,3 +178,13 @@ Then W8 (the user's A3T pass), then performance, then graph.
 `flowr:2026-10-28-ee7` (console, `A3T_RUNTIME_IMAGE`, and Runtime CR `worker`
 `spec.image` — isolated canvases take their target Runtime's image, so the CR must be
 bumped too), A3T UI rebuilt (Settings → ADB Embeddings). Gates 10/10 before release.
+
+## W10 — hot cache (28 Oct, user: "implement the cache and indexes as per the plan")
+
+Pulled ahead of the W8 gate at the user's request (`W10_INDEXES_CACHE.md`). Lance
+scalar indexes tried first and dropped (no gain in the MemWAL LSM); the per-node
+hot cache built (`40f1949`, A3T page flowr `5f53930`): rules per memory type and
+scope (newest n / bytes / time window / all / none), fed by every put, complete-or-
+floor buckets, Lance fallback, `ADB_CACHE=on|off|shadow`. Gates 10/10 in shadow
+mode; conformance 182/182 with 207 cache hits and 0 mismatches. Limitations W10-L1
+… L8.
