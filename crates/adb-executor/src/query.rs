@@ -12,29 +12,13 @@ use adb_core::{
     evaluate_conditions, evaluate_conditions_on_record, AdbError, AdbResult, AggregateFunc, AggregateFuncType, Condition, Link,
     MemoryRecord, MemoryType, Metadata, Modifiers, OrderBy, Predicate, Scope, Value, Window,
 };
-use adb_store::{decode, predicate_filter, row_id, PartitionStore, StoredRow, META_ID};
+use adb_store::{decode, predicate_filter, row_id, PartitionStore, StoredRow};
 use datafusion::prelude::{col, lit, Expr};
-use datafusion::scalar::ScalarValue;
 
 use crate::reads::{to_link, to_record};
 
 fn store_err(e: adb_store::StoreError) -> AdbError {
     AdbError::Internal(format!("store: {e}"))
-}
-
-fn ts(t: CommitTs) -> Expr {
-    lit(ScalarValue::TimestampMicrosecond(Some(t.0), Some("UTC".into())))
-}
-
-/// The current view at `now` (D2 §3) as a filter: not forgotten, superseded, closed
-/// or expired; not `_meta`.
-fn current_view(now: CommitTs) -> Expr {
-    col("id")
-        .not_eq(lit(META_ID))
-        .and(col("tombstone").eq(lit(false)))
-        .and(col("superseded_by").is_null())
-        .and(col("valid_to").is_null().or(col("valid_to").gt(ts(now))))
-        .and(col("ttl_at").is_null().or(col("ttl_at").gt(ts(now))))
 }
 
 /// Record rows of `memory` (not edges, events, registrations), in `in_scope`.
@@ -53,7 +37,10 @@ fn records_of(memory: Memory, in_scope: Option<&str>, namespace: Option<&str>) -
 /// The current rows matching `filter`, from one snapshot; `vectors`: with the
 /// `embedding` column (LIKE), otherwise without it.
 pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, vectors: bool) -> AdbResult<Vec<StoredRow>> {
-    let filter = current_view(now).and(filter);
+    // Only cheap column filters go into the scan; the current view (D2 §3: not
+    // superseded, closed or expired) is tested on the decoded rows — its timestamp
+    // tests cost more in the scan (measured, W7).
+    let filter = col("tombstone").eq(lit(false)).and(filter);
     let batches = store
         .query(move |ctx| async move {
             let df = ctx.table("memory").await?.filter(filter)?;
