@@ -56,6 +56,9 @@ impl ApplyBarrier {
     }
 }
 
+/// Most queued records the applier puts into the table at once.
+const APPLY_BATCH: usize = 256;
+
 /// Queue of committed records for the background applier.
 #[derive(Debug, Clone)]
 pub struct Applier {
@@ -69,11 +72,15 @@ impl Applier {
         let (tx, mut rx) = mpsc::unbounded_channel::<LogRecord>();
         let task_barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
-            while let Some(record) = rx.recv().await {
-                if let Err(e) = store.apply(&record).await {
-                    tracing::warn!(offset = record.offset.0, error = %e, "Lance apply failed; the log has it, catch-up on next open");
+            // Whatever is queued goes in as one put (W7: fewer, larger batches).
+            let mut batch = Vec::with_capacity(APPLY_BATCH);
+            while rx.recv_many(&mut batch, APPLY_BATCH).await > 0 {
+                let last = batch.last().map_or(0, |r| r.offset.0);
+                if let Err(e) = store.apply_many(&batch).await {
+                    tracing::warn!(first = batch[0].offset.0, last, error = %e, "Lance apply failed; the log has it, catch-up on next open");
                 }
-                task_barrier.applied(record.offset.0);
+                task_barrier.applied(last);
+                batch.clear();
             }
         });
         Self { tx, barrier }

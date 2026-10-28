@@ -307,6 +307,20 @@ pub fn project(records: &mut [MemoryRecord], fields: &[String]) {
 
 // ------------------------------------------------------------------ reads
 
+/// Record `key` of `memory` by primary key (Lance's point lookup, ~1 ms): its first
+/// version's row, if that is current and passes the scope / namespace filters. `None`
+/// when it isn't — updated, forgotten, missing, or its first version compacted away —
+/// and the caller scans by lineage instead (exact either way).
+async fn point(store: &PartitionStore, memory: Memory, key: &str, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs) -> AdbResult<Option<StoredRow>> {
+    let Some(r) = store.get(&row_id(memory, key)).await.map_err(store_err)? else { return Ok(None) };
+    let ok = r.is_current(now)
+        && r.data.memory == memory
+        && matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool)
+        && in_scope.is_none_or(|s| r.data.scope == s)
+        && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns));
+    Ok(ok.then_some(r))
+}
+
 /// The candidates of a read: current rows of `memory` passing the pushed-down part
 /// of `predicate`, as records.
 async fn candidates(
@@ -317,6 +331,17 @@ async fn candidates(
     now: CommitTs,
 ) -> AdbResult<Vec<MemoryRecord>> {
     let m: Memory = memory.into();
+    // KEY lookups: the primary-key fast path first (W7).
+    if let Predicate::Key { field, value } = predicate {
+        let keyed = matches!(field.as_str(), "id" | "key")
+            || (memory == MemoryType::Procedural && field == "pattern_id")
+            || (memory == MemoryType::Tools && field == "tool_id");
+        if keyed {
+            if let Some(r) = point(store, m, &value_text(value), modifiers.in_scope.as_deref(), modifiers.namespace.as_deref(), now).await? {
+                return Ok(vec![record(&r)]);
+            }
+        }
+    }
     let mut filter = records_of(m, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
     // Payload pushdown where the payload is the record (PROCEDURAL / TOOLS conditions
     // see shaped records with defaults the payload may lack).
@@ -479,11 +504,30 @@ pub async fn links_from(store: &PartitionStore, memory: MemoryType, keys: &[Stri
     Ok(out)
 }
 
-/// The current records `keys` of `memory`, by key: one scan.
+/// Link targets fetched by point lookup rather than a scan (each ~1 ms; a scan
+/// costs ~10–40 ms).
+const POINT_LOOKUPS: usize = 16;
+
+/// The current records `keys` of `memory`, by key: point lookups for a few, one
+/// scan for the rest.
 pub async fn by_keys(store: &PartitionStore, memory: MemoryType, keys: &[String], now: CommitTs) -> AdbResult<HashMap<String, MemoryRecord>> {
     let mut out = HashMap::new();
     let m: Memory = memory.into();
-    for chunk in keys.chunks(500) {
+    // A few targets: point lookups (W7); the rest in one scan.
+    let mut rest: Vec<String> = Vec::new();
+    if keys.len() <= POINT_LOOKUPS {
+        for k in keys {
+            match point(store, m, k, None, None, now).await? {
+                Some(r) => {
+                    out.insert(r.key().to_string(), record(&r));
+                }
+                None => rest.push(k.clone()),
+            }
+        }
+    } else {
+        rest = keys.to_vec();
+    }
+    for chunk in rest.chunks(500) {
         let ids: Vec<Expr> = chunk.iter().map(|k| lit(row_id(m, k))).collect();
         let filter = records_of(m, None, None).and(col("lineage_id").in_list(ids, false));
         for r in current_rows(store, filter, now, false).await? {

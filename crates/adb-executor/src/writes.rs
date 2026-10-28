@@ -262,6 +262,10 @@ pub struct DurableWrites<L: Log> {
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
 }
 
+/// Records written since the last compaction that make one due (W7, user 28 Oct:
+/// thousands of small puts slow every scan; at least a quarter of the table).
+pub const COMPACT_AFTER_WRITES: u64 = 2_000;
+
 /// How long superseded versions (UPDATE history) are kept (W5, user 27 Oct).
 pub const HISTORY: Duration = Duration::from_secs(90 * 86_400);
 
@@ -433,10 +437,11 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(rows.into_iter().map(|r| (r.id, r.data.value)).collect())
     }
 
-    /// Whether compaction is due on size: more than 16 MemWAL generations (W5).
+    /// Whether compaction is due on size: more than 16 MemWAL generations (W5), or
+    /// many writes since the last one (W7).
     pub async fn compaction_due(&self) -> bool {
         match &self.store {
-            Some(s) => s.generation_count().await.is_ok_and(|n| n > 16),
+            Some(s) => s.writes_due(COMPACT_AFTER_WRITES) || s.generation_count().await.is_ok_and(|n| n > 16),
             None => false,
         }
     }
@@ -702,10 +707,8 @@ pub async fn catch_up<L: Log>(store: &PartitionStore, log: &L) -> AdbResult<u64>
     loop {
         let batch = log.read(from, 1024).await.map_err(log_err)?;
         let Some(last) = batch.last().map(|r| r.offset) else { break };
-        for record in &batch {
-            if store.apply(record).await.map_err(store_err)? {
-                applied += 1;
-            }
+        for chunk in batch.chunks(256) {
+            applied += store.apply_many(chunk).await.map_err(store_err)? as u64;
         }
         from = last.next();
     }

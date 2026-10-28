@@ -85,6 +85,10 @@ pub struct PartitionStore {
     /// `_meta`'s applied offset, read once on open and advanced by `apply`, so
     /// applying a record doesn't scan the table just to check it.
     applied: std::sync::atomic::AtomicU64,
+    /// Records applied since the last compaction, and the rows that compaction kept
+    /// (W7 compaction trigger: many small puts slow every scan).
+    puts_since_compaction: std::sync::atomic::AtomicU64,
+    rows_at_compaction: std::sync::atomic::AtomicU64,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -234,7 +238,18 @@ impl PartitionStore {
                 std::fs::remove_dir_all(e.path()).map_err(err)?;
             }
         }
+        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.rows_at_compaction.store(rows.len() as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(CompactStats { total, kept: rows.len(), bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
+    }
+
+    /// Whether enough small writes have piled up to compact (W7): more records
+    /// applied since the last compaction than max(`min`, a quarter of the rows it
+    /// kept), so a compaction's pause stays proportional to what it saves. Counts
+    /// from open when this process hasn't compacted yet.
+    pub fn writes_due(&self, min: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.puts_since_compaction.load(SeqCst) > min.max(self.rows_at_compaction.load(SeqCst) / 4)
     }
 
     /// MemWAL generations (sealed memtables) not yet compacted away: a W5 threshold.
@@ -324,6 +339,8 @@ impl PartitionStore {
             dim: cfg.embedding_dim,
             memtable_rows: cfg.memtable_rows,
             applied: std::sync::atomic::AtomicU64::new(0),
+            puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
+            rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -609,16 +626,43 @@ impl PartitionStore {
     /// Apply one committed log record as a single MemWAL put. Records at or below
     /// the applied offset are skipped. Returns whether it was applied.
     pub async fn apply(&self, record: &LogRecord) -> StoreResult<bool> {
-        if record.offset <= self.applied_offset().await? {
-            return Ok(false);
-        }
+        Ok(self.apply_many(std::slice::from_ref(record)).await? > 0)
+    }
+
+    /// Apply consecutive records as **one** put (W7: fewer, larger MemWAL batches make
+    /// every later scan cheaper). Records at or below the applied offset are skipped;
+    /// later effects see the rows earlier ones wrote. Returns how many were applied.
+    pub async fn apply_many(&self, records: &[LogRecord]) -> StoreResult<usize> {
+        let applied_before = self.applied_offset().await?;
+        let records: Vec<&LogRecord> = records.iter().filter(|r| r.offset > applied_before).collect();
+        let Some(last) = records.last().copied() else { return Ok(0) };
         let g = self.state.read().await;
         let inner = open_state(&g);
+        // Rows these records write, one per id (later effects see earlier ones).
+        let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
+        for record in &records {
+            Self::rows_of(inner, &mut out, record).await?;
+        }
+        let (off, ts, epoch) = (last.offset.0, last.commit_ts, last.epoch.0);
+        out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, serde_json::json!({ "embedding_dim": self.dim })));
+
+        let rows: Vec<StoredRow> = out.into_values().collect();
+        let batch = encode(&rows, &self.schema, self.dim)?;
+        inner.writer.put(vec![batch]).await.map_err(lance)?;
+        self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
+        inner.puts.lock().unwrap().offsets.push_back(off);
+        self.puts_since_compaction.fetch_add(records.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
+            inner.writer.force_seal_active().await.map_err(lance)?;
+        }
+        Ok(records.len())
+    }
+
+    /// The rows `record` writes, into `out`.
+    async fn rows_of(inner: &Inner, out: &mut BTreeMap<String, StoredRow>, record: &LogRecord) -> StoreResult<()> {
         let ts = record.commit_ts;
         let (off, epoch) = (record.offset.0, record.epoch.0);
-        // Rows this record writes, one per id (later effects see earlier ones).
-        let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
-
+        let out = &mut *out;
         for effect in &record.effects {
             match effect {
                 // Records and edges get memory-qualified row ids (`rows::row_id`).
@@ -693,17 +737,7 @@ impl PartitionStore {
                 Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableReplace { .. } => {}
             }
         }
-        out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, serde_json::json!({ "embedding_dim": self.dim })));
-
-        let rows: Vec<StoredRow> = out.into_values().collect();
-        let batch = encode(&rows, &self.schema, self.dim)?;
-        inner.writer.put(vec![batch]).await.map_err(lance)?;
-        self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
-        inner.puts.lock().unwrap().offsets.push_back(off);
-        if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
-            inner.writer.force_seal_active().await.map_err(lance)?;
-        }
-        Ok(true)
+        Ok(())
     }
 
     /// A row as this record has it so far, else as stored.
