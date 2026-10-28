@@ -77,7 +77,6 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 | E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. FlowR has no topic *trigger* yet. | Agents poll; flows can't start on a message. | FlowR wiring (stage F). |
 | E-L10 | **Topic messages' TTL is a read filter only**: the expiry timer (L3, fixed) commits `Expire` for memory records, not for `event` rows. | Subscribers aren't told a message expired. | Expire events with compaction (W5). |
 | E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | Scope in the row id (schema v4) with tenancy (M4). |
-| E-L11 | **The expiry timer scans for due rows every second** (a Lance scan with `ttl_at IS NOT NULL`). | Cost grows with TTL'd rows awaiting expiry. | A timer wheel fed by STORE … TTL and seeded at open. |
 
 ## FlowR wiring (stage F)
 
@@ -220,3 +219,4 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 | E-L3: an abandoned subscription pins the log | W9.6: subscriptions nobody reads or acks for 7 days (`ADB_SUB_IDLE`, seconds) are unsubscribed (checked each minute); FlowR's `adb_topic` triggers subscribe again when theirs is gone |
 | L4: no optimistic concurrency; references checked outside the sequencer | W9.7: `UPDATE … WHERE … AND metadata.version = n` is a compare-and-set (WHERE evaluated under the sequencer after every earlier write is applied; 20 concurrent updaters → exactly one wins, `tests/concurrency.rs`); LINK checks both ends under the sequencer; PROCEDURAL conditions see `metadata.*`. M3 must keep the WHERE at the partition owner |
 | W4-L1: one fixed embedding model | W9.10: local model or an OpenAI-compatible endpoint, model and dimension in `<data dir>/embedding.json`, set from A3T Settings → ADB Embeddings (through FlowR `/registry/adb-embedding`); the API key comes from ADB's environment (`api_key_env`, a Secret) |
+| E-L11: the expiry timer scanned for due rows every second | W9.12: TTL timers in memory (fed by every committed write with a TTL, seeded from the table at open); a tick with nothing due costs nothing; each due record is checked against the table before its `Expire` commits |

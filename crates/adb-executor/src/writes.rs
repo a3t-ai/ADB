@@ -275,6 +275,11 @@ pub struct DurableWrites<L: Log> {
     retain_max: u64,
     /// `ADB_SUB_IDLE`, default [`SUB_IDLE`].
     sub_idle: Duration,
+    /// TTL timers (W9.12, E-L11): `(ttl_at, row lineage id)` of every record written
+    /// with a TTL, seeded from the table at open. The expiry tick takes what is due
+    /// instead of scanning the table; each is checked against the table before it
+    /// expires (an UPDATE may have moved its TTL, a FORGET removed it).
+    timers: std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>,
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
@@ -571,8 +576,15 @@ impl<L: Log + 'static> DurableWrites<L> {
         // Caught up with the log: the applier starts from its end.
         let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
         let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
+        let timers = store
+            .with_ttl()
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+            .into_iter()
+            .filter_map(|r| r.data.ttl_at.map(|t| (t.0, r.lineage_id)))
+            .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle() }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers) }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -619,21 +631,35 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// rows for compaction. Returns how many lineages expired.
     pub async fn expire_due(&self) -> AdbResult<u64> {
         let Some(store) = &self.store else { return Ok(0) };
+        let now = CommitTs::from_datetime(time::now());
+        if !self.timers.lock().unwrap().first().is_some_and(|(t, _)| *t <= now.0) {
+            return Ok(0);
+        }
         let mut seq = self.seq.lock().await;
         // Every earlier record is in Lance first.
         if let Some(b) = self.barrier() {
             b.wait_for_committed().await;
         }
         let ts = seq.begin();
-        let due = store
-            .due_expiries(ts, EXPIRE_BATCH)
-            .await
-            .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-        if due.is_empty() {
+        let candidates: Vec<String> = {
+            let mut timers = self.timers.lock().unwrap();
+            let mut out = Vec::new();
+            while out.len() < EXPIRE_BATCH && timers.first().is_some_and(|(t, _)| *t <= ts.0) {
+                out.push(timers.pop_first().expect("checked").1);
+            }
+            out
+        };
+        let mut effects = Vec::new();
+        for lineage in &candidates {
+            if let Some(r) = store.ttl_version(lineage).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? {
+                if r.data.ttl_at.is_some_and(|t| t <= ts) {
+                    effects.push(Effect::Expire { memory: r.data.memory, lineage_id: RecordId(r.key().to_string()) });
+                }
+            }
+        }
+        if effects.is_empty() {
             return Ok(0);
         }
-        let effects: Vec<Effect> =
-            due.into_iter().map(|(memory, key)| Effect::Expire { memory, lineage_id: RecordId(key) }).collect();
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
         self.to_store(&record, seq.log()).await;
@@ -693,6 +719,14 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
     async fn to_store(&self, record: &LogRecord, log: &L) {
         let (Some(s), Some(applier)) = (&self.store, &self.applier) else { return };
+        // TTL timers (W9.12) for records written with one.
+        for e in &record.effects {
+            if let Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) | Effect::Supersede { new: n, .. } = e {
+                if let Some(t) = n.data.ttl_at {
+                    self.timers.lock().unwrap().insert((t.0, adb_store::row_id(n.data.memory, &n.lineage_id.0)));
+                }
+            }
+        }
         applier.enqueue(record.clone());
         if record.offset.0 % PURGE_EVERY == 0 {
             match s.durable_offset().await {

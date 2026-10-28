@@ -184,6 +184,38 @@ async fn ttl_expiry_is_committed_and_delivered() {
     assert!(r.contains("stays") && r.contains("back") && !r.contains("short-lived"), "{r}");
 }
 
+/// W9.12: TTL timers. A TTL set before a restart still expires after it (the timers
+/// are seeded from the table); a record forgotten before its TTL doesn't expire
+/// again; an UPDATE keeps the record's TTL and it expires once.
+#[tokio::test]
+async fn ttl_timers_survive_a_restart_and_skip_forgotten_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = |b: &Batch| b.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect::<Vec<_>>();
+    let all;
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        all = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default""#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "later", content = "expires after the restart") TTL 2s"#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "gone", content = "forgotten first") TTL 2s"#).await;
+        q(&engine, r#"STORE INTO SEMANTIC (key = "updated", content = "v1") TTL 2s"#).await;
+        q(&engine, r#"UPDATE INTO SEMANTIC WHERE key = "updated" (content = "v2")"#).await;
+        q(&engine, r#"FORGET FROM SEMANTIC WHERE key = "gone""#).await;
+    }
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let gw = engine.gateway().unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        seen = ops(&drain(&gw, &all, None).await);
+        if seen.contains(&"expire:later".to_string()) && seen.contains(&"expire:updated".to_string()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(seen.contains(&"expire:later".to_string()), "seeded timer fired: {seen:?}");
+    assert_eq!(seen.iter().filter(|o| *o == "expire:updated").count(), 1, "{seen:?}");
+    assert!(!seen.iter().any(|o| o == "expire:gone"), "forgotten, not expired: {seen:?}");
+}
+
 /// Named scopes (AQL v0.6 `IN SCOPE`, E-L6): STORE writes the row's scope; RECALL /
 /// LOOKUP / UPDATE / FORGET with IN SCOPE see only that scope (without it, every
 /// scope); SUBSCRIBE SCOPE narrows to it; the scope survives a restart. IN SCOPE is
