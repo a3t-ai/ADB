@@ -151,7 +151,9 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 |---|---|---|---|
 | W7-L1 | **Every read scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a read costs about the same whatever it selects (debug, 10k facts: ~150 ms for a key lookup, ~220 ms for a pushed-down WHERE, ~650 ms for a `!=`; release figures in `W7_QUERY_ENGINE.md`). | Read latency grows with the partition, not the result. | Scalar indexes on `memory` / `lineage_id` used by the LSM scan (Lance), or one table per memory type. |
 | W7-L2 | **ORDER BY / LIMIT run after decoding** the candidates (no TopK in the scan). | `RECALL … ALL ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns (or a UDF) and a TopK plan. |
-| W7-L3 | **WORKING is read from the table like the rest** (the in-memory hot tier is gone): `SCAN FROM WORKING` costs a table scan (debug, 10k facts in the partition: 2.5 ms → ~240 ms). | Scratchpad reads are slower. | See W7_QUERY_ENGINE.md (decision pending). |
+| W7-L3 | **WORKING is read from the table like the rest** (the in-memory hot tier is gone): `SCAN FROM WORKING` costs a table scan — release, 10k facts in the partition: ~0.5 ms → 19 ms after a compaction, ~60 ms before. | Scratchpad reads are slower than in memory. | A WORKING cache, if agents need it. |
+| W7-L5 | **A payload `WHERE` parses every row's JSON in the scan** (`adb_json_scalar`), whatever it selects: ~40 ms at 10k facts in release. | Payload filters cost the same on small and large results. | Frequently filtered fields as columns, or a JSON index. |
+| W7-L6 | **Reads are fastest just after a compaction**: between compactions, small MemWAL batches and generations add ~2× (LOOKUP 24 vs 10 ms at 10k facts). Compaction runs after max(2,000, rows/4) writes. | Latency saw-tooths with the write rate. | Merge memtable batches in Lance; incremental compaction. |
 | W7-L4 | **ADB without `--data-dir` writes to a temporary directory** (removed when it stops) instead of memory. | Needs disk; same engine as durable. | — |
 
 ## Outside ADB (FlowR / A3T), found while testing

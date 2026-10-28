@@ -135,3 +135,12 @@ vc-dev data and the 10k-row spike.
   compaction: LOOKUP KEY 29 → 21 ms, SCAN WORKING 46 → 20, WITH LINKS 73 → 35. A
   read returning all 10k rows: scan ~50 ms, decode ~25 ms, AQL semantics in Rust
   ~40 ms.
+- **Decision (28 Oct, user): batch + compact + point lookups** (`13fb818`). Release,
+  10k facts, median ms — this morning / now fresh / now after a compaction:
+  LOOKUP KEY 29 / 24 / 9.8; SCAN WORKING 46 / 66 / 19; WITH LINKS 73 / 75 / 42;
+  FOLLOW LINKS 162 / 149 / 83; ORDER BY LIMIT 10 158 / 147 / 104; `!=` 125 / 121 /
+  99; pushed-down WHERE 40 / 44 / 43; AGGREGATE 38 / 38 / 36. The gain comes with
+  compaction, which the new trigger (> max(2,000, rows / 4) writes, checked each
+  minute) now runs on its own; batching helps only under concurrent writes (the
+  bench's one-record STOREs are serialised by the sequencer). Payload WHERE stays
+  ~40 ms: `adb_json_scalar` parses every row's JSON in the scan (W7-L5).
