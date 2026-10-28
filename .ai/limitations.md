@@ -137,7 +137,7 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
 | W4-L2 | **Relevance recall scans its candidates** (brute force): every `LIKE` loads the current rows passing the filters, with their vectors, and ranks them in Rust; no ANN (IVF_RQ) or inverted (BM25) index yet. | Fine below ~10k rows per memory type and filter (S8); slower above. | Lance IVF_RQ + inverted index past the threshold, with the W7 query engine. |
-| W4-L3 | **Word matching is crude**: English stop words and suffix stripping (no real stemmer, no synonyms); BM25 statistics are computed over the candidate set per query. | Words only back up meaning (weight 0.2). | A proper analyzer with the inverted index (W4-L2). |
+| W4-L3 | **Word matching is English-only and has no synonyms**: Snowball English stemming and a short stop list (W9.11; a longer stop list scored worse — "down", "out", "not" matter in agent memory); BM25 statistics are computed over the candidate set per query. | Words only back up meaning (weight 0.2). | Per-language analyzers with the inverted index (W4-L2). |
 | W4-L4 | **The evaluation set is small and synthetic** (93 facts, 42 queries, English); the weights were set on it. | Real agent memory may rank differently. | Grow it from real (anonymised) A3T queries. |
 | W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | Calibrate per model (W4-L1). |
 

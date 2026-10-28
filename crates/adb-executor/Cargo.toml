@@ -27,6 +27,8 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Word recall's analyzer (W9.11): Snowball English.
+rust-stemmers = "1.2"
 
 [dev-dependencies]
 tempfile.workspace = true

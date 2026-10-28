@@ -105,7 +105,9 @@ fn ranks(scores: &[Option<f32>]) -> Vec<Option<usize>> {
     out
 }
 
-/// Words that say nothing about a record's subject.
+/// Words that say nothing about a record's subject. Short on purpose: "down",
+/// "out", "off", "not" mean something in what agents remember ("service down",
+/// "ran out of memory"); the longer Snowball list scored worse (W9.11).
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "do", "does", "for", "from", "has", "have",
     "how", "i", "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "so", "that", "the", "their", "them",
@@ -113,25 +115,16 @@ const STOP_WORDS: &[&str] = &[
     "will", "with", "you", "your",
 ];
 
-/// Lower-cased words, stop words dropped, common endings stripped ("renewal",
-/// "renews", "renewed" → "renew"; "Acme's" → "acme").
+/// Lower-cased words, apostrophes folded ("Acme's" → "acme"), stop words dropped,
+/// stemmed with Snowball's English stemmer ("renewal", "renews", "renewed" → "renew").
 fn tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .map(|t| t.to_lowercase())
-        .filter(|t| t.len() > 1 && !STOP_WORDS.contains(&t.as_str()))
-        .map(|t| stem(&t))
+    static STEMMER: std::sync::OnceLock<rust_stemmers::Stemmer> = std::sync::OnceLock::new();
+    let stemmer = STEMMER.get_or_init(|| rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English));
+    text.split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '\u{2019}'))
+        .map(|t| t.split(['\'', '\u{2019}']).next().unwrap_or("").to_lowercase())
+        .filter(|t| t.chars().count() > 1 && !STOP_WORDS.contains(&t.as_str()))
+        .map(|t| stemmer.stem(&t).into_owned())
         .collect()
-}
-
-fn stem(word: &str) -> String {
-    for suffix in ["ations", "ation", "ings", "ing", "als", "al", "edly", "ed", "ies", "es", "ly", "s"] {
-        if let Some(stem) = word.strip_suffix(suffix) {
-            if stem.chars().count() >= 3 {
-                return if suffix == "ies" { format!("{stem}y") } else { stem.to_string() };
-            }
-        }
-    }
-    word.to_string()
 }
 
 /// BM25 of `query` over `docs` (scored within this candidate set); `None` where no
@@ -224,10 +217,13 @@ mod tests {
 
     #[test]
     fn stemming_and_stop_words() {
-        assert_eq!(tokens("When is the Acme renewal?"), ["acme", "renew"]);
-        assert_eq!(tokens("Acme's contract renews"), ["acme", "contract", "renew"]);
-        assert_eq!(stem("policies"), "policy");
-        assert_eq!(stem("bus"), "bus", "too short to strip");
+        let one = |w: &str| tokens(w).remove(0);
+        assert_eq!(tokens("When is the Acme renewal?"), [one("acme"), one("renew")]);
+        assert_eq!(tokens("Acme's contract renews"), [one("acme"), one("contract"), one("renewed")]);
+        assert_eq!(one("policies"), one("policy"));
+        assert_eq!(one("running"), one("runs"));
+        assert_eq!(one("bus"), "bus");
+        assert_eq!(tokens("they’re deploying it"), [one("deploy")], "curly apostrophe, stop words");
     }
 
     #[test]
