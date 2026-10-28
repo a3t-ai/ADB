@@ -99,7 +99,6 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| G-L1 | **ADB Flight is unauthenticated** (no handshake / token). | Anything that can reach port 3001 can read and write A3T's platform tables. Fine inside the cluster network; not for exposure. | With ADB auth (M4 tenancy). |
 | G-L2 | **Every platform column is UTF-8**, as in A3T's embedded LanceDB; no vector search (`call:lancedb` `search` is unsupported on both backends). | Same as today. | When A3T needs typed / vector platform columns. |
 | G-L3 | **Platform writes are synchronous and serialised with memory writes** (one sequencer). | Fine for registry traffic; a heavy writer would queue behind memory writes. | Separate partition for platform tables (M3 placement). |
 | G-L5 | **Switching a running install to ADB is manual**: `import-lancedb` then edit `a3t/a3t-platform-db` (`backend: adb`) and restart FlowR. Writes between the import and the restart go to the embedded copy. | Plan a short write freeze for the switch. | An import mode that follows FlowR writes, or a switch flow. |
@@ -211,3 +210,4 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 | P1: a throwaway backend per read | W7 (`97e04ee`): AQL reads as one DataFusion scan of an LSM snapshot, semantics once in `adb_executor::query` |
 | P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all edges of a result in one scan, targets in one scan per memory type |
 | S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |
+| G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |
