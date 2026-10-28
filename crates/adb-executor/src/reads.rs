@@ -96,19 +96,16 @@ pub struct LanceReads {
     embedder: Option<Arc<adb_embed::Embedder>>,
 }
 
-/// `IN SCOPE` (named scopes, AQL v0.6) is served where rows carry their scope: the
-/// Lance-owned memory types on a durable engine (`durable`). Elsewhere it is refused
-/// rather than ignored — a FORGET that ignored its scope would forget everywhere.
-pub fn check_scope(memory: MemoryType, in_scope: Option<&str>, durable: bool) -> AdbResult<()> {
+/// `IN SCOPE` (named scopes, AQL v0.6) is served on the long-term memory types.
+/// Elsewhere it is refused rather than ignored — a FORGET that ignored its scope
+/// would forget everywhere.
+pub fn check_scope(memory: MemoryType, in_scope: Option<&str>) -> AdbResult<()> {
     let Some(s) = in_scope else { return Ok(()) };
     let ok_chars = s.chars().all(|c| c.is_ascii_alphanumeric() || ":_-./@".contains(c));
     if s.is_empty() || s.len() > 128 || !ok_chars {
         return Err(AdbError::QueryError(format!(
             "IN SCOPE {s:?}: a scope is 1-128 characters of letters, digits and : _ - . / @ (e.g. \"team:billing\")"
         )));
-    }
-    if !durable {
-        return Err(AdbError::UnsupportedOperation("IN SCOPE (named scopes need a durable engine: start ADB with --data-dir)".into()));
     }
     if !lance_owned(memory) {
         return Err(AdbError::UnsupportedOperation(format!("IN SCOPE on {memory:?} (supported on SEMANTIC, EPISODIC and PROCEDURAL)")));
@@ -245,7 +242,7 @@ impl LanceReads {
 #[async_trait]
 impl Reads for LanceReads {
     async fn lookup_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        check_scope(memory, modifiers.in_scope.as_deref(), true)?;
+        check_scope(memory, modifiers.in_scope.as_deref())?;
         self.read(memory, predicate, modifiers).await
     }
 
@@ -281,7 +278,7 @@ impl Reads for LanceReads {
     }
 
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        check_scope(memory, modifiers.in_scope.as_deref(), true)?;
+        check_scope(memory, modifiers.in_scope.as_deref())?;
         if matches!(predicate, Predicate::Like { .. }) {
             if !Self::serves(memory) {
                 return Err(AdbError::UnsupportedOperation(format!("LIKE on {memory:?} (supported on SEMANTIC, EPISODIC and PROCEDURAL)")));

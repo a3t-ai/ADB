@@ -556,7 +556,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches superseded versions, so
     /// a value surviving only in an old version is forgotten too (D2 T5).
     async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
-        check_scope(memory, in_scope, self.in_lance(memory).is_some())?;
+        check_scope(memory, in_scope)?;
         let Some(store) = &self.store else { return Err(needs_table("UPDATE / FORGET")) };
         // Every earlier record is in Lance first.
         if let Some(b) = self.barrier() {
@@ -727,7 +727,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         ttl: Option<Duration>,
         in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord> {
-        check_scope(memory_type, in_scope, self.in_lance(memory_type).is_some())?;
+        check_scope(memory_type, in_scope)?;
         // Embedded before the sequencer, so the model doesn't serialise writes (T4).
         let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
             true => self.vector_of(crate::reads::embed_text(memory_type, &payload)).await,

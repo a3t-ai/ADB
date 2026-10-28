@@ -166,7 +166,7 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W6-L4 | **FORGET and watches**: frames buffered in ADB are scrubbed when the watcher reaches the `Forget` (milliseconds); clients that already received a record keep their copy until the `removed` diff. | Never on disk; clients must apply `removed`. | — |
 | W6-L5 | **No per-tenant limits, metering or per-watch permissions**: anyone with the ADB token can watch anything. | Fine on one trusted node. | Tenancy limits with the cluster gateway (M4). |
 | W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed (1 s timer, W3), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
-| W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). The AQL conformance suites don't cover `WATCH` (ADB tests do). | — | Cross-partition watches (spec v2); a v0.6 conformance suite. |
+| W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). The AQL conformance suites don't cover `WATCH` (ADB tests do). | — | Cross-partition watches (spec v2). |
 
 ## Spec completion (W9)
 
@@ -216,3 +216,4 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 | G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |
 | L7 / W4-L5: PROCEDURAL kept only its node fields | W9.1: extra payload fields kept and matched (`WHERE`, `KEY` on any field); `LIKE` returns shaped procedures since W7 |
 | S7: `PATTERN` needed a variable (and ADB matched the variable's name) | W9.3: `PATTERN "text"` (AQL v0.7 grammar) and `$p` bound from request / pipeline variables |
+| v0.6 conformance suite missing | W9.4: AQL `tests/suites/18_subscriptions.yaml`, `19_watch.yaml`, `20_in_scope.yaml` (42 tests); ADB 182/182. `IN SCOPE` on WORKING / TOOLS now says so (it said "needs a durable engine") |
