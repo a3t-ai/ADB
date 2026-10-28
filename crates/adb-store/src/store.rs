@@ -96,6 +96,8 @@ pub struct PartitionStore {
     /// (W7 compaction trigger: many small puts slow every scan).
     puts_since_compaction: std::sync::atomic::AtomicU64,
     rows_at_compaction: std::sync::atomic::AtomicU64,
+    /// The table's vectors came from another embedding model (W9.10).
+    model_changed: std::sync::atomic::AtomicBool,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -167,15 +169,15 @@ impl PartitionStore {
             }
         }
         let store = Self::open_at(cfg, partition, &dir).await?;
-        // W9.10: vectors from another model can't be compared with this one's.
+        // W9.10: vectors from another model can't be compared with this one's. They
+        // are cleared after the log's tail is applied (`clear_vectors`), or the
+        // replay would bring back the old model's vectors.
         if let Some(want) = &cfg.embedding_model {
             let meta = store.get(META_ID).await?;
-            let had = meta.as_ref().and_then(|m| m.data.value.get("embedding_model")).and_then(|v| v.as_str()).unwrap_or(DEFAULT_EMBEDDING_MODEL).to_string();
-            if &had != want {
-                store.close().await?;
-                let stats = Self::rewrite_table(cfg, partition, cfg.embedding_dim, &Some, None, true).await?;
-                tracing::info!(rows = stats.kept, from = %had, to = %want, "embedding model changed: vectors cleared, the backfill embeds them again");
-                return Self::open_at(cfg, partition, &dir).await;
+            let had = meta.as_ref().and_then(|m| m.data.value.get("embedding_model")).and_then(|v| v.as_str()).unwrap_or(DEFAULT_EMBEDDING_MODEL);
+            if had != want {
+                tracing::info!(from = %had, to = %want, "embedding model changed: vectors are cleared once the log is applied");
+                store.model_changed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
         Ok(store)
@@ -208,6 +210,41 @@ impl PartitionStore {
     /// is applied first. The old table, its versions and MemWAL files, and any
     /// rewrite backups (`memory.dim*.bak`) are deleted: forgotten data is gone.
     pub async fn compact(&self, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
+        let keep = compaction_row(history, now);
+        let stats = self.rewrite_online(&keep).await?;
+        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(stats)
+    }
+
+    /// Whether the vectors came from another embedding model than the configured one
+    /// (W9.10): the caller applies the log's tail, then [`Self::clear_vectors`].
+    pub fn model_changed(&self) -> bool {
+        self.model_changed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Drop every vector and record the configured model in `_meta` (W9.10), as an
+    /// online rewrite (the caller makes sure nothing is being applied). The
+    /// backfill embeds the records again.
+    pub async fn clear_vectors(&self) -> StoreResult<CompactStats> {
+        let model = self.cfg.embedding_model.clone();
+        let keep = move |mut r: StoredRow| {
+            r.data.embedding = None;
+            if r.id == META_ID {
+                if let (Some(m), serde_json::Value::Object(v)) = (&model, &mut r.data.value) {
+                    v.insert("embedding_model".into(), m.clone().into());
+                }
+            }
+            Some(r)
+        };
+        let stats = self.rewrite_online(&keep).await?;
+        self.model_changed.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(stats)
+    }
+
+    /// Rewrite the open table keeping what `keep` returns, swapped in under the
+    /// exclusive lock (compaction, W5; clearing vectors, W9.10).
+    async fn rewrite_online(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync)) -> StoreResult<CompactStats> {
         let started = std::time::Instant::now();
         let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
         let staged = dir.with_file_name("memory.rewrite.lance");
@@ -217,8 +254,7 @@ impl PartitionStore {
         let bytes_before = dir_size(&dir);
         let all = Self::scan_in(open_state(&g), None).await?;
         let total = all.len();
-        let keep = compaction_row(history, now);
-        let rows: Vec<StoredRow> = all.into_iter().filter_map(&keep).collect();
+        let rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
         // The new table, complete and closed, beside the old one.
         if staged.exists() {
             std::fs::remove_dir_all(&staged).map_err(err)?;
@@ -261,8 +297,6 @@ impl PartitionStore {
                 std::fs::remove_dir_all(e.path()).map_err(err)?;
             }
         }
-        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.rows_at_compaction.store(rows.len() as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(CompactStats { total, kept: rows.len(), bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
     }
 
@@ -381,6 +415,7 @@ impl PartitionStore {
             applied: std::sync::atomic::AtomicU64::new(0),
             puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
             rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
+            model_changed: std::sync::atomic::AtomicBool::new(false),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);

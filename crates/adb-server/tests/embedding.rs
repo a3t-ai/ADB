@@ -116,5 +116,6 @@ async fn an_endpoint_provider_is_checked_saved_and_applied_at_restart() {
     assert_eq!(e["active"]["model"], "mock-bb");
     // mock-a's vectors were cleared: all three records went to mock-bb (plus the
     // sample a PUT would embed; none here, the file was edited directly).
-    assert_eq!(seen.lock().unwrap().get("mock-bb").copied(), Some(3), "{:?}", seen.lock().unwrap());
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.get("mock-bb").copied(), Some(3), "{seen:?}");
 }

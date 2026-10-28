@@ -561,6 +561,12 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub async fn open(mut seq: Sequencer<L>, store: Arc<PartitionStore>) -> AdbResult<(Self, ReplayStats)> {
         let t = std::time::Instant::now();
         let store_caught_up = catch_up(&store, seq.log()).await?;
+        // W9.10: another embedding model's vectors go once the log is applied (the
+        // tail may hold that model's `Embed` records); the backfill embeds again.
+        if store.model_changed() {
+            let c = store.clear_vectors().await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            tracing::info!(rows = c.kept, took = ?c.took, "embedding model changed: vectors cleared");
+        }
         let caught_up_in = t.elapsed();
         let (hydrated_rows, live) = hydrate(&store).await?;
         tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
