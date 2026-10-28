@@ -133,3 +133,26 @@ compaction (a FORGET, the nightly run or the admin `compact`).
 - **Performance is deferred** (user, 28 Oct): no performance work until the
   feature matrix is complete; then come back to W7-L3, W7-L5 and W7-L6 (typed
   columns for filtered fields, scalar indexes, a WORKING cache).
+
+## W9 — spec completion (agreed 28 Oct)
+
+User, 28 Oct: deliver and test the rest of the single-node spec; **graph / links
+(GR-1…GR-7, L6) and performance are parked** — afterwards performance first, then
+graph. `AS OF` history reads (L9) stay out.
+
+| # | Item | Limitation | Done when |
+|---|---|---|---|
+| 9.1 | PROCEDURAL keeps its whole payload and a namespace | L7, F-L2, W4-L5 | `WHERE owner = …` matches a procedure; namespace filters it |
+| 9.2 | `TIMEOUT` modifier applied | — | A query past its timeout fails with a timeout error |
+| 9.3 | `PATTERN "literal"` parses | S7 | Pattern recall in the differential test |
+| 9.4 | v0.6 conformance suite (subscriptions, `WATCH`, `IN SCOPE`) | W6-L7 | Suites in the AQL repo, ADB passes them |
+| 9.5 | Subscription catch-up / `reset` past the log | E-L2 | A subscriber behind the purged log gets `reset` + current rows |
+| 9.6 | Idle subscriptions expire | E-L3 | An abandoned subscription stops pinning the log |
+| 9.7 | `UPDATE` optimistic concurrency; references checked | L4 | Stale `version` refused; LINK to a missing record refused |
+| 9.8 | Power-safe local store | L11 | Lance data synced before `_meta` claims it; open falls back to the last good version |
+| 9.9 | 1,000-kill crash run; forget byte-scan test | M1 / M2 exit | Both pass once, recorded |
+| 9.10 | Embedding provider + dimension in ADB settings | W4-L1 | A3T Settings → ADB picks local model or endpoint; re-embed on change |
+| 9.11 | Text analyzer for word recall | W4-L3 | Stemming / stop words; eval set not worse |
+| 9.12 | Timer wheel for TTL / validity | E-L11, W6-L6 | No per-second scan; expiry on time |
+
+Then W8 (the user's A3T pass), then performance, then graph.
