@@ -62,6 +62,9 @@ pub struct ResultMetadata {
     pub records_returned: Option<u64>,
     /// Pipeline step timings
     pub step_timings: Option<Vec<u64>>,
+    /// A pipeline (or its stage) ran out of its `TIMEOUT` budget (W9)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
 }
 
 impl QueryResult {

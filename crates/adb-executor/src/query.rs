@@ -70,7 +70,8 @@ pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, v
 // ------------------------------------------------------------------ records
 
 /// A PROCEDURAL payload as its procedure node (the shape the procedural memory type
-/// has always returned): defaults filled, `steps` a list, numeric `variables`.
+/// has always returned): defaults filled, `steps` a list, numeric `variables`; other
+/// payload fields kept as they are (L7).
 pub fn procedure_value(key: &str, data: &serde_json::Value, version: u32) -> serde_json::Value {
     let s = |k: &str, d: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string();
     let count = |k: &str| data.get(k).and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64))).unwrap_or(0);
@@ -97,7 +98,7 @@ pub fn procedure_value(key: &str, data: &serde_json::Value, version: u32) -> ser
         }
         _ => {}
     }
-    serde_json::json!({
+    let mut node = serde_json::json!({
         "pattern_id": data.get("pattern_id").and_then(|v| v.as_str()).unwrap_or(key),
         "pattern": s("pattern", ""),
         "steps": steps,
@@ -109,7 +110,15 @@ pub fn procedure_value(key: &str, data: &serde_json::Value, version: u32) -> ser
         "variables": variables,
         "metadata": data.get("metadata").cloned().unwrap_or(serde_json::Value::Null),
         "version": version,
-    })
+    });
+    if let (Some(n), Some(d)) = (node.as_object_mut(), data.as_object()) {
+        for (k, v) in d {
+            if k != "key" && !n.contains_key(k) {
+                n.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    node
 }
 
 /// A TOOLS payload as its tool record: defaults filled, unknown fields kept in
@@ -223,10 +232,11 @@ pub fn matches(memory: MemoryType, r: &MemoryRecord, predicate: &Predicate) -> b
             let want = value_text(value);
             match (memory, field.as_str()) {
                 (MemoryType::Procedural, "pattern_id" | "id") | (MemoryType::Tools, "tool_id" | "id") => r.id == want,
-                (MemoryType::Procedural, "severity" | "source") | (MemoryType::Tools, "name" | "category") => {
+                (MemoryType::Procedural, _) => r.data.get(field).map(json_text) == Some(want),
+                (MemoryType::Tools, "name" | "category") => {
                     matches!(value, Value::String(_)) && r.data.get(field).and_then(|v| v.as_str()) == Some(want.as_str())
                 }
-                (MemoryType::Procedural | MemoryType::Tools, _) => false,
+                (MemoryType::Tools, _) => false,
                 (_, "id" | "key") => r.id == want,
                 _ => r.data.get(field).map(json_text) == Some(want),
             }

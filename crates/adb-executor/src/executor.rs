@@ -27,6 +27,10 @@ pub struct Executor {
     reads: Arc<dyn Reads>,
     /// The planner
     planner: Planner,
+    /// Whether `PIPELINE … TIMEOUT` is a hard budget (spec §12). Off by default
+    /// (`ADB_ENFORCE_TIMEOUT=1` turns it on) until reads are fast enough for
+    /// tens-of-milliseconds budgets (user, 28 Oct).
+    enforce_timeout: bool,
 }
 
 impl Executor {
@@ -36,7 +40,14 @@ impl Executor {
             writes,
             reads,
             planner: Planner::new(),
+            enforce_timeout: std::env::var("ADB_ENFORCE_TIMEOUT").is_ok_and(|v| v == "1" || v == "true"),
         }
+    }
+
+    /// Turn the pipeline `TIMEOUT` budget on or off (overrides `ADB_ENFORCE_TIMEOUT`).
+    pub fn with_enforced_timeout(mut self, on: bool) -> Self {
+        self.enforce_timeout = on;
+        self
     }
 
     /// The write path (tests seed through it).
@@ -167,9 +178,23 @@ impl Executor {
                 PipelineStage::Reflect(reflect) => PipelineStage::Reflect(reflect.clone()),
             };
 
-            let result = match &bound_stage {
-                PipelineStage::Step(step) => self.execute_step(step).await,
-                PipelineStage::Reflect(reflect) => self.execute_reflect(reflect).await,
+            let run = async {
+                match &bound_stage {
+                    PipelineStage::Step(step) => self.execute_step(step).await,
+                    PipelineStage::Reflect(reflect) => self.execute_reflect(reflect).await,
+                }
+            };
+            // A hard budget: the stage gets what is left of the pipeline's TIMEOUT;
+            // when it runs out, the stages done so far are the (partial) answer.
+            let result = match pipeline.timeout.filter(|_| self.enforce_timeout) {
+                Some(budget) => match budget.checked_sub(start.elapsed()).map(|left| tokio::time::timeout(left, run)) {
+                    Some(t) => match t.await {
+                        Ok(r) => r,
+                        Err(_) => return Ok(Self::timed_out(step_results, start)),
+                    },
+                    None => return Ok(Self::timed_out(step_results, start)),
+                },
+                None => run.await,
             };
 
             match result {
@@ -191,6 +216,13 @@ impl Executor {
             step_results,
             start.elapsed().as_millis() as u64,
         ))
+    }
+
+    /// A pipeline cut short by its `TIMEOUT`: the stages that finished, flagged.
+    fn timed_out(steps: Vec<QueryResult>, start: Instant) -> QueryResult {
+        let mut r = QueryResult::pipeline(steps, start.elapsed().as_millis() as u64);
+        r.metadata.timed_out = Some(true);
+        r
     }
 
     /// Bind variables in a step's predicate from bindings

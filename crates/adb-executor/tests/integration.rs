@@ -587,3 +587,52 @@ async fn test_pipeline_variable_binding() {
         panic!("Expected Pipeline result");
     }
 }
+
+/// L7 / F-L2: a procedure keeps payload fields beyond its node fields, they match
+/// WHERE and KEY, and NAMESPACE separates procedures.
+#[tokio::test]
+async fn procedures_keep_their_payload_and_namespace() {
+    let adb = Mem::new().await;
+    adb.execute(r#"STORE INTO PROCEDURAL (key = "deploy", pattern = "deploy a service", steps = "build\npush", owner = "ops", priority = 2) NAMESPACE "team-a""#)
+        .await
+        .unwrap();
+    adb.execute(r#"STORE INTO PROCEDURAL (key = "rollback", pattern = "roll back a service", owner = "sre") NAMESPACE "team-b""#)
+        .await
+        .unwrap();
+
+    let ids = |r: QueryResult| r.get_records().unwrap().iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    let r = adb.execute(r#"RECALL FROM PROCEDURAL WHERE owner = "ops""#).await.unwrap();
+    let recs = r.get_records().unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].id, "deploy");
+    assert_eq!(recs[0].data["owner"], "ops");
+    assert_eq!(recs[0].data["priority"], 2);
+    assert_eq!(recs[0].data["steps"], json!(["build", "push"]), "node fields stay shaped");
+
+    assert_eq!(ids(adb.execute(r#"LOOKUP FROM PROCEDURAL KEY owner = "sre""#).await.unwrap()), vec!["rollback"]);
+    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "team-b""#).await.unwrap()), vec!["rollback"]);
+    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL WHERE priority > 1 NAMESPACE "team-a""#).await.unwrap()), vec!["deploy"]);
+}
+
+/// W9 (spec §12): with the budget enforced, a pipeline that runs out of TIMEOUT
+/// returns the stages that finished, flagged `timed_out`; without it, it runs on.
+#[tokio::test]
+async fn pipeline_timeout_is_a_hard_budget_when_enforced() {
+    let adb = Mem::new().await;
+    for i in 0..200 {
+        adb.store(MemoryType::Semantic, &format!("f{i}"), json!({"topic": format!("t{}", i % 5)})).await.unwrap();
+    }
+    let q = r#"PIPELINE slow TIMEOUT 1ms RECALL FROM SEMANTIC WHERE topic = "t1" | RECALL FROM SEMANTIC WHERE topic = "t2" | RECALL FROM SEMANTIC WHERE topic = "t3""#;
+    let x = adb.0.executor();
+    let strict = adb_executor::Executor::with_io(x.writes().clone(), x.reads().clone()).with_enforced_timeout(true);
+    let r = strict.execute(q).await.unwrap();
+    assert_eq!(r.metadata.timed_out, Some(true));
+    let adb_executor::ResultSet::Pipeline { steps } = &r.data else { panic!("pipeline result") };
+    assert!(steps.len() < 3, "cut short: {} stages ran", steps.len());
+
+    let loose = adb_executor::Executor::with_io(x.writes().clone(), x.reads().clone()).with_enforced_timeout(false);
+    let r = loose.execute(q).await.unwrap();
+    assert_eq!(r.metadata.timed_out, None);
+    let adb_executor::ResultSet::Pipeline { steps } = &r.data else { panic!("pipeline result") };
+    assert_eq!(steps.len(), 3);
+}

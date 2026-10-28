@@ -11,7 +11,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | L4 | **No optimistic concurrency** on UPDATE (`version` in `Patch` is always 0; supersede reads the current version under the sequencer lock instead). | Fine with one writer per partition; breaks with concurrent writers or replicas. | M3 (replication) / sequencer validation. |
 | L5 | **Records that shared a key across memory types before schema v3 were already one Lance row.** The v2→v3 migration keeps the survivor under the type it was last written as; the overwritten one can't be recovered. | Only data written before 25 Oct. vc-dev had one record and migrated cleanly. | None — note for anyone migrating an old data dir. |
 | L6 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record**, not the linked ones. `RECALL … WHERE … FOLLOW LINKS` works. | AQL users must use the `RECALL` form. | Executor LOOKUP path; with the M2 query rework. |
-| L7 | **PROCEDURAL keeps only its node fields** (`pattern_id`, `pattern`, `steps`, `severity`, `confidence`, `source`, counts, `variables`, `metadata`). Other payload fields are dropped by the backend (in the response and in matching), though Lance stores the full payload. | `WHERE owner = …` never matches a procedure. | M2, when the backend's query code is replaced. |
 | L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update. Lineage creation time is in the history rows if needed. | Revisit if A3T needs first-creation time (add a column or read v1). |
 | L9 | **History is not readable through AQL** (no `AS OF` / `WITH HISTORY`), by design in D2 v1. The rows are kept. | Audit / time travel only by reading the table directly. | AQL v0.6 proposal (D2 §8). |
 | L11 | **Lance on local disk is not power-safe by itself** (risk K8): its local writer writes data files without fsync, and its local store has fsync off. ADB now `syncfs`es the store before every log purge, so purged records are on disk — but a power failure between purges can still leave Lance's newest version referring to unsynced data, and opening a damaged table has no recovery path (rebuild from the log only works while the log is complete). | Process crashes are safe (tested); power loss or a node reboot could need manual repair. Object storage is unaffected. | Ask Lance for fsync in its local writer (with the K7 report), or always run the store on object storage; add "open the last good version" recovery. |
@@ -88,7 +87,7 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| F-L2 | **Procedures have no namespace** (ADB's procedural backend ignores it) and are matched in FlowR (token overlap), since `PATTERN` needs a bound variable. | Every agent with PROCEDURAL reads sees every procedure. | With L7 / M2. |
+| F-L2 | **FlowR matches procedures itself** (token overlap), since `PATTERN` needs a bound variable (S7). Namespaces now separate procedures (W9). | FlowR does its own matching. | With S7 (W9.3). |
 | F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | Reflection / summarisation (M2 lifecycle). |
 | F-L4 | **`adb_topic` triggers can only be created through the API / `create_trigger`** — A3T's Triggers page lists webhook and cron. | No UI to set one up yet. | A3T UI. |
 | F-L5 | **`adb_topic` delivers to workflow targets only** (FlowR has no agent inbox). | Point the trigger at an agent's flow. | — |
@@ -144,7 +143,6 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W4-L2 | **Relevance recall scans its candidates** (brute force): every `LIKE` loads the current rows passing the filters, with their vectors, and ranks them in Rust; no ANN (IVF_RQ) or inverted (BM25) index yet. | Fine below ~10k rows per memory type and filter (S8); slower above. | Lance IVF_RQ + inverted index past the threshold, with the W7 query engine. |
 | W4-L3 | **Word matching is crude**: English stop words and suffix stripping (no real stemmer, no synonyms); BM25 statistics are computed over the candidate set per query. | Words only back up meaning (weight 0.2). | A proper analyzer with the inverted index (W4-L2). |
 | W4-L4 | **The evaluation set is small and synthetic** (93 facts, 42 queries, English); the weights were set on it. | Real agent memory may rank differently. | Grow it from real (anonymised) A3T queries. |
-| W4-L5 | **PROCEDURAL `LIKE` returns raw payloads** (not the backend's procedure nodes, L7) and embeds `content` or `pattern` + `steps`. | Procedure fields as stored. | With L7. |
 | W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | Calibrate per model (W4-L1). |
 | W4-L1 | **One embedding model, fixed: bge-small-en-v1.5, 384 dims** (baked into the image; `ADB_EMBED_MODEL_DIR` swaps the files, not the size). The table's `embedding` column has one fixed dimension. | No larger / multilingual / hosted models (e.g. 768 / 1024 / 1536 dims, OpenAI-compatible endpoints). | **User, 26 Oct:** choose the embedding provider and its size in **ADB settings** (A3T Settings → ADB): local model or provider endpoint, dimension recorded in `_meta`; changing it re-embeds into a new column / table in the background. Not needed for the MVP. |
 
@@ -170,6 +168,12 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W6-L5 | **No per-tenant limits, metering or per-watch permissions**: anyone with the ADB token can watch anything. | Fine on one trusted node. | Tenancy limits with the cluster gateway (M4). |
 | W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed (1 s timer, W3), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
 | W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). The AQL conformance suites don't cover `WATCH` (ADB tests do). | — | Cross-partition watches (spec v2); a v0.6 conformance suite. |
+
+## Spec completion (W9)
+
+| # | Limitation | Effect | Fix |
+|---|---|---|---|
+| W9-L1 | **`PIPELINE … TIMEOUT` is enforced only with `ADB_ENFORCE_TIMEOUT=1`** (user, 28 Oct): reads take 10–100 ms, so tight budgets would return partial results. When on, each stage gets what is left of the budget; the stage that runs out is dropped (its own partial rows aren't kept), later stages are skipped, and the result carries `timed_out: true`. `TIMEOUT` on a single statement is ignored. | Budgets aren't honoured by default. | Turn it on by default with the performance work. |
 
 ## Query engine (W7)
 
@@ -211,3 +215,4 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 | P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all edges of a result in one scan, targets in one scan per memory type |
 | S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |
 | G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |
+| L7 / W4-L5: PROCEDURAL kept only its node fields | W9.1: extra payload fields kept and matched (`WHERE`, `KEY` on any field); `LIKE` returns shaped procedures since W7 |
