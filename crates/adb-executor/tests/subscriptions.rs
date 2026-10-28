@@ -140,11 +140,11 @@ async fn scope_subscription_sees_record_changes_with_filters() {
 }
 
 #[tokio::test]
-async fn subscriptions_need_a_durable_engine() {
-    let engine = LocalEngine::default();
-    let e = engine.query(r#"SUBSCRIBE TOPIC "t""#, None).await.unwrap_err();
-    assert!(e.contains("durable engine"), "{e}");
-    assert!(engine.gateway().is_none());
+async fn a_temporary_engine_has_subscriptions() {
+    // W7: without a data directory ADB is the same durable engine on a temporary one.
+    let engine = LocalEngine::temporary().await.unwrap();
+    q(&engine, r#"SUBSCRIBE TOPIC "t""#).await;
+    assert!(engine.gateway().is_some());
 }
 
 /// L3 / D2 §4: when a record's TTL passes, the expiry timer commits an `Expire`
@@ -236,8 +236,9 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
     assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales" ALL"#).await), ["b"], "scope survives a restart");
     assert_eq!(keys(&q(&engine, r#"RECALL FROM EPISODIC IN SCOPE "team:sales" ALL"#).await), ["e"]);
 
-    let mem = LocalEngine::default();
-    assert!(mem.query(r#"STORE INTO SEMANTIC (k = 1) IN SCOPE "team:x""#, None).await.is_err(), "in-memory engine refuses IN SCOPE");
+    let mem = LocalEngine::temporary().await.unwrap();
+    q(&mem, r#"STORE INTO SEMANTIC (key = "t", k = 1) IN SCOPE "team:x""#).await;
+    assert_eq!(keys(&q(&mem, r#"RECALL FROM SEMANTIC IN SCOPE "team:x" ALL"#).await), ["t"], "a temporary engine has named scopes");
 }
 
 /// AQL v0.7: UPDATE LINK makes a new version of the edge, UNLINK tombstones it;
@@ -288,7 +289,7 @@ async fn link_update_and_unlink() {
     let ops: Vec<String> = drain(&gw, &sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| c.op.clone())).collect();
     assert_eq!(ops, ["link", "supersede", "link", "supersede", "unlink", "unlink"], "LINK, re-LINK, LINK, UPDATE LINK, UNLINK ×2");
 
-    let mem = LocalEngine::default();
+    let mem = LocalEngine::temporary().await.unwrap();
     script(&mem).await;
     let mut l = links(&q(&mem, with_links).await);
     l.sort_by(|a, b| a.0.cmp(&b.0));

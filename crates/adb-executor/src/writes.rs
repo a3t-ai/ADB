@@ -1,15 +1,10 @@
 //! Where the executor's writes go (DELIVERY_PLAN.md stage C).
 //!
-//! - [`DirectWrites`] — straight to the in-memory backends (no log): tests and the
-//!   in-memory server.
-//! - [`DurableWrites`] — log first: each write is resolved into effects
-//!   (`adb_core::log::Effect`) at its commit timestamp, appended to the partition log
-//!   through the sequencer, and applied only after the log made it durable. On open,
-//!   [`replay`] rebuilds the backends from the log.
-//!
-//! Applying always runs under `adb_core::time::at(commit_ts)`, so a write applied
-//! live and the same write replayed after a restart produce the same records (same
-//! ids, `created_at`, TTL start, expiry checks; D2_TEMPORAL.md T2).
+//! [`DurableWrites`] — log first: each write is resolved into effects
+//! (`adb_core::log::Effect`) at its commit timestamp, appended to the partition log
+//! through the sequencer, and applied to the partition's Lance table by the
+//! applier; on open the table catches up from the log's tail. The table is the only
+//! copy of every memory type (W7: no in-memory tier).
 //!
 //! `UPDATE` on SEMANTIC / PROCEDURAL supersedes (D2 §2, stage D4.3): each matched
 //! record gets a new version row (new id, same lineage, `version + 1`, fields
@@ -22,7 +17,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adb_backends::Adb;
 use adb_core::log::{
     CommitTs, Effect, Kind, LogOffset, LogRecord, Memory, NewRow, PartitionId, Provenance, RecordId, RowData,
     Visibility,
@@ -150,11 +144,6 @@ fn key_exists(memory: MemoryType, key: &str) -> AdbError {
     AdbError::KeyExists { memory_type: format!("{memory:?}").to_uppercase(), key: key.to_string() }
 }
 
-/// Whether the in-memory backends hold a current `memory` record with id `id`.
-async fn backend_has(adb: &Adb, memory: MemoryType, id: &str) -> AdbResult<bool> {
-    Ok(!adb.lookup(memory, &Predicate::key("id", id)).await?.is_empty())
-}
-
 /// Drop from `r` the effects that carry a forgotten row's content (W5): its puts,
 /// versions, patches and vectors, and the edges touching it. `Forget` effects and
 /// everything else stay. Returns whether anything was dropped.
@@ -206,79 +195,6 @@ pub const DEFAULT_EVENT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The most records the log keeps behind its tip for subscribers (E3).
 pub const RETAIN_MAX: u64 = 100_000;
 
-/// Writes straight to the backends.
-pub struct DirectWrites(pub Arc<Adb>);
-
-#[async_trait]
-impl Writes for DirectWrites {
-    async fn store(
-        &self,
-        memory_type: MemoryType,
-        key: &str,
-        payload: serde_json::Value,
-        scope: Scope,
-        namespace: Option<&str>,
-        ttl: Option<Duration>,
-        in_scope: Option<&str>,
-    ) -> AdbResult<MemoryRecord> {
-        check_scope(memory_type, in_scope, false)?;
-        if caller_keyed(memory_type, &payload) {
-            let id = Adb::store_id(memory_type, key, &payload);
-            if backend_has(&self.0, memory_type, &id).await? {
-                return Err(key_exists(memory_type, &id));
-            }
-        }
-        self.0.store_with_options(memory_type, key, payload, scope, namespace, ttl).await
-    }
-
-    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64> {
-        check_scope(memory_type, in_scope, false)?;
-        self.0.update(memory_type, predicate, data).await
-    }
-
-    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
-        check_scope(memory_type, in_scope, false)?;
-        self.0.forget(memory_type, predicate).await
-    }
-
-    async fn link(
-        &self,
-        from_type: MemoryType,
-        from_id: &str,
-        to_type: MemoryType,
-        to_id: &str,
-        link_type: &str,
-        weight: Option<f32>,
-    ) -> AdbResult<Link> {
-        // AQL v0.7: the same link again (same ends, same type) sets its weight.
-        let (from, to) = ([from_id.to_string()], [to_id.to_string()]);
-        if let Some(existing) = self.0.links_between(from_type, &from, to_type, &to, Some(link_type)).await?.into_iter().next() {
-            if weight.is_some() {
-                self.0.update_links(from_type, &from, to_type, &to, Some(link_type), weight, None).await?;
-            }
-            return Ok(Link { weight: weight.unwrap_or(existing.weight), ..existing });
-        }
-        self.0.link(from_type, from_id, to_type, to_id, link_type, weight.unwrap_or(1.0)).await
-    }
-
-    async fn update_links(
-        &self,
-        from_type: MemoryType,
-        from_ids: &[String],
-        to_type: MemoryType,
-        to_ids: &[String],
-        link_type: Option<&str>,
-        weight: Option<f32>,
-        new_type: Option<&str>,
-    ) -> AdbResult<u64> {
-        self.0.update_links(from_type, from_ids, to_type, to_ids, link_type, weight, new_type).await
-    }
-
-    async fn unlink(&self, from_type: MemoryType, from_ids: &[String], to_type: MemoryType, to_ids: &[String], link_type: Option<&str>) -> AdbResult<u64> {
-        self.0.unlink(from_type, from_ids, to_type, to_ids, link_type).await
-    }
-}
-
 fn log_err(e: LogError) -> AdbError {
     AdbError::Internal(format!("log: {e}"))
 }
@@ -316,7 +232,6 @@ fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
 
 /// Writes through the log.
 pub struct DurableWrites<L: Log> {
-    adb: Arc<Adb>,
     seq: Mutex<Sequencer<L>>,
     /// The partition's Lance table (stage D2: written alongside the in-memory
     /// backends; reads move to it in D3). `None` = log + memory only.
@@ -592,41 +507,28 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
         }
     }
-    /// Replay `log` into `adb`, bring `store` up to the log's end, then accept new
-    /// writes on top of both.
-    pub async fn open(adb: Arc<Adb>, mut seq: Sequencer<L>, store: Option<Arc<PartitionStore>>) -> AdbResult<(Self, ReplayStats)> {
-        let mut live = LiveKeys::new();
-        let stats = match &store {
-            // Stage D3: no full log replay. Lance catches up from the log's tail, then
-            // the in-memory tier is rebuilt from Lance's current rows.
-            Some(s) => {
-                let t = std::time::Instant::now();
-                let store_caught_up = catch_up(s, seq.log()).await?;
-                let caught_up_in = t.elapsed();
-                let (hydrated_rows, keys) = hydrate(&adb, s).await?;
-                live = keys;
-                tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
-                let last_offset = seq.log().last_offset();
-                let last_commit_ts = match last_offset.0 {
-                    0 => None,
-                    _ => seq.log().read(last_offset, 1).await.map_err(log_err)?.first().map(|r| r.commit_ts),
-                };
-                ReplayStats { records: last_offset.0, effects: 0, last_offset, last_commit_ts, store_caught_up, hydrated_rows }
-            }
-            None => replay(&adb, seq.log()).await?,
+    /// Bring `store` up to the log's end, then accept new writes on top of it.
+    /// No full log replay (stage D3): the table catches up from the log's tail.
+    pub async fn open(mut seq: Sequencer<L>, store: Arc<PartitionStore>) -> AdbResult<(Self, ReplayStats)> {
+        let t = std::time::Instant::now();
+        let store_caught_up = catch_up(&store, seq.log()).await?;
+        let caught_up_in = t.elapsed();
+        let (hydrated_rows, live) = hydrate(&store).await?;
+        tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
+        let last_offset = seq.log().last_offset();
+        let last_commit_ts = match last_offset.0 {
+            0 => None,
+            _ => seq.log().read(last_offset, 1).await.map_err(log_err)?.first().map(|r| r.commit_ts),
         };
+        let stats = ReplayStats { records: last_offset.0, effects: 0, last_offset, last_commit_ts, store_caught_up, hydrated_rows };
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
         }
         // Caught up with the log: the applier starts from its end.
-        let applier = store
-            .as_ref()
-            .map(|s| Applier::spawn(Arc::clone(s), ApplyBarrier::new(seq.log().last_offset().0)));
-        let subs = match &store {
-            Some(s) => Registry::load(s, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?,
-            None => Registry::default(),
-        };
-        Ok((Self { adb, seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default() }, stats))
+        let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
+        let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
+        let store = Some(store);
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default() }, stats))
     }
 
     /// The last durable offset (tests and metrics).
@@ -649,12 +551,9 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches superseded versions, so
     /// a value surviving only in an old version is forgotten too (D2 T5).
     async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
-        use crate::reads::QueryMode;
         check_scope(memory, in_scope, self.in_lance(memory).is_some())?;
-        let mode = crate::reads::query_mode();
-        let Some(store) = self.store.as_ref().filter(|_| mode != QueryMode::View) else {
-            return self.targets_view(memory, predicate, ts, forget, in_scope).await;
-        };
+        let Some(store) = &self.store else { return Err(needs_table("UPDATE / FORGET")) };
+        // Every earlier record is in Lance first.
         if let Some(b) = self.barrier() {
             b.wait_for_committed().await;
         }
@@ -667,64 +566,6 @@ impl<L: Log + 'static> DurableWrites<L> {
             for r in &old {
                 if crate::query::matches(memory, &crate::query::record(r), predicate) {
                     ids.push(r.key().to_string());
-                }
-            }
-            let mut seen = std::collections::HashSet::new();
-            ids.retain(|id| seen.insert(id.clone()));
-        }
-        if mode == QueryMode::Shadow {
-            let mut view = self.targets_view(memory, predicate, ts, forget, in_scope).await?;
-            let mut plan = ids.clone();
-            view.sort();
-            plan.sort();
-            if view != plan {
-                crate::reads::SHADOW_DIFFERENCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tracing::warn!(?memory, ?predicate, forget, ?plan, ?view, "query shadow difference (targets)");
-            }
-        }
-        Ok(ids)
-    }
-
-    /// The old target resolution: the backends' matching code over throwaway views.
-    async fn targets_view(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
-        let at = ts.to_datetime();
-        let Some(store) = self.in_lance(memory) else {
-            return match forget {
-                true => time::at(at, self.adb.forget_targets(memory, predicate)).await,
-                false => time::at(at, self.adb.update_targets(memory, predicate)).await,
-            };
-        };
-        // Every earlier record is in Lance first.
-        if let Some(b) = self.barrier() {
-            b.wait_for_committed().await;
-        }
-        let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
-        let view = crate::reads::current_view(store, memory, predicate, ts, in_scope).await?;
-        let mut ids = match forget {
-            true => time::at(at, view.forget_targets(predicate)).await?,
-            false => time::at(at, view.update_targets(predicate)).await?,
-        };
-        if forget && supersedes(memory) {
-            let mut old = store.superseded(memory.into()).await.map_err(store_err)?;
-            if let Some(s) = in_scope {
-                old.retain(|r| r.data.scope == s);
-            }
-            if memory == MemoryType::Procedural {
-                // Procedural ids come from the payload: one view per version.
-                for r in &old {
-                    let v = crate::reads::View::of(memory, vec![r.clone()], false).await?;
-                    if !time::at(at, v.forget_targets(predicate)).await?.is_empty() {
-                        ids.push(r.key().to_string());
-                    }
-                }
-            } else {
-                let lineage: std::collections::HashMap<String, String> =
-                    old.iter().map(|r| (r.id.clone(), r.key().to_string())).collect();
-                let v = crate::reads::View::of(memory, old, true).await?;
-                for row_id in time::at(at, v.forget_targets(predicate)).await? {
-                    if let Some(key) = lineage.get(&row_id) {
-                        ids.push(key.clone());
-                    }
                 }
             }
             let mut seen = std::collections::HashSet::new();
@@ -756,14 +597,6 @@ impl<L: Log + 'static> DurableWrites<L> {
             due.into_iter().map(|(memory, key)| Effect::Expire { memory, lineage_id: RecordId(key) }).collect();
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
-        // WORKING / TOOLS live in memory too: drop them there as replay would.
-        for effect in &effects {
-            if let Effect::Expire { memory, .. } = effect {
-                if self.in_lance((*memory).into()).is_none() {
-                    apply_count(&self.adb, ts, effect).await?;
-                }
-            }
-        }
         self.to_store(&record, seq.log()).await;
         Ok(effects.len() as u64)
     }
@@ -899,14 +732,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
-        let id = RecordId(Adb::store_id(memory_type, key, &payload));
+        let id = RecordId(store_id(memory_type, key, &payload));
         // Checked under the sequencer lock, so two STOREs of one key can't both pass.
         if caller_keyed(memory_type, &payload) {
-            let taken = match self.in_lance(memory_type) {
-                Some(_) => self.key_taken(memory_type.into(), &id.0, ts),
-                None => time::at(ts.to_datetime(), backend_has(&self.adb, memory_type, &id.0)).await?,
-            };
-            if taken {
+            if self.key_taken(memory_type.into(), &id.0, ts) {
                 return Err(key_exists(memory_type, &id.0));
             }
         }
@@ -928,12 +757,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if unique_keys(memory_type) && self.store.is_some() {
             self.live.lock().unwrap().insert((memory_type.into(), new.lineage_id.0.clone()), new.data.ttl_at);
         }
-        let stored = match self.in_lance(memory_type) {
-            // Lance is the only copy (D4.4a): answer with the record as the
-            // memory type's backend shapes it, without keeping it in memory.
-            Some(_) => shaped_record(memory_type, &new, ts).await?,
-            None => apply(&self.adb, ts, &effect).await?.ok_or_else(|| AdbError::Internal("store produced no record".into()))?,
-        };
+        // The table is the only copy: answer with the record as reads shape it.
+        let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
         self.to_store(&record, seq.log()).await;
         Ok(stored)
     }
@@ -987,13 +812,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             effects.extend(ids.iter().map(|id| Effect::Embed { memory: memory_type.into(), id: RecordId(id.clone()), embedding: v.clone() }));
         }
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        // Apply exactly what was logged, so live and replayed updates agree.
-        let n = match self.in_lance(memory_type) {
-            Some(_) => ids.len() as u64,
-            None => time::at(ts.to_datetime(), self.adb.update_ids(memory_type, &ids, serde_json::Value::Object(fields))).await?,
-        };
         self.to_store(&record, seq.log()).await;
-        Ok(n)
+        Ok(ids.len() as u64)
     }
 
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
@@ -1008,14 +828,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
         self.forgotten.lock().unwrap().extend(ids.iter().map(|id| (Memory::from(memory_type), id.clone())));
-        let mut removed = 0;
-        if self.in_lance(memory_type).is_some() {
-            removed = ids.len() as u64;
-        } else {
-            for effect in &effects {
-                removed += apply_count(&self.adb, ts, effect).await?;
-            }
-        }
+        let removed = ids.len() as u64;
         self.to_store(&record, seq.log()).await;
         drop(seq);
         // Physically gone before FORGET returns (W5): table, versions, log.
@@ -1069,12 +882,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         data.weight = Some(weight.unwrap_or(1.0));
         let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
         let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
-        // With a table, links are read from its edge rows only (D4.1, D4.4a).
-        let link = match (&self.store, &effect) {
-            (Some(_), Effect::PutEdge(n)) => crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(n), ts, 0, 0))
-                .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?,
-            _ => apply_link(&self.adb, ts, &effect).await?,
-        };
+        // Links are read from the table's edge rows (D4.1).
+        let Effect::PutEdge(n) = &effect else { unreachable!() };
+        let link = crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(n), ts, 0, 0))
+            .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?;
         self.to_store(&record, seq.log()).await;
         Ok(link)
     }
@@ -1231,98 +1042,29 @@ pub struct ReplayStats {
     pub hydrated_rows: u64,
 }
 
-/// Rebuild the in-memory hot tier (WORKING, TOOLS) from the Lance table's current
-/// rows (stage D3), so startup needs only the log's tail, not all of it. WORKING is
-/// put in place as rebuilt; TOOLS re-runs its `store` at the commit time (the backend
-/// shapes the payload into its own struct). Everything else stays in Lance (D4.4a).
-/// Also returns the live keys of SEMANTIC / EPISODIC / PROCEDURAL (from the same
-/// scan), for the D3 S4 key check.
-pub async fn hydrate(adb: &Adb, store: &PartitionStore) -> AdbResult<(u64, LiveKeys)> {
-    let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+/// The live keys of SEMANTIC / EPISODIC / PROCEDURAL from the table's current rows,
+/// for the D3 S4 key check. Returns how many current records it read.
+pub async fn hydrate(store: &PartitionStore) -> AdbResult<(u64, LiveKeys)> {
     let now = CommitTs::from_datetime(time::now());
-    let rows = store.current(None, now).await.map_err(store_err)?;
-    let live: LiveKeys = rows
+    let rows = store.current(None, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+    let records: Vec<_> = rows.iter().filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool)).collect();
+    let live: LiveKeys = records
         .iter()
-        .filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool) && unique_keys(r.data.memory.into()))
+        .filter(|r| unique_keys(r.data.memory.into()))
         .map(|r| ((r.data.memory, r.key().to_string()), r.data.ttl_at))
         .collect();
-    // Only the hot tier: SEMANTIC / EPISODIC / PROCEDURAL records and every link
-    // are read from Lance (D4.4a).
-    let records: Vec<_> = rows
-        .into_iter()
-        .filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool) && !crate::reads::lance_owned(r.data.memory.into()))
-        .collect();
-    for r in &records {
-        let memory: MemoryType = r.data.memory.into();
-        let rec = crate::reads::to_record(r);
-        match memory {
-            MemoryType::Working => adb.working().insert_record(rec),
-            MemoryType::Semantic => adb.semantic().insert_record(rec),
-            MemoryType::Episodic => adb.episodic().insert_record(rec),
-            MemoryType::Tools | MemoryType::Procedural => {
-                let stored = adb.store_with_options(
-                    memory,
-                    r.key(),
-                    r.data.value.clone(),
-                    rec.metadata.scope,
-                    r.data.namespace.as_deref(),
-                    rec.metadata.ttl,
-                );
-                time::at(r.commit_ts.to_datetime(), stored).await?;
-                if memory == MemoryType::Procedural {
-                    adb.procedural().set_version(r.key(), u64::from(r.version));
-                }
-            }
-        }
-    }
     Ok((records.len() as u64, live))
 }
 
-/// Rebuild `adb` from every record in `log`, in order.
-pub async fn replay<L: Log>(adb: &Adb, log: &L) -> AdbResult<ReplayStats> {
-    let mut stats = ReplayStats::default();
-    let mut from = LogOffset(1);
-    loop {
-        let batch = log.read(from, 1024).await.map_err(log_err)?;
-        let Some(last) = batch.last().map(|r| r.offset) else { break };
-        for record in &batch {
-            for effect in &record.effects {
-                match effect {
-                    Effect::PutEdge(_) => {
-                        apply_link(adb, record.commit_ts, effect).await?;
-                    }
-                    _ => {
-                        apply_count(adb, record.commit_ts, effect).await?;
-                    }
-                }
-                stats.effects += 1;
-            }
-            stats.records += 1;
-            stats.last_commit_ts = Some(record.commit_ts);
-        }
-        stats.last_offset = last;
-        from = last.next();
-    }
-    Ok(stats)
-}
-
-/// The record a STORE of `new` answers with, as `memory`'s backend shapes it
-/// (PROCEDURAL fills in its node's defaults), without keeping it anywhere.
-async fn shaped_record(memory: MemoryType, new: &NewRow, ts: CommitTs) -> AdbResult<MemoryRecord> {
-    let row = adb_store::StoredRow::from_new(&adb_store::qualified(new), ts, 0, 0);
-    if memory == MemoryType::Procedural && crate::reads::query_mode() != crate::reads::QueryMode::View {
-        return Ok(crate::query::record(&row));
-    }
-    if memory != MemoryType::Procedural {
-        // SEMANTIC / EPISODIC hold records as given: no backend needed.
-        return Ok(crate::reads::to_record(&row));
-    }
-    let view = crate::reads::View::of(memory, vec![row], false).await?;
-    time::at(ts.to_datetime(), view.lookup(&Predicate::All, &adb_core::Modifiers::default()))
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AdbError::Internal("store produced no record".into()))
+/// The id a STORE gives a record: TOOLS' `tool_id` / PROCEDURAL's `pattern_id` when
+/// the payload has one, else the key.
+pub fn store_id(memory: MemoryType, key: &str, payload: &serde_json::Value) -> String {
+    let field = match memory {
+        MemoryType::Tools => Some("tool_id"),
+        MemoryType::Procedural => Some("pattern_id"),
+        _ => None,
+    };
+    field.and_then(|f| payload.get(f)).and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| key.to_string())
 }
 
 /// Memory types whose `UPDATE` writes a new version (D2 §2).
@@ -1349,102 +1091,3 @@ fn next_version(cur: &adb_store::StoredRow, fields: &serde_json::Map<String, ser
     NewRow { id, lineage_id: RecordId(cur.key().to_string()), version: cur.version + 1, data }
 }
 
-/// The in-memory tier after a supersede: the record (its lineage id) holds the new
-/// version, as a restart rebuilds it from Lance (`hydrate`).
-async fn apply_version(adb: &Adb, ts: CommitTs, new: &NewRow) -> AdbResult<MemoryRecord> {
-    let row = adb_store::StoredRow::from_new(&adb_store::qualified(new), ts, 0, 0);
-    let rec = crate::reads::to_record(&row);
-    match MemoryType::from(new.data.memory) {
-        MemoryType::Procedural => {
-            // The backend's `store` adds a node per call: drop the old version first.
-            adb.forget_ids(MemoryType::Procedural, &[row.key().to_string()]).await?;
-            let stored = adb
-                .store_with_options(MemoryType::Procedural, row.key(), row.data.value.clone(), rec.metadata.scope, row.data.namespace.as_deref(), rec.metadata.ttl)
-                .await?;
-            adb.procedural().set_version(row.key(), u64::from(row.version));
-            Ok(stored)
-        }
-        _ => {
-            adb.semantic().insert_record(rec.clone());
-            Ok(rec)
-        }
-    }
-}
-
-/// Apply one effect at its commit time; returns the stored record for `Put*`.
-async fn apply(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Option<MemoryRecord>> {
-    time::at(ts.to_datetime(), async {
-        match effect {
-            Effect::PutEntity(r) | Effect::PutEpisode(r) | Effect::PutTool(r) | Effect::PutFact(r) => {
-                let ttl = r.data.ttl_at.map(|at| Duration::from_micros((at.0 - ts.0).max(0) as u64));
-                let record = adb
-                    .store_with_options(
-                        r.data.memory.into(),
-                        &r.id.0,
-                        r.data.value.clone(),
-                        r.data.visibility.into(),
-                        r.data.namespace.as_deref(),
-                        ttl,
-                    )
-                    .await?;
-                Ok(Some(record))
-            }
-            Effect::Supersede { new, .. } => apply_version(adb, ts, new).await.map(Some),
-            _ => {
-                apply_count_now(adb, effect).await?;
-                Ok(None)
-            }
-        }
-    })
-    .await
-}
-
-async fn apply_count(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<u64> {
-    match effect {
-        Effect::PutEntity(_) | Effect::PutEpisode(_) | Effect::PutTool(_) | Effect::PutFact(_) | Effect::Supersede { .. } => {
-            apply(adb, ts, effect).await.map(|r| r.is_some() as u64)
-        }
-        _ => time::at(ts.to_datetime(), apply_count_now(adb, effect)).await,
-    }
-}
-
-/// Non-`Put` effects; the clock is already fixed by the caller.
-async fn apply_count_now(adb: &Adb, effect: &Effect) -> AdbResult<u64> {
-    match effect {
-        Effect::Patch { memory, id, fields, .. } => {
-            adb.update_ids((*memory).into(), &[id.0.clone()], serde_json::Value::Object(fields.clone())).await
-        }
-        Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
-            adb.forget_ids((*memory).into(), &[lineage_id.0.clone()]).await
-        }
-        // Subscriptions and events arrive with stage E.
-        _ => Ok(0),
-    }
-}
-
-async fn apply_link(adb: &Adb, ts: CommitTs, effect: &Effect) -> AdbResult<Link> {
-    let Effect::PutEdge(r) = effect else {
-        return Err(AdbError::Internal("apply_link needs PutEdge".into()));
-    };
-    let to: Memory = r
-        .data
-        .value
-        .get("to_memory")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?;
-    let d = &r.data;
-    time::at(
-        ts.to_datetime(),
-        adb.link_with_id(
-            &r.id.0,
-            d.memory.into(),
-            d.subject_id.as_deref().unwrap_or_default(),
-            to.into(),
-            d.object_id.as_deref().unwrap_or_default(),
-            d.link_type.as_deref().unwrap_or_default(),
-            d.weight.unwrap_or(1.0),
-        ),
-    )
-    .await
-}

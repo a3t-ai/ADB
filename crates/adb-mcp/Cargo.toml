@@ -17,6 +17,5 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-adb-backends = { path = "../adb-backends" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }

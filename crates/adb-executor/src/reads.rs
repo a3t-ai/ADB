@@ -1,27 +1,15 @@
-//! Where the executor's reads come from (DELIVERY_PLAN.md stage D3).
-//!
-//! - [`DirectReads`] — the in-memory backends (`adb-backends`).
-//! - [`LanceReads`] — SEMANTIC and EPISODIC records, and every link, from the
-//!   partition's Lance table (its current view, D2_TEMPORAL.md §3); other memory
-//!   types from the backends (WORKING and TOOLS are the in-memory hot tier).
-//!   PROCEDURAL reads from Lance too (stage D4.2). Links are the table's edge rows (stage D4.1), so a
-//!   forgotten record's links are gone at once, as D2 §5 says, not only after a
-//!   restart.
-//!
-//! `LanceReads` rebuilds the records from the table and answers with the backend's
-//! own query code (a throwaway backend filled with `insert_record`), so predicates,
-//! ordering and modifiers behave exactly as before. The predicate is also pushed into
-//! the Lance scan where it can be (`adb_store::predicate_filter`, stage D3.6), so a
-//! read loads only a superset of the matching rows instead of the whole memory type.
+//! Where the executor's reads come from: [`LanceReads`], every memory type and every
+//! link from the partition's Lance table (its current view, D2_TEMPORAL.md §3),
+//! answered by the query engine (`crate::query`, MVP W7). Links are the table's
+//! edge rows (stage D4.1), so a forgotten record's links are gone at once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adb_backends::{Adb, Backend, EpisodicBackend, ProceduralBackend, SemanticBackend};
 use adb_core::log::{CommitTs, Memory};
 use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
-use adb_store::{predicate_filter, PartitionStore, StoredRow};
+use adb_store::{PartitionStore, StoredRow};
 use datafusion::prelude::{col, lit};
 use async_trait::async_trait;
 
@@ -69,92 +57,7 @@ pub trait Reads: Send + Sync {
     async fn load(&self, predicate: &Predicate, limit: usize) -> AdbResult<Vec<MemoryRecord>>;
 }
 
-/// Where reads are answered (W7): `plan` (the query engine, default), `view` (the
-/// old throwaway backends) or `shadow` (both; differences are logged), from
-/// `ADB_QUERY`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryMode {
-    Plan,
-    View,
-    Shadow,
-}
-
-pub fn query_mode() -> QueryMode {
-    static MODE: std::sync::OnceLock<QueryMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("ADB_QUERY").as_deref() {
-        Ok("view") => QueryMode::View,
-        Ok("shadow") => QueryMode::Shadow,
-        _ => QueryMode::Plan,
-    })
-}
-
-/// Differences between the old and new read paths found in shadow mode.
-pub static SHADOW_DIFFERENCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Compare a shadow read (records as sets, without `accessed_at`, which the old
-/// WORKING path set to the read time); log a difference.
-fn shadow_compare(what: &str, plan: &[MemoryRecord], view: &[MemoryRecord]) {
-    let norm = |rs: &[MemoryRecord]| {
-        let mut v: Vec<serde_json::Value> = rs
-            .iter()
-            .map(|r| {
-                let mut j = serde_json::to_value(r).unwrap_or_default();
-                if let Some(m) = j.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                    m.remove("accessed_at");
-                }
-                j
-            })
-            .collect();
-        v.sort_by_key(|j| j.to_string());
-        v
-    };
-    let (p, v) = (norm(plan), norm(view));
-    if p != v {
-        SHADOW_DIFFERENCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tracing::warn!(read = what, plan = %serde_json::Value::Array(p), view = %serde_json::Value::Array(v), "query shadow difference");
-    }
-}
-
-/// Reads from the in-memory backends.
-pub struct DirectReads(pub Arc<Adb>);
-
-#[async_trait]
-impl Reads for DirectReads {
-    async fn lookup_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        check_scope(memory, modifiers.in_scope.as_deref(), false)?;
-        self.0.lookup_with_modifiers(memory, predicate, modifiers).await
-    }
-
-    async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        check_scope(memory, modifiers.in_scope.as_deref(), false)?;
-        if matches!(predicate, Predicate::Like { .. }) {
-            // The in-memory backends hold no vectors: refuse rather than match all.
-            return Err(AdbError::UnsupportedOperation("LIKE (relevance recall needs a durable engine: start ADB with --data-dir)".into()));
-        }
-        self.0.recall_with_modifiers(memory, predicate, modifiers).await
-    }
-
-    async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
-        self.0.get_links_from(from_type, from_id, link_type).await
-    }
-
-    async fn scan(&self, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        let mut records = match &modifiers.window {
-            Some(w) => self.0.scan_window(w).await?,
-            None => self.0.scan().await?,
-        };
-        if let Some(n) = modifiers.limit {
-            records.truncate(n);
-        }
-        Ok(records)
-    }
-
-    async fn load(&self, predicate: &Predicate, limit: usize) -> AdbResult<Vec<MemoryRecord>> {
-        self.0.load(predicate, limit).await
-    }
-}
-
-/// A stored row as the backends hold it.
+/// A stored row as a record (before PROCEDURAL / TOOLS shaping, `query::record`).
 pub fn to_record(r: &StoredRow) -> MemoryRecord {
     let mut m = Metadata::new(r.data.visibility.into());
     m.created_at = r.commit_ts.to_datetime();
@@ -185,7 +88,6 @@ pub fn to_link(r: &StoredRow) -> Option<Link> {
 /// SEMANTIC and EPISODIC records and every link from Lance, the rest from the
 /// backends.
 pub struct LanceReads {
-    adb: Arc<Adb>,
     store: Arc<PartitionStore>,
     /// Waits for the background applier, so reads see every write that returned
     /// before them (stage D3.7). `None` = the table is written synchronously.
@@ -194,82 +96,6 @@ pub struct LanceReads {
     embedder: Option<Arc<adb_embed::Embedder>>,
 }
 
-/// A throwaway backend over some of the table's rows, answering with the backend's
-/// own query code (reads, and the targets of UPDATE / FORGET, stage D4.4a).
-pub(crate) enum View {
-    Semantic(SemanticBackend),
-    Episodic(EpisodicBackend),
-    Procedural(ProceduralBackend),
-}
-
-impl View {
-    /// `rows` (current, or history with `by_row_id`) as `memory`'s backend holds
-    /// them. With `by_row_id` each row keeps its own row id, so several versions of
-    /// one record can sit in one view (FORGET over history, D2 T5).
-    pub(crate) async fn of(memory: MemoryType, mut rows: Vec<StoredRow>, by_row_id: bool) -> AdbResult<View> {
-        let record = |r: &StoredRow| {
-            let mut rec = to_record(r);
-            if by_row_id {
-                rec.id = r.id.clone();
-            }
-            rec
-        };
-        Ok(match memory {
-            MemoryType::Semantic => {
-                let b = SemanticBackend::new()?;
-                rows.iter().for_each(|r| b.insert_record(record(r)));
-                View::Semantic(b)
-            }
-            MemoryType::Procedural => {
-                // The backend shapes payloads into its own nodes: re-run each `store`
-                // at its commit time (as `hydrate` does), oldest first, then restore
-                // the version. Its ids come from the payload's `pattern_id`, so
-                // history needs one view per row (`by_row_id` is not supported).
-                let b = ProceduralBackend::new();
-                rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
-                for r in &rows {
-                    let rec = to_record(r);
-                    let stored = b.store(r.key(), r.data.value.clone(), rec.metadata.scope, r.data.namespace.as_deref(), rec.metadata.ttl);
-                    time::at(r.commit_ts.to_datetime(), stored).await?;
-                    b.set_version(r.key(), u64::from(r.version));
-                }
-                View::Procedural(b)
-            }
-            _ => {
-                let b = EpisodicBackend::new();
-                rows.iter().for_each(|r| b.insert_record(record(r)));
-                View::Episodic(b)
-            }
-        })
-    }
-
-    fn backend(&self) -> &dyn Backend {
-        match self {
-            View::Semantic(b) => b,
-            View::Episodic(b) => b,
-            View::Procedural(b) => b,
-        }
-    }
-
-    pub(crate) async fn lookup(&self, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        self.backend().lookup(predicate, modifiers).await
-    }
-
-    pub(crate) async fn recall(&self, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        self.backend().recall(predicate, modifiers).await
-    }
-
-    pub(crate) async fn update_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
-        self.backend().update_targets(predicate).await
-    }
-
-    pub(crate) async fn forget_targets(&self, predicate: &Predicate) -> AdbResult<Vec<String>> {
-        self.backend().forget_targets(predicate).await
-    }
-}
-
-/// The memory types whose records live only in Lance once there is a table
-/// (stage D4.4a); WORKING and TOOLS are the in-memory hot tier.
 /// `IN SCOPE` (named scopes, AQL v0.6) is served where rows carry their scope: the
 /// Lance-owned memory types on a durable engine (`durable`). Elsewhere it is refused
 /// rather than ignored — a FORGET that ignored its scope would forget everywhere.
@@ -306,40 +132,15 @@ pub fn embed_text(memory: MemoryType, value: &serde_json::Value) -> Option<Strin
     None
 }
 
+/// The long-term memory types: named scopes (`IN SCOPE`), embeddings and `LIKE`.
+/// WORKING and TOOLS are scratchpad and registry (all in the table too, W7).
 pub fn lance_owned(memory: MemoryType) -> bool {
     matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
 }
 
-/// A view of `memory`'s current rows at `now` that may match `predicate`.
-pub(crate) async fn current_view(
-    store: &PartitionStore,
-    memory: MemoryType,
-    predicate: &Predicate,
-    now: CommitTs,
-    in_scope: Option<&str>,
-) -> AdbResult<View> {
-    let m: Memory = memory.into();
-    // Record rows only: not edges, topic events or subscriptions (`RECORD_KINDS`).
-    let kinds = ["entity", "fact", "episode", "tool"].map(lit).to_vec();
-    let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").in_list(kinds, false));
-    if let Some(s) = in_scope {
-        filter = filter.and(col("scope").eq(lit(s)));
-    }
-    // Not for PROCEDURAL: its conditions see the backend's `ProcedureNode`, whose
-    // defaults (`severity`, `confidence`, `version`, counts) the payload may lack,
-    // so a payload filter could drop a match. Procedure sets are small.
-    if memory != MemoryType::Procedural {
-        if let Some(p) = predicate_filter(m, predicate) {
-            filter = filter.and(p);
-        }
-    }
-    let rows = store.current_expr(Some(filter), now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-    View::of(memory, rows, false).await
-}
-
 impl LanceReads {
-    pub fn new(adb: Arc<Adb>, store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { adb, store, barrier, embedder: None }
+    pub fn new(store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
+        Self { store, barrier, embedder: None }
     }
 
     pub fn with_embedder(mut self, embedder: Option<Arc<adb_embed::Embedder>>) -> Self {
@@ -435,36 +236,9 @@ impl LanceReads {
         CommitTs::from_datetime(time::now())
     }
 
-    /// A non-`LIKE` RECALL / LOOKUP in the current mode (`lookup`: the backends'
-    /// `lookup`, else `recall`).
-    async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, lookup: bool) -> AdbResult<Vec<MemoryRecord>> {
-        let old = || async {
-            match (Self::serves(memory), lookup) {
-                (false, true) => self.adb.lookup_with_modifiers(memory, predicate, modifiers).await,
-                (false, false) => self.adb.recall_with_modifiers(memory, predicate, modifiers).await,
-                (true, true) => self.view(memory, predicate, modifiers.in_scope.as_deref()).await?.lookup(predicate, modifiers).await,
-                (true, false) => self.view(memory, predicate, modifiers.in_scope.as_deref()).await?.recall(predicate, modifiers).await,
-            }
-        };
-        match query_mode() {
-            QueryMode::View => old().await,
-            QueryMode::Plan => crate::query::read(&self.store, memory, predicate, modifiers, self.committed().await).await,
-            QueryMode::Shadow => {
-                let plan = crate::query::read(&self.store, memory, predicate, modifiers, self.committed().await).await?;
-                let view = old().await?;
-                shadow_compare(&format!("{memory:?} {predicate:?} {modifiers:?}"), &plan, &view);
-                Ok(plan)
-            }
-        }
-    }
-
-    /// A throwaway backend holding the memory type's current rows that may match
-    /// `predicate`.
-    async fn view(&self, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<View> {
-        if let Some(b) = &self.barrier {
-            b.wait_for_committed().await;
-        }
-        current_view(&self.store, memory, predicate, CommitTs::from_datetime(time::now()), in_scope).await
+    /// A non-`LIKE` RECALL / LOOKUP.
+    async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+        crate::query::read(&self.store, memory, predicate, modifiers, self.committed().await).await
     }
 }
 
@@ -472,7 +246,7 @@ impl LanceReads {
 impl Reads for LanceReads {
     async fn lookup_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref(), true)?;
-        self.read(memory, predicate, modifiers, true).await
+        self.read(memory, predicate, modifiers).await
     }
 
     async fn links_from_many(&self, from_type: MemoryType, from_ids: &[String], link_type: Option<&str>) -> AdbResult<HashMap<String, Vec<Link>>> {
@@ -481,48 +255,16 @@ impl Reads for LanceReads {
     }
 
     async fn records_by_id(&self, memory: MemoryType, ids: &[String]) -> AdbResult<HashMap<String, MemoryRecord>> {
-        if query_mode() == QueryMode::View {
-            let mut out = HashMap::new();
-            for id in ids {
-                let key = Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.clone()) };
-                if let Some(r) = self.lookup(memory, &key).await?.into_iter().next() {
-                    out.insert(id.clone(), r);
-                }
-            }
-            return Ok(out);
-        }
         let now = self.committed().await;
         crate::query::by_keys(&self.store, memory, ids, now).await
     }
 
     async fn scan(&self, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        let old = || DirectReads(Arc::clone(&self.adb));
-        match query_mode() {
-            QueryMode::View => old().scan(modifiers).await,
-            QueryMode::Plan => crate::query::scan(&self.store, modifiers, self.committed().await).await,
-            QueryMode::Shadow => {
-                let plan = crate::query::scan(&self.store, modifiers, self.committed().await).await?;
-                let mut view = old().scan(modifiers).await?;
-                if let Some(f) = &modifiers.return_fields {
-                    crate::query::project(&mut view, f);
-                }
-                shadow_compare(&format!("SCAN {modifiers:?}"), &plan, &view);
-                Ok(plan)
-            }
-        }
+        crate::query::scan(&self.store, modifiers, self.committed().await).await
     }
 
     async fn load(&self, predicate: &Predicate, limit: usize) -> AdbResult<Vec<MemoryRecord>> {
-        match query_mode() {
-            QueryMode::View => self.adb.load(predicate, limit).await,
-            QueryMode::Plan => crate::query::load(&self.store, predicate, limit, self.committed().await).await,
-            QueryMode::Shadow => {
-                let plan = crate::query::load(&self.store, predicate, limit, self.committed().await).await?;
-                let view = self.adb.load(predicate, limit).await?;
-                shadow_compare(&format!("LOAD {predicate:?} {limit}"), &plan, &view);
-                Ok(plan)
-            }
-        }
+        crate::query::load(&self.store, predicate, limit, self.committed().await).await
     }
 
     async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
@@ -546,6 +288,6 @@ impl Reads for LanceReads {
             }
             return self.similar(memory, modifiers).await;
         }
-        self.read(memory, predicate, modifiers, false).await
+        self.read(memory, predicate, modifiers).await
     }
 }

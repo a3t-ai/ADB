@@ -101,8 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(engine)
         }
         None => {
-            tracing::info!("ADB in memory only (no --data-dir): memory is lost on restart");
-            Arc::new(LocalEngine::default())
+            tracing::info!("ADB without --data-dir: a temporary directory, removed when ADB stops — memory is lost on restart");
+            Arc::new(LocalEngine::temporary().await?)
         }
     };
 

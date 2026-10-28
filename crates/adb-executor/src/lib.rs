@@ -1,6 +1,6 @@
 //! ADB Executor - Query execution engine
 //!
-//! Executes planned queries against ADB backends.
+//! Executes planned AQL against the partition log and its Lance table.
 
 pub mod engine;
 mod error;
@@ -17,5 +17,5 @@ pub use executor::Executor;
 pub use engine::{Engine, LocalEngine};
 pub use result::{QueryResult, ResultSet};
 pub use apply::ApplyBarrier;
-pub use reads::{DirectReads, LanceReads, Reads};
-pub use writes::{DirectWrites, DurableWrites, ReplayStats, Writes};
+pub use reads::{LanceReads, Reads};
+pub use writes::{DurableWrites, ReplayStats, Writes};

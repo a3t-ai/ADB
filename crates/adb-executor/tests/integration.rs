@@ -4,14 +4,39 @@
 
 use std::sync::Arc;
 
-use adb_backends::Adb;
-use adb_core::MemoryType;
-use adb_executor::Executor;
+use adb_core::{MemoryType, Scope};
+use adb_executor::{ExecutorResult, LocalEngine, QueryResult};
 use serde_json::json;
 
+/// A temporary engine, seeded through its write path (W7: no in-memory backends).
+#[derive(Clone)]
+struct Mem(Arc<LocalEngine>);
+
+impl Mem {
+    async fn new() -> Self {
+        Mem(Arc::new(LocalEngine::temporary().await.unwrap()))
+    }
+
+    async fn store(&self, memory: MemoryType, key: &str, data: serde_json::Value) -> adb_core::AdbResult<adb_core::MemoryRecord> {
+        self.0.executor().writes().store(memory, key, data, Scope::Private, None, None, None).await
+    }
+
+    async fn link(&self, from: MemoryType, from_id: &str, to: MemoryType, to_id: &str, link_type: &str, weight: f32) -> adb_core::AdbResult<adb_core::Link> {
+        self.0.executor().writes().link(from, from_id, to, to_id, link_type, Some(weight)).await
+    }
+
+    async fn get_links_from(&self, from: MemoryType, id: &str, link_type: Option<&str>) -> adb_core::AdbResult<Vec<adb_core::Link>> {
+        self.0.executor().reads().links_from(from, id, link_type).await
+    }
+
+    async fn execute(&self, aql: &str) -> ExecutorResult<QueryResult> {
+        self.0.executor().execute(aql).await
+    }
+}
+
 /// Test helper to create executor with pre-populated data
-async fn create_test_executor() -> Executor {
-    let adb = Arc::new(Adb::new());
+async fn create_test_executor() -> Mem {
+    let adb = Mem::new().await;
 
     // Populate working memory
     adb.store(MemoryType::Working, "task-1", json!({"status": "active", "priority": 5}))
@@ -63,7 +88,7 @@ async fn create_test_executor() -> Executor {
     .await
     .unwrap();
 
-    Executor::new(adb)
+    adb
 }
 
 // ============================================================================
@@ -306,7 +331,7 @@ async fn test_empty_result() {
 
 #[tokio::test]
 async fn test_follow_links() {
-    let adb = Arc::new(Adb::new());
+    let adb = Mem::new().await;
 
     // Store source record in PROCEDURAL
     adb.store(
@@ -339,7 +364,7 @@ async fn test_follow_links() {
     ).await.unwrap();
 
     // Execute FOLLOW LINKS query
-    let executor = Executor::new(Arc::clone(&adb));
+    let executor = adb.clone();
     let result = executor.execute(
         r#"RECALL FROM PROCEDURAL WHERE pattern = "OOMKilled" FOLLOW LINKS TYPE "applied_to""#
     ).await.unwrap();
@@ -358,7 +383,7 @@ async fn test_follow_links() {
 
 #[tokio::test]
 async fn test_having_with_alias() {
-    let adb = Arc::new(Adb::new());
+    let adb = Mem::new().await;
 
     // Store some records
     adb.store(
@@ -377,7 +402,7 @@ async fn test_having_with_alias() {
         json!({"strategy": "sports", "ctr": 0.08}),
     ).await.unwrap();
 
-    let executor = Executor::new(Arc::clone(&adb));
+    let executor = adb.clone();
 
     // Test HAVING with alias - should return the count
     let result = executor.execute(
@@ -402,7 +427,7 @@ async fn test_having_with_alias() {
 
 #[tokio::test]
 async fn test_link_creates_link_when_records_exist() {
-    let adb = Arc::new(Adb::new());
+    let adb = Mem::new().await;
 
     // Store source record in PROCEDURAL
     adb.store(
@@ -426,7 +451,7 @@ async fn test_link_creates_link_when_records_exist() {
         }),
     ).await.unwrap();
 
-    let executor = Executor::new(Arc::clone(&adb));
+    let executor = adb.clone();
 
     // LINK statement should succeed
     let result = executor.execute(
@@ -444,7 +469,7 @@ async fn test_link_creates_link_when_records_exist() {
 
 #[tokio::test]
 async fn test_link_fails_when_source_not_found() {
-    let adb = Arc::new(Adb::new());
+    let adb = Mem::new().await;
 
     // Only store target record, no source
     adb.store(
@@ -456,7 +481,7 @@ async fn test_link_fails_when_source_not_found() {
         }),
     ).await.unwrap();
 
-    let executor = Executor::new(Arc::clone(&adb));
+    let executor = adb.clone();
 
     // LINK statement should fail - no source records
     let result = executor.execute(
@@ -470,7 +495,7 @@ async fn test_link_fails_when_source_not_found() {
 
 #[tokio::test]
 async fn test_link_fails_when_target_not_found() {
-    let adb = Arc::new(Adb::new());
+    let adb = Mem::new().await;
 
     // Only store source record, no target
     adb.store(
@@ -482,7 +507,7 @@ async fn test_link_fails_when_target_not_found() {
         }),
     ).await.unwrap();
 
-    let executor = Executor::new(Arc::clone(&adb));
+    let executor = adb.clone();
 
     // LINK statement should fail - no target records
     let result = executor.execute(
@@ -501,7 +526,7 @@ async fn test_link_fails_when_target_not_found() {
 #[tokio::test]
 async fn test_pipeline_variable_binding() {
     // B29: Test that {var} in later stages binds to values from earlier stages
-    let adb = Arc::new(Adb::new());
+    let adb = Mem::new().await;
 
     // Store a record in WORKING with a "target_pod" field
     adb.store(
@@ -532,7 +557,7 @@ async fn test_pipeline_variable_binding() {
         }),
     ).await.unwrap();
 
-    let executor = Executor::new(Arc::clone(&adb));
+    let executor = adb.clone();
 
     // Pipeline: First stage gets target_pod from WORKING,
     // second stage uses {target_pod} to filter EPISODIC

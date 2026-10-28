@@ -283,11 +283,10 @@ async fn log_is_purged_below_lances_durable_offset() {
         wal_flush: std::time::Duration::from_millis(20),
     };
     let open = || async {
-        let adb = Arc::new(adb_backends::Adb::new());
         let seq = Sequencer::new(LocalWal::open(PartitionId(0), wal_cfg.clone()).unwrap(), Epoch(1));
         let store = Arc::new(PartitionStore::open(&store_cfg, PartitionId(0)).await.unwrap());
-        let (w, stats) = DurableWrites::open(Arc::clone(&adb), seq, Some(store)).await.unwrap();
-        (adb, w, stats)
+        let (w, stats) = DurableWrites::open(seq, store).await.unwrap();
+        ((), w, stats)
     };
     let n = 700u64;
     let segments_at_most;
@@ -535,9 +534,9 @@ async fn store_refuses_a_key_in_use() {
     engine.query(r#"FORGET FROM SEMANTIC WHERE key = "k1""#, None).await.unwrap();
     engine.query(r#"STORE INTO SEMANTIC (key = "k1", content = "three")"#, None).await.unwrap();
 
-    let mem = LocalEngine::new(std::sync::Arc::new(adb_backends::Adb::new()));
+    let mem = LocalEngine::temporary().await.unwrap();
     seed(&mem).await;
-    check(&mem, "in-memory").await;
+    check(&mem, "temporary").await;
 }
 
 /// `ORDER BY created_at` sorts on the record's own commit time when the payload

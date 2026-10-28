@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/adb-core",
     "crates/aql-planner",
-    "crates/adb-backends",
     "crates/adb-executor",
     "crates/adb-server",
     "crates/adb-mcp",
@@ -97,7 +96,6 @@ adb-core = { path = "crates/adb-core" }
 # development against a sibling checkout, see .cargo/config.toml.example.
 aql-parser = { git = "https://github.com/srirammails/AQL.git", branch = "main" }
 aql-planner = { path = "crates/aql-planner" }
-adb-backends = { path = "crates/adb-backends" }
 adb-executor = { path = "crates/adb-executor" }
 adb-server = { path = "crates/adb-server" }
 adb-mcp = { path = "crates/adb-mcp" }

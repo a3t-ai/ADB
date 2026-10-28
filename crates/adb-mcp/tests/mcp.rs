@@ -7,8 +7,8 @@ use adb_mcp::protocol::JsonRpcRequest;
 use adb_mcp::McpServer;
 use serde_json::{json, Value};
 
-fn server() -> McpServer {
-    McpServer::new(Arc::new(LocalEngine::default()))
+async fn server() -> McpServer {
+    McpServer::new(Arc::new(LocalEngine::temporary().await.unwrap()))
 }
 
 fn req(id: i64, method: &str, params: Value) -> JsonRpcRequest {
@@ -26,7 +26,7 @@ async fn call(s: &McpServer, name: &str, args: Value) -> (bool, Value) {
 
 #[tokio::test]
 async fn initialize_negotiates_version() {
-    let s = server();
+    let s = server().await;
     let r = s.handle(req(1, "initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}}))).await.unwrap();
     let res = r.result.unwrap();
     assert_eq!(res["protocolVersion"], json!("2025-03-26"));
@@ -40,14 +40,14 @@ async fn initialize_negotiates_version() {
 
 #[tokio::test]
 async fn notifications_get_no_response() {
-    let s = server();
+    let s = server().await;
     let n = JsonRpcRequest { jsonrpc: "2.0".into(), id: None, method: "notifications/initialized".into(), params: None };
     assert!(s.handle(n).await.is_none());
 }
 
 #[tokio::test]
 async fn tool_list_has_clawdb_and_llm_tools() {
-    let s = server();
+    let s = server().await;
     let r = s.handle(req(1, "tools/list", json!({}))).await.unwrap().result.unwrap();
     let names: Vec<&str> = r["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     for t in ["aql_query", "store_memory", "recall_memory", "get_stats", "remember", "recall", "forget", "link", "unlink", "watch", "watch_changes", "unwatch"] {
@@ -57,7 +57,7 @@ async fn tool_list_has_clawdb_and_llm_tools() {
 
 #[tokio::test]
 async fn clawdb_tools_round_trip() {
-    let s = server();
+    let s = server().await;
     let (err, v) = call(&s, "store_memory", json!({
         "memory_type": "EPISODIC", "data": {"key": "inc-1", "pod": "payments"}, "scope": "private", "namespace": "a3t"
     })).await;
@@ -80,7 +80,7 @@ async fn clawdb_tools_round_trip() {
 
 #[tokio::test]
 async fn llm_tools_remember_recall_link_forget() {
-    let s = server();
+    let s = server().await;
     let (err, v) = call(&s, "remember", json!({"content": "Acme renews on 1 Nov", "key": "acme-renewal", "fields": {"account": "acme"}})).await;
     assert!(!err, "{v}");
     let (err, v) = call(&s, "remember", json!({"content": "Called Acme", "memory_type": "episodic", "key": "acme-call-1"})).await;
@@ -105,7 +105,7 @@ async fn llm_tools_remember_recall_link_forget() {
 
 #[tokio::test]
 async fn shortcut_tools_reject_bad_input() {
-    let s = server();
+    let s = server().await;
     let (err, _) = call(&s, "recall_memory", json!({"memory_type": "EPISODIC", "filter": {"x = 1 OR y": 2}})).await;
     assert!(err, "field names must not inject AQL");
     let (err, _) = call(&s, "store_memory", json!({"memory_type": "WORKING; FORGET", "data": {"a": 1}})).await;
@@ -120,7 +120,7 @@ async fn shortcut_tools_reject_bad_input() {
 
 #[tokio::test]
 async fn resources_and_prompts() {
-    let s = server();
+    let s = server().await;
     let r = s.handle(req(1, "resources/list", json!({}))).await.unwrap().result.unwrap();
     assert_eq!(r["resources"].as_array().unwrap().len(), 2);
     let r = s.handle(req(2, "resources/read", json!({"uri": "adb://aql/grammar"}))).await.unwrap().result.unwrap();

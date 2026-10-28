@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use std::collections::HashMap;
 
-use adb_backends::Adb;
 use adb_core::{Condition, MemoryType, Predicate, Scope, Value};
 use aql_parser::parse;
 use aql_planner::{
@@ -17,42 +16,37 @@ use aql_planner::{
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::result::{QueryResult, ResultSet, SourceResult};
-use crate::reads::{DirectReads, Reads};
-use crate::writes::{DirectWrites, Writes};
+use crate::reads::Reads;
+use crate::writes::Writes;
 
 /// The query executor
 pub struct Executor {
-    /// The ADB instance
-    adb: Arc<Adb>,
-    /// Where writes go: straight to `adb`, or through the log (stage C)
+    /// Where writes go: through the log (stage C)
     writes: Arc<dyn Writes>,
-    /// Where reads come from: `adb`, or the Lance table for some memory types (D3)
+    /// Where reads come from: the Lance table, through the query engine (W7)
     reads: Arc<dyn Reads>,
     /// The planner
     planner: Planner,
 }
 
 impl Executor {
-    /// Create a new executor
-    pub fn new(adb: Arc<Adb>) -> Self {
-        let writes = Arc::new(DirectWrites(Arc::clone(&adb)));
-        Self::with_writes(adb, writes)
-    }
-
-    /// An executor whose writes go through `writes` (e.g. [`crate::writes::DurableWrites`]).
-    pub fn with_writes(adb: Arc<Adb>, writes: Arc<dyn Writes>) -> Self {
-        let reads = Arc::new(DirectReads(Arc::clone(&adb)));
-        Self::with_io(adb, writes, reads)
-    }
-
-    /// An executor with its own write and read paths (e.g. log + Lance, stage D3).
-    pub fn with_io(adb: Arc<Adb>, writes: Arc<dyn Writes>, reads: Arc<dyn Reads>) -> Self {
+    /// An executor over its write and read paths (log + Lance).
+    pub fn with_io(writes: Arc<dyn Writes>, reads: Arc<dyn Reads>) -> Self {
         Self {
-            adb,
             writes,
             reads,
             planner: Planner::new(),
         }
+    }
+
+    /// The write path (tests seed through it).
+    pub fn writes(&self) -> &Arc<dyn Writes> {
+        &self.writes
+    }
+
+    /// The read path.
+    pub fn reads(&self) -> &Arc<dyn Reads> {
+        &self.reads
     }
 
     /// Execute an AQL query string
@@ -993,206 +987,6 @@ fn json_to_value(json: &serde_json::Value) -> Value {
         serde_json::Value::Object(_) => {
             // Convert object to string representation
             Value::String(json.to_string())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn create_executor() -> Executor {
-        let adb = Arc::new(Adb::new());
-        Executor::new(adb)
-    }
-
-    #[tokio::test]
-    async fn test_execute_scan() {
-        let executor = create_executor();
-
-        // Store some data first
-        executor
-            .adb
-            .store(MemoryType::Working, "task-1", json!({"status": "active"}))
-            .await
-            .unwrap();
-
-        // Execute scan
-        let result = executor.execute("SCAN FROM WORKING").await.unwrap();
-        assert!(result.success);
-
-        if let ResultSet::Records { records } = result.data {
-            assert_eq!(records.len(), 1);
-        } else {
-            panic!("Expected records result");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_recall() {
-        let executor = create_executor();
-
-        // Store some data
-        executor
-            .adb
-            .store(
-                MemoryType::Working,
-                "task-1",
-                json!({"status": "active", "priority": 5}),
-            )
-            .await
-            .unwrap();
-        executor
-            .adb
-            .store(
-                MemoryType::Working,
-                "task-2",
-                json!({"status": "completed", "priority": 3}),
-            )
-            .await
-            .unwrap();
-
-        // Execute recall with filter
-        let result = executor
-            .execute(r#"RECALL FROM WORKING WHERE status = "active""#)
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        if let ResultSet::Records { records } = result.data {
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].id, "task-1");
-        } else {
-            panic!("Expected records result");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_lookup() {
-        let executor = create_executor();
-
-        // Store data
-        executor
-            .adb
-            .store(MemoryType::Procedural, "task-1", json!({"name": "Test Task"}))
-            .await
-            .unwrap();
-
-        // AQL v0.5 §19: LOOKUP is not valid on WORKING memory
-        assert!(executor.execute(r#"LOOKUP FROM WORKING KEY id = "task-1""#).await.is_err());
-
-        // Execute lookup by key
-        let result = executor
-            .execute(r#"LOOKUP FROM PROCEDURAL KEY id = "task-1""#)
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        if let ResultSet::Records { records } = result.data {
-            assert_eq!(records.len(), 1);
-        } else {
-            panic!("Expected records result");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_store() {
-        let executor = create_executor();
-
-        let result = executor
-            .execute(r#"STORE INTO WORKING (key = "new-task", name = "New Task", priority = 1)"#)
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        if let ResultSet::Stored { record } = result.data {
-            assert_eq!(record.id, "new-task");
-        } else {
-            panic!("Expected stored result");
-        }
-
-        // Verify it was stored
-        assert_eq!(executor.adb.count(MemoryType::Working).await, 1);
-    }
-
-    #[tokio::test]
-    async fn test_execute_forget() {
-        let executor = create_executor();
-
-        // Store some data
-        executor
-            .adb
-            .store(
-                MemoryType::Working,
-                "temp-1",
-                json!({"temp": true}),
-            )
-            .await
-            .unwrap();
-        executor
-            .adb
-            .store(
-                MemoryType::Working,
-                "temp-2",
-                json!({"temp": true}),
-            )
-            .await
-            .unwrap();
-        executor
-            .adb
-            .store(
-                MemoryType::Working,
-                "keep",
-                json!({"temp": false}),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(executor.adb.count(MemoryType::Working).await, 3);
-
-        // Execute forget
-        let result = executor
-            .execute(r#"FORGET FROM WORKING WHERE temp = true"#)
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        if let ResultSet::Count { count } = result.data {
-            assert_eq!(count, 2);
-        } else {
-            panic!("Expected count result");
-        }
-
-        assert_eq!(executor.adb.count(MemoryType::Working).await, 1);
-    }
-
-    #[tokio::test]
-    async fn test_execute_pipeline() {
-        let executor = create_executor();
-
-        // Store some data
-        executor
-            .adb
-            .store(
-                MemoryType::Working,
-                "task-1",
-                json!({"status": "active"}),
-            )
-            .await
-            .unwrap();
-
-        // Execute pipeline
-        let result = executor
-            .execute(r#"PIPELINE test_pipe TIMEOUT 50ms SCAN FROM WORKING | SCAN FROM WORKING LIMIT 1"#)
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        if let ResultSet::Pipeline { steps } = result.data {
-            assert_eq!(steps.len(), 2);
-        } else {
-            panic!("Expected pipeline result");
         }
     }
 }

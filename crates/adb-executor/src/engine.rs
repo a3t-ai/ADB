@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use adb_backends::Adb;
 use adb_core::{MemoryRecord, MemoryType};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -20,7 +19,7 @@ use adb_store::{PartitionStore, StoreConfig};
 
 use crate::apply::ApplyBarrier;
 use adb_gateway::Gateway;
-use crate::reads::{DirectReads, LanceReads, Reads};
+use crate::reads::{LanceReads, Reads};
 use crate::writes::{DurableWrites, ReplayStats, Writes, SINGLE_PARTITION};
 use crate::{Executor, QueryResult, ResultSet};
 
@@ -62,12 +61,11 @@ pub trait Engine: Send + Sync {
     }
 }
 
-/// The engine backed by today's in-memory backends (`adb-backends`).
+/// The engine: the partition log, its Lance table (the only copy of every memory
+/// type, W7), platform tables, subscriptions and watches.
 pub struct LocalEngine {
-    adb: Arc<Adb>,
     executor: Executor,
-    /// The Lance table, which alone holds SEMANTIC / EPISODIC / PROCEDURAL (D4.4a),
-    /// and the barrier its reads wait on.
+    /// The Lance table and the barrier its reads wait on.
     store: Option<(Arc<PartitionStore>, Option<Arc<ApplyBarrier>>)>,
     gateway: Option<Arc<Gateway>>,
     /// Platform tables (stage G) and the writes that commit them.
@@ -78,6 +76,8 @@ pub struct LocalEngine {
     durable: Option<Arc<DurableWrites<Arc<LocalWal>>>>,
     /// Continuous queries (W6) and the task keeping them current.
     watcher: Option<(Arc<adb_cq::Watcher>, tokio::task::JoinHandle<()>)>,
+    /// A temporary engine's directory, removed with it (dropped last).
+    temp: Option<tempfile::TempDir>,
 }
 
 impl Drop for LocalEngine {
@@ -212,9 +212,18 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
 }
 
 impl LocalEngine {
-    pub fn new(adb: Arc<Adb>) -> Self {
-        let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None, watcher: None }
+    /// The executor (tests).
+    pub fn executor(&self) -> &Executor {
+        &self.executor
+    }
+
+    /// A durable engine on a fresh temporary directory, removed when the engine is
+    /// dropped (an ADB without `--data-dir`, tests).
+    pub async fn temporary() -> Result<Self, String> {
+        let dir = tempfile::Builder::new().prefix("adb-").tempdir().map_err(|e| e.to_string())?;
+        let (mut engine, _) = Self::durable(dir.path()).await?;
+        engine.temp = Some(dir);
+        Ok(engine)
     }
 }
 
@@ -225,7 +234,6 @@ impl LocalEngine {
     /// table (stage D3). Returns what the replay found.
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
-        let adb = Arc::new(Adb::new());
         // Shared: the sequencer appends, subscribers read (stage E).
         let wal = Arc::new(open_wal(&dir).await?);
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
@@ -235,7 +243,7 @@ impl LocalEngine {
                 .map_err(|e| e.to_string())?,
         );
         let (mut writes, stats) =
-            DurableWrites::open(Arc::clone(&adb), seq, Some(Arc::clone(&store))).await.map_err(|e| e.to_string())?;
+            DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
         writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
         let barrier = writes.barrier();
@@ -247,18 +255,18 @@ impl LocalEngine {
         });
         let embedder = adb_embed::Embedder::shared();
         writes.set_embedder(embedder.clone());
-        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&adb), Arc::clone(&store), barrier.clone()).with_embedder(embedder));
+        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder));
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
         let durable_handle = Arc::clone(&durable);
         let writes: Arc<dyn Writes> = durable;
-        let executor = Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), Arc::clone(&reads));
+        let executor = Executor::with_io(Arc::clone(&writes), Arc::clone(&reads));
         // W6: the watcher re-runs watched queries through an executor of its own and
         // reloads the registered watches.
         let watcher = match &barrier {
             Some(b) => {
                 let runner = Arc::new(WatchRunner {
-                    executor: Executor::with_io(Arc::clone(&adb), Arc::clone(&writes), reads),
+                    executor: Executor::with_io(Arc::clone(&writes), reads),
                     durable: Arc::clone(&durable_handle),
                 });
                 let applied = b.watch();
@@ -279,24 +287,29 @@ impl LocalEngine {
             None => None,
         };
         Ok((
-            Self { adb, executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry, durable: Some(durable_handle), watcher },
+            Self { executor, store: Some((store, barrier)), gateway, platform: Some((platform, writes)), expiry, durable: Some(durable_handle), watcher, temp: None },
             stats,
         ))
     }
 
-    /// The log in `dir` replayed into the in-memory backends, with no Lance table:
-    /// everything held and read in memory (stage C). An oracle for tests — the same
-    /// committed records through a second, independent path — valid while the log is
-    /// complete (it is purged below Lance's durable offset every 256 records).
+    /// The log in `dir` replayed into a fresh table in a temporary directory: an
+    /// oracle for tests — the same committed records through a second path (log →
+    /// apply), not the live table — valid while the log is complete (it is purged
+    /// below Lance's durable offset every 256 records).
     pub async fn replay_only(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
-        let adb = Arc::new(Adb::new());
-        let wal = open_wal(&dir).await?;
-        let (writes, stats) =
-            DurableWrites::open(Arc::clone(&adb), Sequencer::new(wal, Epoch(1)), None).await.map_err(|e| e.to_string())?;
-        let reads: Arc<dyn Reads> = Arc::new(DirectReads(Arc::clone(&adb)));
-        let executor = Executor::with_io(Arc::clone(&adb), Arc::new(writes), reads);
-        Ok((Self { adb, executor, store: None, gateway: None, platform: None, expiry: None, durable: None, watcher: None }, stats))
+        let temp = tempfile::Builder::new().prefix("adb-replay-").tempdir().map_err(|e| e.to_string())?;
+        let log = temp.path().join("p0");
+        std::fs::create_dir_all(&log).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(dir.join("p0")).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_name() != "LOCK" && entry.path().is_file() {
+                std::fs::copy(entry.path(), log.join(entry.file_name())).map_err(|e| e.to_string())?;
+            }
+        }
+        let (mut engine, stats) = Self::durable(temp.path()).await?;
+        engine.temp = Some(temp);
+        Ok((engine, stats))
     }
 }
 
@@ -341,11 +354,6 @@ impl LocalEngine {
     }
 }
 
-impl Default for LocalEngine {
-    fn default() -> Self {
-        Self::new(Arc::new(Adb::new()))
-    }
-}
 
 #[async_trait]
 impl Engine for LocalEngine {
@@ -406,14 +414,14 @@ impl Engine for LocalEngine {
             ("semantic", MemoryType::Semantic),
         ] {
             let n = match &self.store {
-                Some((store, barrier)) if crate::reads::lance_owned(t) => {
+                Some((store, barrier)) => {
                     if let Some(b) = barrier {
                         b.wait_for_committed().await;
                     }
                     let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
                     store.count_current(t.into(), now).await.map_err(|e| e.to_string())? as usize
                 }
-                _ => self.adb.count(t).await,
+                None => 0,
             };
             counts.insert(name.into(), json!(n));
         }
@@ -506,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn wire_format_matches_flowr_adapter() {
-        let engine = LocalEngine::default();
+        let engine = LocalEngine::temporary().await.unwrap();
         let stored = engine
             .query(r#"STORE INTO SEMANTIC (key = "k1", content = "hello") SCOPE private NAMESPACE "ns1""#, None)
             .await
@@ -531,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_counts_per_type() {
-        let engine = LocalEngine::default();
+        let engine = LocalEngine::temporary().await.unwrap();
         engine.query(r#"STORE INTO EPISODIC (event = "e")"#, None).await.unwrap();
         let s = engine.stats().await.unwrap();
         assert_eq!(s["episodic"], json!(1));
@@ -543,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_variables_bind() {
-        let engine = LocalEngine::default();
+        let engine = LocalEngine::temporary().await.unwrap();
         engine.query(r#"STORE INTO EPISODIC (pod = "payments")"#, None).await.unwrap();
         engine.query(r#"STORE INTO EPISODIC (pod = "auth")"#, None).await.unwrap();
         let vars: HashMap<String, Value> = [("pod".to_string(), json!("auth"))].into();
@@ -554,8 +562,9 @@ mod tests {
 
     #[tokio::test]
     async fn errors_are_err() {
-        let engine = LocalEngine::default();
+        let engine = LocalEngine::temporary().await.unwrap();
         assert!(engine.query("THIS IS NOT AQL", None).await.is_err());
-        assert!(engine.query(r#"SUBSCRIBE TOPIC "t""#, None).await.is_err());
+        assert!(engine.query(r#"UNWATCH "no-such-watch""#, None).await.is_ok(), "unknown watch: unwatched = false");
+        assert!(engine.query("RECALL FROM SEMANTIC LIKE $q", None).await.is_err(), "LIKE without a value");
     }
 }

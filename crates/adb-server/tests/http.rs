@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 async fn start() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let app = adb_server::router(Arc::new(LocalEngine::default()));
+    let app = adb_server::router(Arc::new(LocalEngine::temporary().await.unwrap()));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
 }
@@ -181,7 +181,7 @@ async fn mcp_over_sse() {
 async fn token_guards_everything_but_health() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let app = adb_server::router_with_token(Arc::new(LocalEngine::default()), Some(Arc::from("s3cret")));
+    let app = adb_server::router_with_token(Arc::new(LocalEngine::temporary().await.unwrap()), Some(Arc::from("s3cret")));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://{addr}");
     let c = reqwest::Client::new();
