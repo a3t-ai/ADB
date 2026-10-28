@@ -15,5 +15,6 @@ async-trait.workspace = true
 half.workspace = true
 ulid.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+libc = "0.2"
 
 [dev-dependencies]

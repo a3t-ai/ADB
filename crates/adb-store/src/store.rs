@@ -210,6 +210,8 @@ impl PartitionStore {
             new.writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
         }
         new.writer.close().await.map_err(lance)?;
+        // On disk before anything old goes (L11, W9): Lance doesn't fsync locally.
+        adb_core::disk::sync_fs_async(&staged).await.map_err(err)?;
         // Close the current writer before the directories move: its WAL path is the
         // table's. From here the store is closed; any failure reopens what is there.
         let old = g.take().expect("the partition store is open");
@@ -231,6 +233,8 @@ impl PartitionStore {
         *g = Some(inner);
         drop(g);
         swapped?;
+        // The renames are durable before the old table is deleted.
+        adb_core::disk::sync_fs_async(&dir).await.map_err(err)?;
         std::fs::remove_dir_all(&trash).map_err(err)?;
         for e in std::fs::read_dir(dir.parent().unwrap_or(&dir)).map_err(err)?.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
@@ -306,6 +310,8 @@ impl PartitionStore {
         let new = Self::open_at(cfg, partition, &staged).await?;
         new.put_rows(&rows).await?;
         new.close().await?;
+        // On disk before anything old moves (L11, W9).
+        adb_core::disk::sync_fs_async(&staged).await.map_err(err)?;
         match &backup {
             Some(name) => {
                 let b = dir.with_file_name(name);
@@ -322,6 +328,7 @@ impl PartitionStore {
                 }
                 std::fs::rename(&dir, &trash).map_err(err)?;
                 std::fs::rename(&staged, &dir).map_err(err)?;
+                adb_core::disk::sync_fs_async(&dir).await.map_err(err)?;
                 std::fs::remove_dir_all(&trash).map_err(err)?;
             }
         }
@@ -810,19 +817,7 @@ impl PartitionStore {
     /// purging its log below Lance's durable offset (stage D3.5), so the log is only
     /// dropped once what replaces it is on disk.
     pub async fn sync_to_disk(&self) -> StoreResult<()> {
-        let root = self.root.clone();
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            use std::os::fd::AsRawFd;
-            let dir = std::fs::File::open(&root)?;
-            // SAFETY: `dir` is an open descriptor for the duration of the call.
-            if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| StoreError::Lance(format!("syncfs task: {e}")))?
-        .map_err(|e| StoreError::Lance(format!("syncfs {}: {e}", self.root.display())))
+        adb_core::disk::sync_fs_async(&self.root).await.map_err(|e| StoreError::Lance(format!("syncfs {}: {e}", self.root.display())))
     }
 
     /// Flush and release the writer.

@@ -8,6 +8,7 @@
 //! - Scope and namespace handling
 //! - Log records and effects (`log`)
 
+pub mod disk;
 pub mod error;
 pub mod link;
 pub mod log;

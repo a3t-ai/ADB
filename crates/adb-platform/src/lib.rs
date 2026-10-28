@@ -421,6 +421,8 @@ impl PlatformStore {
             let ds = Arc::new(ds);
             self.tables.write().await.insert(table.clone(), Arc::clone(&ds));
             stats.fragments_removed += compacted.map_err(lance)?.fragments_removed;
+            // The compacted files on disk before the old ones are deleted (L11, W9).
+            adb_core::disk::sync_fs_async(&self.root).await.map_err(|e| PlatformError::Io(e.to_string()))?;
             let removed = {
                 let _files = self.files.write().await;
                 ds.cleanup_old_versions(chrono::TimeDelta::zero(), Some(true), Some(false)).await.map_err(lance)?
