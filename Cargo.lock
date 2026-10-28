@@ -231,6 +231,7 @@ dependencies = [
  "adb-core",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "datafusion",
  "futures",
  "half",

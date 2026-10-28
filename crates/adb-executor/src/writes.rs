@@ -649,8 +649,45 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches superseded versions, so
     /// a value surviving only in an old version is forgotten too (D2 T5).
     async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
-        let at = ts.to_datetime();
+        use crate::reads::QueryMode;
         check_scope(memory, in_scope, self.in_lance(memory).is_some())?;
+        let mode = crate::reads::query_mode();
+        let Some(store) = self.store.as_ref().filter(|_| mode != QueryMode::View) else {
+            return self.targets_view(memory, predicate, ts, forget, in_scope).await;
+        };
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let mut ids = crate::query::targets(store, memory, predicate, in_scope, ts).await?;
+        if forget && supersedes(memory) {
+            let mut old = store.superseded(memory.into()).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            if let Some(s) = in_scope {
+                old.retain(|r| r.data.scope == s);
+            }
+            for r in &old {
+                if crate::query::matches(memory, &crate::query::record(r), predicate) {
+                    ids.push(r.key().to_string());
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            ids.retain(|id| seen.insert(id.clone()));
+        }
+        if mode == QueryMode::Shadow {
+            let mut view = self.targets_view(memory, predicate, ts, forget, in_scope).await?;
+            let mut plan = ids.clone();
+            view.sort();
+            plan.sort();
+            if view != plan {
+                crate::reads::SHADOW_DIFFERENCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::warn!(?memory, ?predicate, forget, ?plan, ?view, "query shadow difference (targets)");
+            }
+        }
+        Ok(ids)
+    }
+
+    /// The old target resolution: the backends' matching code over throwaway views.
+    async fn targets_view(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
+        let at = ts.to_datetime();
         let Some(store) = self.in_lance(memory) else {
             return match forget {
                 true => time::at(at, self.adb.forget_targets(memory, predicate)).await,
@@ -1273,6 +1310,9 @@ pub async fn replay<L: Log>(adb: &Adb, log: &L) -> AdbResult<ReplayStats> {
 /// (PROCEDURAL fills in its node's defaults), without keeping it anywhere.
 async fn shaped_record(memory: MemoryType, new: &NewRow, ts: CommitTs) -> AdbResult<MemoryRecord> {
     let row = adb_store::StoredRow::from_new(&adb_store::qualified(new), ts, 0, 0);
+    if memory == MemoryType::Procedural && crate::reads::query_mode() != crate::reads::QueryMode::View {
+        return Ok(crate::query::record(&row));
+    }
     if memory != MemoryType::Procedural {
         // SEMANTIC / EPISODIC hold records as given: no backend needed.
         return Ok(crate::reads::to_record(&row));

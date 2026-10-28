@@ -7,6 +7,7 @@ mod error;
 mod executor;
 mod result;
 pub mod apply;
+pub mod query;
 pub mod reads;
 pub mod rank;
 pub mod writes;

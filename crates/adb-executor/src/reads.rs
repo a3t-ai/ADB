@@ -14,6 +14,7 @@
 //! the Lance scan where it can be (`adb_store::predicate_filter`, stage D3.6), so a
 //! read loads only a superset of the matching rows instead of the whole memory type.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,79 @@ pub trait Reads: Send + Sync {
 
     /// Links leaving record `from_id` (`WITH LINKS`, `FOLLOW LINKS`), oldest first.
     async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>>;
+
+    /// Links leaving each of `from_ids`, by record id.
+    async fn links_from_many(&self, from_type: MemoryType, from_ids: &[String], link_type: Option<&str>) -> AdbResult<HashMap<String, Vec<Link>>> {
+        let mut out = HashMap::new();
+        for id in from_ids {
+            out.insert(id.clone(), self.links_from(from_type, id, link_type).await?);
+        }
+        Ok(out)
+    }
+
+    /// The current records `ids` of `memory`, by id (link targets).
+    async fn records_by_id(&self, memory: MemoryType, ids: &[String]) -> AdbResult<HashMap<String, MemoryRecord>> {
+        let mut out = HashMap::new();
+        for id in ids {
+            let key = Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.clone()) };
+            if let Some(r) = self.lookup(memory, &key).await?.into_iter().next() {
+                out.insert(id.clone(), r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `SCAN FROM WORKING [WINDOW …] [LIMIT n] [RETURN …]`.
+    async fn scan(&self, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>>;
+
+    /// `LOAD FROM TOOLS`: matching tools by ranking, at most `limit`.
+    async fn load(&self, predicate: &Predicate, limit: usize) -> AdbResult<Vec<MemoryRecord>>;
+}
+
+/// Where reads are answered (W7): `plan` (the query engine, default), `view` (the
+/// old throwaway backends) or `shadow` (both; differences are logged), from
+/// `ADB_QUERY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryMode {
+    Plan,
+    View,
+    Shadow,
+}
+
+pub fn query_mode() -> QueryMode {
+    static MODE: std::sync::OnceLock<QueryMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("ADB_QUERY").as_deref() {
+        Ok("view") => QueryMode::View,
+        Ok("shadow") => QueryMode::Shadow,
+        _ => QueryMode::Plan,
+    })
+}
+
+/// Differences between the old and new read paths found in shadow mode.
+pub static SHADOW_DIFFERENCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compare a shadow read (records as sets, without `accessed_at`, which the old
+/// WORKING path set to the read time); log a difference.
+fn shadow_compare(what: &str, plan: &[MemoryRecord], view: &[MemoryRecord]) {
+    let norm = |rs: &[MemoryRecord]| {
+        let mut v: Vec<serde_json::Value> = rs
+            .iter()
+            .map(|r| {
+                let mut j = serde_json::to_value(r).unwrap_or_default();
+                if let Some(m) = j.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                    m.remove("accessed_at");
+                }
+                j
+            })
+            .collect();
+        v.sort_by_key(|j| j.to_string());
+        v
+    };
+    let (p, v) = (norm(plan), norm(view));
+    if p != v {
+        SHADOW_DIFFERENCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!(read = what, plan = %serde_json::Value::Array(p), view = %serde_json::Value::Array(v), "query shadow difference");
+    }
 }
 
 /// Reads from the in-memory backends.
@@ -62,6 +136,21 @@ impl Reads for DirectReads {
 
     async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
         self.0.get_links_from(from_type, from_id, link_type).await
+    }
+
+    async fn scan(&self, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+        let mut records = match &modifiers.window {
+            Some(w) => self.0.scan_window(w).await?,
+            None => self.0.scan().await?,
+        };
+        if let Some(n) = modifiers.limit {
+            records.truncate(n);
+        }
+        Ok(records)
+    }
+
+    async fn load(&self, predicate: &Predicate, limit: usize) -> AdbResult<Vec<MemoryRecord>> {
+        self.0.load(predicate, limit).await
     }
 }
 
@@ -289,7 +378,7 @@ impl LanceReads {
         if let Some(s) = &modifiers.in_scope {
             filter = filter.and(col("scope").eq(lit(s.clone())));
         }
-        let mut rows = self.store.current_expr(Some(filter), now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        let mut rows = crate::query::current_rows(&self.store, filter, now, true).await?;
         if let Some(ns) = &modifiers.namespace {
             rows.retain(|r| r.data.namespace.as_ref() == Some(ns));
         }
@@ -307,7 +396,7 @@ impl LanceReads {
             .into_iter()
             .take(limit)
             .map(|r| {
-                let mut rec = to_record(&rows[r.index]);
+                let mut rec = crate::query::record(&rows[r.index]);
                 rec.metadata.confidence = r.similarity;
                 rec
             })
@@ -339,6 +428,36 @@ impl LanceReads {
         lance_owned(memory)
     }
 
+    async fn committed(&self) -> CommitTs {
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
+        CommitTs::from_datetime(time::now())
+    }
+
+    /// A non-`LIKE` RECALL / LOOKUP in the current mode (`lookup`: the backends'
+    /// `lookup`, else `recall`).
+    async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, lookup: bool) -> AdbResult<Vec<MemoryRecord>> {
+        let old = || async {
+            match (Self::serves(memory), lookup) {
+                (false, true) => self.adb.lookup_with_modifiers(memory, predicate, modifiers).await,
+                (false, false) => self.adb.recall_with_modifiers(memory, predicate, modifiers).await,
+                (true, true) => self.view(memory, predicate, modifiers.in_scope.as_deref()).await?.lookup(predicate, modifiers).await,
+                (true, false) => self.view(memory, predicate, modifiers.in_scope.as_deref()).await?.recall(predicate, modifiers).await,
+            }
+        };
+        match query_mode() {
+            QueryMode::View => old().await,
+            QueryMode::Plan => crate::query::read(&self.store, memory, predicate, modifiers, self.committed().await).await,
+            QueryMode::Shadow => {
+                let plan = crate::query::read(&self.store, memory, predicate, modifiers, self.committed().await).await?;
+                let view = old().await?;
+                shadow_compare(&format!("{memory:?} {predicate:?} {modifiers:?}"), &plan, &view);
+                Ok(plan)
+            }
+        }
+    }
+
     /// A throwaway backend holding the memory type's current rows that may match
     /// `predicate`.
     async fn view(&self, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<View> {
@@ -353,10 +472,57 @@ impl LanceReads {
 impl Reads for LanceReads {
     async fn lookup_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref(), true)?;
-        if !Self::serves(memory) {
-            return self.adb.lookup_with_modifiers(memory, predicate, modifiers).await;
+        self.read(memory, predicate, modifiers, true).await
+    }
+
+    async fn links_from_many(&self, from_type: MemoryType, from_ids: &[String], link_type: Option<&str>) -> AdbResult<HashMap<String, Vec<Link>>> {
+        let now = self.committed().await;
+        crate::query::links_from(&self.store, from_type, from_ids, link_type, now).await
+    }
+
+    async fn records_by_id(&self, memory: MemoryType, ids: &[String]) -> AdbResult<HashMap<String, MemoryRecord>> {
+        if query_mode() == QueryMode::View {
+            let mut out = HashMap::new();
+            for id in ids {
+                let key = Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.clone()) };
+                if let Some(r) = self.lookup(memory, &key).await?.into_iter().next() {
+                    out.insert(id.clone(), r);
+                }
+            }
+            return Ok(out);
         }
-        self.view(memory, predicate, modifiers.in_scope.as_deref()).await?.lookup(predicate, modifiers).await
+        let now = self.committed().await;
+        crate::query::by_keys(&self.store, memory, ids, now).await
+    }
+
+    async fn scan(&self, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+        let old = || DirectReads(Arc::clone(&self.adb));
+        match query_mode() {
+            QueryMode::View => old().scan(modifiers).await,
+            QueryMode::Plan => crate::query::scan(&self.store, modifiers, self.committed().await).await,
+            QueryMode::Shadow => {
+                let plan = crate::query::scan(&self.store, modifiers, self.committed().await).await?;
+                let mut view = old().scan(modifiers).await?;
+                if let Some(f) = &modifiers.return_fields {
+                    crate::query::project(&mut view, f);
+                }
+                shadow_compare(&format!("SCAN {modifiers:?}"), &plan, &view);
+                Ok(plan)
+            }
+        }
+    }
+
+    async fn load(&self, predicate: &Predicate, limit: usize) -> AdbResult<Vec<MemoryRecord>> {
+        match query_mode() {
+            QueryMode::View => self.adb.load(predicate, limit).await,
+            QueryMode::Plan => crate::query::load(&self.store, predicate, limit, self.committed().await).await,
+            QueryMode::Shadow => {
+                let plan = crate::query::load(&self.store, predicate, limit, self.committed().await).await?;
+                let view = self.adb.load(predicate, limit).await?;
+                shadow_compare(&format!("LOAD {predicate:?} {limit}"), &plan, &view);
+                Ok(plan)
+            }
+        }
     }
 
     async fn links_from(&self, from_type: MemoryType, from_id: &str, link_type: Option<&str>) -> AdbResult<Vec<Link>> {
@@ -380,9 +546,6 @@ impl Reads for LanceReads {
             }
             return self.similar(memory, modifiers).await;
         }
-        if !Self::serves(memory) {
-            return self.adb.recall_with_modifiers(memory, predicate, modifiers).await;
-        }
-        self.view(memory, predicate, modifiers.in_scope.as_deref()).await?.recall(predicate, modifiers).await
+        self.read(memory, predicate, modifiers, false).await
     }
 }

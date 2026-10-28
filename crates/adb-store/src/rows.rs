@@ -261,7 +261,12 @@ fn opt_ts(a: &TimestampMicrosecondArray, i: usize) -> Option<CommitTs> {
     (!a.is_null(i)).then(|| CommitTs(a.value(i)))
 }
 
-/// A record batch (any projection containing every column) → rows.
+fn opt_col<'a, T: 'static>(b: &'a RecordBatch, name: &str) -> Option<&'a T> {
+    b.column_by_name(name).and_then(|c| c.as_any().downcast_ref::<T>())
+}
+
+/// A record batch → rows. Every column is needed but `embedding` and `sealed`, which
+/// reads that don't use them leave out (W7: a vector is 384 floats per row).
 pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
     let id = col::<StringArray>(b, "id")?;
     let lineage = col::<StringArray>(b, "lineage_id")?;
@@ -278,9 +283,9 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
     let link_type = col::<StringArray>(b, "link_type")?;
     let weight = col::<Float32Array>(b, "weight")?;
     let value = col::<LargeBinaryArray>(b, "value")?;
-    let sealed = col::<LargeBinaryArray>(b, "sealed")?;
+    let sealed = opt_col::<LargeBinaryArray>(b, "sealed");
     let text = col::<StringArray>(b, "text")?;
-    let embedding = col::<FixedSizeListArray>(b, "embedding")?;
+    let embedding = opt_col::<FixedSizeListArray>(b, "embedding");
     let commit_ts = col::<TimestampMicrosecondArray>(b, "commit_ts")?;
     let valid_from = col::<TimestampMicrosecondArray>(b, "valid_from")?;
     let valid_to = col::<TimestampMicrosecondArray>(b, "valid_to")?;
@@ -296,7 +301,7 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
 
     let mut rows = Vec::with_capacity(b.num_rows());
     for i in 0..b.num_rows() {
-        let emb = (!embedding.is_null(i)).then(|| {
+        let emb = embedding.filter(|e| !e.is_null(i)).map(|embedding| {
             let v = embedding.value(i);
             let f = v.as_any().downcast_ref::<Float32Array>().map(|a| a.values().to_vec()).unwrap_or_default();
             f.into_iter().map(f16::from_f32).collect::<Vec<_>>()
@@ -324,7 +329,7 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
                 link_type: opt_str(link_type, i),
                 weight: (!weight.is_null(i)).then(|| weight.value(i)),
                 value,
-                sealed: (!sealed.is_null(i)).then(|| sealed.value(i).to_vec()),
+                sealed: sealed.filter(|s| !s.is_null(i)).map(|s| s.value(i).to_vec()),
                 text: opt_str(text, i),
                 embedding: emb,
                 ttl_at: opt_ts(ttl_at, i),

@@ -6,11 +6,12 @@ pub mod filter;
 pub mod rows;
 pub mod schema;
 pub mod store;
+pub mod table;
 
 pub use datafusion::logical_expr::Expr;
 pub use filter::predicate_filter;
 pub use lance;
-pub use rows::{key_of, qualified, row_id, StoredRow};
+pub use rows::{decode, key_of, qualified, row_id, StoredRow};
 pub use schema::{memory_schema, META_ID, RECORD_KINDS};
 pub use store::{configure_lance_runtime, sql_str, CompactStats, PartitionStore, StoreConfig, DEFAULT_EMBEDDING_DIM};
 

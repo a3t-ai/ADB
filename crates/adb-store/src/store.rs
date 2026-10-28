@@ -473,6 +473,44 @@ impl PartitionStore {
             .collect())
     }
 
+    /// Run a DataFusion query over one snapshot of the table (MVP W7): `f` gets a
+    /// session with the table registered as `memory` and ADB's UDFs, and runs its
+    /// plan to the end while the store's state is held — a compaction waits for it.
+    pub async fn query<T, F, Fut>(&self, f: F) -> StoreResult<T>
+    where
+        F: FnOnce(datafusion::prelude::SessionContext) -> Fut,
+        Fut: std::future::Future<Output = datafusion::error::Result<T>>,
+    {
+        let g = self.state.read().await;
+        let inner = open_state(&g);
+        let table = Self::snapshot(inner).await?;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_udf(crate::filter::json_scalar_udf());
+        ctx.register_table("memory", Arc::new(table)).map_err(lance)?;
+        f(ctx).await.map_err(lance)
+    }
+
+    async fn snapshot(inner: &Inner) -> StoreResult<crate::table::LsmTable> {
+        let manifest = inner.writer.manifest().await.map_err(lance)?;
+        let mut snapshot = ShardSnapshot::new(inner.writer.shard_id());
+        if let Some(m) = &manifest {
+            snapshot = snapshot.with_current_generation(m.current_generation);
+            for t in &m.sstables {
+                snapshot = snapshot.with_sstable(t.generation, t.path.clone());
+            }
+        }
+        let mut table = crate::table::LsmTable {
+            base: inner.base.clone(),
+            snapshot,
+            shard: inner.writer.shard_id(),
+            memtables: inner.writer.in_memory_memtable_refs().await.map_err(lance)?,
+            cache: inner.cache.clone(),
+            schema: Arc::new(arrow_schema::Schema::empty()),
+        };
+        table.schema = table.scanner().schema();
+        Ok(table)
+    }
+
     /// An LSM scanner over memtable + flushed generations + base table.
     async fn scanner(inner: &Inner) -> StoreResult<LsmScanner> {
         let manifest = inner.writer.manifest().await.map_err(lance)?;

@@ -475,21 +475,51 @@ impl Executor {
     // Individual operation implementations
     // =========================================================================
 
+    /// The links leaving each of `records`, by (memory type, id): one batched read per
+    /// memory type (W7, P4).
+    async fn links_of(
+        &self,
+        records: &[adb_core::MemoryRecord],
+        link_type: Option<&str>,
+    ) -> ExecutorResult<HashMap<(MemoryType, String), Vec<adb_core::Link>>> {
+        let mut ids: HashMap<MemoryType, Vec<String>> = HashMap::new();
+        for r in records {
+            ids.entry(r.memory_type).or_default().push(r.id.clone());
+        }
+        let mut out = HashMap::new();
+        for (memory, ids) in ids {
+            for (id, links) in self.reads.links_from_many(memory, &ids, link_type).await? {
+                out.insert((memory, id), links);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `FOLLOW LINKS`: the current targets of the links leaving `records`, in link
+    /// order (W7: one read for the links, one per target memory type).
+    async fn follow(&self, records: &[adb_core::MemoryRecord], link_type: Option<&str>) -> ExecutorResult<Vec<adb_core::MemoryRecord>> {
+        let mut by_record = self.links_of(records, link_type).await?;
+        let links: Vec<adb_core::Link> = records
+            .iter()
+            .flat_map(|r| by_record.remove(&(r.memory_type, r.id.clone())).unwrap_or_default())
+            .collect();
+        let mut wanted: HashMap<MemoryType, Vec<String>> = HashMap::new();
+        for l in &links {
+            wanted.entry(l.to_type).or_default().push(l.to_id.clone());
+        }
+        let mut found: HashMap<(MemoryType, String), adb_core::MemoryRecord> = HashMap::new();
+        for (memory, ids) in wanted {
+            for (id, r) in self.reads.records_by_id(memory, &ids).await? {
+                found.insert((memory, id), r);
+            }
+        }
+        Ok(links.iter().filter_map(|l| found.get(&(l.to_type, l.to_id.clone())).cloned()).collect())
+    }
+
     async fn execute_scan(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
 
-        let records = if let Some(window) = &step.modifiers.window {
-            self.adb.scan_window(window).await?
-        } else {
-            self.adb.scan().await?
-        };
-
-        // Apply limit if present
-        let records = if let Some(limit) = step.modifiers.limit {
-            records.into_iter().take(limit).collect()
-        } else {
-            records
-        };
+        let records = self.reads.scan(&step.modifiers).await?;
 
         Ok(QueryResult::records(
             records,
@@ -519,7 +549,7 @@ impl Executor {
 
         // Handle aggregation if present - works for all memory types
         if let Some(agg_funcs) = &step.modifiers.aggregate {
-            let agg_result = self.adb.episodic().aggregate(records, agg_funcs).await?;
+            let agg_result = crate::query::aggregate(&records, agg_funcs);
 
             // Apply HAVING filter if present
             if let Some(having_conditions) = &step.modifiers.having {
@@ -547,32 +577,7 @@ impl Executor {
 
         // Handle FOLLOW LINKS - traverse links and return target records
         if let Some(follow_links) = &step.modifiers.follow_links {
-            let mut target_records = Vec::new();
-
-            for record in &records {
-                // Get links from this record
-                let links = self
-                    .reads
-                    .links_from(
-                        record.memory_type,
-                        &record.id,
-                        Some(&follow_links.link_type),
-                    )
-                    .await?;
-
-                // Fetch target records for each link
-                for link in links {
-                    let targets = self
-                        .reads
-                        .lookup(link.to_type, &adb_core::Predicate::Key {
-                            field: "id".to_string(),
-                            value: adb_core::Value::String(link.to_id.clone()),
-                        })
-                        .await?;
-
-                    target_records.extend(targets);
-                }
-            }
+            let target_records = self.follow(&records, Some(&follow_links.link_type)).await?;
 
             // Apply field projection if RETURN clause specified
             let final_records = if let Some(ref return_fields) = step.modifiers.return_fields {
@@ -597,17 +602,13 @@ impl Executor {
         if let Some(with_links) = &step.modifiers.with_links {
             let mut records_with_links = Vec::new();
 
+            let link_type_filter = match with_links {
+                adb_core::WithLinks::All => None,
+                adb_core::WithLinks::Type { link_type } => Some(link_type.as_str()),
+            };
+            let mut by_record = self.links_of(&records, link_type_filter).await?;
             for mut record in records {
-                // Get links for this record
-                let link_type_filter = match with_links {
-                    adb_core::WithLinks::All => None,
-                    adb_core::WithLinks::Type { link_type } => Some(link_type.as_str()),
-                };
-
-                let links = self
-                    .reads
-                    .links_from(record.memory_type, &record.id, link_type_filter)
-                    .await?;
+                let links = by_record.remove(&(record.memory_type, record.id.clone())).unwrap_or_default();
 
                 // Add links array to record data
                 if let Some(obj) = record.data.as_object_mut() {
@@ -652,16 +653,13 @@ impl Executor {
         if let Some(with_links) = &step.modifiers.with_links {
             let mut records_with_links = Vec::new();
 
+            let link_type_filter = match with_links {
+                adb_core::WithLinks::All => None,
+                adb_core::WithLinks::Type { link_type } => Some(link_type.as_str()),
+            };
+            let mut by_record = self.links_of(&records, link_type_filter).await?;
             for mut record in records {
-                let link_type_filter = match with_links {
-                    adb_core::WithLinks::All => None,
-                    adb_core::WithLinks::Type { link_type } => Some(link_type.as_str()),
-                };
-
-                let links = self
-                    .reads
-                    .links_from(record.memory_type, &record.id, link_type_filter)
-                    .await?;
+                let links = by_record.remove(&(record.memory_type, record.id.clone())).unwrap_or_default();
 
                 if let Some(obj) = record.data.as_object_mut() {
                     let links_json: Vec<serde_json::Value> = links
@@ -697,7 +695,7 @@ impl Executor {
         let start = Instant::now();
 
         let limit = step.modifiers.limit.unwrap_or(10);
-        let records = self.adb.load(&step.predicate, limit).await?;
+        let records = self.reads.load(&step.predicate, limit).await?;
 
         Ok(QueryResult::records(
             records,
