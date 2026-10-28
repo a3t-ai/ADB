@@ -188,3 +188,8 @@ scope (newest n / bytes / time window / all / none), fed by every put, complete-
 floor buckets, Lance fallback, `ADB_CACHE=on|off|shadow`. Gates 10/10 in shadow
 mode; conformance 182/182 with 207 cache hits and 0 mismatches. Limitations W10-L1
 … L8.
+
+**W10 rolled (28 Oct ~23:45 UTC):** `adb:2026-10-28-w10` (clean start: hot cache loaded
+6 rows in 7 ms, auth on), `flowr:2026-10-28-ee8` (console, controller
+`A3T_RUNTIME_IMAGE`, Runtime CR `worker`), A3T UI rebuilt (Settings → ADB Memory
+Cache). Default rules on vc-dev (no `cache.json` yet).
