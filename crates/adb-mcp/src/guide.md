@@ -54,8 +54,9 @@ subscriber of a topic sees the same messages in the same order.
 - `subscribe` with `topic` (or `scope` = `"tenant:default"` for every memory change) → a subscription id.
 - `publish` with `topic` and `fields` sends a message (kept 7 days unless `ttl`).
 - `next_events` with the subscription id waits for and returns deliveries; pass its `next` back as `from`.
-  If it carries `reset`, you were away longer than the log keeps: replace what you
-  hold for that topic or scope with `reset.changes` (the current state), then go on.
+  If it carries `reset`, you were away longer than the log keeps. For a topic,
+  `reset.changes` are the messages you missed (still retained), in order; for a
+  scope, they are its current state: replace what you hold for it. Then go on.
 - `ack` the last offset you handled, so after a restart you continue from there.
 - `unsubscribe` when done.
 

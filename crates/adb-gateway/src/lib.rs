@@ -54,6 +54,9 @@ pub struct Subscription {
     pub spec: SubSpec,
     /// The last acknowledged offset; deliveries resume after it.
     pub cursor: u64,
+    /// When it was last registered, read or acked here (since this process opened:
+    /// a restart starts every subscription's idle clock again).
+    pub seen: std::time::Instant,
 }
 
 /// The `value` of a `sub` row (D3: `{target, filter, …, cursor}`).
@@ -68,7 +71,7 @@ pub fn sub_value(spec: &SubSpec, cursor: u64) -> serde_json::Value {
 fn from_value(id: &str, v: &serde_json::Value) -> Option<Subscription> {
     let spec: SubSpec = serde_json::from_value(v.clone()).ok()?;
     let cursor = v.get("cursor").and_then(|c| c.as_u64()).unwrap_or(0);
-    Some(Subscription { id: id.to_string(), spec, cursor })
+    Some(Subscription { id: id.to_string(), spec, cursor, seen: std::time::Instant::now() })
 }
 
 /// The partition's live subscriptions.
@@ -102,6 +105,7 @@ impl Registry {
                 Effect::UpdateSubCursor { sub_id, cursor } => {
                     if let Some(s) = subs.get_mut(&sub_id.0) {
                         s.cursor = s.cursor.max(cursor.0);
+                        s.seen = std::time::Instant::now();
                     }
                 }
                 Effect::Unregister { id } => {
@@ -127,6 +131,18 @@ impl Registry {
     /// The oldest acked cursor: the log must keep everything after it (E3).
     pub fn min_cursor(&self) -> Option<u64> {
         self.subs.read().values().map(|s| s.cursor).min()
+    }
+
+    /// A subscriber read `id`: its idle clock starts again (W9).
+    pub fn touch(&self, id: &str) {
+        if let Some(s) = self.subs.write().get_mut(id) {
+            s.seen = std::time::Instant::now();
+        }
+    }
+
+    /// Subscriptions nobody has read or acked for `idle` (W9, E-L3).
+    pub fn idle(&self, idle: Duration) -> Vec<String> {
+        self.subs.read().values().filter(|s| s.seen.elapsed() >= idle).map(|s| s.id.clone()).collect()
     }
 }
 
@@ -160,6 +176,9 @@ pub struct Change {
     /// the link (`link`); absent for `forget` / `expire`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>,
+    /// In a `reset`: the offset that wrote this row (a delivery has its own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
 }
 
 /// Scope and kind of record `key` of `memory`, from any of its versions; and the
@@ -167,7 +186,8 @@ pub struct Change {
 #[async_trait::async_trait]
 pub trait Lineages: Send + Sync {
     async fn lineage(&self, memory: Memory, key: &str) -> Option<(String, Kind)>;
-    async fn current_rows(&self, target: &Target) -> Result<Vec<StoredRow>, String>;
+    /// Current rows of a scope; a topic's retained messages after offset `after`.
+    async fn current_rows(&self, target: &Target, after: u64) -> Result<Vec<StoredRow>, String>;
 }
 
 #[async_trait::async_trait]
@@ -179,10 +199,12 @@ impl Lineages for PartitionStore {
         self.scan(Some(&filter)).await.ok()?.into_iter().next().map(|r| (r.data.scope, r.data.kind))
     }
 
-    async fn current_rows(&self, target: &Target) -> Result<Vec<StoredRow>, String> {
+    async fn current_rows(&self, target: &Target, after: u64) -> Result<Vec<StoredRow>, String> {
         let filter = match target {
             Target::Scope(s) => format!("scope = {} AND ({RECORD_KINDS} OR kind IN ('edge', 'event'))", sql_str(s)),
-            Target::Topic(t) => format!("kind = 'event' AND subject_id = {}", sql_str(t)),
+            // Messages never change: the ones after the subscriber's position are
+            // exactly what it missed (those still retained).
+            Target::Topic(t) => format!("kind = 'event' AND subject_id = {} AND log_offset > {after}", sql_str(t)),
         };
         self.current(Some(&filter), CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
     }
@@ -209,6 +231,7 @@ fn row_change(r: &StoredRow) -> Change {
                 "link_type": d.link_type,
                 "weight": d.weight,
             })),
+            offset: Some(r.log_offset),
         },
         Kind::Event => Change {
             op: "publish".into(),
@@ -219,6 +242,7 @@ fn row_change(r: &StoredRow) -> Change {
             scope: d.scope.clone(),
             topic: d.subject_id.clone(),
             value: Some(d.value.clone()),
+            offset: Some(r.log_offset),
         },
         kind => Change {
             op: "put".into(),
@@ -229,6 +253,7 @@ fn row_change(r: &StoredRow) -> Change {
             scope: d.scope.clone(),
             topic: None,
             value: Some(d.value.clone()),
+            offset: Some(r.log_offset),
         },
     }
 }
@@ -247,6 +272,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                 scope: n.data.scope.clone(),
                 topic: None,
                 value: Some(n.data.value.clone()),
+                offset: None,
             },
             Effect::Supersede { new: n, .. } => Change {
                 op: "supersede".into(),
@@ -257,6 +283,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                 scope: n.data.scope.clone(),
                 topic: None,
                 value: Some(n.data.value.clone()),
+                offset: None,
             },
             Effect::PutEdge(n) => Change {
                 op: "link".into(),
@@ -273,6 +300,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                     "link_type": n.data.link_type,
                     "weight": n.data.weight,
                 })),
+                offset: None,
             },
             Effect::PublishEvent(n) => Change {
                 op: "publish".into(),
@@ -283,6 +311,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                 scope: n.data.scope.clone(),
                 topic: n.data.subject_id.clone(),
                 value: Some(n.data.value.clone()),
+                offset: None,
             },
             Effect::Patch { memory, id, fields, .. } => {
                 let Some((scope, kind)) = lineages.lineage(*memory, &id.0).await else { continue };
@@ -295,6 +324,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                     scope,
                     topic: None,
                     value: Some(serde_json::Value::Object(fields.clone())),
+                    offset: None,
                 }
             }
             Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
@@ -313,6 +343,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                     scope,
                     topic: None,
                     value: None,
+                    offset: None,
                 }
             }
             // A vector attached to a row is not a change of its content.
@@ -373,9 +404,11 @@ pub struct Batch {
     pub reset: Option<Reset>,
 }
 
-/// The current rows a subscription covers, as of `offset`: the subscriber drops what
-/// it holds for the target and takes these. Changes after `offset` follow as
-/// deliveries (some may repeat what the reset already shows: at-least-once).
+/// Catch-up from the table, as of `offset`. For a scope: its current rows — the
+/// subscriber drops what it holds for the scope and takes these. For a topic: the
+/// retained messages after the subscriber's position, in order (each change carries
+/// its own `offset`). Changes after `offset` follow as deliveries (some may repeat
+/// what the reset already shows: at-least-once).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reset {
     pub partition: u32,
@@ -407,6 +440,7 @@ impl Gateway {
     /// cursor), waiting up to `wait` for the first one.
     pub async fn next(&self, sub: &str, from: Option<u64>, max: usize, wait: Duration) -> Result<Batch, GatewayError> {
         let s = self.registry.get(sub).ok_or_else(|| GatewayError::UnknownSubscription(sub.to_string()))?;
+        self.registry.touch(sub);
         let mut next = from.unwrap_or(s.cursor + 1).max(1);
         let deadline = tokio::time::Instant::now() + wait;
         let mut applied = self.applied.clone();
@@ -419,8 +453,9 @@ impl Gateway {
                     Ok(r) => r,
                     Err(LogError::Purged { .. }) => {
                         // Past log retention: catch up from the table (W9).
-                        let rows = self.lineages.current_rows(&s.spec.target).await.map_err(GatewayError::Log)?;
-                        let changes = rows.iter().map(row_change).filter(|c| matches(&s.spec, c)).collect();
+                        let rows = self.lineages.current_rows(&s.spec.target, next - 1).await.map_err(GatewayError::Log)?;
+                        let mut changes: Vec<Change> = rows.iter().map(row_change).filter(|c| matches(&s.spec, c)).collect();
+                        changes.sort_by_key(|c| c.offset);
                         let reset = Reset { partition: u32::from(self.log.partition().0), offset: tip, changes };
                         return Ok(Batch { deliveries: Vec::new(), next: tip + 1, tip, reset: Some(reset) });
                     }

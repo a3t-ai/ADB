@@ -190,6 +190,12 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                     tracing::warn!(error = %e, "platform compaction failed; retrying later");
                 }
             }
+            // W9: subscriptions nobody reads (E-L3), each minute.
+            if ticks % 60 == 15 {
+                if let Err(e) = w.drop_idle_subscriptions().await {
+                    tracing::warn!(error = %e, "dropping idle subscriptions failed; retrying later");
+                }
+            }
             match w.expire_due().await {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
@@ -212,6 +218,13 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
 }
 
 impl LocalEngine {
+    /// Drop subscriptions idle past `ADB_SUB_IDLE` now (the expiry task does it each
+    /// minute). Returns their ids.
+    pub async fn drop_idle_subscriptions(&self) -> Result<Vec<String>, String> {
+        let Some(w) = &self.durable else { return Ok(Vec::new()) };
+        w.drop_idle_subscriptions().await.map_err(|e| e.to_string())
+    }
+
     /// The executor (tests).
     pub fn executor(&self) -> &Executor {
         &self.executor

@@ -196,6 +196,14 @@ pub const DEFAULT_EVENT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// `ADB_LOG_RETAIN` says otherwise. Past it a subscriber gets a `reset` (W9).
 pub const RETAIN_MAX: u64 = 100_000;
 
+/// A subscription nobody reads or acks for this long is dropped (W9, E-L3), unless
+/// `ADB_SUB_IDLE` (seconds) says otherwise. As long as topic messages are kept.
+pub const SUB_IDLE: Duration = DEFAULT_EVENT_TTL;
+
+fn sub_idle() -> Duration {
+    std::env::var("ADB_SUB_IDLE").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(SUB_IDLE)
+}
+
 fn retain_max() -> u64 {
     std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
 }
@@ -265,6 +273,8 @@ pub struct DurableWrites<L: Log> {
     /// The most records the log keeps behind its tip for subscribers (E3):
     /// `ADB_LOG_RETAIN`, default [`RETAIN_MAX`].
     retain_max: u64,
+    /// `ADB_SUB_IDLE`, default [`SUB_IDLE`].
+    sub_idle: Duration,
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
@@ -280,6 +290,17 @@ pub const HISTORY: Duration = Duration::from_secs(90 * 86_400);
 pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
 
 impl<L: Log + 'static> DurableWrites<L> {
+    /// Unsubscribe every subscription idle for longer than `ADB_SUB_IDLE` (W9,
+    /// E-L3): an abandoned subscriber stops pinning the log. Returns the ids.
+    pub async fn drop_idle_subscriptions(&self) -> AdbResult<Vec<String>> {
+        let ids = self.subs.idle(self.sub_idle);
+        for id in &ids {
+            Writes::unsubscribe(self, id).await?;
+            tracing::info!(subscription = %id, idle_secs = self.sub_idle.as_secs(), "idle subscription dropped");
+        }
+        Ok(ids)
+    }
+
     /// The current edges from any of `from_ids` to any of `to_ids` (of `link_type`,
     /// if given), after every earlier record is in Lance.
     #[allow(clippy::too_many_arguments)]
@@ -541,7 +562,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
         let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max() }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle() }, stats))
     }
 
     /// The last durable offset (tests and metrics).

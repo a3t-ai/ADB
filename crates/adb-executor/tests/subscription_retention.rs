@@ -1,11 +1,15 @@
-//! W9 (spec §4.4, reconciliation note 2): a subscriber whose position is no longer
-//! in the log gets a `reset` with the current rows of its target, then deliveries.
-//! Own test binary: it sets `ADB_LOG_RETAIN` for the whole process.
+//! W9: log retention and subscriptions. A subscriber whose position is no longer in
+//! the log gets a `reset` with the current rows of its target, then deliveries
+//! (spec §4.4, reconciliation note 2); a subscription nobody reads is dropped (E-L3).
+//! Own test binary: it sets `ADB_LOG_RETAIN` / `ADB_SUB_IDLE` for the whole process.
 
 use std::time::Duration;
 
 use adb_executor::{Engine, LocalEngine};
 use serde_json::Value;
+
+/// The tests set process-wide settings: one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn q(engine: &LocalEngine, aql: &str) -> Value {
     engine.query(aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}"))
@@ -28,7 +32,9 @@ async fn flood(engine: &LocalEngine) {
 
 #[tokio::test]
 async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
+    let _serial = SERIAL.lock().await;
     std::env::set_var("ADB_LOG_RETAIN", "10");
+    std::env::remove_var("ADB_SUB_IDLE");
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let gw = engine.gateway().unwrap();
@@ -67,9 +73,33 @@ async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
     assert_eq!(reset.changes.len(), 1);
     assert_eq!(reset.changes[0].op, "publish");
     assert_eq!(reset.changes[0].value.as_ref().unwrap()["headline"], "one");
+    assert!(reset.changes[0].offset.is_some_and(|o| o > 1));
 
     // SUBSCRIBE … FROM OFFSET past retention registers and starts with a reset.
     let old = subscribe(&engine, r#"SUBSCRIBE TOPIC "news" FROM OFFSET 1"#).await;
     let b = gw.next(&old, None, 10, Duration::from_millis(300)).await.unwrap();
     assert_eq!(b.reset.expect("reset").changes.len(), 1);
+}
+
+#[tokio::test]
+async fn an_idle_subscription_is_dropped_and_a_read_one_kept() {
+    let _serial = SERIAL.lock().await;
+    std::env::set_var("ADB_SUB_IDLE", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let gw = engine.gateway().unwrap();
+    let idle = subscribe(&engine, r#"SUBSCRIBE TOPIC "quiet""#).await;
+    let read = subscribe(&engine, r#"SUBSCRIBE TOPIC "busy""#).await;
+    let acked = subscribe(&engine, r#"SUBSCRIBE TOPIC "busy""#).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    gw.next(&read, None, 10, Duration::ZERO).await.unwrap();
+    let p = q(&engine, r#"PUBLISH TOPIC "busy" (n = 1)"#).await["data"]["offset"].as_u64().unwrap();
+    q(&engine, &format!(r#"ACK "{acked}" OFFSET {p}"#)).await;
+
+    assert_eq!(engine.drop_idle_subscriptions().await.unwrap(), vec![idle.clone()]);
+    assert!(gw.registry().get(&idle).is_none());
+    assert!(gw.registry().get(&read).is_some() && gw.registry().get(&acked).is_some());
+    // Dropped for good: committed as an UNSUBSCRIBE.
+    let r = q(&engine, &format!(r#"UNSUBSCRIBE "{idle}""#)).await;
+    assert_eq!(r["data"]["unsubscribed"], false);
 }

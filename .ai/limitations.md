@@ -71,7 +71,6 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
 | E-L1 | **Each subscriber reads the log itself** (tails the applied log) instead of a matcher at apply fanning out. | Cost grows with subscribers × writes; fine for tens of subscribers on one node. | M4 cluster gateway (spec §6 matcher at apply). |
-| E-L3 | **An abandoned subscription pins the log** (purge keeps everything after the oldest cursor, up to the 100k-record cap). | Up to 100k extra log records kept per partition. | Subscription idle TTL / auto-expiry. |
 | E-L4 | **Every `ACK` is a log record.** | Log volume with many subscribers acking often. | Batch cursors (one effect, many subscriptions) or gateway-held cursors (spec open question). |
 | E-L5 | **No authorization at registration or delivery** (ADB has no credentials yet). | Anyone who can reach ADB can subscribe to any topic or scope. | §14.4 auth, with the SaaS control plane. |
 | E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | With CQ watch sets (M2). |
@@ -172,7 +171,8 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | # | Limitation | Effect | Fix |
 |---|---|---|---|
 | W9-L1 | **`PIPELINE … TIMEOUT` is enforced only with `ADB_ENFORCE_TIMEOUT=1`** (user, 28 Oct): reads take 10–100 ms, so tight budgets would return partial results. When on, each stage gets what is left of the budget; the stage that runs out is dropped (its own partial rows aren't kept), later stages are skipped, and the result carries `timed_out: true`. `TIMEOUT` on a single statement is ignored. | Budgets aren't honoured by default. | Turn it on by default with the performance work. |
-| W9-L2 | **A subscription `reset` carries the target's whole current state** (every current row of the scope, or every retained message of the topic, after its filter), in one batch, and says nothing about which rows were deleted while the subscriber was away — it replaces what the subscriber holds. | A large scope gives a large first batch after a long absence. | Page the reset (`next` cursor over the table) if scopes get big. |
+| W9-L2 | **A scope subscription's `reset` carries the scope's whole current state** (every current row, after its filter) in one batch, and says nothing about which rows were deleted while the subscriber was away — it replaces what the subscriber holds. (A topic's reset is exact: the retained messages after the subscriber's position.) | A large scope gives a large first batch after a long absence. | Page the reset (`next` cursor over the table) if scopes get big. |
+| W9-L3 | **A subscription's idle clock is in memory**: a restart of ADB starts every subscription's 7 days (`ADB_SUB_IDLE`) again. | An abandoned subscription survives longer if ADB restarts often. | Persist the last read with the cursor, if it matters. |
 
 ## Query engine (W7)
 
@@ -218,3 +218,4 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 | S7: `PATTERN` needed a variable (and ADB matched the variable's name) | W9.3: `PATTERN "text"` (AQL v0.7 grammar) and `$p` bound from request / pipeline variables |
 | v0.6 conformance suite missing | W9.4: AQL `tests/suites/18_subscriptions.yaml`, `19_watch.yaml`, `20_in_scope.yaml` (42 tests); ADB 182/182. `IN SCOPE` on WORKING / TOOLS now says so (it said "needs a durable engine") |
 | E-L2: no table catch-up past log retention (`cursor_expired`) | W9.5: the gateway answers with a `reset` (current rows of the target, as of the applied tip) and continues with deliveries; `SUBSCRIBE … FROM OFFSET` past retention registers and starts with it; SSE `event: reset`, MCP `next_events.reset`; retention cap `ADB_LOG_RETAIN` (default 100,000) |
+| E-L3: an abandoned subscription pins the log | W9.6: subscriptions nobody reads or acks for 7 days (`ADB_SUB_IDLE`, seconds) are unsubscribed (checked each minute); FlowR's `adb_topic` triggers subscribe again when theirs is gone |
