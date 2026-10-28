@@ -120,3 +120,16 @@ compaction (a FORGET, the nightly run or the admin `compact`).
   debounce, durable registrations with resume / `reset`, idle watches dropped after
   24 h; AQL `WATCH` / `UNWATCH`, `GET /watches/{id}/events` (SSE), MCP `watch` /
   `watch_changes` / `unwatch`. Limits W6-L1…L7.
+
+## W7 (28 Oct)
+
+- **W7 query engine** (`W7_QUERY_ENGINE.md`, commits `97e04ee`…`13fb818`): every read is
+  a DataFusion plan over the Lance tables; `adb-backends` deleted; batched apply,
+  compaction after max(2,000, rows/4) writes, primary-key point lookups. Rolled
+  `adb:2026-10-28-w7`, then `adb:2026-10-28-w7b` (28 Oct 14:13 UTC).
+- **Read latency, for reference** (10k facts, median ms): ADB compacted 10–104;
+  embedded LanceDB 0.40 optimized 3.5–39; Postgres 18 0.25–1.2. The largest ADB
+  cost is filtering on JSON payload fields (W7-L5).
+- **Performance is deferred** (user, 28 Oct): no performance work until the
+  feature matrix is complete; then come back to W7-L3, W7-L5 and W7-L6 (typed
+  columns for filtered fields, scalar indexes, a WORKING cache).
