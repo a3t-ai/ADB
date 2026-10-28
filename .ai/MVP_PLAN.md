@@ -173,3 +173,8 @@ Then W8 (the user's A3T pass), then performance, then graph.
 | 9.10 | `526d971`, flowr `f41c409`, a3t `09cf9a9` | Embedding provider settings: local or OpenAI-compatible, key from env, clear-and-re-embed (user decisions) |
 | 9.11 | `505f74a` | Snowball English stemming: word recall@1 0.64 → 0.67 |
 | 9.12 | `c70e953` | TTL timers instead of the per-second scan |
+
+**W9 rolled (28 Oct ~19:10 UTC):** `adb:2026-10-28-w9` (clean start, auth on, Flight 3001),
+`flowr:2026-10-28-ee7` (console, `A3T_RUNTIME_IMAGE`, and Runtime CR `worker`
+`spec.image` — isolated canvases take their target Runtime's image, so the CR must be
+bumped too), A3T UI rebuilt (Settings → ADB Embeddings). Gates 10/10 before release.
