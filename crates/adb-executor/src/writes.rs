@@ -593,6 +593,13 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers) }, stats))
     }
 
+    /// Drop what the hot cache holds past its window, TTL or validity (W10).
+    pub fn sweep_cache(&self) {
+        if let Some(h) = self.store.as_ref().and_then(|s| s.hot()) {
+            h.sweep();
+        }
+    }
+
     /// The last durable offset (tests and metrics).
     pub async fn durable_offset(&self) -> LogOffset {
         self.seq.lock().await.log().durable_offset()

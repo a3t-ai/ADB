@@ -21,6 +21,22 @@ QUICK=0; [ "${1:-}" = "--quick" ] && QUICK=1
 # The embedding model (W4), so the gates run relevance recall too (fetched once).
 export ADB_EMBED_MODEL_DIR="${ADB_EMBED_MODEL_DIR:-$("$ROOT/tests/fetch-model.sh")}"
 
+# W10: every ADB the gates start checks each hot-cache answer against Lance, with
+# rules that keep every memory type, small enough that buckets are evicted from.
+export ADB_CACHE="${ADB_CACHE:-shadow}"
+if [ -z "${ADB_CACHE_RULES:-}" ]; then
+    ADB_CACHE_RULES=$(cat <<'JSON'
+{"max_bytes": "64MB", "rules": [
+  {"memory": "working", "keep": {"last": 5}},
+  {"memory": "episodic", "keep": {"last": 5}},
+  {"memory": "semantic", "keep": {"last": 20}},
+  {"memory": "procedural", "keep": "all"},
+  {"memory": "tools", "keep": "all"}]}
+JSON
+)
+fi
+export ADB_CACHE_RULES
+
 pass=(); fail=()
 step() {
     local name="$1"; shift

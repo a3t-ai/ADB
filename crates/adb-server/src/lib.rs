@@ -75,6 +75,7 @@ fn routes(engine: Arc<dyn Engine>) -> Router {
         .route("/query", post(query))
         .route("/stats", get(stats))
         .route("/admin/embedding", get(embedding).put(set_embedding))
+        .route("/admin/cache", get(cache).put(set_cache))
         .route("/mcp", post(mcp_post).get(mcp_get))
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
@@ -261,6 +262,17 @@ async fn embedding(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse
 /// checked with a sample embedding, saved, applied by restarting ADB (W9.10).
 async fn set_embedding(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
     respond(s.engine.set_embedding(body).await, StatusCode::BAD_REQUEST)
+}
+
+/// `GET /admin/cache` — the hot cache's mode, rules and figures (W10).
+async fn cache(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.cache().await, StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// `PUT /admin/cache` — `{max_bytes, rules: [{memory, scope?, keep}]}`: saved and
+/// applied at once (the cache is rebuilt from the table; no restart).
+async fn set_cache(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.set_cache(body).await, StatusCode::BAD_REQUEST)
 }
 
 fn respond(r: Result<Value, String>, on_error: StatusCode) -> (StatusCode, Json<QueryResponse>) {

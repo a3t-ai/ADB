@@ -1,0 +1,153 @@
+# W10 — Indexes and a per-node hot cache (28 Oct 2026)
+
+Answers the read-latency limitations W7-L1, W7-L3, W7-L6, P7 and P11. The user
+asked for indexes scoped as *scope → memory type → index*, kept as a local copy on
+each node, with configurable residency (e.g. the last 30 EPISODIC records in memory,
+the most recent 10 MB of WORKING).
+
+## As built (28 Oct)
+
+- **L1 dropped after the spike.** Lance 12's MemWAL maintains BTree, FTS and HNSW
+  indexes (not bitmap); flushed generations get them and the base table's scanner
+  uses them, the memtable only for a filter that is a single comparison. Built with
+  BTrees on `lineage_id`, `memory`, `scope`, `subject_id`, `commit_ts` (all
+  maintained): bench reads at 10k facts unchanged (debug: LOOKUP 63 → 72 ms, the
+  rest within noise) — as the W7 spike found (≤ 10 %). The time is per-source scan
+  overhead in the LSM (one scan per generation and memtable, block lists, plan),
+  not row selection. Reverted.
+- **L2 built** — `adb-store/src/hot.rs`, read path in `adb-executor/src/query.rs`:
+  - fed from `PartitionStore::apply_many` (the rows each put wrote, under the store
+    lock); `set_cache` fills a new cache from the table under the exclusive lock,
+    at open and on a rules change (no restart);
+  - buckets `(memory, scope)`, each with a *floor* (newest commit time evicted):
+    rows after it are all there; no floor = complete;
+  - reads (`read`, `scan`, `load`, `targets`, `by_keys`) take their candidates from
+    the cache, then run exactly as on Lance's rows. Complete buckets answer
+    anything; incomplete ones answer EPISODIC newest-first `LIMIT k` (no ORDER BY)
+    and WORKING `WINDOW LAST n` / `LAST <duration>` when every returned row is newer
+    than the floor. Otherwise the read goes to Lance (counted as a miss);
+  - `ADB_CACHE=on|off|shadow` (shadow: every cached answer is also read from Lance;
+    a difference fails the read and is counted);
+  - rules in `<data dir>/cache.json`, `GET/PUT /admin/cache`; the expiry tick
+    sweeps rows past their window / TTL;
+  - defaults: WORKING 10 MB per scope, TOOLS and PROCEDURAL all, EPISODIC last 200
+    per scope, SEMANTIC none; 256 MB cap.
+- **Tests:** `adb-store/tests/hot.rs` (random puts / supersedes / patches / forgets /
+  expiries over 3 memory types × 3 scopes under tight rules, cache vs table after
+  every 5th record, across a compaction, a sweep, a rebuild and a reopen); unit tests
+  for the rules; the gates in shadow mode.
+
+- **Measured** (`tests/bench-reads.mjs --cache off|default|all`, debug build,
+  10k SEMANTIC facts, 200 EPISODIC, 200 WORKING, median ms):
+
+  | Read | off | default rules | keep all |
+  |---|---|---|---|
+  | SEMANTIC LOOKUP KEY | 72 | 68 (not kept) | 1.8 |
+  | WORKING SCAN WINDOW LAST 10 | 122 | 5.7 | 4.2 |
+  | WORKING KEY id | 72 | 1.3 | 1.2 |
+  | EPISODIC newest 10 | 130 | 5.9 | 5.4 |
+  | SEMANTIC WHERE (10k rows) | 326 | 248 | 145 (W10-L8) |
+  | WITH / FOLLOW LINKS | 250 / 497 | — | 232 / 371 (edges from Lance, W10-L2) |
+
+## Two layers (proposal)
+
+| Layer | Where | Serves | Fixes |
+|---|---|---|---|
+| **L1 — Lance scalar indexes** | On disk, in the partition's table; kept current in memtables by the MemWAL (`maintained_indexes`) | Every read that misses the cache: key lookups, scope / type selection, time order | W7-L1, P7 (reads cost what they select, not the partition size) |
+| **L2 — Hot cache** | In memory, on every node that applies the log (the owner today, every replica in M3) | Reads the cache can answer completely (rules below) | W7-L3, P11, most of W7-L6 |
+
+L1 comes first: it makes every cache miss and every cold start cheap, and the cache
+warms from it.
+
+### L1 — indexes
+
+- BTree on `lineage_id` (KEY lookups, edges, UPDATE / FORGET targets).
+- Bitmap on `memory`, `kind`, `scope` (low cardinality; scope → type selection).
+- BTree on `commit_ts` (newest-first reads: `ORDER BY time DESC LIMIT k`, windows).
+- All listed in `maintained_indexes` so memtables and sealed generations use them.
+- **Payload fields** (W7-L5): the payload is one JSON column, so `WHERE status = …`
+  has no column to index and parses every row. Config names the fields to promote
+  per memory type (like a Postgres expression index on `data->>'status'`); ADB
+  writes them as typed columns at apply and indexes them; filters on other fields
+  keep parsing JSON.
+- **Spike first (1 day):** confirm Lance 12's MemWAL maintains bitmap and multiple
+  BTree indexes in memtables and that the LSM scanner uses them for `memory = … AND
+  scope = …`. If not, fall back to BTree on a composite `scope_key = scope|memory`
+  column, or one table per memory type.
+
+### L2 — the hot cache
+
+- **Built from the log, not from reads.** The applier hands every record to the cache
+  right after Lance applies it, in log order. So the cache is exactly the table's
+  state at the applied offset; reads keep the same barrier (read-your-writes), and
+  there is no invalidation problem. A replica (M3) builds its own copy from the same
+  log — the "local copy on each node".
+- **Keyed `scope → memory type → entries`**, each entry the current row (decoded
+  JSON + metadata, no vector unless the rule says so), plus per-bucket indexes:
+  by lineage id (hash map) and by commit time (ordered).
+  WORKING and TOOLS have no named scopes: their bucket key is the `namespace`
+  (the agent / session), or `*` without one.
+- **Rules (config):** first match wins; scope is an exact name or a glob.
+
+  ```json
+  {
+    "max_bytes": "512MB",
+    "rules": [
+      { "memory": "working",  "scope": "*",            "keep": { "bytes": "10MB" } },
+      { "memory": "episodic", "scope": "team:billing", "keep": { "last": 200 } },
+      { "memory": "episodic", "scope": "*",            "keep": { "last": 30 } },
+      { "memory": "tools",    "scope": "*",            "keep": "all" },
+      { "memory": "semantic", "scope": "*",            "keep": "none" }
+    ]
+  }
+  ```
+
+  `keep`: `{last: n}` (newest n per bucket), `{bytes: x}` (newest that fit),
+  `{within: "24h"}` (time window), `all`, `none`. `max_bytes` is the node-wide cap;
+  past it the coldest buckets shrink first and the cache reports it.
+- **Where it lives:** `<data dir>/cache.json` (like `embedding.json`), `GET/PUT
+  /admin/cache`, an A3T Settings page. Changing rules rebuilds the cache in the
+  background from L1 — no restart, reads fall back to Lance meanwhile.
+
+### When a read uses the cache (completeness rules)
+
+The cache answers only when it provably holds every row the read can return;
+otherwise the read goes to Lance (L1). Never a partial answer.
+
+| Read | Served from cache when |
+|---|---|
+| LOOKUP / KEY | hit → cache. Miss → Lance, unless the bucket is complete (`all`, or under its budget) |
+| Newest-first `LIMIT k` (with or without WHERE) | the newest cached rows contain k matches — they are a prefix of time order, so they are the top k |
+| SCAN WORKING / a window | the bucket covers the whole window (complete, or `within` ≥ window) |
+| WHERE without order, AGGREGATE, LIKE | only on a complete bucket |
+| Unscoped reads over a memory type | only if every bucket of that type is complete |
+| History (`AS OF`, superseded versions) | never (cache holds current rows only) |
+
+### Restart and cluster
+
+- On open: Lance catch-up, then warm each rule from L1 (`scope = … AND memory = …
+  ORDER BY commit_ts DESC LIMIT n`), then follow the applier. Reads go to Lance
+  until a bucket is warm.
+- M3: every replica applies the log, so every replica has its own cache; follower
+  reads at their applied offset can use it the same way.
+
+## Correctness gate
+
+Shadow mode (as in W7): every read answered from the cache also runs on Lance and
+fails on a difference. The AQL conformance suites, the crash tests and the recall
+eval run in shadow mode until the cache has run clean on vc-dev.
+
+## Steps
+
+1. Spike: MemWAL-maintained bitmap / BTree indexes in Lance 12 (above).
+2. L1 indexes + rewrite on compaction; `bench-reads.mjs` before / after.
+3. Cache core: buckets, rules, byte accounting, applier hook, completeness checks.
+4. Config: `cache.json`, `/admin/cache`, metrics (hits, misses, fallbacks, bytes per
+   rule); A3T Settings page.
+5. Warm-up on open; rebuild on rule change.
+6. Shadow gate, release, roll; measurements recorded in `limitations.md`.
+
+## Expected
+
+Release, 10k facts: cache hits ~0.1–0.5 ms over HTTP (vs 10–100 ms now); misses with
+L1 in the LanceDB-with-indexes range (1.5–30 ms) instead of scanning.

@@ -31,6 +31,7 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use uuid::Uuid;
 
+use crate::hot::HotCache;
 use crate::rows::{decode, encode, qualified, row_id, StoredRow};
 use crate::schema::{memory_schema, META_ID, RECORD_KINDS};
 use crate::{StoreError, StoreResult};
@@ -98,6 +99,10 @@ pub struct PartitionStore {
     rows_at_compaction: std::sync::atomic::AtomicU64,
     /// The table's vectors came from another embedding model (W9.10).
     model_changed: std::sync::atomic::AtomicBool,
+    /// W10 hot cache, fed by every put (`set_cache`).
+    hot: std::sync::RwLock<Option<Arc<HotCache>>>,
+    /// Odd while a put and its cache update are under way (`apply_seq`).
+    apply_seq: std::sync::atomic::AtomicU64,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -416,6 +421,8 @@ impl PartitionStore {
             puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
             rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
             model_changed: std::sync::atomic::AtomicBool::new(false),
+            hot: std::sync::RwLock::new(None),
+            apply_seq: std::sync::atomic::AtomicU64::new(0),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -686,6 +693,43 @@ impl PartitionStore {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())
     }
 
+    /// Counts puts in two steps (before the put, after the cache took its rows):
+    /// odd while one is under way. Two reads between equal, even values saw the
+    /// same state in the table and the cache (the W10 shadow check).
+    pub fn apply_seq(&self) -> u64 {
+        self.apply_seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The hot cache, if one is set (W10).
+    pub fn hot(&self) -> Option<Arc<HotCache>> {
+        self.hot.read().unwrap().clone()
+    }
+
+    /// Replace the hot cache (`None`: no cache). The new one is filled from the
+    /// table's current record rows of the memory types it keeps, with applies
+    /// held off (the store's exclusive lock), so it starts at the applied offset.
+    pub async fn set_cache(&self, cache: Option<HotCache>) -> StoreResult<()> {
+        let g = self.state.write().await;
+        let Some(cache) = cache else {
+            *self.hot.write().unwrap() = None;
+            return Ok(());
+        };
+        let tracked = cache.tracked();
+        let started = std::time::Instant::now();
+        if !tracked.is_empty() {
+            let memories: Vec<String> = tracked.iter().map(|m| sql_str(m.tag())).collect();
+            let filter = format!("memory IN ({}) AND {RECORD_KINDS} AND tombstone = false AND superseded_by IS NULL", memories.join(", "));
+            let mut rows = Self::scan_in(open_state(&g), Some(&filter)).await?;
+            rows.retain(|r| r.id != META_ID);
+            cache.load(rows);
+        }
+        let st = cache.stats();
+        tracing::info!(rows = st.rows, bytes = st.bytes, took = ?started.elapsed(), "hot cache loaded");
+        *self.hot.write().unwrap() = Some(Arc::new(cache));
+        drop(g);
+        Ok(())
+    }
+
     /// The last log offset applied to this table (`_meta`, cached).
     pub async fn applied_offset(&self) -> StoreResult<LogOffset> {
         Ok(LogOffset(self.applied.load(std::sync::atomic::Ordering::SeqCst)))
@@ -716,7 +760,14 @@ impl PartitionStore {
 
         let rows: Vec<StoredRow> = out.into_values().collect();
         let batch = encode(&rows, &self.schema, self.dim)?;
-        inner.writer.put(vec![batch]).await.map_err(lance)?;
+        self.apply_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let put = inner.writer.put(vec![batch]).await.map_err(lance);
+        // Still under the state lock, so the cache moves with the table (W10).
+        if let (Ok(_), Some(h)) = (&put, self.hot()) {
+            h.apply(&rows);
+        }
+        self.apply_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        put?;
         self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
         inner.puts.lock().unwrap().offsets.push_back(off);
         self.puts_since_compaction.fetch_add(records.len() as u64, std::sync::atomic::Ordering::SeqCst);

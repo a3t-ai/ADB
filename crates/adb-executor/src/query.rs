@@ -332,6 +332,121 @@ async fn point(store: &PartitionStore, memory: Memory, key: &str, in_scope: Opti
     Ok(ok.then_some(r))
 }
 
+/// Where a read's candidates come from (W10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The hot cache where it can answer, else Lance.
+    Cache,
+    Lance,
+}
+
+/// A read's candidates. `floor`: from the cache, rows committed at or before it
+/// may be missing (`None`: complete).
+struct Candidates {
+    records: Vec<MemoryRecord>,
+    cached: bool,
+    floor: Option<CommitTs>,
+}
+
+/// A read's answer: from the cache, from Lance, or the cache's rows weren't
+/// enough (read again from Lance).
+enum Answer<T> {
+    Cache(T),
+    Lance(T),
+    Insufficient,
+}
+
+impl<T> Answer<T> {
+    fn of(c: &Candidates, v: T) -> Self {
+        if c.cached { Answer::Cache(v) } else { Answer::Lance(v) }
+    }
+}
+
+/// Run `f` from the cache, falling back to Lance; in shadow mode a cached answer
+/// is checked against Lance's and a difference is an error.
+async fn served<T, F, Fut>(store: &PartitionStore, what: &str, f: F, same: impl Fn(&T, &T) -> bool, show: impl Fn(&T) -> String) -> AdbResult<T>
+where
+    F: Fn(Source) -> Fut,
+    Fut: std::future::Future<Output = AdbResult<Answer<T>>>,
+{
+    let lance = |a: Answer<T>| match a {
+        Answer::Cache(v) | Answer::Lance(v) => v,
+        Answer::Insufficient => unreachable!("a Lance read is complete"),
+    };
+    let Some(hot) = store.hot() else { return Ok(lance(f(Source::Lance).await?)) };
+    // Shadow: both answers from the same state — no put began or ended between
+    // them (a write applied in between makes them differ rightly); else again.
+    let mut tries = 0;
+    let (answer, seq) = loop {
+        let seq = store.apply_seq();
+        let a = f(Source::Cache).await?;
+        if !hot.shadow() || seq % 2 == 0 || tries == 5 {
+            break (a, seq);
+        }
+        tries += 1;
+        tokio::task::yield_now().await;
+    };
+    match answer {
+        Answer::Lance(v) => Ok(v),
+        Answer::Cache(v) => {
+            hot.hit();
+            if hot.shadow() && seq % 2 == 0 {
+                let l = lance(f(Source::Lance).await?);
+                if store.apply_seq() == seq && !same(&v, &l) {
+                    hot.mismatch();
+                    tracing::error!(what, cache = %show(&v), lance = %show(&l), "hot cache answer differs from Lance");
+                    return Err(AdbError::Internal(format!("hot cache shadow check: {what} differs from Lance (cache {}, Lance {})", show(&v), show(&l))));
+                }
+            }
+            Ok(v)
+        }
+        Answer::Insufficient => {
+            hot.miss();
+            Ok(lance(f(Source::Lance).await?))
+        }
+    }
+}
+
+fn same_records(a: &Vec<MemoryRecord>, b: &Vec<MemoryRecord>) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+
+fn show_records(v: &Vec<MemoryRecord>) -> String {
+    let ids: Vec<&str> = v.iter().take(20).map(|r| r.id.as_str()).collect();
+    format!("{} records {ids:?}", v.len())
+}
+
+/// The candidates from the hot cache, if it keeps `memory`: as from Lance, every
+/// current record row of `memory` in the scope and namespace (the exact predicate
+/// runs after, as on Lance's superset).
+fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> Option<Candidates> {
+    let hot = store.hot()?;
+    let m: Memory = memory.into();
+    let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
+    let ok = |r: &StoredRow| {
+        r.is_current(now) && in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns))
+    };
+    // KEY: the lineage's current version, as the point lookup finds it.
+    if let Some(key) = keyed(memory, predicate) {
+        if let Some(Some(r)) = hot.lineage(m, &row_id(m, &key)) {
+            if ok(&r) {
+                return Some(Candidates { records: vec![record(&r)], cached: true, floor: None });
+            }
+        }
+    }
+    let hit = hot.rows(m, in_scope)?;
+    Some(Candidates { records: hit.rows.iter().filter(|r| ok(r)).map(record).collect(), cached: true, floor: hit.floor })
+}
+
+/// The key a KEY predicate names, when it is the record's key.
+fn keyed(memory: MemoryType, predicate: &Predicate) -> Option<String> {
+    let Predicate::Key { field, value } = predicate else { return None };
+    let keyed = matches!(field.as_str(), "id" | "key")
+        || (memory == MemoryType::Procedural && field == "pattern_id")
+        || (memory == MemoryType::Tools && field == "tool_id");
+    keyed.then(|| value_text(value))
+}
+
 /// The candidates of a read: current rows of `memory` passing the pushed-down part
 /// of `predicate`, as records.
 async fn candidates(
@@ -340,17 +455,19 @@ async fn candidates(
     predicate: &Predicate,
     modifiers: &Modifiers,
     now: CommitTs,
-) -> AdbResult<Vec<MemoryRecord>> {
+    source: Source,
+) -> AdbResult<Candidates> {
+    if source == Source::Cache {
+        if let Some(c) = cached(store, memory, predicate, modifiers, now) {
+            return Ok(c);
+        }
+    }
+    let lance = |records| Ok(Candidates { records, cached: false, floor: None });
     let m: Memory = memory.into();
     // KEY lookups: the primary-key fast path first (W7).
-    if let Predicate::Key { field, value } = predicate {
-        let keyed = matches!(field.as_str(), "id" | "key")
-            || (memory == MemoryType::Procedural && field == "pattern_id")
-            || (memory == MemoryType::Tools && field == "tool_id");
-        if keyed {
-            if let Some(r) = point(store, m, &value_text(value), modifiers.in_scope.as_deref(), modifiers.namespace.as_deref(), now).await? {
-                return Ok(vec![record(&r)]);
-            }
+    if let Some(key) = keyed(memory, predicate) {
+        if let Some(r) = point(store, m, &key, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref(), now).await? {
+            return lance(vec![record(&r)]);
         }
     }
     let mut filter = records_of(m, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
@@ -361,25 +478,33 @@ async fn candidates(
             filter = filter.and(p);
         }
     }
-    Ok(current_rows(store, filter, now, false).await?.iter().map(record).collect())
+    lance(current_rows(store, filter, now, false).await?.iter().map(record).collect())
 }
 
 /// `RECALL` / `LOOKUP` (not `LIKE`): candidates → exact predicate → visibility →
 /// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap.
 pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
-    let mut records = candidates(store, memory, predicate, modifiers, now).await?;
+    served(store, "read", |source| read_from(store, memory, predicate, modifiers, now, source), same_records, show_records).await
+}
+
+async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
+    let c = candidates(store, memory, predicate, modifiers, now, source).await?;
     if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
         if memory != MemoryType::Procedural {
-            return Ok(Vec::new());
+            return Ok(Answer::of(&c, Vec::new()));
+        }
+        if c.floor.is_some() {
+            return Ok(Answer::Insufficient);
         }
         // The literal or bound value; an unbound `$name` matches its name (as before).
         let query = text.as_deref().unwrap_or(pattern_var.trim_start_matches('$'));
         let threshold = threshold.unwrap_or(0.7);
-        let mut scored: Vec<(f32, MemoryRecord)> = records
-            .into_iter()
+        let mut scored: Vec<(f32, MemoryRecord)> = c
+            .records
+            .iter()
             .filter_map(|r| {
                 let s = jaccard(query, r.data["pattern"].as_str().unwrap_or(""));
-                (s >= threshold).then_some((s, r))
+                (s >= threshold).then(|| (s, r.clone()))
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
@@ -387,9 +512,9 @@ pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predic
         if let Some(n) = modifiers.limit {
             out.truncate(n);
         }
-        return Ok(out);
+        return Ok(Answer::of(&c, out));
     }
-    records.retain(|r| matches(memory, r, predicate));
+    let mut records: Vec<MemoryRecord> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
     if let Some(v) = &modifiers.scope {
         records.retain(|r| &r.metadata.scope == v);
     }
@@ -397,19 +522,45 @@ pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predic
     if let Some(o) = &modifiers.order_by {
         order_by(&mut records, o);
     }
+    // From an incomplete bucket: only a newest-first read whose rows are all newer
+    // than the floor (rows that may be missing are older, so they'd rank below).
+    if let Some(floor) = c.floor {
+        let newest_first = memory == MemoryType::Episodic && modifiers.order_by.is_none();
+        let enough = modifiers.limit.is_some_and(|k| k == 0 || (records.len() >= k && records[k - 1].metadata.created_at > floor.to_datetime()));
+        if !(newest_first && enough) {
+            return Ok(Answer::Insufficient);
+        }
+    }
     if let Some(n) = modifiers.limit {
         records.truncate(n);
     }
     if let Some(f) = &modifiers.return_fields {
         project(&mut records, f);
     }
-    Ok(records)
+    Ok(Answer::of(&c, records))
 }
 
 /// `SCAN FROM WORKING [WINDOW …]`: oldest first, then the window, `LIMIT`, `RETURN`.
 pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
-    let mut records = candidates(store, MemoryType::Working, &Predicate::All, modifiers, now).await?;
+    served(store, "scan", |source| scan_from(store, modifiers, now, source), same_records, show_records).await
+}
+
+async fn scan_from(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
+    let c = candidates(store, MemoryType::Working, &Predicate::All, modifiers, now, source).await?;
+    let mut records = c.records.clone();
     default_order(MemoryType::Working, &mut records);
+    // From an incomplete bucket: a window over the newest rows, all newer than the floor.
+    if let Some(floor) = c.floor {
+        let floor = floor.to_datetime();
+        let covered = match &modifiers.window {
+            Some(Window::LastN { count }) => *count == 0 || (records.len() >= *count && records[records.len() - count].metadata.created_at > floor),
+            Some(Window::LastDuration { duration }) => adb_core::time::now() - chrono::Duration::from_std(*duration).unwrap_or_default() >= floor,
+            _ => false,
+        };
+        if !covered {
+            return Ok(Answer::Insufficient);
+        }
+    }
     if let Some(w) = &modifiers.window {
         records = window(records, w);
     }
@@ -419,14 +570,21 @@ pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) 
     if let Some(f) = &modifiers.return_fields {
         project(&mut records, f);
     }
-    Ok(records)
+    Ok(Answer::of(&c, records))
 }
 
 /// `LOAD FROM TOOLS`: matching tools by ranking (blended 70 / 30 with the relevance
 /// for `task` / `task_type` when the WHERE names one), at most `limit`.
 pub async fn load(store: &PartitionStore, predicate: &Predicate, limit: usize, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
-    let mut records = candidates(store, MemoryType::Tools, predicate, &Modifiers::default(), now).await?;
-    records.retain(|r| matches(MemoryType::Tools, r, predicate));
+    served(store, "load", |source| load_from(store, predicate, limit, now, source), same_records, show_records).await
+}
+
+async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
+    let c = candidates(store, MemoryType::Tools, predicate, &Modifiers::default(), now, source).await?;
+    if c.floor.is_some() {
+        return Ok(Answer::Insufficient);
+    }
+    let mut records: Vec<MemoryRecord> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, predicate)).cloned().collect();
     let task = match predicate {
         Predicate::Where { conditions } => conditions.iter().find_map(|c| match c {
             Condition::Simple { field, value: Value::String(s), .. } if field == "task" || field == "task_type" => Some(s.clone()),
@@ -444,15 +602,29 @@ pub async fn load(store: &PartitionStore, predicate: &Predicate, limit: usize, n
     default_order(MemoryType::Tools, &mut records);
     records.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(Ordering::Equal));
     records.truncate(limit);
-    Ok(records)
+    Ok(Answer::of(&c, records))
 }
 
 /// The keys (or, with `history`, the row ids of every version) that UPDATE /
 /// FORGET with `predicate` touch.
 pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<String>> {
+    let sorted = |v: &Vec<String>| {
+        let mut v = v.clone();
+        v.sort();
+        v
+    };
+    served(store, "targets", |source| targets_from(store, memory, predicate, in_scope, now, source), |a, b| sorted(a) == sorted(b), |v| format!("{:?}", sorted(v)))
+        .await
+}
+
+async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
     let modifiers = Modifiers { in_scope: in_scope.map(String::from), ..Default::default() };
-    let records = candidates(store, memory, predicate, &modifiers, now).await?;
-    Ok(records.into_iter().filter(|r| matches(memory, r, predicate)).map(|r| r.id).collect())
+    let c = candidates(store, memory, predicate, &modifiers, now, source).await?;
+    if c.floor.is_some() {
+        return Ok(Answer::Insufficient);
+    }
+    let ids = c.records.iter().filter(|r| matches(memory, r, predicate)).map(|r| r.id.clone()).collect();
+    Ok(Answer::of(&c, ids))
 }
 
 // ------------------------------------------------------------------ aggregates
@@ -520,11 +692,38 @@ pub async fn links_from(store: &PartitionStore, memory: MemoryType, keys: &[Stri
 /// costs ~10–40 ms).
 const POINT_LOOKUPS: usize = 16;
 
-/// The current records `keys` of `memory`, by key: point lookups for a few, one
-/// scan for the rest.
+/// The current records `keys` of `memory`, by key: from the hot cache when it can
+/// say for every key, else point lookups for a few, one scan for the rest.
 pub async fn by_keys(store: &PartitionStore, memory: MemoryType, keys: &[String], now: CommitTs) -> AdbResult<HashMap<String, MemoryRecord>> {
+    let same = |a: &HashMap<String, MemoryRecord>, b: &HashMap<String, MemoryRecord>| {
+        let sorted = |m: &HashMap<String, MemoryRecord>| serde_json::to_value(m.iter().collect::<std::collections::BTreeMap<_, _>>()).ok();
+        sorted(a) == sorted(b)
+    };
+    let show = |m: &HashMap<String, MemoryRecord>| {
+        let mut k: Vec<&String> = m.keys().collect();
+        k.sort();
+        format!("{k:?}")
+    };
+    served(store, "by_keys", |source| by_keys_from(store, memory, keys, now, source), same, show).await
+}
+
+async fn by_keys_from(store: &PartitionStore, memory: MemoryType, keys: &[String], now: CommitTs, source: Source) -> AdbResult<Answer<HashMap<String, MemoryRecord>>> {
     let mut out = HashMap::new();
     let m: Memory = memory.into();
+    if let Some(hot) = store.hot().filter(|h| source == Source::Cache && h.tracks(m)) {
+        for k in keys {
+            match hot.lineage(m, &row_id(m, k)) {
+                Some(Some(r)) => {
+                    if r.is_current(now) {
+                        out.insert(r.key().to_string(), record(&r));
+                    }
+                }
+                Some(None) => {}
+                None => return Ok(Answer::Insufficient),
+            }
+        }
+        return Ok(Answer::Cache(out));
+    }
     // A few targets: point lookups (W7); the rest in one scan.
     let mut rest: Vec<String> = Vec::new();
     if keys.len() <= POINT_LOOKUPS {
@@ -546,5 +745,5 @@ pub async fn by_keys(store: &PartitionStore, memory: MemoryType, keys: &[String]
             out.insert(r.key().to_string(), record(&r));
         }
     }
-    Ok(out)
+    Ok(Answer::Lance(out))
 }

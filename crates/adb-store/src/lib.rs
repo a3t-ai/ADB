@@ -3,6 +3,7 @@
 //! D3_SCHEMA.md; DELIVERY_PLAN.md stage D).
 
 pub mod filter;
+pub mod hot;
 pub mod rows;
 pub mod schema;
 pub mod store;
@@ -10,6 +11,7 @@ pub mod table;
 
 pub use datafusion::logical_expr::Expr;
 pub use filter::predicate_filter;
+pub use hot::{CacheConfig, CacheStats, Hit, HotCache, Keep, Rule};
 pub use lance;
 pub use rows::{decode, key_of, qualified, row_id, StoredRow};
 pub use schema::{memory_schema, META_ID, RECORD_KINDS};

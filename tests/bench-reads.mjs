@@ -4,7 +4,8 @@
 // WORKING items; then times each read shape (median and p95 of R runs).
 //
 //   node tests/bench-reads.mjs --adb target/debug/adb [--rows 10000] [--runs 30]
-//   (extra env for the server, e.g. ADB_QUERY=view, is passed through)
+//     [--cache all|default|off]   (W10: hot cache rules applied before timing)
+//   (extra env for the server, e.g. ADB_CACHE=shadow, is passed through)
 
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -36,6 +37,15 @@ const server = spawn(ADB, ["serve-http", "--port", String(port), "--flight-port"
   stdio: ["ignore", "inherit", "inherit"],
 });
 const url = `http://127.0.0.1:${port}`;
+// A failed read must not leave the server running (it holds our stdout).
+const die = (e) => {
+  console.error(e);
+  server.kill("SIGKILL");
+  process.exit(1);
+};
+process.on("uncaughtException", die);
+process.on("unhandledRejection", die);
+process.on("exit", () => server.kill("SIGKILL"));
 for (let i = 0; i < 200; i++) {
   try {
     if ((await fetch(`${url}/health`)).ok) break;
@@ -68,6 +78,21 @@ if (process.argv.includes("--compact")) {
   console.log(`compacted in ${((Date.now() - t1) / 1000).toFixed(1)} s`);
 }
 
+// W10: `all` keeps every memory type whole; `off` keeps nothing; `default` as is.
+const CACHE = arg("cache", "default");
+if (CACHE !== "default") {
+  const memories = ["working", "tools", "procedural", "semantic", "episodic"];
+  const keep = CACHE === "all" ? "all" : "none";
+  const r = await fetch(`${url}/admin/cache`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ max_bytes: "1GB", rules: memories.map((memory) => ({ memory, keep })) }),
+  });
+  const j = await r.json();
+  if (!j.success) throw new Error(`cache rules: ${j.error}`);
+  console.log(`cache ${CACHE}: ${j.data.stats?.rows ?? 0} rows, ${((j.data.stats?.bytes ?? 0) / 1048576).toFixed(1)} MB, loaded in ${j.data.took_ms} ms`);
+}
+
 const reads = {
   "LOOKUP KEY": `LOOKUP FROM SEMANTIC KEY id = "f4242"`,
   "RECALL WHERE (pushed down)": `RECALL FROM SEMANTIC WHERE topic = "t7" LIMIT 10`,
@@ -76,6 +101,9 @@ const reads = {
   "WITH LINKS (50 records)": `RECALL FROM SEMANTIC WHERE n < 50 AND topic = "t1" WITH LINKS ALL`,
   "FOLLOW LINKS": `RECALL FROM SEMANTIC WHERE topic = "t3" FOLLOW LINKS TYPE "about"`,
   "SCAN WORKING WINDOW": `SCAN FROM WORKING WINDOW LAST 10`,
+  "RECALL WORKING KEY": `RECALL FROM WORKING KEY id = "w42"`,
+  "RECALL EPISODIC newest 10": `RECALL FROM EPISODIC ALL LIMIT 10`,
+  "RECALL EPISODIC KEY": `RECALL FROM EPISODIC KEY id = "e42"`,
   "AGGREGATE COUNT": `RECALL FROM SEMANTIC WHERE topic = "t5" AGGREGATE COUNT(*) AS c`,
 };
 const stat = (xs) => {

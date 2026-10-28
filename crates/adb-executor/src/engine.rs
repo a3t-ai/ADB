@@ -70,6 +70,43 @@ pub trait Engine: Send + Sync {
     async fn set_embedding(&self, _settings: Value) -> Result<Value, String> {
         Err("embedding settings need a data directory (start ADB with --data-dir)".into())
     }
+
+    /// The hot cache (W10): `{mode, source, settings, stats}`.
+    async fn cache(&self) -> Result<Value, String> {
+        Err("the hot cache needs a durable engine (start ADB with --data-dir)".into())
+    }
+
+    /// Check and save new cache rules and rebuild the cache with them (no restart).
+    async fn set_cache(&self, _settings: Value) -> Result<Value, String> {
+        Err("the hot cache needs a durable engine (start ADB with --data-dir)".into())
+    }
+}
+
+/// `ADB_CACHE`: `on` (default), `off`, or `shadow` (every answer from the hot cache
+/// is checked against Lance; a difference fails the read).
+fn cache_mode() -> String {
+    match std::env::var("ADB_CACHE").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "off" | "0" | "false" => "off".into(),
+        "shadow" => "shadow".into(),
+        _ => "on".into(),
+    }
+}
+
+/// `ADB_CACHE_RULES`: the cache rules (JSON, as `cache.json`) when none are saved.
+fn env_cache_rules() -> Result<Option<adb_store::CacheConfig>, String> {
+    let Ok(j) = std::env::var("ADB_CACHE_RULES") else { return Ok(None) };
+    let c: adb_store::CacheConfig = serde_json::from_str(&j).map_err(|e| format!("ADB_CACHE_RULES: {e}"))?;
+    c.check()?;
+    Ok(Some(c))
+}
+
+/// The hot cache with `cfg`, unless
+/// `ADB_CACHE=off`.
+fn hot_cache(cfg: adb_store::CacheConfig) -> Option<adb_store::HotCache> {
+    match cache_mode().as_str() {
+        "off" => None,
+        mode => Some(adb_store::HotCache::new(cfg, mode == "shadow")),
+    }
 }
 
 static RESTART: tokio::sync::Notify = tokio::sync::Notify::const_new();
@@ -245,6 +282,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                     tracing::warn!(error = %e, "dropping idle subscriptions failed; retrying later");
                 }
             }
+            w.sweep_cache();
             match w.expire_due().await {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
@@ -304,6 +342,12 @@ impl LocalEngine {
         let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
         let store_cfg = StoreConfig { embedding_dim, embedding_model, ..StoreConfig::new(dir.join("store")) };
         let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
+        // W10: the hot cache follows every apply from here on (the catch-up too).
+        let cache_cfg = match adb_store::CacheConfig::load(&dir)? {
+            Some(c) => c,
+            None => env_cache_rules()?.unwrap_or_default(),
+        };
+        store.set_cache(hot_cache(cache_cfg)).await.map_err(|e| e.to_string())?;
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
@@ -503,6 +547,36 @@ impl Engine for LocalEngine {
             request_restart();
         });
         Ok(json!({ "saved": c, "restart": true, "reembed": clears }))
+    }
+
+    async fn cache(&self) -> Result<Value, String> {
+        let Some((store, _)) = &self.store else { return Err("the hot cache needs a durable engine (start ADB with --data-dir)".into()) };
+        let saved = adb_store::CacheConfig::load(&self.dir)?;
+        let source = match (&saved, std::env::var_os("ADB_CACHE_RULES")) {
+            (Some(_), _) => "settings",
+            (None, Some(_)) => "environment",
+            (None, None) => "default",
+        };
+        let hot = store.hot();
+        Ok(json!({
+            "mode": cache_mode(),
+            "source": source,
+            "settings": hot.as_ref().map(|h| h.config()).or(saved).unwrap_or_default(),
+            "stats": hot.map(|h| h.stats()),
+        }))
+    }
+
+    async fn set_cache(&self, settings: Value) -> Result<Value, String> {
+        let Some((store, _)) = &self.store else { return Err("the hot cache needs a durable engine (start ADB with --data-dir)".into()) };
+        let c: adb_store::CacheConfig = serde_json::from_value(settings).map_err(|e| format!("cache settings: {e}"))?;
+        c.check()?;
+        if self.temp.is_none() {
+            c.save(&self.dir)?;
+        }
+        let started = std::time::Instant::now();
+        store.set_cache(hot_cache(c.clone())).await.map_err(|e| e.to_string())?;
+        tracing::info!(rules = c.rules.len(), max_bytes = c.max_bytes, took = ?started.elapsed(), "hot cache rules saved and applied");
+        Ok(json!({ "saved": c, "mode": cache_mode(), "stats": store.hot().map(|h| h.stats()), "took_ms": started.elapsed().as_millis() as u64 }))
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
