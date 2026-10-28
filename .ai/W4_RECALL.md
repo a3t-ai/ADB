@@ -79,3 +79,13 @@ of messages ago.
 | 8 Release | pending |
 
 Limits: W4-L1…L6 in `limitations.md`. ADB's memory limit raised to 2 GiB.
+
+## W9.10 (28 Oct): providers
+
+User decisions: local model **or** any OpenAI-compatible `/embeddings` endpoint; the
+API key lives in ADB's environment (`api_key_env` names the variable, set from a
+Secret); changing model or dimension **clears the vectors and re-embeds** in the
+background. Settings: `<data dir>/embedding.json` (`adb_embed::EmbedConfig`), read at
+start; `GET/PUT /admin/embedding` (PUT embeds a sample, checks the size, saves and
+restarts ADB). The model's name is kept in `_meta` (`embedding_model`); at open a
+different one clears the vectors (a different size rewrites the table, as T6).
