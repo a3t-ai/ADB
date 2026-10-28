@@ -50,13 +50,17 @@ async function waitHealthy(url) {
 async function start() {
   const port = await freePort();
   const url = `http://127.0.0.1:${port}`;
-  const child = spawn(args.adb, ['--data-dir', dataDir, 'serve-http', '--port', String(port)], {
+  // `--flight-port 0`: no fixed port, so runs side by side don't collide on 3001.
+  const child = spawn(args.adb, ['--data-dir', dataDir, 'serve-http', '--port', String(port), '--flight-port', '0'], {
     stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, RUST_LOG: 'warn' },
   });
   let log = '';
   child.stderr.on('data', d => { log = (log + d).slice(-4000); });
   const exited = new Promise(res => child.on('exit', (code, signal) => res({ code, signal, log })));
-  await waitHealthy(url);
+  // Fail at once, with ADB's own log, if it exits instead of becoming healthy.
+  const died = exited.then(e => { throw new Error(`ADB exited during startup (code ${e.code}, signal ${e.signal}):\n${e.log}`); });
+  await Promise.race([waitHealthy(url), died]);
+  died.catch(() => {});
   return { url, child, exited };
 }
 
