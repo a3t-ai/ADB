@@ -156,3 +156,20 @@ graph. `AS OF` history reads (L9) stay out.
 | 9.12 | Timer wheel for TTL / validity | E-L11, W6-L6 | No per-second scan; expiry on time |
 
 Then W8 (the user's A3T pass), then performance, then graph.
+
+### W9 as built (28 Oct)
+
+| # | Commit | Result |
+|---|---|---|
+| 9.1 | `7f28cd7` | Procedures keep their payload; `WHERE` / `KEY` on any field; namespace filters |
+| 9.2 | `7f28cd7` | `PIPELINE … TIMEOUT` budget behind `ADB_ENFORCE_TIMEOUT` (user: off until performance) |
+| 9.3 | `886e4ed`, AQL `c507eb1` | `PATTERN "text"` (AQL v0.7 grammar) and bound `$p` |
+| 9.4 | `05e56a0`, AQL `e33d1f9` | v0.6 conformance suites 18–20 (42 tests); ADB 182/182 |
+| 9.5 | `b2602b5` | Subscription `reset` from the table past log retention; `ADB_LOG_RETAIN` |
+| 9.6 | `0b18b26`, flowr `c1463da` | Idle subscriptions dropped after 7 days (`ADB_SUB_IDLE`); topic resets carry the missed messages; FlowR delivers them |
+| 9.7 | `2699eca` | Compare-and-set `UPDATE … WHERE metadata.version = n` (tested, 20 concurrent writers); LINK checks both ends under the sequencer |
+| 9.8 | `92d51df` | Compaction syncs before deleting; open-time power-loss recovery **deferred to M3** (user) |
+| 9.9 | `5481a86` | Forget byte-scan test; 1,000-kill crash run (result below) |
+| 9.10 | `526d971`, flowr `f41c409`, a3t `09cf9a9` | Embedding provider settings: local or OpenAI-compatible, key from env, clear-and-re-embed (user decisions) |
+| 9.11 | `505f74a` | Snowball English stemming: word recall@1 0.64 → 0.67 |
+| 9.12 | `c70e953` | TTL timers instead of the per-second scan |
