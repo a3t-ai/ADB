@@ -736,6 +736,10 @@ impl PartitionStore {
             let filter = format!("memory IN ({}) AND {RECORD_KINDS} AND tombstone = false AND superseded_by IS NULL", memories.join(", "));
             let mut rows = Self::scan_in(open_state(&g), Some(&filter)).await?;
             rows.retain(|r| r.id != META_ID);
+            if cache.config().edges {
+                let edges = "kind = 'edge' AND tombstone = false AND superseded_by IS NULL";
+                rows.extend(Self::scan_in(open_state(&g), Some(edges)).await?);
+            }
             cache.load(rows);
         }
         let st = cache.stats();

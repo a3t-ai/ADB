@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adb_core::log::{CommitTs, Memory};
-use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
+use adb_core::{time, AdbError, AdbResult, Link, LinkSelect, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
 use adb_store::{PartitionStore, StoredRow};
 use async_trait::async_trait;
 
@@ -33,6 +33,19 @@ pub trait Reads: Send + Sync {
         let mut out = HashMap::new();
         for id in from_ids {
             out.insert(id.clone(), self.links_from(from_type, id, link_type).await?);
+        }
+        Ok(out)
+    }
+
+    /// The links touching each of `ids` that `select` picks (AQL v0.8: types,
+    /// direction, minimum weight), by record id.
+    async fn links_touching(&self, memory: MemoryType, ids: &[String], select: &LinkSelect) -> AdbResult<HashMap<String, Vec<Link>>> {
+        if select.direction.inbound() {
+            return Err(AdbError::UnsupportedOperation("inbound links need LanceReads".into()));
+        }
+        let mut out = HashMap::new();
+        for (id, links) in self.links_from_many(memory, ids, None).await? {
+            out.insert(id, links.into_iter().filter(|l| select.matches(l)).collect());
         }
         Ok(out)
     }
@@ -200,6 +213,11 @@ impl Reads for LanceReads {
     async fn links_from_many(&self, from_type: MemoryType, from_ids: &[String], link_type: Option<&str>) -> AdbResult<HashMap<String, Vec<Link>>> {
         let now = self.committed().await;
         crate::query::links_from(&self.store, from_type, from_ids, link_type, now).await
+    }
+
+    async fn links_touching(&self, memory: MemoryType, ids: &[String], select: &LinkSelect) -> AdbResult<HashMap<String, Vec<Link>>> {
+        let now = self.committed().await;
+        crate::query::links_touching(&self.store, memory, ids, select, now).await
     }
 
     async fn records_by_id(&self, memory: MemoryType, ids: &[String]) -> AdbResult<HashMap<String, MemoryRecord>> {

@@ -472,6 +472,68 @@ async fn reflect_follow_links_depth() {
     assert!(text.contains("\"c\""), "{text}");
 }
 
+/// SEMANTIC records `ids` and typed links `(from, to, type, weight)`.
+async fn typed_graph(ids: &[&str], links: &[(&str, &str, &str, f32)]) -> Mem {
+    let adb = graph(ids, &[]).await;
+    for (from, to, t, w) in links {
+        adb.link(MemoryType::Semantic, from, MemoryType::Semantic, to, t, *w).await.unwrap();
+    }
+    adb
+}
+
+/// AQL v0.8 (GR-2): INBOUND walks links backwards, BOTH either way.
+#[tokio::test]
+async fn follow_links_inbound_and_both() {
+    let adb = graph(&["a", "b", "c", "x"], &[("a", "b", 1.0), ("b", "c", 1.0), ("x", "b", 0.5)]).await;
+    let q = |s: &str| format!(r#"RECALL FROM SEMANTIC WHERE name = "b" FOLLOW LINKS TYPE "next" {s}"#);
+    assert_eq!(ids(&reached(&adb, &q("")).await), ["c"]);
+    assert_eq!(ids(&reached(&adb, &q("INBOUND")).await), ["a", "x"]);
+    assert_eq!(ids(&reached(&adb, &q("BOTH")).await), ["a", "c", "x"]);
+    // c ← b ← a, two hops back.
+    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "c" FOLLOW LINKS INBOUND DEPTH 2"#).await;
+    assert_eq!(ids(&r), ["b", "a", "x"]);
+}
+
+/// AQL v0.8 (GR-3): MIN_WEIGHT drops light links; TYPE IN and ALL pick types.
+#[tokio::test]
+async fn follow_links_min_weight_and_types() {
+    let adb = typed_graph(
+        &["a", "b", "c", "d"],
+        &[("a", "b", "knows", 0.9), ("a", "c", "knows", 0.3), ("a", "d", "works_with", 0.8)],
+    )
+    .await;
+    let q = |s: &str| format!(r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS {s}"#);
+    assert_eq!(ids(&reached(&adb, &q(r#"TYPE "knows""#)).await), ["b", "c"]);
+    assert_eq!(ids(&reached(&adb, &q(r#"TYPE "knows" MIN_WEIGHT 0.5"#)).await), ["b"]);
+    assert_eq!(ids(&reached(&adb, &q(r#"TYPE IN ("knows", "works_with") MIN_WEIGHT 0.5"#)).await), ["b", "d"]);
+    assert_eq!(ids(&reached(&adb, &q("ALL")).await), ["b", "d", "c"]);
+    assert_eq!(ids(&reached(&adb, &q("")).await), ["b", "d", "c"]);
+}
+
+/// WITH LINKS INBOUND lists the links pointing at a record, with their source.
+#[tokio::test]
+async fn with_links_inbound_lists_sources() {
+    let adb = typed_graph(&["a", "b", "c"], &[("a", "c", "next", 1.0), ("b", "c", "next", 0.2), ("c", "a", "next", 1.0)]).await;
+    let result = adb
+        .execute(r#"LOOKUP FROM SEMANTIC KEY id = "c" WITH LINKS ALL INBOUND MIN_WEIGHT 0.5"#)
+        .await
+        .unwrap();
+    let records = result.get_records().unwrap();
+    let links = records[0].data["links"].as_array().unwrap();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(links[0]["from_id"], "a");
+    assert_eq!(links[0]["to_id"], "c");
+}
+
+/// REFLECT … FOLLOW LINKS TYPE follows only that type.
+#[tokio::test]
+async fn reflect_follow_links_respects_type() {
+    let adb = typed_graph(&["a", "b", "c"], &[("a", "b", "next", 1.0), ("a", "c", "other", 1.0)]).await;
+    let result = adb.execute(r#"REFLECT FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next""#).await.unwrap();
+    let text = serde_json::to_string(&result.data).unwrap();
+    assert!(text.contains("\"b\"") && !text.contains("\"c\""), "{text}");
+}
+
 // ============================================================================
 // HAVING with alias tests
 // ============================================================================

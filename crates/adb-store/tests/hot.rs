@@ -39,6 +39,7 @@ fn rules() -> CacheConfig {
             r(Memory::Semantic, "*", Keep::Last(5)),
         ],
         vectors: true,
+        edges: true,
     }
 }
 

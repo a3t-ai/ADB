@@ -659,21 +659,62 @@ impl Window {
     }
 }
 
-/// WITH LINKS modifier
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WithLinks {
-    /// Include all links
-    All,
-    /// Include only links of specific type
-    Type { link_type: String },
+/// Which links `WITH LINKS` / `FOLLOW LINKS` read (AQL v0.8, P1_GRAPH D4 / D5).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkSelect {
+    /// Only links of these types; empty = every type
+    #[serde(default)]
+    pub types: Vec<String>,
+    /// Which way the links point, seen from the record
+    #[serde(default)]
+    pub direction: LinkDirection,
+    /// Only links at least this heavy
+    #[serde(default)]
+    pub min_weight: Option<f32>,
 }
+
+impl LinkSelect {
+    /// Links of one type, outbound (the only kind before v0.8).
+    pub fn of_type(link_type: impl Into<String>) -> Self {
+        Self { types: vec![link_type.into()], ..Self::default() }
+    }
+
+    pub fn matches(&self, link: &crate::Link) -> bool {
+        (self.types.is_empty() || self.types.contains(&link.link_type)) && self.min_weight.is_none_or(|w| link.weight >= w)
+    }
+}
+
+/// Which way a link points, seen from a record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkDirection {
+    /// Links leaving the record
+    #[default]
+    Outbound,
+    /// Links pointing at the record
+    Inbound,
+    /// Both
+    Both,
+}
+
+impl LinkDirection {
+    pub fn outbound(self) -> bool {
+        self != Self::Inbound
+    }
+
+    pub fn inbound(self) -> bool {
+        self != Self::Outbound
+    }
+}
+
+/// WITH LINKS modifier
+pub type WithLinks = LinkSelect;
 
 /// FOLLOW LINKS modifier
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowLinks {
-    /// Link type to follow
-    pub link_type: String,
+    /// Links to follow
+    pub select: LinkSelect,
     /// Maximum depth (default 1)
     pub depth: Option<u32>,
 }

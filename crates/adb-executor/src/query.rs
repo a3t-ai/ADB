@@ -788,6 +788,75 @@ pub async fn links_from(store: &PartitionStore, memory: MemoryType, keys: &[Stri
     Ok(out)
 }
 
+/// The links touching each of `keys` of `memory` that `select` picks (AQL v0.8):
+/// leaving it (outbound), pointing at it (inbound) or both, by that key, oldest
+/// first. A link between two of `keys` is listed under each end it is selected for.
+/// From the hot cache when it holds every link (P1.3).
+pub async fn links_touching(store: &PartitionStore, memory: MemoryType, keys: &[String], select: &adb_core::LinkSelect, now: CommitTs) -> AdbResult<HashMap<String, Vec<Link>>> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids = |m: &HashMap<String, Vec<Link>>| {
+        let mut v: Vec<(&String, Vec<&String>)> = m.iter().map(|(k, ls)| (k, ls.iter().map(|l| &l.id).collect())).collect();
+        v.sort();
+        format!("{v:?}")
+    };
+    served(store, "links", |source| links_touching_from(store, memory, keys, select, now, source), |a, b| ids(a) == ids(b), ids).await
+}
+
+async fn links_touching_from(
+    store: &PartitionStore,
+    memory: MemoryType,
+    keys: &[String],
+    select: &adb_core::LinkSelect,
+    now: CommitTs,
+    source: Source,
+) -> AdbResult<Answer<HashMap<String, Vec<Link>>>> {
+    let m: Memory = memory.into();
+    let ends: Vec<String> = keys.iter().map(|k| row_id(m, k)).collect();
+    let picked = |r: &StoredRow| select.types.is_empty() || r.data.link_type.as_ref().is_some_and(|t| select.types.contains(t));
+    if let Some(hot) = store.hot().filter(|_| source == Source::Cache) {
+        if let Some(edges) = hot.edges_touching(&ends) {
+            let rows: Vec<StoredRow> = edges.iter().filter(|r| r.is_current(now) && picked(r)).map(|r| (**r).clone()).collect();
+            return Ok(Answer::Cache(links_by_end(rows, memory, keys, select)));
+        }
+    }
+    let mut rows = Vec::new();
+    for chunk in ends.chunks(500) {
+        let ids: Vec<Expr> = chunk.iter().map(|e| lit(e.clone())).collect();
+        let by_end = match select.direction {
+            adb_core::LinkDirection::Outbound => col("subject_id").in_list(ids, false),
+            adb_core::LinkDirection::Inbound => col("object_id").in_list(ids, false),
+            adb_core::LinkDirection::Both => col("subject_id").in_list(ids.clone(), false).or(col("object_id").in_list(ids, false)),
+        };
+        let mut filter = col("kind").eq(lit("edge")).and(by_end);
+        if !select.types.is_empty() {
+            filter = filter.and(col("link_type").in_list(select.types.iter().map(|t| lit(t.clone())).collect(), false));
+        }
+        rows.extend(current_rows(store, filter, now, false).await?);
+    }
+    // A link between two chunks' keys comes back twice.
+    let mut seen = HashSet::new();
+    rows.retain(|r| seen.insert(r.id.clone()));
+    Ok(Answer::Lance(links_by_end(rows, memory, keys, select)))
+}
+
+/// Edge rows as links under the key of each end `select` picks, oldest first.
+fn links_by_end(mut rows: Vec<StoredRow>, memory: MemoryType, keys: &[String], select: &adb_core::LinkSelect) -> HashMap<String, Vec<Link>> {
+    rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
+    let wanted: HashSet<&String> = keys.iter().collect();
+    let mut out: HashMap<String, Vec<Link>> = HashMap::new();
+    for l in rows.iter().filter_map(to_link).filter(|l| select.matches(l)) {
+        if select.direction.outbound() && l.from_type == memory && wanted.contains(&l.from_id) {
+            out.entry(l.from_id.clone()).or_default().push(l.clone());
+        }
+        if select.direction.inbound() && l.to_type == memory && wanted.contains(&l.to_id) {
+            out.entry(l.to_id.clone()).or_default().push(l);
+        }
+    }
+    out
+}
+
 /// Link targets fetched by point lookup rather than a scan (each ~1 ms; a scan
 /// costs ~10–40 ms).
 const POINT_LOOKUPS: usize = 16;

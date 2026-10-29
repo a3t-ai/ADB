@@ -164,8 +164,8 @@ pub struct ReflectSourcePlan {
 pub struct LinkOptions {
     /// Include links with results
     pub with_links: bool,
-    /// Link type filter
-    pub link_type: Option<String>,
+    /// Which links (types, direction, minimum weight)
+    pub select: adb_core::LinkSelect,
     /// Follow links to related records
     pub follow: bool,
     /// Max depth when following

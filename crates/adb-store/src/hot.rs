@@ -20,6 +20,9 @@
 //!   copies only what it returns (W10-L8).
 //! - **Vectors** are kept too unless `vectors: false`, so `LIKE` ranks a complete
 //!   bucket in memory (W10-L1).
+//! - **Edges** (P1.3, W10-L2): every current link of the partition, indexed by both
+//!   ends, unless `edges: false`. All or nothing: past `max_bytes / EDGE_SHARE` the
+//!   cache drops them and link reads go to Lance until the next warm-up.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -178,7 +181,13 @@ pub struct CacheConfig {
     /// Keep cached rows' vectors (2 bytes a dimension) for `LIKE` (W10-L1).
     #[serde(default = "yes")]
     pub vectors: bool,
+    /// Keep every current link, by both ends (P1.3).
+    #[serde(default = "yes")]
+    pub edges: bool,
 }
+
+/// Edges may take up to `max_bytes / EDGE_SHARE`.
+pub const EDGE_SHARE: u64 = 4;
 
 fn yes() -> bool {
     true
@@ -207,6 +216,7 @@ impl Default for CacheConfig {
                 rule(Memory::Semantic, Keep::Bytes(64 << 20)),
             ],
             vectors: true,
+            edges: true,
         }
     }
 }
@@ -315,6 +325,11 @@ pub struct BucketStats {
 pub struct CacheStats {
     pub rows: usize,
     pub bytes: u64,
+    /// Links held (P1.3) and what they take; `edges_complete`: link reads are
+    /// answered here.
+    pub edges: usize,
+    pub edge_bytes: u64,
+    pub edges_complete: bool,
     pub max_bytes: u64,
     /// Reads answered from the cache.
     pub hits: u64,
@@ -385,6 +400,52 @@ struct State {
     /// Lineage id → its current row id (one current version per lineage).
     lineages: HashMap<String, String>,
     bytes: u64,
+    edges: Edges,
+}
+
+/// Every current edge row, by id and by each end's row id.
+#[derive(Default)]
+struct Edges {
+    rows: HashMap<String, Arc<StoredRow>>,
+    by_end: HashMap<String, BTreeSet<String>>,
+    bytes: u64,
+    /// Every current edge is here (set by a warm-up with `edges`, cleared past the cap).
+    complete: bool,
+}
+
+impl Edges {
+    fn ends(r: &StoredRow) -> impl Iterator<Item = &String> {
+        r.data.subject_id.iter().chain(r.data.object_id.iter())
+    }
+
+    fn remove(&mut self, id: &str) {
+        let Some(r) = self.rows.remove(id) else { return };
+        self.bytes -= row_bytes(&r);
+        for end in Self::ends(&r) {
+            if let Some(ids) = self.by_end.get_mut(end) {
+                ids.remove(id);
+                if ids.is_empty() {
+                    self.by_end.remove(end);
+                }
+            }
+        }
+    }
+
+    fn upsert(&mut self, r: &StoredRow) {
+        self.remove(&r.id);
+        if !self.complete || r.tombstone || r.superseded_by.is_some() {
+            return;
+        }
+        for end in Self::ends(r) {
+            self.by_end.entry(end.clone()).or_default().insert(r.id.clone());
+        }
+        self.bytes += row_bytes(r);
+        self.rows.insert(r.id.clone(), Arc::new(r.clone()));
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// See the module docs.
@@ -496,8 +557,13 @@ impl HotCache {
         let cfg = st.cfg.take();
         *st = State { cfg, ..Default::default() };
         let now = now();
+        st.edges.complete = st.cfg.as_ref().is_some_and(|c| c.edges);
         for r in rows {
-            Self::upsert(&mut st, r, self.shape);
+            if r.data.kind == Kind::Edge {
+                st.edges.upsert(&r);
+            } else {
+                Self::upsert(&mut st, r, self.shape);
+            }
         }
         Self::trim(&mut st, now);
     }
@@ -508,6 +574,9 @@ impl HotCache {
         let now = now();
         for r in rows.iter().filter(|r| record_kind(r)) {
             Self::upsert(&mut st, r.clone(), self.shape);
+        }
+        for r in rows.iter().filter(|r| r.data.kind == Kind::Edge) {
+            st.edges.upsert(r);
         }
         Self::trim(&mut st, now);
     }
@@ -524,6 +593,10 @@ impl HotCache {
         for id in gone {
             // Not current any more, so never selected again: no floor change.
             Self::remove(&mut st, &id);
+        }
+        let gone: Vec<String> = st.edges.rows.values().filter(|r| !r.is_current(now)).map(|r| r.id.clone()).collect();
+        for id in gone {
+            st.edges.remove(&id);
         }
         Self::trim(&mut st, now);
     }
@@ -578,6 +651,10 @@ impl HotCache {
             }
         }
         let max = st.cfg.as_ref().map_or(0, |c| c.max_bytes);
+        if st.edges.bytes > max / EDGE_SHARE {
+            tracing::warn!(edges = st.edges.rows.len(), bytes = st.edges.bytes, "hot cache: links over their share, dropped");
+            st.edges.clear();
+        }
         let mut total = st.bytes - evicted.iter().map(|e| e.bytes).sum::<u64>();
         while total > max {
             let Some(b) = st.buckets.values_mut().filter(|b| !b.rows.is_empty()).max_by_key(|b| b.bytes) else { break };
@@ -638,6 +715,17 @@ impl HotCache {
         complete.then_some(None)
     }
 
+    /// Every current edge row with an end in `ends` (row ids), each once, or `None`
+    /// when the cache doesn't hold every edge.
+    pub fn edges_touching(&self, ends: &[String]) -> Option<Vec<Arc<StoredRow>>> {
+        let st = self.state.read().unwrap();
+        if !st.edges.complete {
+            return None;
+        }
+        let ids: BTreeSet<&String> = ends.iter().filter_map(|e| st.edges.by_end.get(e)).flatten().collect();
+        Some(ids.into_iter().filter_map(|id| st.edges.rows.get(id).cloned()).collect())
+    }
+
     pub fn hit(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -661,6 +749,9 @@ impl HotCache {
         CacheStats {
             rows: st.at.len(),
             bytes: st.bytes,
+            edges: st.edges.rows.len(),
+            edge_bytes: st.edges.bytes,
+            edges_complete: st.edges.complete,
             max_bytes: st.cfg.as_ref().map_or(0, |c| c.max_bytes),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -739,7 +830,7 @@ mod tests {
 
     #[test]
     fn vectors_kept_counted_and_dropped() {
-        let all = |vectors| CacheConfig { max_bytes: 1 << 20, rules: vec![Rule { memory: Memory::Semantic, scope: "*".into(), keep: Keep::All }], vectors };
+        let all = |vectors| CacheConfig { max_bytes: 1 << 20, rules: vec![Rule { memory: Memory::Semantic, scope: "*".into(), keep: Keep::All }], vectors, edges: true };
         let without = HotCache::new(all(false), false);
         without.apply(&[fact("a")]);
         assert!(without.rows(Memory::Semantic, None).unwrap().rows[0].row.data.embedding.is_none());

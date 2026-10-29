@@ -12,7 +12,7 @@
 | D3 | Agents and the graph (GR-6) | After hybrid recall, FlowR's memory phase pulls up to 5 one-hop neighbours of the top results (link weight ≥ 0.5) into the prompt as *related*, and link weight is a ranking signal. Per-agent setting, on by default. |
 | D4 | Direction (GR-2) | `FOLLOW LINKS … OUTBOUND` (default) / `INBOUND` / `BOTH`; same on `WITH LINKS`. Edges already store their target (`object_id`). |
 | D5 | Conditions (GR-3) | `MIN_WEIGHT w` on `FOLLOW` / `WITH LINKS`; `TYPE "t"`, `TYPE IN ("a", "b")` or `ALL`. |
-| D6 | Cache (W10-L2) | Edge buckets in the hot cache, indexed by subject and by object, kept whenever the source memory type is kept. |
+| D6 | Cache (W10-L2) | **Every current link** of the partition in the hot cache, indexed by both ends (`edges: true`, the default). All or nothing, so a link read never needs a floor: past a quarter of `max_bytes` the links are dropped and link reads go to Lance until the next warm-up. (Per-type edge buckets would leave inbound reads incomplete whenever the far end's bucket is.) |
 | D7 | `LOOKUP … KEY … FOLLOW LINKS` (L6 / GR-7) | Returns the linked records, as `RECALL` does. |
 
 ## Steps

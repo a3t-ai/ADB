@@ -419,7 +419,7 @@ impl Executor {
             // FOLLOW LINKS: the reached records, by memory type, instead of the sources.
             if link_opts.follow {
                 let sources: Vec<adb_core::MemoryRecord> = source_results.iter().flat_map(|s| s.records.iter().cloned()).collect();
-                let (reached, walked) = self.traverse(&sources, link_opts.link_type.as_deref(), link_opts.depth).await?;
+                let (reached, walked) = self.traverse(&sources, &link_opts.select, link_opts.depth).await?;
                 all_links.extend(walked);
                 if !reached.is_empty() {
                     let mut by_type: Vec<SourceResult> = Vec::new();
@@ -434,19 +434,10 @@ impl Executor {
                 }
             } else if link_opts.with_links {
                 // WITH LINKS - include link metadata with source records
-                for source_result in &source_results {
-                    for record in &source_result.records {
-                        let links = self
-                            .reads
-                            .links_from(
-                                record.memory_type,
-                                &record.id,
-                                link_opts.link_type.as_deref(),
-                            )
-                            .await?;
-
-                        all_links.extend(links);
-                    }
+                let sources: Vec<adb_core::MemoryRecord> = source_results.iter().flat_map(|s| s.records.iter().cloned()).collect();
+                let by_record = self.links_of(&sources, &link_opts.select).await?;
+                for r in &sources {
+                    all_links.extend(by_record.get(&(r.memory_type, r.id.clone())).cloned().unwrap_or_default());
                 }
             }
         }
@@ -473,12 +464,12 @@ impl Executor {
     // Individual operation implementations
     // =========================================================================
 
-    /// The links leaving each of `records`, by (memory type, id): one batched read per
-    /// memory type (W7, P4).
+    /// The links `select` picks touching each of `records`, by (memory type, id): one
+    /// batched read per memory type (W7, P4).
     async fn links_of(
         &self,
         records: &[adb_core::MemoryRecord],
-        link_type: Option<&str>,
+        select: &adb_core::LinkSelect,
     ) -> ExecutorResult<HashMap<(MemoryType, String), Vec<adb_core::Link>>> {
         let mut ids: HashMap<MemoryType, Vec<String>> = HashMap::new();
         for r in records {
@@ -486,7 +477,7 @@ impl Executor {
         }
         let mut out = HashMap::new();
         for (memory, ids) in ids {
-            for (id, links) in self.reads.links_from_many(memory, &ids, link_type).await? {
+            for (id, links) in self.reads.links_touching(memory, &ids, select).await? {
                 out.insert((memory, id), links);
             }
         }
@@ -502,7 +493,7 @@ impl Executor {
     async fn traverse(
         &self,
         records: &[adb_core::MemoryRecord],
-        link_type: Option<&str>,
+        select: &adb_core::LinkSelect,
         depth: u32,
     ) -> ExecutorResult<(Vec<adb_core::MemoryRecord>, Vec<adb_core::Link>)> {
         let mut seen: HashSet<(MemoryType, String)> = records.iter().map(|r| (r.memory_type, r.id.clone())).collect();
@@ -511,13 +502,18 @@ impl Executor {
         let mut walked = Vec::new();
         for hop in 1..=depth.clamp(1, MAX_DEPTH) {
             let sources: Vec<adb_core::MemoryRecord> = frontier.iter().map(|(r, _)| r.clone()).collect();
-            let mut by_record = self.links_of(&sources, link_type).await?;
+            let mut by_record = self.links_of(&sources, select).await?;
             // Each new target once, at its best path weight this hop, in link order.
             let mut order: Vec<(MemoryType, String)> = Vec::new();
             let mut best: HashMap<(MemoryType, String), f64> = HashMap::new();
             for (r, w) in &frontier {
                 for l in by_record.remove(&(r.memory_type, r.id.clone())).unwrap_or_default() {
-                    let to = (l.to_type, l.to_id.clone());
+                    // The far end: the target of an outbound link, the source of an inbound one.
+                    let to = if l.from_type == r.memory_type && l.from_id == r.id && select.direction.outbound() {
+                        (l.to_type, l.to_id.clone())
+                    } else {
+                        (l.from_type, l.from_id.clone())
+                    };
                     if !seen.contains(&to) {
                         let pw = w * f64::from(l.weight);
                         match best.get_mut(&to) {
@@ -574,7 +570,7 @@ impl Executor {
         let Some(follow_links) = &step.modifiers.follow_links else {
             return Ok(None);
         };
-        let (reached, _) = self.traverse(records, Some(&follow_links.link_type), follow_links.depth.unwrap_or(1)).await?;
+        let (reached, _) = self.traverse(records, &follow_links.select, follow_links.depth.unwrap_or(1)).await?;
         Ok(Some(match &step.modifiers.return_fields {
             Some(fields) => reached
                 .into_iter()
@@ -655,27 +651,13 @@ impl Executor {
         if let Some(with_links) = &step.modifiers.with_links {
             let mut records_with_links = Vec::new();
 
-            let link_type_filter = match with_links {
-                adb_core::WithLinks::All => None,
-                adb_core::WithLinks::Type { link_type } => Some(link_type.as_str()),
-            };
-            let mut by_record = self.links_of(&records, link_type_filter).await?;
+            let mut by_record = self.links_of(&records, with_links).await?;
             for mut record in records {
                 let links = by_record.remove(&(record.memory_type, record.id.clone())).unwrap_or_default();
 
                 // Add links array to record data
                 if let Some(obj) = record.data.as_object_mut() {
-                    let links_json: Vec<serde_json::Value> = links
-                        .iter()
-                        .map(|l| {
-                            serde_json::json!({
-                                "link_type": l.link_type,
-                                "to_type": serde_json::to_value(l.to_type).unwrap_or_default(),
-                                "to_id": l.to_id,
-                                "weight": l.weight
-                            })
-                        })
-                        .collect();
+                    let links_json: Vec<serde_json::Value> = links.iter().map(|l| link_json(l, with_links)).collect();
                     obj.insert("links".to_string(), serde_json::Value::Array(links_json));
                 }
 
@@ -711,26 +693,12 @@ impl Executor {
         if let Some(with_links) = &step.modifiers.with_links {
             let mut records_with_links = Vec::new();
 
-            let link_type_filter = match with_links {
-                adb_core::WithLinks::All => None,
-                adb_core::WithLinks::Type { link_type } => Some(link_type.as_str()),
-            };
-            let mut by_record = self.links_of(&records, link_type_filter).await?;
+            let mut by_record = self.links_of(&records, with_links).await?;
             for mut record in records {
                 let links = by_record.remove(&(record.memory_type, record.id.clone())).unwrap_or_default();
 
                 if let Some(obj) = record.data.as_object_mut() {
-                    let links_json: Vec<serde_json::Value> = links
-                        .iter()
-                        .map(|l| {
-                            serde_json::json!({
-                                "link_type": l.link_type,
-                                "to_type": serde_json::to_value(l.to_type).unwrap_or_default(),
-                                "to_id": l.to_id,
-                                "weight": l.weight
-                            })
-                        })
-                        .collect();
+                    let links_json: Vec<serde_json::Value> = links.iter().map(|l| link_json(l, with_links)).collect();
                     obj.insert("links".to_string(), serde_json::Value::Array(links_json));
                 }
 
@@ -1053,4 +1021,19 @@ fn json_to_value(json: &serde_json::Value) -> Value {
             Value::String(json.to_string())
         }
     }
+}
+
+/// A link in a record's `links` (`WITH LINKS`). Inbound or both: with its source too.
+fn link_json(l: &adb_core::Link, select: &adb_core::LinkSelect) -> serde_json::Value {
+    let mut j = serde_json::json!({
+        "link_type": l.link_type,
+        "to_type": serde_json::to_value(l.to_type).unwrap_or_default(),
+        "to_id": l.to_id,
+        "weight": l.weight
+    });
+    if select.direction.inbound() {
+        j["from_type"] = serde_json::to_value(l.from_type).unwrap_or_default();
+        j["from_id"] = serde_json::json!(l.from_id);
+    }
+    j
 }

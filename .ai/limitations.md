@@ -9,7 +9,6 @@ should be picked up. Items fixed later move to the bottom with the commit.
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
 | L5 | **Records that shared a key across memory types before schema v3 were already one Lance row.** The v2→v3 migration keeps the survivor under the type it was last written as; the overwritten one can't be recovered. | Only data written before 25 Oct. vc-dev had one record and migrated cleanly. | None — note for anyone migrating an old data dir. |
-| L6 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record**, not the linked ones. `RECALL … WHERE … FOLLOW LINKS` works. | AQL users must use the `RECALL` form. | Executor LOOKUP path; with the M2 query rework. |
 | L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update. Lineage creation time is in the history rows if needed. | Revisit if A3T needs first-creation time (add a column or read v1). |
 | L9 | **History is not readable through AQL** (no `AS OF` / `WITH HISTORY`), by design in D2 v1. The rows are kept. | Audit / time travel only by reading the table directly. | AQL v0.6 proposal (D2 §8). |
 | L11 | **Lance on local disk is not power-safe by itself** (risk K8): its local writer writes data files without fsync. ADB `syncfs`es the store before every log purge and (W9.8) before any compaction deletes the old table or old platform versions, so nothing the log no longer holds depends on unsynced files. Still open: a power cut can leave Lance's *newest* MemWAL / manifest state referring to unsynced files, and opening a damaged table has no fallback (the log only covers what came after the last sync). | Process crashes are safe (tested); power loss or a node reboot could need manual repair of the newest state. Object storage is unaffected. | Open recovery: roll the MemWAL back to the state synced at the last purge and replay the log from there (needs Lance MemWAL internals); or object storage / replicas (M3). |
@@ -126,15 +125,15 @@ What links give today (26 Oct): typed, weighted, directed edges between records 
 memory type; `LINK`, `UPDATE LINK`, `UNLINK` (v0.7), versioned, forgotten with their
 records, delivered to subscribers; one-hop reads `WITH LINKS ALL | TYPE`, `FOLLOW LINKS
 TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
+Since P1.1–P1.2 (29 Oct): multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `ALL`
+(AQL v0.8, `P1_GRAPH.md`).
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| GR-1 | **`FOLLOW LINKS … DEPTH n` is parsed but ignored**: ADB always stops at one hop (a→b→c→d, DEPTH 1–3 all return `b`). A bug against the grammar. | No multi-hop traversal. | Breadth-first, cycle-safe, capped (e.g. 5), each record once. Small, no grammar change. |
-| GR-2 | **Outgoing links only**: no "who links *to* this record". | Reverse questions need the link stored the other way. | AQL addition, e.g. `FOLLOW LINKS TYPE "t" INBOUND`; edge targets are already stored (`object_id`). |
-| GR-3 | **No conditions on links** beyond `TYPE`: no `weight > x`, no order by weight, no edge properties. | Can't prefer strong links. | AQL addition: `MIN_WEIGHT w` on `FOLLOW` / `WITH LINKS`, results by link weight. |
 | GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | Only if a use case needs it (post-MVP). |
+| GR-9 | **Edge properties beyond type and weight** (e.g. provenance, validity) aren't readable in AQL. | Links can't say where they came from. | With entities and facts (P1.4). |
+| GR-10 | **The playground ignores direction and `MIN_WEIGHT`** (it parses v0.8). | Browser results differ from ADB for v0.8 link reads. | With GR-8. |
 | GR-6 | **Agents don't use links**: FlowR's memory phase never follows them into the prompt. | Links help AQL users, not chat agents. | Link weight as a ranking signal in hybrid recall (W4 T10), related facts pulled in. |
-| GR-7 | **`LOOKUP … KEY … FOLLOW LINKS` returns the source record** (L6). | Use `RECALL … WHERE … FOLLOW LINKS`. | With GR-1. |
 | GR-8 | **The WASM playground's built `pkg/` predates v0.6 / v0.7** (source updated; no wasm-pack here). | The browser playground rejects the new statements. | `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
 
 ## Recall (W4)
@@ -248,6 +247,8 @@ Each must be settled before its phase is designed.
 | L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |
 | G-L4 / W5-L4: platform datasets never compacted (DELETE logical, a version per write) | W5-L4 (27 Oct): `PlatformStore::compact` (`compact_files` materialising deletions + `cleanup_old_versions`), nightly, after 256 versions, and in the admin `compact` |
 | P1: a throwaway backend per read | W7 (`97e04ee`): AQL reads as one DataFusion scan of an LSM snapshot, semantics once in `adb_executor::query` |
+| GR-1, GR-7 / L6: DEPTH ignored; LOOKUP … FOLLOW LINKS returned the source | P1.1 (`0f9ff6a`, 29 Oct): every record within n hops by hop then path weight, `_hop` / `_path_weight`, cycle-safe, capped at 5 hops / 1,000 records; LOOKUP and REFLECT the same |
+| GR-2, GR-3: outbound links only, no conditions on links | P1.2 (29 Oct, AQL v0.8 `fa6d0d2`): `INBOUND` / `BOTH`, `MIN_WEIGHT`, `TYPE IN` / `ALL` on FOLLOW and WITH LINKS; REFLECT honours FOLLOW's type |
 | P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all edges of a result in one scan, targets in one scan per memory type |
 | S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |
 | G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |

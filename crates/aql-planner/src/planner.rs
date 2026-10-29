@@ -170,9 +170,11 @@ impl Planner {
         let link_options = if stmt.with_links.is_some() || stmt.follow_links.is_some() {
             Some(LinkOptions {
                 with_links: stmt.with_links.is_some(),
-                link_type: match &stmt.with_links {
-                    Some(aql_parser::ast::WithLinks::Type { link_type }) => Some(link_type.clone()),
-                    _ => None,
+                // FOLLOW's selection when there is one, else WITH's.
+                select: match (&stmt.follow_links, &stmt.with_links) {
+                    (Some(f), _) => convert_follow_links(f).select,
+                    (None, Some(w)) => convert_with_links(w),
+                    (None, None) => adb_core::LinkSelect::default(),
                 },
                 follow: stmt.follow_links.is_some(),
                 depth: stmt.follow_links.as_ref().and_then(|f| f.depth).unwrap_or(1),
@@ -543,18 +545,38 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
     })
 }
 
-fn convert_with_links(wl: &aql_parser::ast::WithLinks) -> adb_core::WithLinks {
-    match wl {
-        aql_parser::ast::WithLinks::All => adb_core::WithLinks::All,
-        aql_parser::ast::WithLinks::Type { link_type } => adb_core::WithLinks::Type {
-            link_type: link_type.clone(),
+fn link_select(
+    link_types: Vec<String>,
+    direction: aql_parser::ast::LinkDirection,
+    min_weight: Option<f64>,
+) -> adb_core::LinkSelect {
+    adb_core::LinkSelect {
+        types: link_types,
+        direction: match direction {
+            aql_parser::ast::LinkDirection::Outbound => adb_core::LinkDirection::Outbound,
+            aql_parser::ast::LinkDirection::Inbound => adb_core::LinkDirection::Inbound,
+            aql_parser::ast::LinkDirection::Both => adb_core::LinkDirection::Both,
         },
+        min_weight: min_weight.map(|w| w as f32),
+    }
+}
+
+fn convert_with_links(wl: &aql_parser::ast::WithLinks) -> adb_core::WithLinks {
+    use aql_parser::ast::WithLinks as W;
+    match wl {
+        W::All { direction, min_weight } => link_select(Vec::new(), *direction, *min_weight),
+        W::Type { link_type, direction, min_weight } => link_select(vec![link_type.clone()], *direction, *min_weight),
+        W::Types { link_types, direction, min_weight } => link_select(link_types.clone(), *direction, *min_weight),
     }
 }
 
 fn convert_follow_links(fl: &aql_parser::ast::FollowLinks) -> adb_core::FollowLinks {
+    let types = match &fl.link_type {
+        Some(t) => vec![t.clone()],
+        None => fl.link_types.clone(),
+    };
     adb_core::FollowLinks {
-        link_type: fl.link_type.clone(),
+        select: link_select(types, fl.direction, fl.min_weight),
         depth: fl.depth,
     }
 }
