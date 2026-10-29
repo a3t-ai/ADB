@@ -14,7 +14,7 @@ pub mod sql;
 pub mod writes;
 
 pub use error::{ExecutorError, ExecutorResult};
-pub use executor::Executor;
+pub use executor::{Executor, MAX_DEPTH, MAX_REACHED};
 pub use engine::{request_restart, restart_requested, Engine, LocalEngine};
 pub use result::{QueryResult, ResultSet};
 pub use apply::ApplyBarrier;

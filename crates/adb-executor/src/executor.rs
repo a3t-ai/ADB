@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use adb_core::{Condition, MemoryType, Predicate, Scope, Value};
 use aql_parser::parse;
@@ -18,6 +18,11 @@ use crate::error::{ExecutorError, ExecutorResult};
 use crate::result::{QueryResult, ResultSet, SourceResult};
 use crate::reads::Reads;
 use crate::writes::Writes;
+
+/// Deepest `FOLLOW LINKS … DEPTH` (P1_GRAPH D1).
+pub const MAX_DEPTH: u32 = 5;
+/// Most records one traversal returns.
+pub const MAX_REACHED: usize = 1000;
 
 /// The query executor
 pub struct Executor {
@@ -411,65 +416,21 @@ impl Executor {
 
         // Handle link options if set
         if let Some(link_opts) = &reflect.link_options {
-            // If FOLLOW LINKS is set, traverse links and return target records
+            // FOLLOW LINKS: the reached records, by memory type, instead of the sources.
             if link_opts.follow {
-                let mut target_results = Vec::new();
-
-                for source_result in &source_results {
-                    for record in &source_result.records {
-                        // Get the source memory type
-                        let source_mem_type = record.memory_type;
-
-                        // Get links from this record
-                        let links = self
-                            .reads
-                            .links_from(
-                                source_mem_type,
-                                &record.id,
-                                link_opts.link_type.as_deref(),
-                            )
-                            .await?;
-
-                        // Collect target record IDs by memory type
-                        let mut targets_by_type: std::collections::HashMap<MemoryType, Vec<String>> =
-                            std::collections::HashMap::new();
-
-                        for link in links {
-                            targets_by_type
-                                .entry(link.to_type)
-                                .or_default()
-                                .push(link.to_id.clone());
-
-                            // Also collect the link
-                            all_links.push(link);
-                        }
-
-                        // Fetch target records from each memory type
-                        for (mem_type, ids) in targets_by_type {
-                            for id in ids {
-                                // Lookup each target record
-                                let target_records = self
-                                    .reads
-                                    .lookup(mem_type, &adb_core::Predicate::Key {
-                                        field: "id".to_string(),
-                                        value: adb_core::Value::String(id),
-                                    })
-                                    .await?;
-
-                                if !target_records.is_empty() {
-                                    target_results.push(SourceResult {
-                                        memory_type: format!("{:?}", mem_type),
-                                        records: target_records,
-                                    });
-                                }
-                            }
+                let sources: Vec<adb_core::MemoryRecord> = source_results.iter().flat_map(|s| s.records.iter().cloned()).collect();
+                let (reached, walked) = self.traverse(&sources, link_opts.link_type.as_deref(), link_opts.depth).await?;
+                all_links.extend(walked);
+                if !reached.is_empty() {
+                    let mut by_type: Vec<SourceResult> = Vec::new();
+                    for r in reached {
+                        let memory_type = format!("{:?}", r.memory_type);
+                        match by_type.iter_mut().find(|s| s.memory_type == memory_type) {
+                            Some(s) => s.records.push(r),
+                            None => by_type.push(SourceResult { memory_type, records: vec![r] }),
                         }
                     }
-                }
-
-                // Return target records instead of source records when following links
-                if !target_results.is_empty() {
-                    source_results = target_results;
+                    source_results = by_type;
                 }
             } else if link_opts.with_links {
                 // WITH LINKS - include link metadata with source records
@@ -532,25 +493,98 @@ impl Executor {
         Ok(out)
     }
 
-    /// `FOLLOW LINKS`: the current targets of the links leaving `records`, in link
-    /// order (W7: one read for the links, one per target memory type).
-    async fn follow(&self, records: &[adb_core::MemoryRecord], link_type: Option<&str>) -> ExecutorResult<Vec<adb_core::MemoryRecord>> {
-        let mut by_record = self.links_of(records, link_type).await?;
-        let links: Vec<adb_core::Link> = records
-            .iter()
-            .flat_map(|r| by_record.remove(&(r.memory_type, r.id.clone())).unwrap_or_default())
-            .collect();
-        let mut wanted: HashMap<MemoryType, Vec<String>> = HashMap::new();
-        for l in &links {
-            wanted.entry(l.to_type).or_default().push(l.to_id.clone());
-        }
-        let mut found: HashMap<(MemoryType, String), adb_core::MemoryRecord> = HashMap::new();
-        for (memory, ids) in wanted {
-            for (id, r) in self.reads.records_by_id(memory, &ids).await? {
-                found.insert((memory, id), r);
+    /// `FOLLOW LINKS … DEPTH n` (P1_GRAPH D1): every current record reached within
+    /// `depth` hops of `records`, breadth-first, each once at its shortest hop, by hop
+    /// then path weight (the product of link weights along the path), each marked with
+    /// `_hop` and `_path_weight`. Cycle-safe; depth capped at [`MAX_DEPTH`], results at
+    /// [`MAX_REACHED`]. Also the links walked, in order. One read for the links and one
+    /// per target memory type, per hop.
+    async fn traverse(
+        &self,
+        records: &[adb_core::MemoryRecord],
+        link_type: Option<&str>,
+        depth: u32,
+    ) -> ExecutorResult<(Vec<adb_core::MemoryRecord>, Vec<adb_core::Link>)> {
+        let mut seen: HashSet<(MemoryType, String)> = records.iter().map(|r| (r.memory_type, r.id.clone())).collect();
+        let mut frontier: Vec<(adb_core::MemoryRecord, f64)> = records.iter().map(|r| (r.clone(), 1.0)).collect();
+        let mut reached = Vec::new();
+        let mut walked = Vec::new();
+        for hop in 1..=depth.clamp(1, MAX_DEPTH) {
+            let sources: Vec<adb_core::MemoryRecord> = frontier.iter().map(|(r, _)| r.clone()).collect();
+            let mut by_record = self.links_of(&sources, link_type).await?;
+            // Each new target once, at its best path weight this hop, in link order.
+            let mut order: Vec<(MemoryType, String)> = Vec::new();
+            let mut best: HashMap<(MemoryType, String), f64> = HashMap::new();
+            for (r, w) in &frontier {
+                for l in by_record.remove(&(r.memory_type, r.id.clone())).unwrap_or_default() {
+                    let to = (l.to_type, l.to_id.clone());
+                    if !seen.contains(&to) {
+                        let pw = w * f64::from(l.weight);
+                        match best.get_mut(&to) {
+                            Some(b) => *b = b.max(pw),
+                            None => {
+                                best.insert(to.clone(), pw);
+                                order.push(to);
+                            }
+                        }
+                    }
+                    walked.push(l);
+                }
             }
+            let mut wanted: HashMap<MemoryType, Vec<String>> = HashMap::new();
+            for (memory, id) in &order {
+                wanted.entry(*memory).or_default().push(id.clone());
+            }
+            let mut found: HashMap<(MemoryType, String), adb_core::MemoryRecord> = HashMap::new();
+            for (memory, ids) in wanted {
+                for (id, r) in self.reads.records_by_id(memory, &ids).await? {
+                    found.insert((memory, id), r);
+                }
+            }
+            let mut level: Vec<(adb_core::MemoryRecord, f64)> = order
+                .into_iter()
+                .filter_map(|k| {
+                    seen.insert(k.clone());
+                    let w = best[&k];
+                    found.remove(&k).map(|r| (r, w))
+                })
+                .collect();
+            // Stable: equal weights keep link order.
+            level.sort_by(|a, b| b.1.total_cmp(&a.1));
+            level.truncate(MAX_REACHED.saturating_sub(reached.len()));
+            for (r, w) in &level {
+                let mut r = r.clone();
+                if let Some(obj) = r.data.as_object_mut() {
+                    obj.insert("_hop".into(), serde_json::json!(hop));
+                    obj.insert("_path_weight".into(), serde_json::json!(w));
+                }
+                reached.push(r);
+            }
+            if level.is_empty() || reached.len() >= MAX_REACHED {
+                break;
+            }
+            frontier = level;
         }
-        Ok(links.iter().filter_map(|l| found.get(&(l.to_type, l.to_id.clone())).cloned()).collect())
+        Ok((reached, walked))
+    }
+
+    /// `FOLLOW LINKS` from a RECALL / LOOKUP step: the reached records, projected by
+    /// its `RETURN` fields.
+    async fn follow(&self, records: &[adb_core::MemoryRecord], step: &StepPlan) -> ExecutorResult<Option<Vec<adb_core::MemoryRecord>>> {
+        let Some(follow_links) = &step.modifiers.follow_links else {
+            return Ok(None);
+        };
+        let (reached, _) = self.traverse(records, Some(&follow_links.link_type), follow_links.depth.unwrap_or(1)).await?;
+        Ok(Some(match &step.modifiers.return_fields {
+            Some(fields) => reached
+                .into_iter()
+                .map(|mut r| {
+                    r.data = r.project_fields(fields);
+                    r
+                })
+                .collect(),
+            None => reached,
+        }))
     }
 
     async fn execute_scan(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
@@ -612,27 +646,9 @@ impl Executor {
             ));
         }
 
-        // Handle FOLLOW LINKS - traverse links and return target records
-        if let Some(follow_links) = &step.modifiers.follow_links {
-            let target_records = self.follow(&records, Some(&follow_links.link_type)).await?;
-
-            // Apply field projection if RETURN clause specified
-            let final_records = if let Some(ref return_fields) = step.modifiers.return_fields {
-                target_records
-                    .into_iter()
-                    .map(|mut r| {
-                        r.data = r.project_fields(return_fields);
-                        r
-                    })
-                    .collect()
-            } else {
-                target_records
-            };
-
-            return Ok(QueryResult::records(
-                final_records,
-                start.elapsed().as_millis() as u64,
-            ));
+        // FOLLOW LINKS returns the reached records, not the recalled ones.
+        if let Some(reached) = self.follow(&records, step).await? {
+            return Ok(QueryResult::records(reached, start.elapsed().as_millis() as u64));
         }
 
         // Handle WITH LINKS - add links array to each record
@@ -685,6 +701,11 @@ impl Executor {
             .reads
             .lookup_with_modifiers(step.memory_type, &step.predicate, &step.modifiers)
             .await?;
+
+        // FOLLOW LINKS returns the reached records, as RECALL does (L6 / GR-7).
+        if let Some(reached) = self.follow(&records, step).await? {
+            return Ok(QueryResult::records(reached, start.elapsed().as_millis() as u64));
+        }
 
         // Handle WITH LINKS - add links array to each record
         if let Some(with_links) = &step.modifiers.with_links {

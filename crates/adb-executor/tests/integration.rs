@@ -377,6 +377,101 @@ async fn test_follow_links() {
     assert_eq!(records[0].data["pod"], "api-server");
 }
 
+/// SEMANTIC records `ids` and `next` links between them, `(from, to, weight)`.
+async fn graph(ids: &[&str], links: &[(&str, &str, f32)]) -> Mem {
+    let adb = Mem::new().await;
+    for id in ids {
+        adb.store(MemoryType::Semantic, id, json!({ "name": id })).await.unwrap();
+    }
+    for (from, to, w) in links {
+        adb.link(MemoryType::Semantic, from, MemoryType::Semantic, to, "next", *w).await.unwrap();
+    }
+    adb
+}
+
+/// `(id, _hop, _path_weight)` of each record `aql` returns.
+async fn reached(adb: &Mem, aql: &str) -> Vec<(String, u64, f64)> {
+    let result = adb.execute(aql).await.unwrap();
+    result
+        .get_records()
+        .unwrap()
+        .iter()
+        .map(|r| (r.id.clone(), r.data["_hop"].as_u64().unwrap(), r.data["_path_weight"].as_f64().unwrap()))
+        .collect()
+}
+
+fn ids(r: &[(String, u64, f64)]) -> Vec<&str> {
+    r.iter().map(|(id, _, _)| id.as_str()).collect()
+}
+
+/// P1_GRAPH D1 (GR-1): DEPTH n returns everything within n hops, nearest first.
+#[tokio::test]
+async fn follow_links_depth_walks_a_chain() {
+    let adb = graph(&["a", "b", "c", "d"], &[("a", "b", 1.0), ("b", "c", 0.5), ("c", "d", 0.5)]).await;
+    let q = |d: u32| format!(r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next" DEPTH {d}"#);
+    assert_eq!(ids(&reached(&adb, &q(1)).await), ["b"]);
+    assert_eq!(ids(&reached(&adb, &q(2)).await), ["b", "c"]);
+    let all = reached(&adb, &q(3)).await;
+    assert_eq!(all, [("b".into(), 1, 1.0), ("c".into(), 2, 0.5), ("d".into(), 3, 0.25)]);
+    // Without DEPTH: one hop, as before.
+    let one = adb.execute(r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next""#).await.unwrap();
+    assert_eq!(one.get_records().unwrap().len(), 1);
+}
+
+/// Cycles end; the start is never returned; each record once.
+#[tokio::test]
+async fn follow_links_is_cycle_safe() {
+    let adb = graph(&["a", "b", "c"], &[("a", "b", 1.0), ("b", "c", 1.0), ("c", "a", 1.0), ("c", "b", 1.0)]).await;
+    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next" DEPTH 5"#).await;
+    assert_eq!(ids(&r), ["b", "c"]);
+}
+
+/// A record reached two ways at one hop counts once, at its best path weight; each
+/// hop is ordered by path weight.
+#[tokio::test]
+async fn follow_links_orders_by_path_weight() {
+    let adb = graph(
+        &["a", "b", "c", "d", "e"],
+        &[("a", "b", 0.2), ("a", "c", 0.9), ("b", "d", 1.0), ("c", "d", 0.5), ("b", "e", 1.0)],
+    )
+    .await;
+    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#).await;
+    assert_eq!(ids(&r), ["c", "b", "d", "e"]);
+    assert!((r[2].2 - 0.45).abs() < 1e-6, "{r:?}");
+    assert!((r[3].2 - 0.2).abs() < 1e-6, "{r:?}");
+}
+
+/// DEPTH beyond the cap stops at MAX_DEPTH.
+#[tokio::test]
+async fn follow_links_depth_is_capped() {
+    let names: Vec<String> = (0..8).map(|i| format!("n{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let links: Vec<(&str, &str, f32)> = refs.windows(2).map(|w| (w[0], w[1], 1.0)).collect();
+    let adb = graph(&refs, &links).await;
+    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "n0" FOLLOW LINKS TYPE "next" DEPTH 50"#).await;
+    assert_eq!(r.len(), adb_executor::MAX_DEPTH as usize);
+}
+
+/// L6 / GR-7: LOOKUP … FOLLOW LINKS returns the linked records, not the source.
+#[tokio::test]
+async fn lookup_follow_links_returns_targets() {
+    let adb = graph(&["a", "b", "c"], &[("a", "b", 1.0), ("b", "c", 1.0)]).await;
+    let r = reached(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#).await;
+    assert_eq!(ids(&r), ["b", "c"]);
+}
+
+/// REFLECT … FOLLOW LINKS honours DEPTH too.
+#[tokio::test]
+async fn reflect_follow_links_depth() {
+    let adb = graph(&["a", "b", "c"], &[("a", "b", 1.0), ("b", "c", 1.0)]).await;
+    let result = adb
+        .execute(r#"REFLECT FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#)
+        .await
+        .unwrap();
+    let text = serde_json::to_string(&result.data).unwrap();
+    assert!(text.contains("\"c\""), "{text}");
+}
+
 // ============================================================================
 // HAVING with alias tests
 // ============================================================================
