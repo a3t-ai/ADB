@@ -1,7 +1,7 @@
 # Known limitations — left out on purpose, to revisit
 
-What the implementation deliberately skipped or worked around through stage D4
-(25 Oct 2026). Each entry says what is missing, what it affects, and where it
+What the implementation deliberately skipped or worked around (started at stage
+D4, 25 Oct 2026; kept current — last pass 29 Oct, W10b). Each entry says what is missing, what it affects, and where it
 should be picked up. Items fixed later move to the bottom with the commit.
 
 ## Correctness gaps
@@ -16,40 +16,43 @@ should be picked up. Items fixed later move to the bottom with the commit.
 
 ## Performance shortcuts (fine for dev-sized data)
 
-**Deferred (user, 28 Oct 2026):** no performance work until the feature matrix is
-complete; then start with W7-L5, W7-L1 and P11.
+**Status (29 Oct 2026):** performance work resumed with W10 (hot cache) and W10b
+(reads in place, `LIKE` from the cache). Reads the cache answers are 1–17 ms at
+10k facts; reads that miss it go to Lance and cost what they did (W7-L1, W7-L5,
+W7-L6, W10-L7). Which reads hit is set by the rules (W10-L3, W10-L9).
 
-Where reads stand (release, 10k facts in the partition, median ms; ADB via HTTP
-`tests/bench-reads.mjs` after a compaction, embedded LanceDB 0.40 in process after
-`optimize()`, Postgres 18.4 over localhost TCP with typed columns and B-tree indexes):
+Where reads stand (release, 10k facts, median ms, `tests/bench-reads.mjs` over
+HTTP, 29 Oct; LanceDB / Postgres columns from the W7 comparison, 28 Oct: embedded
+LanceDB 0.40 after `optimize()`, Postgres 18.4 over localhost TCP with typed columns
+and B-tree indexes):
 
-| Read | ADB | LanceDB | LanceDB + scalar indexes | Postgres | Postgres, JSONB payload |
-|---|---|---|---|---|---|
-| LOOKUP KEY | 9.8 | 7.0 | 3.8 | 0.35 | 0.24 |
-| WHERE field = (pushed down) | 43 | 7.0 | 5.4 | 0.41 | 0.33 |
-| WHERE field != | 99 | 8.5 | 3.8 | 0.24 | 0.30 |
-| ORDER BY LIMIT 10 | 104 | 12.8 | 12.5 | 0.33 | 8.7 |
-| WITH LINKS (50 records) | 42 | 13.2 | 10.4 | 1.2 | 3.8 |
-| FOLLOW LINKS | 83 | 38.9 | 31.0 | 0.91 | 0.87 |
-| SCAN WORKING WINDOW | 19 | 9.9 | 5.9 | 0.27 | 0.32 |
-| AGGREGATE COUNT | 36 | 3.5 | 1.5 | 0.25 | 2.7 |
+| Read | ADB, Lance (cache miss) | ADB, from the cache (W10b) | LanceDB + scalar indexes | Postgres |
+|---|---|---|---|---|
+| LOOKUP KEY | 25 | 1.2 | 3.8 | 0.35 |
+| WHERE field = (10k candidates) | 39 | 8.2 | 5.4 | 0.41 |
+| WHERE field != | 154 | 11 | 3.8 | 0.24 |
+| ORDER BY LIMIT 10 | 180 | 17 | 12.5 | 0.33 |
+| AGGREGATE COUNT | 43 | 12 | 1.5 | 0.25 |
+| LIKE (words, 10k) | 143 | 44 | — | — |
+| SCAN WORKING WINDOW | 44 | 1.0 | 5.9 | 0.27 |
+| EPISODIC newest 10 | 53 | 0.9 | — | — |
+| WITH LINKS (50 records) | 61 | 50 (edges from Lance) | 10.4 | 1.2 |
+| FOLLOW LINKS | 112 | 54 (edges from Lance) | 31.0 | 0.91 |
 
-The near-LanceDB reads (key, WORKING, FOLLOW) pay for the LSM merge, the current
-view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5, W7-L2).
+Lance figures are between compactions (W7-L6: about half right after one). From
+the cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the
+bucket for reads that select from all of it (W10-L10).
 
 | # | Shortcut | Effect | Revisit |
 |---|---|---|---|
-| W7-L1 | **Every read scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a read costs about the same whatever it selects (debug, 10k facts: ~150 ms for a key lookup, ~220 ms for a pushed-down WHERE, ~650 ms for a `!=`; release figures in `W7_QUERY_ENGINE.md`). | Read latency grows with the partition, not the result. | Scalar indexes on `memory` / `lineage_id` used by the LSM scan (Lance), or one table per memory type. |
-| W7-L2 | **ORDER BY / LIMIT run after decoding** the candidates (no TopK in the scan). | `RECALL … ALL ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns (or a UDF) and a TopK plan. |
-| W7-L3 | **WORKING is read from the table like the rest** (the in-memory hot tier is gone): `SCAN FROM WORKING` costs a table scan — release, 10k facts in the partition: ~0.5 ms → 19 ms after a compaction, ~60 ms before. | Scratchpad reads are slower than in memory. | A WORKING cache, if agents need it. |
-| W7-L5 | **A payload `WHERE` parses every row's JSON in the scan** (`adb_json_scalar`), whatever it selects: ~40 ms at 10k facts in release. | Payload filters cost the same on small and large results. | Frequently filtered fields as columns, or a JSON index. |
-| W7-L6 | **Reads are fastest just after a compaction**: between compactions, small MemWAL batches and generations add ~2× (LOOKUP 24 vs 10 ms at 10k facts). Compaction runs after max(2,000, rows/4) writes. | Latency saw-tooths with the write rate. | Merge memtable batches in Lance; incremental compaction. |
-| P11 | **No cached index or page cache of ADB's own**: every read is a Lance scan, so even a key lookup costs milliseconds where Postgres answers from B-tree pages in memory in ~0.3 ms. The gap widens with data size, since scans grow with the partition and indexed lookups don't. | Reads ~30–300× slower than Postgres at 10k rows. | After W7-L5 / W7-L1: scalar indexes on the hot columns, then an in-memory index or row cache per partition if agents need sub-millisecond reads. |
+| W7-L1 | **A cache miss scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a Lance read costs about the same whatever it selects. Scalar indexes were tried in W10 and didn't help (W10-L7). | Misses (and memory types without a rule) grow with the partition, not the result. | Fewer, larger LSM sources; one table per memory type; or cache rules that keep the memory type. |
+| W7-L2 | **ORDER BY / LIMIT on Lance run after decoding** the candidates (no TopK in the scan). From the cache they sort in memory (17 ms at 10k). | A miss with `ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns and a TopK plan, if misses matter. |
+| W7-L5 | **A payload `WHERE` on Lance parses every row's JSON in the scan** (`adb_json_scalar`): ~40 ms at 10k facts in release. From the cache the JSON is already decoded. | Payload filters on a miss cost the same on small and large results. | Frequently filtered fields as typed columns (payload-field promotion, W10 doc). |
+| W7-L6 | **Lance reads are fastest just after a compaction**: between compactions, small MemWAL batches and generations add ~2× (LOOKUP 24 vs 10 ms). Compaction runs after max(2,000, rows/4) writes. | Miss latency saw-tooths with the write rate. | Merge memtable batches in Lance; incremental compaction. |
 | P2 | **Filter pushdown covers only** `=`, `<`, `<=`, `>`, `>=`, `IN` on top-level scalar fields, `id`, `data.x` and `KEY id`; every condition is then checked exactly on the decoded rows (W7). Not pushed: `!=`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `metadata.*`, nested paths, variables, nulls, other `KEY` fields. | Those predicates decode every current row of the memory type (without vectors). | More operators in `adb_store::filter`. |
 | P3 | **No payload pushdown for PROCEDURAL and TOOLS**: their conditions see the shaped record (defaults the payload may lack). | Each read of them decodes all their rows. | Push down fields the shaping keeps as stored. |
 | P5 | **Stats count by loading every current row** (`count_current`). | `stats` cost grows with data. | Keep counts in `_meta`, or a Lance count query. |
 | P6 | **`FORGET` on SEMANTIC / PROCEDURAL scans all superseded versions** of the type to honour D2 T5; PROCEDURAL builds one view per old version. | Forget cost grows with history size. | With compaction (history pruned) or a pushed-down history filter. |
-| P7 | **Only `id` has a scalar index**; filters on `lineage_id`, `subject_id`, `kind`, `memory` scan. | KEY lookups by lineage and edge reads scan the table. | Add BTree / bitmap indexes maintained by the MemWAL (D5). |
 | P8 | **Writes hold the sequencer while their record is synced**, so a write waits for its own `fdatasync`; the WAL still group-commits what queues behind the lock. Measured 26 Oct (debug build, local disk): ~2.6 ms per write sequential, ~1,000 writes/s with 16 concurrent writers. | Fine for MVP traffic. | Release the sequencer before the sync with a pending overlay (later writes see in-flight ones), if a workload needs more. |
 | P10 | **Startup scans every current row twice** (hydrate + subscription registry) after Lance and the WAL open: 6.9 s with 4,000 episodes in the debug build, most of it opening the store. | Slow restarts of big partitions (the crash test takes ~95 s for 20 restarts). | Compaction (W5) and a persisted live-key / registry snapshot. |
 | P9 | **Release builds take ~40 min from clean** (fat LTO, 4 jobs in the pod). | Slow deploy loop after a cache wipe. | Thin LTO for dev images, or a build node. |
@@ -74,7 +77,7 @@ view and HTTP; the 6–12× ones filter, sort or count on payload fields (W7-L5,
 | E-L5 | **No authorization at registration or delivery** (ADB has no credentials yet). | Anyone who can reach ADB can subscribe to any topic or scope. | §14.4 auth, with the SaaS control plane. |
 | E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | With CQ watch sets (M2). |
 | E-L8 | **A patch / forget delivery looks up the record's scope and kind in Lance**; if compaction ever removes all its rows, the change is skipped. | Only matters once compaction exists (D5 / M2). | Carry scope in `Patch` / `Forget` effects. |
-| E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. FlowR has no topic *trigger* yet. | Agents poll; flows can't start on a message. | FlowR wiring (stage F). |
+| E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. (FlowR's `adb_topic` trigger, stage F, starts flows on a message.) | MCP agents poll. | MCP server notifications when clients support them. |
 | E-L10 | **Topic messages' TTL is a read filter only**: the expiry timer (L3, fixed) commits `Expire` for memory records, not for `event` rows. | Subscribers aren't told a message expired. | Expire events with compaction (W5). |
 | E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | Scope in the row id (schema v4) with tenancy (M4). |
 
@@ -160,7 +163,7 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W6-L3 | **A frame's `offset` is a lower bound under concurrent writes**: the result holds every record up to it, and may hold a few just after (they then cause an empty or smaller next diff). | Exact at quiet times; converges under load. | Reads at an exact offset (snapshot reads, W7). |
 | W6-L4 | **FORGET and watches**: frames buffered in ADB are scrubbed when the watcher reaches the `Forget` (milliseconds); clients that already received a record keep their copy until the `removed` diff. | Never on disk; clients must apply `removed`. | — |
 | W6-L5 | **No per-tenant limits, metering or per-watch permissions**: anyone with the ADB token can watch anything. | Fine on one trusted node. | Tenancy limits with the cluster gateway (M4). |
-| W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed (1 s timer, W3), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
+| W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed on time (timers per expiry, W9.12), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
 | W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). Conformance `19_watch.yaml` covers registration; diffs are covered by ADB tests. | — | Cross-partition watches (spec v2). |
 
 ## Spec completion (W9)
@@ -181,11 +184,14 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W10-L4 | **A rules change rebuilds the cache with applies and reads held** (one scan of the kept memory types under the store's exclusive lock). | A pause of a scan's length (ms to seconds) on `PUT /admin/cache`. | Build beside the old cache and replay the applies in between. |
 | W10-L5 | **Sizes are estimates** (payload JSON + ids + 256 B a row), and the cache is per process. | The pod's memory limit must leave room for `max_bytes` plus overhead. | Measure real heap per row; size `max_bytes` from the pod limit. |
 | W10-L6 | **Warm-up at open scans the kept memory types** (after the catch-up, before serving). | Adds to slow restarts of big partitions (P10). | Snapshot the cache with the store, or warm lazily. |
-| W10-L7 | **Scalar indexes didn't help** (spike, W10 doc): Lance reads that miss the cache still cost 10–100 ms at 10k rows (W7-L1, P7, P11 stand for misses). | Cache misses and SEMANTIC without a rule are as slow as before. | Fewer, larger LSM sources (merge generations), one table per memory type, or SEMANTIC rules. |
+| W10-L9 | **SEMANTIC is not cached by default** (rule `none`; WORKING 10 MB / scope, TOOLS and PROCEDURAL all, EPISODIC last 200 / scope, 256 MB cap). | Agents' fact reads and SEMANTIC `LIKE` go to Lance (25–180 ms at 10k) unless a rule is set. | Default a per-scope byte budget for SEMANTIC (user decision: memory vs latency). |
+| W10-L10 | **Reads over a kept bucket are one pass over it**: no per-field index inside buckets, so `WHERE` / `ORDER BY` / `AGGREGATE` / `LIKE` cost O(bucket rows) — 8–17 ms at 10k rows, 44 ms for `LIKE` (BM25 statistics recomputed per query, W4-L3). | Fine to ~10k rows per bucket; linear above. | Per-field ordered maps in buckets for filtered / sorted fields; cached term statistics for BM25; ANN past ~50k rows (W4-L2). |
+| W10-L11 | **Vectors make cached rows ~3× larger** (768 B a row at 384 dims, f16, on ~300 B of payload). | A `keep: all` SEMANTIC bucket of 100k facts is ~110 MB with vectors. | `"vectors": false` (A3T Settings checkbox) when `LIKE` isn't used on cached types; per-rule vectors if needed. |
+| W10-L7 | **Scalar indexes didn't help** (spike, W10 doc): Lance reads that miss the cache still cost 25–180 ms at 10k rows in release (W7-L1 stands for misses). | Cache misses and SEMANTIC without a rule are as slow as before. | Fewer, larger LSM sources (merge generations), one table per memory type, or SEMANTIC rules. |
 
 ## Query engine (W7)
 
-Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
+Read-speed items W7-L1, L2, L5 and L6 are under Performance shortcuts (W7-L3 fixed by the hot cache).
 
 | # | Limitation | Effect | Fix |
 |---|---|---|---|
@@ -204,6 +210,9 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 
 | Was | Fixed in |
 |---|---|
+| W7-L3: WORKING read from the table (no in-memory tier) | W10 (`40f1949`): the hot cache keeps WORKING (10 MB per scope by default); `SCAN … WINDOW` 44 → 1.0 ms in release |
+| P11: no in-memory index or row cache of ADB's own | W10 / W10b: per-node hot cache per memory type and scope, rules in `cache.json` / `PUT /admin/cache` / A3T Settings; key reads ~1 ms, scans of a kept memory type 8–17 ms at 10k. Misses: W7-L1 |
+| P7: only `id` has a scalar index | W10 spike: BTrees on `lineage_id`, `memory`, `scope`, `subject_id`, `commit_ts` (MemWAL-maintained) made no difference — the cost is per-source LSM overhead (W10-L7); the cache serves key lookups instead |
 | W10-L1: `LIKE` not served from the cache (no vectors kept) | W10b (29 Oct): the cache keeps vectors (`vectors`, default on, 2 B a dimension); `LIKE` over a complete bucket ranks in memory (release, 10k facts: 143 → 44 ms, the rest is the word ranking) |
 | W10-L8: a read copied its bucket's rows out of the cache | W10b (29 Oct): rows and their records shared with the cache, copied only when returned; ORDER BY sort keys computed once (release, 10k kept: WHERE 45 → 8 ms, ORDER BY LIMIT 97 → 17 ms) |
 | Same key in two memory types was one Lance row (data loss on restart) | `d4f0573` (schema v3) |
