@@ -5,6 +5,10 @@
 > platform database), the FlowR runtimes and the agents all connect to that one ADB,
 > on both layers — MCP (JSON: agents' tools) and the database layer (Arrow Flight:
 > `call:adb`, platform tables) — and execute AQL.
+>
+> **End goals and the order after the MVP (29 Oct, user):** see `GOALS.md`. After
+> W8: graph core → edge ADB (in the FlowR runtime container) → stitching agents'
+> graphs → central KG / KBLaM → M3 → M4. Cache-miss tuning is deferred.
 
 ## Where things stand (26 Oct)
 

@@ -197,6 +197,19 @@ Read-speed items W7-L1, L2, L5 and L6 are under Performance shortcuts (W7-L3 fix
 |---|---|---|---|
 | W7-L4 | **ADB without `--data-dir` writes to a temporary directory** (removed when it stops) instead of memory. | Needs disk; same engine as durable. | — |
 
+## End goals — open questions (29 Oct)
+
+Unanswered questions from setting the end goals and priority order (`GOALS.md`).
+Each must be settled before its phase is designed.
+
+| # | Question | Blocks | Recommendation so far |
+|---|---|---|---|
+| GQ-1 | **Can an edge serve a read that is a little behind?** | Phase 2 (edge ADB) | Yes for other agents' writes to shared scopes; an agent's own writes always wait for their commit offset (read-your-writes). |
+| GQ-2 | **Where is query text embedded for `LIKE` on an edge?** The model is ~130 MB of memory in every runtime container. | Phase 2 | Embed on the core (~1 ms round trip); local embedding as an option. |
+| GQ-3 | **Who produces the KBLaM key / value vectors?** ADB (needs the agentLM / harnessLM encoder and adapters), or ADB exports triples and the model side encodes. | Phase 4 | — |
+| GQ-4 | **Where are agentLM / harnessLM specified?** Nothing in the workspace describes them. | Phase 4 | — |
+| GQ-5 | **The edge role isn't in ARCHITECTURE.md yet**; §13 still says "no embedded production profile" (7 Oct). | Phase 2 | Design §8 / §13 / §15 when phase 2 starts (user, 29 Oct: don't change the architecture yet). |
+
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |

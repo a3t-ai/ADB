@@ -32,6 +32,24 @@
 M2 can overlap the end of M1, and M3 can start as soon as M1's log trait is stable,
 **once the servers are available** — order them early.
 
+**Priority order after the MVP (29 Oct 2026, user):** the work is now ordered by
+ADB's end goals (`GOALS.md`): agent memory close to the agent, a distributed graph
+stitched from agents' memories, and a central KG for agentLM / harnessLM (KBLaM
+variant). After the M2 / MVP gate (W8), single-node phases come first, then the
+cluster:
+
+| # | Phase | Needs |
+|---|---|---|
+| 1 | Graph core (GR-1…GR-3, GR-6, W10-L2, shared entities) | one node |
+| 2 | Edge ADB (a process in the FlowR runtime container holding its scopes) | one node |
+| 3 | Stitching (cross-partition links, traversal, consolidation) | one node |
+| 4 | Central KG + KBLaM vectors | one node; model side open (GQ-3, GQ-4) |
+| 5 | M3 — Replication (below) | 3 servers |
+| 6 | M4 — Control plane (below), plus placing scopes on edges | M3 |
+
+The milestone sections below are unchanged; how the edge role fits §8 / §13 is
+designed in ARCHITECTURE.md when phase 2 starts.
+
 ---
 
 ## M0 — Foundations (1–2 weeks)
