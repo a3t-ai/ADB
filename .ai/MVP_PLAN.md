@@ -201,3 +201,10 @@ mode; conformance 182/182 with 207 cache hits and 0 mismatches. Limitations W10-
 6 rows in 7 ms, auth on), `flowr:2026-10-28-ee8` (console, controller
 `A3T_RUNTIME_IMAGE`, Runtime CR `worker`), A3T UI rebuilt (Settings → ADB Memory
 Cache). Default rules on vc-dev (no `cache.json` yet).
+
+**W10b rolled (29 Oct ~11:49 UTC):** `adb:2026-10-29-w10b` (release; W10b plus the
+SEMANTIC default of 64 MB per scope, `78b1779`; clean start, hot cache loaded 10 rows
+in 8 ms, auth on), A3T UI rebuilt (Settings → ADB Memory Cache: "keep vectors").
+FlowR unchanged (`flowr:2026-10-28-ee8`). vc-dev has no `cache.json`, so the
+defaults apply. Platform database still on the embedded LanceDB (G-L5 switch
+pending, user). Next: the user's A3T pass (W8).
