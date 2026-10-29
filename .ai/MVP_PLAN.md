@@ -169,7 +169,7 @@ Then W8 (the user's A3T pass), then performance, then graph.
 | 9.6 | `0b18b26`, flowr `c1463da` | Idle subscriptions dropped after 7 days (`ADB_SUB_IDLE`); topic resets carry the missed messages; FlowR delivers them |
 | 9.7 | `2699eca` | Compare-and-set `UPDATE … WHERE metadata.version = n` (tested, 20 concurrent writers); LINK checks both ends under the sequencer |
 | 9.8 | `92d51df` | Compaction syncs before deleting; open-time power-loss recovery **deferred to M3** (user) |
-| 9.9 | `5481a86` | Forget byte-scan test; 1,000-kill crash run (result below) |
+| 9.9 | `5481a86` | Forget byte-scan test; 1,000-kill crash run: 351,387 acknowledged, 0 lost |
 | 9.10 | `526d971`, flowr `f41c409`, a3t `09cf9a9` | Embedding provider settings: local or OpenAI-compatible, key from env, clear-and-re-embed (user decisions) |
 | 9.11 | `505f74a` | Snowball English stemming: word recall@1 0.64 → 0.67 |
 | 9.12 | `c70e953` | TTL timers instead of the per-second scan |
@@ -178,6 +178,10 @@ Then W8 (the user's A3T pass), then performance, then graph.
 `flowr:2026-10-28-ee7` (console, `A3T_RUNTIME_IMAGE`, and Runtime CR `worker`
 `spec.image` — isolated canvases take their target Runtime's image, so the CR must be
 bumped too), A3T UI rebuilt (Settings → ADB Embeddings). Gates 10/10 before release.
+
+**1,000-kill crash run (9.9, W9 debug binary, 28 Oct 17:22 → 29 Oct 06:03):** 1,000
+SIGKILLs, 351,387 acknowledged writes, 0 lost; 3,238 unacknowledged writes also
+survived (allowed). 43,184 s. M1 / M2 crash exit criterion met.
 
 ## W10 — hot cache (28 Oct, user: "implement the cache and indexes as per the plan")
 
