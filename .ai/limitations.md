@@ -101,6 +101,9 @@ bucket for reads that select from all of it (W10-L10).
 | G-L5 | **Switching a running install to ADB is manual**: `import-lancedb` then edit `a3t/a3t-platform-db` (`backend: adb`) and restart FlowR. Writes between the import and the restart go to the embedded copy. | Plan a short write freeze for the switch. | An import mode that follows FlowR writes, or a switch flow. |
 | G-L6 | **FlowR's own state**: the registry (workflows, resources) and `agent:*` state (configs, sessions) are on ADB with `FLOWR_REGISTRY_ADB` (W2c); executions, queue, checkpoints, settings and non-runtime triggers stay local. | Execution history is per FlowR. | When FlowR clusters. |
 | G-L7 | `call:rotate`'s knowledge-graph database (`a3t-kg.lance`) stays embedded. | — | When needed. |
+| G-L8 | **SQL console has no memory cap**: a query is bounded by its row limit (≤ 10,000) and a 30 s timeout, not by memory; a large join or sort can use a lot of RAM on the ADB pod. | Superadmin-only, so a deliberate risk. | A DataFusion memory pool on the SQL session. |
+| G-L9 | **SQL console results reach FlowR as text** (every value formatted), and nested values (lists, structs) as their display form. | Fine for reading; no typed export. | Typed JSON if an export is wanted. |
+| G-L10 | **ADB has one admin token**: anything holding `ADB_AUTH_TOKEN` (FlowR, the CLI) can run SQL; the superadmin check is in FlowR. | Same trust as today's Flight writes. | Per-caller tokens / roles in ADB (M4 tenancy). |
 
 ## Runtimes on ADB (MVP W2)
 

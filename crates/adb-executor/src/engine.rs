@@ -80,6 +80,12 @@ pub trait Engine: Send + Sync {
     async fn set_cache(&self, _settings: Value) -> Result<Value, String> {
         Err("the hot cache needs a durable engine (start ADB with --data-dir)".into())
     }
+
+    /// Read-only SQL over the memory and platform tables (the superadmin's debug
+    /// view, `crate::sql`); at most `limit` rows.
+    async fn sql(&self, _sql: &str, _limit: Option<usize>) -> Result<crate::sql::SqlResult, String> {
+        Err("SQL needs a durable engine (start ADB with --data-dir)".into())
+    }
 }
 
 /// `ADB_CACHE`: `on` (default), `off`, or `shadow` (every answer from the hot cache
@@ -577,6 +583,15 @@ impl Engine for LocalEngine {
         store.set_cache(hot_cache(c.clone())).await.map_err(|e| e.to_string())?;
         tracing::info!(rules = c.rules.len(), max_bytes = c.max_bytes, took = ?started.elapsed(), "hot cache rules saved and applied");
         Ok(json!({ "saved": c, "mode": cache_mode(), "stats": store.hot().map(|h| h.stats()), "took_ms": started.elapsed().as_millis() as u64 }))
+    }
+
+    async fn sql(&self, sql: &str, limit: Option<usize>) -> Result<crate::sql::SqlResult, String> {
+        let Some((store, barrier)) = &self.store else { return Err("SQL needs a durable engine (start ADB with --data-dir)".into()) };
+        // Read-your-writes, as AQL reads: the table holds every committed record.
+        if let Some(b) = barrier {
+            b.wait_for_committed().await;
+        }
+        crate::sql::run(Some(Arc::clone(store)), self.platform(), sql, limit).await
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {

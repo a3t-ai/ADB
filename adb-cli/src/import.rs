@@ -55,16 +55,62 @@ fn utf8(batch: &RecordBatch) -> Result<RecordBatch, String> {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).map_err(|e| e.to_string())
 }
 
-pub async fn import(path: &Path, flight: &str, replace: bool) -> Result<(), String> {
+/// A Flight client for `flight`, with `ADB_AUTH_TOKEN` when it is set.
+async fn connect(flight: &str) -> Result<Client, String> {
     let channel = Channel::from_shared(flight.to_string()).map_err(|e| e.to_string())?.connect().await.map_err(|e| format!("connect {flight}: {e}"))?;
     let bearer = std::env::var("ADB_AUTH_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
         .map(|t| format!("Bearer {t}").parse().map_err(|_| "ADB_AUTH_TOKEN is not a valid header value".to_string()))
         .transpose()?;
-    let mut c = FlightServiceClient::with_interceptor(channel, Bearer(bearer))
+    Ok(FlightServiceClient::with_interceptor(channel, Bearer(bearer))
         .max_encoding_message_size(64 << 20)
-        .max_decoding_message_size(64 << 20);
+        .max_decoding_message_size(64 << 20))
+}
+
+/// `adb sql`: read-only SQL over a running ADB's memory and platform tables (the
+/// superadmin's debug view), printed as JSON rows with every value as text.
+pub async fn sql(query: &str, flight: &str, limit: Option<usize>) -> Result<(), String> {
+    let mut c = connect(flight).await?;
+    let mut ticket = json!({ "sql": query });
+    if let Some(l) = limit {
+        ticket["limit"] = json!(l);
+    }
+    let s = c
+        .do_get(arrow_flight::Ticket { ticket: ticket.to_string().into() })
+        .await
+        .map_err(|e| e.message().to_string())?
+        .into_inner();
+    let batches: Vec<RecordBatch> = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        s.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+    )
+    .try_collect()
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for b in &batches {
+        let cols: Vec<(String, Arc<dyn Array>)> = b
+            .schema()
+            .fields()
+            .iter()
+            .zip(b.columns())
+            .map(|(f, c)| Ok((f.name().clone(), arrow_cast::cast(c, &DataType::Utf8).map_err(|e| format!("{}: {e}", f.name()))?)))
+            .collect::<Result<_, String>>()?;
+        for r in 0..b.num_rows() {
+            let mut o = serde_json::Map::new();
+            for (name, col) in &cols {
+                let a = col.as_any().downcast_ref::<arrow_array::StringArray>().expect("cast to Utf8");
+                o.insert(name.clone(), if a.is_valid(r) { Value::String(a.value(r).to_string()) } else { Value::Null });
+            }
+            rows.push(Value::Object(o));
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
+pub async fn import(path: &Path, flight: &str, replace: bool) -> Result<(), String> {
+    let mut c = connect(flight).await?;
     let existing: Vec<String> = serde_json::from_value(action(&mut c, "list_tables", json!({})).await?).unwrap_or_default();
     let mut tables: Vec<String> = std::fs::read_dir(path)
         .map_err(|e| format!("{}: {e}", path.display()))?

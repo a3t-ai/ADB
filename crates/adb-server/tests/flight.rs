@@ -145,3 +145,71 @@ async fn flight_token_is_required_when_set() {
     assert!(r.is_ok(), "{r:?}");
     server.abort();
 }
+
+/// The superadmin's SQL console: read-only SQL over memory and platform tables.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_over_memory_and_platform_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, server) = start(dir.path()).await;
+    put(&mut c, "agent_configs", &[("a1", "o1", "Alpha"), ("a2", "o1", "Beta"), ("a3", "o2", "Gamma")]).await;
+    for q in [
+        r#"STORE INTO SEMANTIC (key = "f1", content = "fact one", n = 1)"#,
+        r#"STORE INTO SEMANTIC (key = "f2", content = "fact two", n = 2)"#,
+        r#"UPDATE INTO SEMANTIC WHERE key = "f1" (n = 10)"#,
+        r#"FORGET FROM SEMANTIC WHERE key = "f2""#,
+    ] {
+        let r = action(&mut c, "aql", json!({ "query": q })).await.unwrap();
+        assert_eq!(r["success"], true, "{q}: {r}");
+    }
+    let sql = |s: &str| json!({ "sql": s });
+    // SQL results have any type (`Utf8View`, numbers): as text, for the row helper.
+    async fn get(c: &mut FlightServiceClient<Channel>, ticket: Value) -> Result<Vec<Value>, tonic::Status> {
+        let s = c.do_get(Ticket { ticket: ticket.to_string().into() }).await?.into_inner();
+        let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(s.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))))
+            .try_collect()
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let text: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                let cols: Vec<Arc<dyn Array>> = b.columns().iter().map(|c| arrow_cast::cast(c, &DataType::Utf8).unwrap()).collect();
+                let fields: Vec<Field> = b.schema().fields().iter().map(|f| Field::new(f.name(), DataType::Utf8, true)).collect();
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+            })
+            .collect();
+        Ok(adb_platform::batches_to_json(&text))
+    }
+
+    // A platform table, with a filter, an order and a group.
+    let rows = get(&mut c, sql("SELECT id, name FROM agent_configs WHERE org_id = 'o1' ORDER BY id")).await.unwrap();
+    assert_eq!(ids(&rows), ["a1", "a2"]);
+    let rows = get(&mut c, sql("SELECT org_id AS id, CAST(count(*) AS VARCHAR) AS n FROM agent_configs GROUP BY org_id ORDER BY org_id")).await.unwrap();
+    assert_eq!(rows, [json!({ "id": "o1", "n": "2" }), json!({ "id": "o2", "n": "1" })]);
+
+    // Memory, read straight after the writes: current rows only in memory_current,
+    // the payload as JSON text, every version in memory.
+    let rows = get(&mut c, sql("SELECT key AS id, value FROM memory_current WHERE memory = 'semantic'")).await.unwrap();
+    assert_eq!(ids(&rows), ["f1"], "{rows:?}");
+    let v: Value = serde_json::from_str(rows[0]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(v["n"], 10, "{v}");
+    let rows = get(&mut c, sql("SELECT CAST(count(*) AS VARCHAR) AS id FROM memory WHERE key = 'f1'")).await.unwrap();
+    assert_eq!(ids(&rows), ["2"], "f1 has two versions");
+    let rows = get(&mut c, sql("SELECT id FROM memory_raw WHERE id = '_meta'")).await.unwrap();
+    assert_eq!(ids(&rows), ["_meta"]);
+
+    // A join across memory and a platform table, and the table list.
+    let rows = get(&mut c, sql("SELECT a.id FROM agent_configs a JOIN memory_current m ON m.key = 'f1' WHERE a.org_id = 'o2'")).await.unwrap();
+    assert_eq!(ids(&rows), ["a3"]);
+    let rows = get(&mut c, sql("SELECT table_name AS id FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name")).await.unwrap();
+    assert_eq!(ids(&rows), ["agent_configs", "memory", "memory_current", "memory_raw"]);
+
+    // The limit, and writes refused.
+    let rows = get(&mut c, json!({ "sql": "SELECT id FROM agent_configs", "limit": 2 })).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    for bad in ["INSERT INTO agent_configs VALUES ('x', 'o', 'n')", "DROP TABLE agent_configs", "CREATE TABLE t AS SELECT 1", "DELETE FROM agent_configs"] {
+        let e = get(&mut c, sql(bad)).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{bad}: {e}");
+    }
+    assert_eq!(get(&mut c, sql("SELECT id FROM agent_configs")).await.unwrap().len(), 3);
+    server.abort();
+}

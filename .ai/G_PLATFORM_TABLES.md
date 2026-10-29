@@ -47,3 +47,28 @@ knowledge-graph database (`a3t-kg.lance`, embeddings).
 - **A3T on vc-dev:** after `import-lancedb` and switching the resource, A3T runs
   unchanged on ADB platform tables (agents, canvases, templates, audit, login), and
   the data survives ADB restarts.
+
+## SQL console (29 Oct 2026, user)
+
+**Decision (user):** flows and agents use AQL only. SQL is a **superadmin debug
+view** of everything in ADB's Lance, over **Arrow Flight only**, with an AQL / SQL
+pill in A3T's Query Console (`/db-console`).
+
+- **ADB:** `do_get` ticket `{"sql", "limit"?}` (`adb_executor::sql`). One DataFusion
+  session per query over a snapshot: `memory_raw` (the memory table as stored),
+  `memory` (the same rows, `value` as JSON text via `adb_json`, `sealed` /
+  `embedding` as booleans), `memory_current` (current rows only, no `_meta`) and
+  every platform table by name; `information_schema` on. Reads wait for committed
+  writes, as AQL reads. DDL, DML and statements refused; default 1,000 rows, at most
+  10,000; 30 s timeout. Not on HTTP or MCP.
+- **CLI:** `adb sql "<query>" [--flight URL] [--limit n]` (uses `ADB_AUTH_TOKEN`).
+- **FlowR:** `POST /registry/adb-sql` `{url, sql, limit?}` — a signed-in human with
+  the `SuperAdmin` role only (403 for other roles, agents and services); values come
+  back as text.
+- **A3T UI:** Query Console, ADB connection, superadmin: AQL / SQL pill; columns
+  that look like secrets (`password`, `hash`, `token`, …) hidden behind "Show
+  secrets".
+- **Tests:** `adb-server/tests/flight.rs` `sql_over_memory_and_platform_tables`
+  (platform table filter / group / order, the three memory tables read straight
+  after writes, a join, `information_schema`, limit, writes refused); FlowR
+  `registry::tests::adb_sql_is_for_the_superadmin_only`.

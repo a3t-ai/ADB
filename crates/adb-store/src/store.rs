@@ -584,11 +584,22 @@ impl PartitionStore {
         F: FnOnce(datafusion::prelude::SessionContext) -> Fut,
         Fut: std::future::Future<Output = datafusion::error::Result<T>>,
     {
+        self.query_in(datafusion::prelude::SessionConfig::new(), f).await
+    }
+
+    /// [`Self::query`] in a session built from `config` (the SQL console turns on
+    /// `information_schema`); also registers `adb_json(value)`.
+    pub async fn query_in<T, F, Fut>(&self, config: datafusion::prelude::SessionConfig, f: F) -> StoreResult<T>
+    where
+        F: FnOnce(datafusion::prelude::SessionContext) -> Fut,
+        Fut: std::future::Future<Output = datafusion::error::Result<T>>,
+    {
         let g = self.state.read().await;
         let inner = open_state(&g);
         let table = Self::snapshot(inner).await?;
-        let ctx = datafusion::prelude::SessionContext::new();
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
         ctx.register_udf(crate::filter::json_scalar_udf());
+        ctx.register_udf(crate::filter::json_text_udf());
         ctx.register_table("memory", Arc::new(table)).map_err(lance)?;
         f(ctx).await.map_err(lance)
     }

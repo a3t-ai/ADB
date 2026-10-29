@@ -82,6 +82,33 @@ fn scalar_text(bytes: &[u8], key: &str) -> Option<String> {
     }
 }
 
+/// `adb_json(value)`: the whole JSONB `value` as JSON text (the SQL console's
+/// readable payload column).
+pub fn json_text_udf() -> ScalarUDF {
+    create_udf("adb_json", vec![DataType::LargeBinary], DataType::Utf8, Volatility::Immutable, Arc::new(json_text))
+}
+
+fn json_text(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    let [value] = args else {
+        return Err(DataFusionError::Execution("adb_json takes 1 argument".into()));
+    };
+    let values = value.clone().into_array(1)?;
+    let values = values
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| DataFusionError::Execution("adb_json: value must be LargeBinary".into()))?;
+    let mut out = StringBuilder::with_capacity(values.len(), values.len() * 64);
+    for i in 0..values.len() {
+        if values.is_null(i) {
+            out.append_null();
+        } else {
+            out.append_value(jsonb::RawJsonb::new(values.value(i)).to_string());
+        }
+    }
+    let result: ArrayRef = Arc::new(out.finish());
+    Ok(ColumnarValue::Array(result))
+}
+
 /// The payload field `key` as text: `field_text("campaign").eq(lit("summer"))`.
 pub fn field_text(key: &str) -> Expr {
     json_scalar_udf().call(vec![col("value"), lit(key.to_string())])

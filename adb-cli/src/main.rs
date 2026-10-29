@@ -67,6 +67,19 @@ enum Commands {
         #[arg(long)]
         replace: bool,
     },
+    /// Read-only SQL over a running ADB's memory and platform tables, over Arrow
+    /// Flight (superadmin debug view; uses ADB_AUTH_TOKEN). Tables: memory,
+    /// memory_current, memory_raw and each platform table.
+    Sql {
+        /// The SQL query (SELECT / WITH / SHOW / EXPLAIN)
+        query: String,
+        /// ADB's Flight endpoint
+        #[arg(long, default_value = "http://127.0.0.1:3001")]
+        flight: String,
+        /// Most rows to return (default 1,000, at most 10,000)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Execute one AQL statement and print the result as JSON
     Query {
         /// The AQL statement
@@ -80,6 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A client command: no engine of its own.
     if let Some(Commands::ImportLancedb { path, flight, replace }) = &cli.command {
         return import::import(path, flight, *replace).await.map_err(|e| e.into());
+    }
+    if let Some(Commands::Sql { query, flight, limit }) = &cli.command {
+        return import::sql(query, flight, *limit).await.map_err(|e| e.into());
     }
     let command = cli.command.unwrap_or(Commands::Serve { http: false, host: [0, 0, 0, 0].into(), port: 3000, flight_port: 3001 });
 
@@ -133,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = adb_executor::restart_requested() => tracing::info!("ADB stopping to apply its new settings"),
             }
         }
-        Commands::ImportLancedb { .. } => unreachable!("handled before the engine opens"),
+        Commands::ImportLancedb { .. } | Commands::Sql { .. } => unreachable!("handled before the engine opens"),
         Commands::Query { query } => match engine.query(&query, None).await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
             Err(e) => {

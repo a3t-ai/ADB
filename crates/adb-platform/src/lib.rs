@@ -231,6 +231,19 @@ impl PlatformStore {
         scan.try_into_stream().await.map_err(lance)?.try_collect().await.map_err(lance)
     }
 
+    /// Run `f` over every table's current dataset, by name (the SQL console). A
+    /// compaction waits until `f` is done, so the versions it reads stay on disk.
+    pub async fn with_tables<T, F, Fut>(&self, f: F) -> T
+    where
+        F: FnOnce(Vec<(String, Arc<Dataset>)>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _files = self.files.read().await;
+        let tables: Vec<(String, Arc<Dataset>)> =
+            self.tables.read().await.iter().map(|(n, d)| (n.clone(), Arc::clone(d))).collect();
+        f(tables).await
+    }
+
     /// A table's schema.
     pub async fn schema(&self, table: &str) -> PlatformResult<SchemaRef> {
         let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.to_string()))?;

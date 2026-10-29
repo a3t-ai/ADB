@@ -10,6 +10,7 @@ pub mod apply;
 pub mod query;
 pub mod reads;
 pub mod rank;
+pub mod sql;
 pub mod writes;
 
 pub use error::{ExecutorError, ExecutorResult};

@@ -5,6 +5,7 @@
 //! | Call | Request | Answer |
 //! |---|---|---|
 //! | `do_get` | ticket `{"table", "filter"?, "limit"?}` (Lance SQL filter, default limit 100) | the matching rows as Arrow batches |
+//! | `do_get` | ticket `{"sql", "limit"?}`: read-only SQL over memory and platform tables (superadmin debug view, `adb_executor::sql`; default limit 1,000, max 10,000) | the result as Arrow batches |
 //! | `do_put` | descriptor path `[table]`, Arrow batches | one `PutResult`, metadata `{"inserted", "offset"}` |
 //! | `do_put` | descriptor path `[table, "replace"]`, Arrow batches | the table replaced (its columns = the batches'), `{"inserted", "offset"}` |
 //! | `do_action("replace_table")` | `{"table", "columns"}` | the table replaced by an empty one, `{"replaced": true, "offset"}` |
@@ -213,6 +214,16 @@ impl FlightService for AdbFlight {
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let q = body(&req.into_inner().ticket)?;
+        if let Some(sql) = q.get("sql").and_then(|s| s.as_str()) {
+            let limit = q.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
+            let r = self.engine.sql(sql, limit).await.map_err(Status::invalid_argument)?;
+            tracing::info!(rows = r.batches.iter().map(|b| b.num_rows()).sum::<usize>(), "SQL console query");
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(r.schema)
+                .build(futures::stream::iter(r.batches.into_iter().map(Ok)))
+                .map_err(|e| Status::internal(e.to_string()));
+            return Ok(Response::new(Box::pin(stream)));
+        }
         let table = str_field(&q, "table")?;
         let filter = q.get("filter").and_then(|f| f.as_str());
         let limit = q.get("limit").and_then(|l| l.as_u64()).unwrap_or(100) as usize;
