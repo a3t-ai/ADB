@@ -311,6 +311,14 @@ do:
   } else {
     console.log('  (no ADB_EMBED_MODEL_DIR: W4 relevance checks skipped)');
   }
+  // P1.5: other facts about the entities of a recalled fact come along as related.
+  await adbQ('STORE INTO SEMANTIC FACT (subject = "org:acme", predicate = "renews_on", value = "1 Nov", content = "Acme renews on 1 Nov") NAMESPACE "f-test"');
+  await adbQ('STORE INTO SEMANTIC FACT (subject = "org:acme", predicate = "account_manager", object = "person:dana", confidence = 0.9, content = "Dana is the account manager") NAMESPACE "f-test"');
+  r = await ask('f-s1d', 'When does Acme renew?', { memory_config: { semantic: { limit: 1 } } });
+  const t4 = JSON.stringify(flowOutput(r.text) ?? r.text);
+  check('P1.5: a recalled fact brings related facts about its entity', t4.includes('Acme renews on 1 Nov') && t4.includes('(related, link weight 0.90) Dana is the account manager'), t4.slice(0, 800));
+  r = await ask('f-s1e', 'When does Acme renew?', { memory_config: { semantic: { limit: 1, related: 0 } } });
+  check('P1.5: related: 0 turns it off', !JSON.stringify(flowOutput(r.text) ?? r.text).includes('Dana'), r.text.slice(0, 400));
   const turns = await adbQ('RECALL FROM WORKING WHERE session_id = "f-s1" NAMESPACE "f-test"');
   check('the user turn is stored in WORKING', turns?.records?.[0]?.data?.content === 'What is my favourite colour?', JSON.stringify(turns));
   const eps = await adbQ('RECALL FROM EPISODIC WHERE session_id = "f-s1" NAMESPACE "f-test"');

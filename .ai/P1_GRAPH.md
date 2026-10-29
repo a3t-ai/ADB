@@ -25,3 +25,10 @@
 | 1.4 | Entities and facts (D2): `STORE … FACT`, supersede by (subject, predicate), multi-valued predicates, fact edges, MCP `remember` | executor + MCP tests, crash test with facts |
 | 1.5 | FlowR recall with links (D3) | FlowR integration test |
 | 1.6 | Gate: graph conformance suite, A3T check (agent recalls a linked fact) | user's A3T pass |
+
+## Status (29 Oct)
+
+Built and gated (Rust tests, AQL conformance 216/216, FlowR integration): 1.1
+`0f9ff6a`, 1.2 + 1.3 `cbdf06b` (AQL `fa6d0d2`), 1.4 `4241735` (AQL `b03451b`), 1.5
+flowr (agent_memory). Left: 1.6, the user's A3T check on vc-dev. New limitations
+GR-9..GR-13.

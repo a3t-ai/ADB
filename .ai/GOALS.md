@@ -48,7 +48,7 @@ Every phase below is judged against these two goals. Work that doesn't move them
 |---|---|---|
 | Working memory | WORKING with TTL, durable, ~1 ms from the cache | — |
 | Semantic cache near the agent | Hot cache on the ADB node, filled from the log (W10 / W10b); hybrid recall (W4) | Edge ADB in the runtime container; SEMANTIC not cached by default (W10-L9) |
-| Distributed graph | Typed, weighted, versioned links across memory types; one-hop reads | Multi-hop (GR-1), inbound (GR-2), link conditions (GR-3), cached links (W10-L2), links in agent recall (GR-6); shared entities; cross-partition links and traversal |
+| Distributed graph | Typed, weighted, versioned links; multi-hop, inbound, `MIN_WEIGHT` (AQL v0.8); links in the hot cache; entities and facts (fact = link); agents recall related facts (P1, 29 Oct) | Cross-partition links and traversal; entity resolution (GR-12) |
 | Central KG / KBLaM | Nothing in ADB; FlowR's `call:rotate` (RotatE embeddings, embedded `a3t-kg.lance`, G-L7) | Triple model, consolidation from agent memories with provenance, KBLaM key / value vectors, versioned feed to the model, invalidation on supersede / forget |
 
 ## Priority order

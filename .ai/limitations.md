@@ -136,7 +136,6 @@ Since P1.1–P1.2 (29 Oct): multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` /
 | GR-12 | **No entity resolution**: `person:ada` and `person:ada-lovelace` are two entities; entity stubs hold only key and name. | Duplicates until callers agree on keys. | Phase 3 consolidation (GOALS). |
 | GR-13 | **Forgetting an entity leaves facts pointing at it**; traversal skips the missing record. | Dangling facts stay until forgotten. | Cascade on FORGET of an entity, if needed. |
 | GR-10 | **The playground ignores direction and `MIN_WEIGHT`** (it parses v0.8). | Browser results differ from ADB for v0.8 link reads. | With GR-8. |
-| GR-6 | **Agents don't use links**: FlowR's memory phase never follows them into the prompt. | Links help AQL users, not chat agents. | Link weight as a ranking signal in hybrid recall (W4 T10), related facts pulled in. |
 | GR-8 | **The WASM playground's built `pkg/` predates v0.6 / v0.7** (source updated; no wasm-pack here). | The browser playground rejects the new statements. | `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
 
 ## Recall (W4)
@@ -184,7 +183,6 @@ Since P1.1–P1.2 (29 Oct): multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` /
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| W10-L2 | **Links aren't cached**: `WITH LINKS`, `FOLLOW LINKS` and LINK checks read edges from Lance. | Graph reads stay at Lance latency (parked with graph). | Edge buckets keyed by subject, with graph (GR-*). |
 | W10-L3 | **Reads that need every row use the cache only when the bucket is complete**; from an incomplete one only EPISODIC newest-first `LIMIT k` (no ORDER BY) and WORKING `WINDOW LAST n` / `LAST <duration>`. A read without `IN SCOPE` needs every scope's bucket complete. | A `last: n` rule speeds up recent-first reads, not WHERE / ORDER BY / AGGREGATE over the whole memory type. | `all` (or a large `bytes`) for memory types read that way; per-field ordered indexes in buckets if needed. |
 | W10-L4 | **A rules change rebuilds the cache with applies and reads held** (one scan of the kept memory types under the store's exclusive lock). | A pause of a scan's length (ms to seconds) on `PUT /admin/cache`. | Build beside the old cache and replay the applies in between. |
 | W10-L5 | **Sizes are estimates** (payload JSON + ids + 256 B a row), and the cache is per process. | The pod's memory limit must leave room for `max_bytes` plus overhead. | Measure real heap per row; size `max_bytes` from the pod limit. |
@@ -252,6 +250,8 @@ Each must be settled before its phase is designed.
 | P1: a throwaway backend per read | W7 (`97e04ee`): AQL reads as one DataFusion scan of an LSM snapshot, semantics once in `adb_executor::query` |
 | GR-1, GR-7 / L6: DEPTH ignored; LOOKUP … FOLLOW LINKS returned the source | P1.1 (`0f9ff6a`, 29 Oct): every record within n hops by hop then path weight, `_hop` / `_path_weight`, cycle-safe, capped at 5 hops / 1,000 records; LOOKUP and REFLECT the same |
 | GR-2, GR-3: outbound links only, no conditions on links | P1.2 (29 Oct, AQL v0.8 `fa6d0d2`): `INBOUND` / `BOTH`, `MIN_WEIGHT`, `TYPE IN` / `ALL` on FOLLOW and WITH LINKS; REFLECT honours FOLLOW's type |
+| GR-6: agents didn't use links | P1.5 (flowr, 29 Oct): related facts about recalled entities and linked records in the prompt (weight ≥ 0.5, up to 5), fact confidence in the rank; `memory_config.semantic.{related, related_min_weight}` |
+| W10-L2: links weren't cached | P1.3: every current link (edges and fact links) in the hot cache by both ends |
 | P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all edges of a result in one scan, targets in one scan per memory type |
 | S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |
 | G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |
