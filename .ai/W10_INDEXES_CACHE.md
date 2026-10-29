@@ -31,7 +31,7 @@ the most recent 10 MB of WORKING).
   - rules in `<data dir>/cache.json`, `GET/PUT /admin/cache`; the expiry tick
     sweeps rows past their window / TTL;
   - defaults: WORKING 10 MB per scope, TOOLS and PROCEDURAL all, EPISODIC last 200
-    per scope, SEMANTIC none; 256 MB cap.
+    per scope, SEMANTIC none (64 MB per scope from 29 Oct, W10-L9); 256 MB cap.
 - **Tests:** `adb-store/tests/hot.rs` (random puts / supersedes / patches / forgets /
   expiries over 3 memory types × 3 scopes under tight rules, cache vs table after
   every 5th record, across a compaction, a sweep, a rebuild and a reopen); unit tests

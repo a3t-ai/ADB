@@ -194,7 +194,7 @@ fn de_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
 
 impl Default for CacheConfig {
     /// The scratchpad and registries whole (as the old hot tier), recent episodes;
-    /// SEMANTIC is left to Lance.
+    /// the newest 64 MB of facts per scope.
     fn default() -> Self {
         let rule = |memory, keep| Rule { memory, scope: any_scope(), keep };
         Self {
@@ -204,7 +204,7 @@ impl Default for CacheConfig {
                 rule(Memory::Tools, Keep::All),
                 rule(Memory::Procedural, Keep::All),
                 rule(Memory::Episodic, Keep::Last(200)),
-                rule(Memory::Semantic, Keep::None),
+                rule(Memory::Semantic, Keep::Bytes(64 << 20)),
             ],
             vectors: true,
         }

@@ -19,7 +19,7 @@ should be picked up. Items fixed later move to the bottom with the commit.
 **Status (29 Oct 2026):** performance work resumed with W10 (hot cache) and W10b
 (reads in place, `LIKE` from the cache). Reads the cache answers are 1–17 ms at
 10k facts; reads that miss it go to Lance and cost what they did (W7-L1, W7-L5,
-W7-L6, W10-L7). Which reads hit is set by the rules (W10-L3, W10-L9).
+W7-L6, W10-L7). Which reads hit is set by the rules (W10-L3).
 
 Where reads stand (release, 10k facts, median ms, `tests/bench-reads.mjs` over
 HTTP, 29 Oct; LanceDB / Postgres columns from the W7 comparison, 28 Oct: embedded
@@ -184,7 +184,6 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 | W10-L4 | **A rules change rebuilds the cache with applies and reads held** (one scan of the kept memory types under the store's exclusive lock). | A pause of a scan's length (ms to seconds) on `PUT /admin/cache`. | Build beside the old cache and replay the applies in between. |
 | W10-L5 | **Sizes are estimates** (payload JSON + ids + 256 B a row), and the cache is per process. | The pod's memory limit must leave room for `max_bytes` plus overhead. | Measure real heap per row; size `max_bytes` from the pod limit. |
 | W10-L6 | **Warm-up at open scans the kept memory types** (after the catch-up, before serving). | Adds to slow restarts of big partitions (P10). | Snapshot the cache with the store, or warm lazily. |
-| W10-L9 | **SEMANTIC is not cached by default** (rule `none`; WORKING 10 MB / scope, TOOLS and PROCEDURAL all, EPISODIC last 200 / scope, 256 MB cap). | Agents' fact reads and SEMANTIC `LIKE` go to Lance (25–180 ms at 10k) unless a rule is set. | Default a per-scope byte budget for SEMANTIC (user decision: memory vs latency). |
 | W10-L10 | **Reads over a kept bucket are one pass over it**: no per-field index inside buckets, so `WHERE` / `ORDER BY` / `AGGREGATE` / `LIKE` cost O(bucket rows) — 8–17 ms at 10k rows, 44 ms for `LIKE` (BM25 statistics recomputed per query, W4-L3). | Fine to ~10k rows per bucket; linear above. | Per-field ordered maps in buckets for filtered / sorted fields; cached term statistics for BM25; ANN past ~50k rows (W4-L2). |
 | W10-L11 | **Vectors make cached rows ~3× larger** (768 B a row at 384 dims, f16, on ~300 B of payload). | A `keep: all` SEMANTIC bucket of 100k facts is ~110 MB with vectors. | `"vectors": false` (A3T Settings checkbox) when `LIKE` isn't used on cached types; per-rule vectors if needed. |
 | W10-L7 | **Scalar indexes didn't help** (spike, W10 doc): Lance reads that miss the cache still cost 25–180 ms at 10k rows in release (W7-L1 stands for misses). | Cache misses and SEMANTIC without a rule are as slow as before. | Fewer, larger LSM sources (merge generations), one table per memory type, or SEMANTIC rules. |
@@ -218,6 +217,7 @@ Each must be settled before its phase is designed.
 | F2 | Agents / templates saved with `enabled_tools: []` before the 25 Oct UI fix (`4c988de`) deny every tool. | Re-save each affected agent (turn "Restrict tools" off or pick tools). |
 | F3 | When an agent has no tool list, the chat engine passes `enabled_tools: null` into `system/agent-engine`'s config; whether that overrides a list set on the template wasn't checked. | Check if template-level restrictions seem not to apply. |
 | F4 | `a3t-chat-engine` hard-codes `mcp_servers` `[a3t/agent-flows]` as its fallback. | Should be `${ .mcp_servers // [...] }`. |
+| F5 | FlowR on vc-dev (`flowr:2026-10-28-ee8`) rejects the registry's Cedar policies at start (policy12–21 use `flow:deploy`, `flow:terminate`, `runtime:hibernate`, … which the schema doesn't define) and falls back to the embedded base schema (`registry_policies=0`). | Registry policies aren't applied on vc-dev. | Add the actions to the AESOP schema or fix the policies (FlowR). |
 
 ## Fixed (moved here when done)
 
@@ -228,6 +228,7 @@ Each must be settled before its phase is designed.
 | P7: only `id` has a scalar index | W10 spike: BTrees on `lineage_id`, `memory`, `scope`, `subject_id`, `commit_ts` (MemWAL-maintained) made no difference — the cost is per-source LSM overhead (W10-L7); the cache serves key lookups instead |
 | W10-L1: `LIKE` not served from the cache (no vectors kept) | W10b (29 Oct): the cache keeps vectors (`vectors`, default on, 2 B a dimension); `LIKE` over a complete bucket ranks in memory (release, 10k facts: 143 → 44 ms, the rest is the word ranking) |
 | W10-L8: a read copied its bucket's rows out of the cache | W10b (29 Oct): rows and their records shared with the cache, copied only when returned; ORDER BY sort keys computed once (release, 10k kept: WHERE 45 → 8 ms, ORDER BY LIMIT 97 → 17 ms) |
+| W10-L9: SEMANTIC not cached by default | 29 Oct: default rule keeps the newest 64 MB of facts per scope (user: as recommended, rolled with W10b); a saved `cache.json` keeps its own rules |
 | Same key in two memory types was one Lance row (data loss on restart) | `d4f0573` (schema v3) |
 | Links to a forgotten record lingered until restart | `310a3d1` (D4.1) |
 | Procedural `ORDER BY` / `RETURN` ignored | `18f7a25` (D4.2) |
