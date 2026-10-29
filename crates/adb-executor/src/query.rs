@@ -4,15 +4,17 @@
 //! AQL semantics once, for every memory type: exact WHERE / KEY / PATTERN, WINDOW,
 //! ORDER BY, LIMIT, RETURN, aggregates, links in batches.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use adb_core::log::{CommitTs, Kind, Memory};
 use adb_core::{
     evaluate_conditions, evaluate_conditions_on_record, AdbError, AdbResult, AggregateFunc, AggregateFuncType, Condition, Link,
     MemoryRecord, MemoryType, Metadata, Modifiers, OrderBy, Predicate, Scope, Value, Window,
 };
-use adb_store::{decode, predicate_filter, row_id, PartitionStore, StoredRow};
+use adb_store::{decode, predicate_filter, row_id, Cached, PartitionStore, StoredRow};
 use datafusion::prelude::{col, lit, Expr};
 
 use crate::reads::{to_link, to_record};
@@ -260,29 +262,35 @@ fn cmp_json(a: &serde_json::Value, b: &serde_json::Value) -> Ordering {
 
 /// `ORDER BY`: numbers by value, strings by text; a missing value sorts last
 /// ascending and first descending (as SQL). Ties keep the input order.
-pub fn order_by(records: &mut [MemoryRecord], order: &OrderBy) {
-    records.sort_by(|a, b| {
-        let c = match (a.order_value(&order.field), b.order_value(&order.field)) {
-            (Some(x), Some(y)) => cmp_json(&x, &y),
+pub fn order_by<R: Borrow<MemoryRecord>>(records: &mut Vec<R>, order: &OrderBy) {
+    // Each record's sort value once, not per comparison.
+    let mut keyed: Vec<(Option<serde_json::Value>, R)> = records.drain(..).map(|r| (r.borrow().order_value(&order.field), r)).collect();
+    keyed.sort_by(|(a, _), (b, _)| {
+        let c = match (a, b) {
+            (Some(x), Some(y)) => cmp_json(x, y),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
         };
         if order.ascending { c } else { c.reverse() }
     });
+    records.extend(keyed.into_iter().map(|(_, r)| r));
 }
 
 /// The order without `ORDER BY`: EPISODIC newest first, the others oldest first;
 /// ties by id.
-pub fn default_order(memory: MemoryType, records: &mut [MemoryRecord]) {
-    records.sort_by(|a, b| (a.metadata.created_at, &a.id).cmp(&(b.metadata.created_at, &b.id)));
+pub fn default_order<R: Borrow<MemoryRecord>>(memory: MemoryType, records: &mut [R]) {
+    records.sort_by(|a, b| {
+        let (a, b) = (a.borrow(), b.borrow());
+        (a.metadata.created_at, &a.id).cmp(&(b.metadata.created_at, &b.id))
+    });
     if memory == MemoryType::Episodic {
         records.reverse();
     }
 }
 
 /// `WINDOW` over records in default (oldest first) order.
-pub fn window(mut records: Vec<MemoryRecord>, w: &Window) -> Vec<MemoryRecord> {
+pub fn window<R: Borrow<MemoryRecord>>(mut records: Vec<R>, w: &Window) -> Vec<R> {
     match w {
         Window::LastN { count } => {
             let skip = records.len().saturating_sub(*count);
@@ -290,10 +298,10 @@ pub fn window(mut records: Vec<MemoryRecord>, w: &Window) -> Vec<MemoryRecord> {
         }
         Window::LastDuration { duration } => {
             let cutoff = adb_core::time::now() - chrono::Duration::from_std(*duration).unwrap_or_default();
-            records.into_iter().filter(|r| r.metadata.created_at > cutoff).collect()
+            records.into_iter().filter(|r| r.borrow().metadata.created_at > cutoff).collect()
         }
         Window::TopBy { count, field } => {
-            records.sort_by(|a, b| match (b.data.get(field), a.data.get(field)) {
+            records.sort_by(|a, b| match (b.borrow().data.get(field), a.borrow().data.get(field)) {
                 (Some(x), Some(y)) => cmp_json(x, y),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
@@ -303,7 +311,7 @@ pub fn window(mut records: Vec<MemoryRecord>, w: &Window) -> Vec<MemoryRecord> {
             records
         }
         Window::Since { condition } => {
-            let start = records.iter().position(|r| condition.matches(&r.data)).unwrap_or(records.len());
+            let start = records.iter().position(|r| condition.matches(&r.borrow().data)).unwrap_or(records.len());
             records.split_off(start)
         }
     }
@@ -343,7 +351,8 @@ enum Source {
 /// A read's candidates. `floor`: from the cache, rows committed at or before it
 /// may be missing (`None`: complete).
 struct Candidates {
-    records: Vec<MemoryRecord>,
+    /// Shared with the cache (copied only when returned, W10-L8).
+    records: Vec<Arc<MemoryRecord>>,
     cached: bool,
     floor: Option<CommitTs>,
 }
@@ -411,6 +420,16 @@ fn same_records(a: &Vec<MemoryRecord>, b: &Vec<MemoryRecord>) -> bool {
     serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
 
+/// The records a read returns, copied out of the candidates.
+fn owned(records: Vec<Arc<MemoryRecord>>) -> Vec<MemoryRecord> {
+    records.into_iter().map(|r| Arc::try_unwrap(r).unwrap_or_else(|r| (*r).clone())).collect()
+}
+
+/// A cached row's record (decoded at apply when the cache has the shape).
+fn cached_record(c: &Cached) -> Arc<MemoryRecord> {
+    c.record.clone().unwrap_or_else(|| Arc::new(record(&c.row)))
+}
+
 fn show_records(v: &Vec<MemoryRecord>) -> String {
     let ids: Vec<&str> = v.iter().take(20).map(|r| r.id.as_str()).collect();
     format!("{} records {ids:?}", v.len())
@@ -428,14 +447,14 @@ fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, mod
     };
     // KEY: the lineage's current version, as the point lookup finds it.
     if let Some(key) = keyed(memory, predicate) {
-        if let Some(Some(r)) = hot.lineage(m, &row_id(m, &key)) {
-            if ok(&r) {
-                return Some(Candidates { records: vec![record(&r)], cached: true, floor: None });
+        if let Some(Some(c)) = hot.lineage(m, &row_id(m, &key)) {
+            if ok(&c.row) {
+                return Some(Candidates { records: vec![cached_record(&c)], cached: true, floor: None });
             }
         }
     }
     let hit = hot.rows(m, in_scope)?;
-    Some(Candidates { records: hit.rows.iter().filter(|r| ok(r)).map(record).collect(), cached: true, floor: hit.floor })
+    Some(Candidates { records: hit.rows.iter().filter(|c| ok(&c.row)).map(cached_record).collect(), cached: true, floor: hit.floor })
 }
 
 /// The key a KEY predicate names, when it is the record's key.
@@ -462,7 +481,7 @@ async fn candidates(
             return Ok(c);
         }
     }
-    let lance = |records| Ok(Candidates { records, cached: false, floor: None });
+    let lance = |records: Vec<MemoryRecord>| Ok(Candidates { records: records.into_iter().map(Arc::new).collect(), cached: false, floor: None });
     let m: Memory = memory.into();
     // KEY lookups: the primary-key fast path first (W7).
     if let Some(key) = keyed(memory, predicate) {
@@ -499,7 +518,7 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
         // The literal or bound value; an unbound `$name` matches its name (as before).
         let query = text.as_deref().unwrap_or(pattern_var.trim_start_matches('$'));
         let threshold = threshold.unwrap_or(0.7);
-        let mut scored: Vec<(f32, MemoryRecord)> = c
+        let mut scored: Vec<(f32, Arc<MemoryRecord>)> = c
             .records
             .iter()
             .filter_map(|r| {
@@ -508,13 +527,13 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
-        let mut out: Vec<MemoryRecord> = scored.into_iter().map(|(_, r)| r).collect();
+        let mut out: Vec<Arc<MemoryRecord>> = scored.into_iter().map(|(_, r)| r).collect();
         if let Some(n) = modifiers.limit {
             out.truncate(n);
         }
-        return Ok(Answer::of(&c, out));
+        return Ok(Answer::of(&c, owned(out)));
     }
-    let mut records: Vec<MemoryRecord> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
+    let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
     if let Some(v) = &modifiers.scope {
         records.retain(|r| &r.metadata.scope == v);
     }
@@ -534,6 +553,7 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
     if let Some(n) = modifiers.limit {
         records.truncate(n);
     }
+    let mut records = owned(records);
     if let Some(f) = &modifiers.return_fields {
         project(&mut records, f);
     }
@@ -567,6 +587,7 @@ async fn scan_from(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs,
     if let Some(n) = modifiers.limit {
         records.truncate(n);
     }
+    let mut records = owned(records);
     if let Some(f) = &modifiers.return_fields {
         project(&mut records, f);
     }
@@ -584,7 +605,7 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
-    let mut records: Vec<MemoryRecord> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, predicate)).cloned().collect();
+    let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, predicate)).cloned().collect();
     let task = match predicate {
         Predicate::Where { conditions } => conditions.iter().find_map(|c| match c {
             Condition::Simple { field, value: Value::String(s), .. } if field == "task" || field == "task_type" => Some(s.clone()),
@@ -592,7 +613,7 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
         }),
         _ => None,
     };
-    let score = |r: &MemoryRecord| {
+    let score = |r: &Arc<MemoryRecord>| {
         let ranking = r.data["ranking"].as_f64().unwrap_or(0.5);
         match &task {
             Some(t) => ranking * 0.7 + r.data["relevance_scores"].get(t).and_then(|v| v.as_f64()).unwrap_or(0.5) * 0.3,
@@ -602,7 +623,7 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
     default_order(MemoryType::Tools, &mut records);
     records.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(Ordering::Equal));
     records.truncate(limit);
-    Ok(Answer::of(&c, records))
+    Ok(Answer::of(&c, owned(records)))
 }
 
 /// The keys (or, with `history`, the row ids of every version) that UPDATE /
@@ -625,6 +646,85 @@ async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Pr
     }
     let ids = c.records.iter().filter(|r| matches(memory, r, predicate)).map(|r| r.id.clone()).collect();
     Ok(Answer::of(&c, ids))
+}
+
+// ------------------------------------------------------------------ LIKE
+
+/// `RECALL … LIKE` (W4): every current row of `memory` passing `IN SCOPE` /
+/// `NAMESPACE`, ranked by [`crate::rank`] against the query text and / or vector;
+/// `MIN_CONFIDENCE`, `LIMIT` (default 10), then `ORDER BY` and `RETURN` over the
+/// selected. From the hot cache when it holds the whole memory type (scope) with
+/// vectors (W10-L1).
+pub async fn similar(store: &PartitionStore, memory: MemoryType, modifiers: &Modifiers, text: Option<&str>, vector: Option<&[f32]>, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
+    served(store, "like", |source| similar_from(store, memory, modifiers, text, vector, now, source), same_records, show_records).await
+}
+
+async fn similar_from(
+    store: &PartitionStore,
+    memory: MemoryType,
+    modifiers: &Modifiers,
+    text: Option<&str>,
+    vector: Option<&[f32]>,
+    now: CommitTs,
+    source: Source,
+) -> AdbResult<Answer<Vec<MemoryRecord>>> {
+    let m: Memory = memory.into();
+    let in_scope = modifiers.in_scope.as_deref();
+    let hot = store.hot().filter(|h| source == Source::Cache && h.tracks(m));
+    let (mut rows, cached): (Vec<Arc<StoredRow>>, bool) = match hot {
+        Some(h) => {
+            let Some(hit) = h.rows(m, in_scope).filter(|hit| hit.floor.is_none() && h.vectors()) else { return Ok(Answer::Insufficient) };
+            (hit.rows.into_iter().map(|c| c.row).filter(|r| r.is_current(now)).collect(), true)
+        }
+        None => {
+            let kinds = ["entity", "fact", "episode", "tool"].map(lit).to_vec();
+            let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").in_list(kinds, false));
+            if let Some(s) = in_scope {
+                filter = filter.and(col("scope").eq(lit(s.to_string())));
+            }
+            (current_rows(store, filter, now, true).await?.into_iter().map(Arc::new).collect(), false)
+        }
+    };
+    if let Some(ns) = &modifiers.namespace {
+        rows.retain(|r| r.data.namespace.as_ref() == Some(ns));
+    }
+    // One order whatever the source (ranking breaks ties by position).
+    rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
+    let vectors: Vec<Option<Vec<f32>>> = rows.iter().map(|r| r.data.embedding.as_ref().map(|e| e.iter().map(|x| x.to_f32()).collect())).collect();
+    let texts: Vec<Option<String>> = rows.iter().map(|r| crate::reads::embed_text(r.data.memory.into(), &r.data.value)).collect();
+    let candidates: Vec<crate::rank::Candidate> =
+        rows.iter().enumerate().map(|(i, r)| crate::rank::Candidate { embedding: vectors[i].as_deref(), text: texts[i].as_deref(), at: r.commit_ts }).collect();
+    let ranked = crate::rank::rank(&candidates, vector, text, modifiers.min_confidence, now);
+    let limit = modifiers.limit.unwrap_or(10);
+    let mut out: Vec<MemoryRecord> = ranked
+        .into_iter()
+        .take(limit)
+        .map(|r| {
+            let mut rec = record(&rows[r.index]);
+            rec.metadata.confidence = r.similarity;
+            rec
+        })
+        .collect();
+    if let Some(order) = &modifiers.order_by {
+        out.sort_by(|a, b| {
+            let (x, y) = (a.order_value(&order.field), b.order_value(&order.field));
+            let c = match (x.as_ref(), y.as_ref()) {
+                (Some(x), Some(y)) => x.to_string().cmp(&y.to_string()),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            if order.ascending { c } else { c.reverse() }
+        });
+    }
+    if let Some(fields) = &modifiers.return_fields {
+        for r in out.iter_mut() {
+            if let serde_json::Value::Object(m) = &mut r.data {
+                m.retain(|k, _| fields.iter().any(|f| f == k || f == "*"));
+            }
+        }
+    }
+    Ok(if cached { Answer::Cache(out) } else { Answer::Lance(out) })
 }
 
 // ------------------------------------------------------------------ aggregates
@@ -713,9 +813,9 @@ async fn by_keys_from(store: &PartitionStore, memory: MemoryType, keys: &[String
     if let Some(hot) = store.hot().filter(|h| source == Source::Cache && h.tracks(m)) {
         for k in keys {
             match hot.lineage(m, &row_id(m, k)) {
-                Some(Some(r)) => {
-                    if r.is_current(now) {
-                        out.insert(r.key().to_string(), record(&r));
+                Some(Some(c)) => {
+                    if c.row.is_current(now) {
+                        out.insert(c.row.key().to_string(), (*cached_record(&c)).clone());
                     }
                 }
                 Some(None) => {}

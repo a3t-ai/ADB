@@ -10,7 +10,6 @@ use std::time::Duration;
 use adb_core::log::{CommitTs, Memory};
 use adb_core::{time, AdbError, AdbResult, Link, MemoryRecord, MemoryType, Metadata, Modifiers, Predicate};
 use adb_store::{PartitionStore, StoredRow};
-use datafusion::prelude::{col, lit};
 use async_trait::async_trait;
 
 use crate::apply::ApplyBarrier;
@@ -170,55 +169,7 @@ impl LanceReads {
             b.wait_for_committed().await;
         }
         let now = CommitTs::from_datetime(time::now());
-        let m: Memory = memory.into();
-        let kinds = ["entity", "fact", "episode", "tool"].map(lit).to_vec();
-        let mut filter = col("memory").eq(lit(m.tag())).and(col("kind").in_list(kinds, false));
-        if let Some(s) = &modifiers.in_scope {
-            filter = filter.and(col("scope").eq(lit(s.clone())));
-        }
-        let mut rows = crate::query::current_rows(&self.store, filter, now, true).await?;
-        if let Some(ns) = &modifiers.namespace {
-            rows.retain(|r| r.data.namespace.as_ref() == Some(ns));
-        }
-        let vectors: Vec<Option<Vec<f32>>> =
-            rows.iter().map(|r| r.data.embedding.as_ref().map(|e| e.iter().map(|x| x.to_f32()).collect())).collect();
-        let texts: Vec<Option<String>> = rows.iter().map(|r| embed_text(r.data.memory.into(), &r.data.value)).collect();
-        let candidates: Vec<crate::rank::Candidate> = rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| crate::rank::Candidate { embedding: vectors[i].as_deref(), text: texts[i].as_deref(), at: r.commit_ts })
-            .collect();
-        let ranked = crate::rank::rank(&candidates, query_vec.as_deref(), query_text.as_deref(), modifiers.min_confidence, now);
-        let limit = modifiers.limit.unwrap_or(10);
-        let mut out: Vec<MemoryRecord> = ranked
-            .into_iter()
-            .take(limit)
-            .map(|r| {
-                let mut rec = crate::query::record(&rows[r.index]);
-                rec.metadata.confidence = r.similarity;
-                rec
-            })
-            .collect();
-        if let Some(order) = &modifiers.order_by {
-            out.sort_by(|a, b| {
-                let (x, y) = (a.order_value(&order.field), b.order_value(&order.field));
-                let c = match (x.as_ref(), y.as_ref()) {
-                    (Some(x), Some(y)) => x.to_string().cmp(&y.to_string()),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                };
-                if order.ascending { c } else { c.reverse() }
-            });
-        }
-        if let Some(fields) = &modifiers.return_fields {
-            for r in out.iter_mut() {
-                if let serde_json::Value::Object(m) = &mut r.data {
-                    m.retain(|k, _| fields.iter().any(|f| f == k || f == "*"));
-                }
-            }
-        }
-        Ok(out)
+        crate::query::similar(&self.store, memory, modifiers, query_text.as_deref(), query_vec.as_deref(), now).await
     }
 
     /// The memory types served from Lance.

@@ -176,13 +176,11 @@ TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| W10-L1 | **`LIKE` is not served from the cache**: vectors aren't kept, so recall by meaning reads Lance. | EPISODIC / SEMANTIC `LIKE` costs what it did. | Keep vectors per rule (`vectors: true`, 1.5 KB a row at 384 dims) and rank in memory. |
 | W10-L2 | **Links aren't cached**: `WITH LINKS`, `FOLLOW LINKS` and LINK checks read edges from Lance. | Graph reads stay at Lance latency (parked with graph). | Edge buckets keyed by subject, with graph (GR-*). |
 | W10-L3 | **Reads that need every row use the cache only when the bucket is complete**; from an incomplete one only EPISODIC newest-first `LIMIT k` (no ORDER BY) and WORKING `WINDOW LAST n` / `LAST <duration>`. A read without `IN SCOPE` needs every scope's bucket complete. | A `last: n` rule speeds up recent-first reads, not WHERE / ORDER BY / AGGREGATE over the whole memory type. | `all` (or a large `bytes`) for memory types read that way; per-field ordered indexes in buckets if needed. |
 | W10-L4 | **A rules change rebuilds the cache with applies and reads held** (one scan of the kept memory types under the store's exclusive lock). | A pause of a scan's length (ms to seconds) on `PUT /admin/cache`. | Build beside the old cache and replay the applies in between. |
 | W10-L5 | **Sizes are estimates** (payload JSON + ids + 256 B a row), and the cache is per process. | The pod's memory limit must leave room for `max_bytes` plus overhead. | Measure real heap per row; size `max_bytes` from the pod limit. |
 | W10-L6 | **Warm-up at open scans the kept memory types** (after the catch-up, before serving). | Adds to slow restarts of big partitions (P10). | Snapshot the cache with the store, or warm lazily. |
-| W10-L8 | **A read copies its bucket's rows out of the cache** before the exact predicate runs, so a read over a large complete bucket costs ~O(rows) (debug, 10k SEMANTIC kept: WHERE 145 ms, ORDER BY LIMIT 440 ms vs 1.8 ms for a key). | `keep: all` on a big memory type speeds key and newest reads, much less WHERE / ORDER BY. | Evaluate the predicate on the cached rows in place (no clone); per-field ordered indexes in buckets. |
 | W10-L7 | **Scalar indexes didn't help** (spike, W10 doc): Lance reads that miss the cache still cost 10–100 ms at 10k rows (W7-L1, P7, P11 stand for misses). | Cache misses and SEMANTIC without a rule are as slow as before. | Fewer, larger LSM sources (merge generations), one table per memory type, or SEMANTIC rules. |
 
 ## Query engine (W7)
@@ -206,6 +204,8 @@ Read-speed items W7-L1, L2, L3, L5 and L6 are under Performance shortcuts.
 
 | Was | Fixed in |
 |---|---|
+| W10-L1: `LIKE` not served from the cache (no vectors kept) | W10b (29 Oct): the cache keeps vectors (`vectors`, default on, 2 B a dimension); `LIKE` over a complete bucket ranks in memory (release, 10k facts: 143 → 44 ms, the rest is the word ranking) |
+| W10-L8: a read copied its bucket's rows out of the cache | W10b (29 Oct): rows and their records shared with the cache, copied only when returned; ORDER BY sort keys computed once (release, 10k kept: WHERE 45 → 8 ms, ORDER BY LIMIT 97 → 17 ms) |
 | Same key in two memory types was one Lance row (data loss on restart) | `d4f0573` (schema v3) |
 | Links to a forgotten record lingered until restart | `310a3d1` (D4.1) |
 | Procedural `ORDER BY` / `RETURN` ignored | `18f7a25` (D4.2) |

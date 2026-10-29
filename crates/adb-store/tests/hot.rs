@@ -38,6 +38,7 @@ fn rules() -> CacheConfig {
             r(Memory::Episodic, "*", Keep::None),
             r(Memory::Semantic, "*", Keep::Last(5)),
         ],
+        vectors: true,
     }
 }
 
@@ -104,7 +105,7 @@ async fn check(store: &PartitionStore, step: usize) {
         for scope in SCOPES.iter().map(|s| Some(*s)).chain([None]) {
             let want: HashMap<&str, &StoredRow> = table.iter().filter(|r| scope.is_none_or(|s| r.data.scope == s)).map(|r| (r.id.as_str(), r)).collect();
             let hit = hot.rows(m, scope).expect("tracked");
-            let got: HashMap<&str, &StoredRow> = hit.rows.iter().filter(|r| r.is_current(now)).map(|r| (r.id.as_str(), r)).collect();
+            let got: HashMap<&str, &StoredRow> = hit.rows.iter().map(|c| &*c.row).filter(|r| r.is_current(now)).map(|r| (r.id.as_str(), r)).collect();
             for (id, r) in &got {
                 let t = want.get(id).unwrap_or_else(|| panic!("step {step}: {m:?} {scope:?}: cached {id} is not current in the table"));
                 assert!(same(r, t), "step {step}: {m:?} {scope:?}: cached {id} differs from the table\n{r:?}\n{t:?}");
@@ -117,7 +118,7 @@ async fn check(store: &PartitionStore, step: usize) {
         }
         for t in &table {
             match hot.lineage(m, &t.lineage_id) {
-                Some(Some(r)) => assert!(same(&r, t), "step {step}: lineage {} cached as another row", t.lineage_id),
+                Some(Some(c)) => assert!(same(&c.row, t), "step {step}: lineage {} cached as another row", t.lineage_id),
                 Some(None) => panic!("step {step}: lineage {} reported missing", t.lineage_id),
                 None => {}
             }

@@ -2,7 +2,8 @@
 //! read from Lance; a difference fails the query). Tight rules, so buckets are
 //! evicted from and every path runs: complete buckets, newest-first answers from
 //! an incomplete one, fallbacks to Lance, KEY by lineage, UPDATE / FORGET targets,
-//! links by key, a rules change. Own test binary: it sets `ADB_CACHE`.
+//! links by key, `LIKE` (ranked from complete buckets), a rules change. Own test
+//! binary: it sets `ADB_CACHE`.
 
 use adb_executor::{Engine, LocalEngine};
 use serde_json::{json, Value};
@@ -42,9 +43,22 @@ const READS: &[&str] = &[
     r#"LOAD FROM TOOLS WHERE category = "c1" LIMIT 3"#,
 ];
 
+/// `LIKE $q` reads (text: word ranking; no embedder in this test).
+const LIKES: &[(&str, &str)] = &[
+    (r#"RECALL FROM SEMANTIC LIKE $q LIMIT 3"#, "topic t1"),
+    (r#"RECALL FROM SEMANTIC LIKE $q LIMIT 50"#, "t2"),
+    (r#"RECALL FROM EPISODIC LIKE $q LIMIT 5 IN SCOPE "s2""#, "event 2"),
+    (r#"RECALL FROM EPISODIC LIKE $q LIMIT 5"#, "event"),
+    (r#"RECALL FROM PROCEDURAL LIKE $q LIMIT 2"#, "restart service"),
+];
+
 async fn reads(engine: &LocalEngine) {
     for r in READS {
         q(engine, r).await;
+    }
+    for (r, text) in LIKES {
+        let vars = std::collections::HashMap::from([("q".to_string(), json!(text))]);
+        engine.query(r, Some(&vars)).await.unwrap_or_else(|e| panic!("{r}: {e}"));
     }
 }
 
@@ -75,7 +89,7 @@ async fn reads_through_the_cache_match_lance() {
         q(&engine, &format!(r#"STORE INTO WORKING (key = "w{i}", i = {i})"#)).await;
     }
     for i in 0..25 {
-        q(&engine, &format!(r#"STORE INTO SEMANTIC (key = "f{i}", topic = "t{}", n = {i})"#, i % 3)).await;
+        q(&engine, &format!(r#"STORE INTO SEMANTIC (key = "f{i}", topic = "t{}", n = {i}, content = "fact {i} about topic t{}")"#, i % 3, i % 3)).await;
     }
     for i in 0..6 {
         q(&engine, &format!(r#"STORE INTO PROCEDURAL (pattern_id = "p{i}", pattern = "restart the service {i}", steps = "check; restart")"#)).await;

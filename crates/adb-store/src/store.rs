@@ -216,7 +216,7 @@ impl PartitionStore {
     /// rewrite backups (`memory.dim*.bak`) are deleted: forgotten data is gone.
     pub async fn compact(&self, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
         let keep = compaction_row(history, now);
-        let stats = self.rewrite_online(&keep).await?;
+        let stats = self.rewrite_online(&keep, false).await?;
         self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
         self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(stats)
@@ -242,14 +242,15 @@ impl PartitionStore {
             }
             Some(r)
         };
-        let stats = self.rewrite_online(&keep).await?;
+        let stats = self.rewrite_online(&keep, true).await?;
         self.model_changed.store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(stats)
     }
 
     /// Rewrite the open table keeping what `keep` returns, swapped in under the
-    /// exclusive lock (compaction, W5; clearing vectors, W9.10).
-    async fn rewrite_online(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync)) -> StoreResult<CompactStats> {
+    /// exclusive lock (compaction, W5; clearing vectors, W9.10 — `vectors_cleared`:
+    /// the hot cache drops its vectors in the same swap).
+    async fn rewrite_online(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), vectors_cleared: bool) -> StoreResult<CompactStats> {
         let started = std::time::Instant::now();
         let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
         let staged = dir.with_file_name("memory.rewrite.lance");
@@ -291,6 +292,9 @@ impl PartitionStore {
         let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
         Self::reset_ledger(&inner, self.applied.load(std::sync::atomic::Ordering::SeqCst)).await?;
         *g = Some(inner);
+        if let (true, Some(h)) = (vectors_cleared, self.hot()) {
+            h.drop_vectors();
+        }
         drop(g);
         swapped?;
         // The renames are durable before the old table is deleted.

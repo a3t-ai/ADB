@@ -15,6 +15,11 @@
 //!   returns are all newer than the floor. Otherwise the read goes to Lance.
 //! - Rows are kept as reads decode them (no `embedding`, no `sealed`), so a read
 //!   from the cache sees exactly what a read from the table sees.
+//! - **Read in place:** a read gets shared pointers to the rows (and to each row's
+//!   record, decoded once at apply by the [`Shape`] the cache was given), so it
+//!   copies only what it returns (W10-L8).
+//! - **Vectors** are kept too unless `vectors: false`, so `LIKE` ranks a complete
+//!   bucket in memory (W10-L1).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -23,6 +28,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use adb_core::log::{CommitTs, Kind, Memory};
+use adb_core::memory::MemoryRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::rows::StoredRow;
@@ -169,6 +175,13 @@ pub struct CacheConfig {
     #[serde(serialize_with = "ser_size", deserialize_with = "de_size")]
     pub max_bytes: u64,
     pub rules: Vec<Rule>,
+    /// Keep cached rows' vectors (2 bytes a dimension) for `LIKE` (W10-L1).
+    #[serde(default = "yes")]
+    pub vectors: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn ser_size<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
@@ -193,6 +206,7 @@ impl Default for CacheConfig {
                 rule(Memory::Episodic, Keep::Last(200)),
                 rule(Memory::Semantic, Keep::None),
             ],
+            vectors: true,
         }
     }
 }
@@ -267,10 +281,21 @@ pub fn glob(pattern: &str, s: &str) -> bool {
     true
 }
 
+/// How the cache decodes a row into the record reads work on (the executor's
+/// `record`), once per row at apply.
+pub type Shape = fn(&StoredRow) -> MemoryRecord;
+
+/// A cached row and its record (`None` without a [`Shape`]).
+#[derive(Debug, Clone)]
+pub struct Cached {
+    pub row: Arc<StoredRow>,
+    pub record: Option<Arc<MemoryRecord>>,
+}
+
 /// Rows of a read from the cache.
 #[derive(Debug)]
 pub struct Hit {
-    pub rows: Vec<StoredRow>,
+    pub rows: Vec<Cached>,
     /// `None`: every current row the read could select is here. `Some(t)`: rows
     /// committed at or before `t` may be missing.
     pub floor: Option<CommitTs>,
@@ -303,7 +328,14 @@ pub struct CacheStats {
 
 struct Entry {
     row: Arc<StoredRow>,
+    record: Option<Arc<MemoryRecord>>,
     bytes: u64,
+}
+
+impl Entry {
+    fn cached(&self) -> Cached {
+        Cached { row: self.row.clone(), record: self.record.clone() }
+    }
 }
 
 struct Bucket {
@@ -359,6 +391,7 @@ struct State {
 pub struct HotCache {
     state: RwLock<State>,
     shadow: bool,
+    shape: Option<Shape>,
     hits: AtomicU64,
     misses: AtomicU64,
     mismatches: AtomicU64,
@@ -387,6 +420,7 @@ fn row_bytes(r: &StoredRow) -> u64 {
         + s(&d.text)
         + s(&d.subject_id)
         + s(&d.object_id)
+        + d.embedding.as_ref().map_or(0, |e| e.len() * 2)
         + 256) as u64
 }
 
@@ -401,10 +435,17 @@ impl HotCache {
         Self {
             state: RwLock::new(State { cfg: Some(cfg), ..Default::default() }),
             shadow,
+            shape: None,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             mismatches: AtomicU64::new(0),
         }
+    }
+
+    /// Decode each row with `shape` as it is cached (reads then share the record).
+    pub fn shaped(mut self, shape: Shape) -> Self {
+        self.shape = Some(shape);
+        self
     }
 
     pub fn shadow(&self) -> bool {
@@ -425,6 +466,30 @@ impl HotCache {
         self.state.read().unwrap().cfg.as_ref().is_some_and(|c| c.tracks(memory))
     }
 
+    /// Whether cached rows carry their vectors (`LIKE` can be answered here).
+    pub fn vectors(&self) -> bool {
+        self.state.read().unwrap().cfg.as_ref().is_some_and(|c| c.vectors)
+    }
+
+    /// Drop every cached vector (the table's were cleared, W9.10); the backfill's
+    /// `Embed` records bring them back.
+    pub fn drop_vectors(&self) {
+        let mut st = self.state.write().unwrap();
+        let mut freed = 0;
+        for b in st.buckets.values_mut() {
+            for e in b.rows.values_mut().filter(|e| e.row.data.embedding.is_some()) {
+                let mut r = (*e.row).clone();
+                r.data.embedding = None;
+                let bytes = row_bytes(&r);
+                freed += e.bytes - bytes;
+                b.bytes -= e.bytes - bytes;
+                e.bytes = bytes;
+                e.row = Arc::new(r);
+            }
+        }
+        st.bytes -= freed;
+    }
+
     /// Start from `rows`: every current record row of the tracked memory types.
     pub fn load(&self, rows: Vec<StoredRow>) {
         let mut st = self.state.write().unwrap();
@@ -432,7 +497,7 @@ impl HotCache {
         *st = State { cfg, ..Default::default() };
         let now = now();
         for r in rows {
-            Self::upsert(&mut st, r);
+            Self::upsert(&mut st, r, self.shape);
         }
         Self::trim(&mut st, now);
     }
@@ -442,7 +507,7 @@ impl HotCache {
         let mut st = self.state.write().unwrap();
         let now = now();
         for r in rows.iter().filter(|r| record_kind(r)) {
-            Self::upsert(&mut st, r.clone());
+            Self::upsert(&mut st, r.clone(), self.shape);
         }
         Self::trim(&mut st, now);
     }
@@ -473,7 +538,7 @@ impl HotCache {
         }
     }
 
-    fn upsert(st: &mut State, mut r: StoredRow) {
+    fn upsert(st: &mut State, mut r: StoredRow, shape: Option<Shape>) {
         Self::remove(st, &r.id);
         let Some(cfg) = &st.cfg else { return };
         if !cfg.tracks(r.data.memory) || !cacheable(&r) {
@@ -481,8 +546,10 @@ impl HotCache {
         }
         let key = (r.data.memory, r.data.scope.clone());
         let keep = cfg.keep(key.0, &key.1);
-        // As reads decode rows (without these columns).
-        r.data.embedding = None;
+        // As reads decode rows (vectors only when kept).
+        if !cfg.vectors {
+            r.data.embedding = None;
+        }
         r.data.sealed = None;
         let bytes = row_bytes(&r);
         let b = st.buckets.entry(key.clone()).or_insert_with(|| Bucket::new(keep));
@@ -495,7 +562,8 @@ impl HotCache {
         st.bytes += bytes;
         st.lineages.insert(r.lineage_id.clone(), r.id.clone());
         st.at.insert(r.id.clone(), key);
-        b.rows.insert(r.id.clone(), Entry { row: Arc::new(r), bytes });
+        let record = shape.map(|f| Arc::new(f(&r)));
+        b.rows.insert(r.id.clone(), Entry { row: Arc::new(r), record, bytes });
     }
 
     /// Each bucket within its rule, then the whole cache within `max_bytes`.
@@ -543,7 +611,7 @@ impl HotCache {
             if *m != memory || scope.is_some_and(|want| want != s) {
                 continue;
             }
-            rows.extend(b.rows.values().map(|e| (*e.row).clone()));
+            rows.extend(b.rows.values().map(Entry::cached));
             if let Some(f) = b.floor {
                 floor = Some(floor.map_or(f, |g| g.max(f)));
             }
@@ -555,7 +623,7 @@ impl HotCache {
     /// The current row of lineage `lineage` (a row lineage id) of `memory`:
     /// `Some(Some(row))` cached, `Some(None)` known to have none (every bucket of
     /// the memory type complete), `None` unknown.
-    pub fn lineage(&self, memory: Memory, lineage: &str) -> Option<Option<StoredRow>> {
+    pub fn lineage(&self, memory: Memory, lineage: &str) -> Option<Option<Cached>> {
         let st = self.state.read().unwrap();
         if !st.cfg.as_ref().is_some_and(|c| c.tracks(memory)) {
             return None;
@@ -563,7 +631,7 @@ impl HotCache {
         if let Some(id) = st.lineages.get(lineage) {
             let at = st.at.get(id)?;
             if at.0 == memory {
-                return st.buckets.get(at).and_then(|b| b.rows.get(id)).map(|e| Some((*e.row).clone()));
+                return st.buckets.get(at).and_then(|b| b.rows.get(id)).map(|e| Some(e.cached()));
             }
         }
         let complete = st.buckets.iter().filter(|((m, _), _)| *m == memory).all(|(_, b)| b.floor.is_none());
@@ -641,5 +709,47 @@ mod tests {
         let again: CacheConfig = serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
         assert_eq!(again, cfg);
         assert!(serde_json::from_value::<CacheConfig>(serde_json::json!({"max_bytes": 1, "rules": [{"memory": "working", "keep": "some"}]})).is_err());
+        assert!(cfg.vectors, "vectors are kept unless turned off");
+    }
+
+    fn fact(key: &str) -> StoredRow {
+        use adb_core::log::{NewRow, Provenance, RecordId, RowData, Visibility};
+        let data = RowData {
+            tenant_id: "default".into(),
+            scope: "s".into(),
+            visibility: Visibility::Private,
+            namespace: None,
+            memory: Memory::Semantic,
+            kind: Kind::Fact,
+            key: Some(key.into()),
+            subject_id: None,
+            predicate: None,
+            object_id: None,
+            link_type: None,
+            weight: None,
+            text: None,
+            value: serde_json::json!({ "key": key }),
+            sealed: None,
+            embedding: Some(vec![half::f16::from_f32(0.5); 384]),
+            ttl_at: None,
+            provenance: Provenance::default(),
+        };
+        StoredRow::from_new(&NewRow { id: RecordId(key.into()), lineage_id: RecordId(key.into()), version: 1, data }, now(), 1, 1)
+    }
+
+    #[test]
+    fn vectors_kept_counted_and_dropped() {
+        let all = |vectors| CacheConfig { max_bytes: 1 << 20, rules: vec![Rule { memory: Memory::Semantic, scope: "*".into(), keep: Keep::All }], vectors };
+        let without = HotCache::new(all(false), false);
+        without.apply(&[fact("a")]);
+        assert!(without.rows(Memory::Semantic, None).unwrap().rows[0].row.data.embedding.is_none());
+        let with = HotCache::new(all(true), false);
+        with.apply(&[fact("a")]);
+        assert_eq!(with.rows(Memory::Semantic, None).unwrap().rows[0].row.data.embedding.as_ref().map(Vec::len), Some(384));
+        assert_eq!(with.stats().bytes, without.stats().bytes + 768);
+        with.drop_vectors();
+        assert!(with.rows(Memory::Semantic, None).unwrap().rows[0].row.data.embedding.is_none());
+        assert_eq!(with.stats().bytes, without.stats().bytes);
+        assert_eq!(with.stats().buckets[0].bytes, with.stats().bytes);
     }
 }

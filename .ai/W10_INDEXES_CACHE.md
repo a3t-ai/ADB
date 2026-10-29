@@ -49,6 +49,22 @@ the most recent 10 MB of WORKING).
   | SEMANTIC WHERE (10k rows) | 326 | 248 | 145 (W10-L8) |
   | WITH / FOLLOW LINKS | 250 / 497 | — | 232 / 371 (edges from Lance, W10-L2) |
 
+- **W10b (29 Oct): reads in place, `LIKE` from the cache.** Rows and their decoded
+  records are shared with the cache (W10-L8); vectors are kept (`"vectors": true`,
+  default) so `LIKE` ranks complete buckets in memory (W10-L1); clearing vectors on
+  a model change drops the cache's in the same swap. Release, 10k facts, median ms:
+
+  | Read | Lance (cache off) | W10 keep all | W10b keep all |
+  |---|---|---|---|
+  | SEMANTIC LOOKUP KEY | 25 | 0.8 | 1.2 |
+  | SEMANTIC WHERE (10k rows) | 39 | 45 | 8.2 |
+  | WHERE != | 154 | 63 | 11 |
+  | ORDER BY n DESC LIMIT 10 | 180 | 97 | 17 |
+  | AGGREGATE COUNT | 43 | 45 | 12 |
+  | LIKE (words, 10k) | 143 | 135 | 44 |
+  | WORKING SCAN WINDOW / EPISODIC newest 10 | 44 / 53 | 2.3 / 2.9 | 1.0 / 0.9 |
+  | WITH / FOLLOW LINKS (edges from Lance, W10-L2) | 61 / 112 | 84 / 99 | 50 / 54 |
+
 ## Two layers (proposal)
 
 | Layer | Where | Serves | Fixes |

@@ -105,7 +105,7 @@ fn env_cache_rules() -> Result<Option<adb_store::CacheConfig>, String> {
 fn hot_cache(cfg: adb_store::CacheConfig) -> Option<adb_store::HotCache> {
     match cache_mode().as_str() {
         "off" => None,
-        mode => Some(adb_store::HotCache::new(cfg, mode == "shadow")),
+        mode => Some(adb_store::HotCache::new(cfg, mode == "shadow").shaped(crate::query::record)),
     }
 }
 

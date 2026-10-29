@@ -11,7 +11,7 @@ pub mod table;
 
 pub use datafusion::logical_expr::Expr;
 pub use filter::predicate_filter;
-pub use hot::{CacheConfig, CacheStats, Hit, HotCache, Keep, Rule};
+pub use hot::{CacheConfig, CacheStats, Cached, Hit, HotCache, Keep, Rule, Shape};
 pub use lance;
 pub use rows::{decode, key_of, qualified, row_id, StoredRow};
 pub use schema::{memory_schema, META_ID, RECORD_KINDS};

@@ -53,8 +53,8 @@ for (let i = 0; i < 200; i++) {
   await new Promise((r) => setTimeout(r, 100));
 }
 
-async function q(query) {
-  const r = await fetch(`${url}/query`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query }) });
+async function q(query, variables) {
+  const r = await fetch(`${url}/query`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query, variables }) });
   const j = await r.json();
   if (!j.success) throw new Error(`${query}: ${j.error}`);
   return j;
@@ -62,7 +62,7 @@ async function q(query) {
 
 // Seed, 32 writes in flight at a time.
 async function seed(queries) {
-  for (let i = 0; i < queries.length; i += 32) await Promise.all(queries.slice(i, i + 32).map(q));
+  for (let i = 0; i < queries.length; i += 32) await Promise.all(queries.slice(i, i + 32).map((s) => q(s)));
 }
 const t0 = Date.now();
 await seed(Array.from({ length: ROWS }, (_, i) => `STORE INTO SEMANTIC (key = "f${i}", topic = "t${i % 20}", n = ${i % 997}, content = "fact number ${i} about topic t${i % 20}")`));
@@ -105,6 +105,8 @@ const reads = {
   "RECALL EPISODIC newest 10": `RECALL FROM EPISODIC ALL LIMIT 10`,
   "RECALL EPISODIC KEY": `RECALL FROM EPISODIC KEY id = "e42"`,
   "AGGREGATE COUNT": `RECALL FROM SEMANTIC WHERE topic = "t5" AGGREGATE COUNT(*) AS c`,
+  // Words only (the server runs with ADB_EMBED=off): ranks every fact.
+  "LIKE (words, 10k)": [`RECALL FROM SEMANTIC LIKE $q LIMIT 10`, { q: "fact about topic t7" }],
 };
 const stat = (xs) => {
   const s = [...xs].sort((a, b) => a - b);
@@ -112,11 +114,12 @@ const stat = (xs) => {
 };
 console.log("read".padEnd(32), "median ms".padStart(10), "p95 ms".padStart(10));
 for (const [name, query] of Object.entries(reads)) {
-  await q(query); // warm
+  const [aql, vars] = Array.isArray(query) ? query : [query];
+  await q(aql, vars); // warm
   const times = [];
   for (let i = 0; i < RUNS; i++) {
     const t = performance.now();
-    await q(query);
+    await q(aql, vars);
     times.push(performance.now() - t);
   }
   const { median, p95 } = stat(times);
