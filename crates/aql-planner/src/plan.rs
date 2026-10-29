@@ -187,6 +187,15 @@ pub struct StoreData {
     pub in_scope: Option<String>,
     /// TTL
     pub ttl: Option<Duration>,
+    /// AQL v0.8 `FACT [MULTI]`: the payload is a fact (P1_GRAPH D2)
+    pub fact: Option<FactPlan>,
+}
+
+/// `STORE … FACT [MULTI]`.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct FactPlan {
+    /// One current fact per (subject, predicate, object) rather than per (subject, predicate)
+    pub multi: bool,
 }
 
 /// Link operation data
@@ -319,13 +328,14 @@ impl serde::Serialize for StoreData {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StoreData", 6)?;
+        let mut state = serializer.serialize_struct("StoreData", 7)?;
         state.serialize_field("key", &self.key)?;
         state.serialize_field("payload", &self.payload)?;
         state.serialize_field("scope", &format!("{:?}", self.scope))?;
         state.serialize_field("namespace", &self.namespace)?;
         state.serialize_field("in_scope", &self.in_scope)?;
         state.serialize_field("ttl_ms", &self.ttl.map(|d| d.as_millis() as u64))?;
+        state.serialize_field("fact", &self.fact)?;
         state.end()
     }
 }

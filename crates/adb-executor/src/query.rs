@@ -829,7 +829,8 @@ async fn links_touching_from(
             adb_core::LinkDirection::Inbound => col("object_id").in_list(ids, false),
             adb_core::LinkDirection::Both => col("subject_id").in_list(ids.clone(), false).or(col("object_id").in_list(ids, false)),
         };
-        let mut filter = col("kind").eq(lit("edge")).and(by_end);
+        // Links: edges, and facts whose object is an entity (P1.4).
+        let mut filter = col("kind").in_list(vec![lit("edge"), lit("fact")], false).and(col("object_id").is_not_null()).and(by_end);
         if !select.types.is_empty() {
             filter = filter.and(col("link_type").in_list(select.types.iter().map(|t| lit(t.clone())).collect(), false));
         }

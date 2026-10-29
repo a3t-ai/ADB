@@ -48,14 +48,20 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "remember",
-            "description": "Remember something. Stores `content` (plus optional fields) in memory. Default memory type SEMANTIC (facts); use EPISODIC for events, PROCEDURAL for how-tos, WORKING for the current task.",
+            "description": "Remember something. Stores `content` (plus optional fields) in memory. Default memory type SEMANTIC (facts); use EPISODIC for events, PROCEDURAL for how-tos, WORKING for the current task. With `subject` + `predicate` (+ `object` or `value`) it is a fact in the knowledge graph.",
             "inputSchema": { "type": "object", "properties": {
                 "scope": { "type": "string", "description": "Named scope, e.g. \"team:billing\" or \"agent:42\" (optional; SEMANTIC, EPISODIC, PROCEDURAL). Without it, recall and forget cover every scope." },
                 "content": { "type": "string", "description": "What to remember, in plain words" },
                 "memory_type": with_desc(&mt, "Where to store it (default SEMANTIC)"),
                 "key": { "type": "string", "description": "A stable key, so you can update, link or forget it later (optional). Remembering a key again updates that memory (a new version)." },
                 "fields": { "type": "object", "description": "Extra structured fields, e.g. {\"account\": \"acct-9\"} (optional)" },
-                "namespace": { "type": "string", "description": "Namespace for isolation (optional)" }
+                "namespace": { "type": "string", "description": "Namespace for isolation (optional)" },
+                "subject": { "type": "string", "description": "Make it a fact about this entity, e.g. \"person:ada\" (with predicate; SEMANTIC). A new fact for the same subject and predicate replaces the old one." },
+                "predicate": { "type": "string", "description": "The fact's relation, e.g. \"works_at\" (with subject)" },
+                "object": { "type": "string", "description": "The entity the fact points at, e.g. \"org:acme\" — a link you can follow (or give value)" },
+                "value": { "description": "The fact's literal value, e.g. 1815 (or give object)" },
+                "confidence": { "type": "number", "description": "How sure, 0-1 (the link's weight; default 1)" },
+                "multi": { "type": "boolean", "description": "The predicate holds several values (e.g. knows): keep one fact per object" }
             }, "required": ["content"] }
         },
         {

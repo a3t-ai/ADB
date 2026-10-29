@@ -20,8 +20,8 @@
 //!   copies only what it returns (W10-L8).
 //! - **Vectors** are kept too unless `vectors: false`, so `LIKE` ranks a complete
 //!   bucket in memory (W10-L1).
-//! - **Edges** (P1.3, W10-L2): every current link of the partition, indexed by both
-//!   ends, unless `edges: false`. All or nothing: past `max_bytes / EDGE_SHARE` the
+//! - **Edges** (P1.3, W10-L2): every current link of the partition (edges, and facts
+//!   with an entity object), indexed by both ends, unless `edges: false`. All or nothing: past `max_bytes / EDGE_SHARE` the
 //!   cache drops them and link reads go to Lance until the next warm-up.
 
 use std::collections::{BTreeSet, HashMap};
@@ -433,7 +433,7 @@ impl Edges {
 
     fn upsert(&mut self, r: &StoredRow) {
         self.remove(&r.id);
-        if !self.complete || r.tombstone || r.superseded_by.is_some() {
+        if !self.complete || r.tombstone || r.superseded_by.is_some() || r.data.object_id.is_none() {
             return;
         }
         for end in Self::ends(r) {
@@ -559,9 +559,10 @@ impl HotCache {
         let now = now();
         st.edges.complete = st.cfg.as_ref().is_some_and(|c| c.edges);
         for r in rows {
-            if r.data.kind == Kind::Edge {
+            if matches!(r.data.kind, Kind::Edge | Kind::Fact) {
                 st.edges.upsert(&r);
-            } else {
+            }
+            if r.data.kind != Kind::Edge {
                 Self::upsert(&mut st, r, self.shape);
             }
         }
@@ -575,7 +576,8 @@ impl HotCache {
         for r in rows.iter().filter(|r| record_kind(r)) {
             Self::upsert(&mut st, r.clone(), self.shape);
         }
-        for r in rows.iter().filter(|r| r.data.kind == Kind::Edge) {
+        // Edges, and facts (a fact with an entity object is a link, P1.4).
+        for r in rows.iter().filter(|r| matches!(r.data.kind, Kind::Edge | Kind::Fact)) {
             st.edges.upsert(r);
         }
         Self::trim(&mut st, now);

@@ -240,3 +240,22 @@ async fn watch_tools_follow_a_query() {
     let (err, v) = call(&s, "unwatch", json!({"cq_id": id})).await;
     assert!(!err && v["data"]["unwatched"] == json!(true), "{v}");
 }
+
+/// P1.4: `remember` with subject + predicate stores a fact, which supersedes and
+/// can be followed as a link.
+#[tokio::test]
+async fn remember_stores_facts() {
+    let s = server().await;
+    let fact = |o: &str| json!({"content": format!("Ada works at {o}"), "subject": "person:ada", "predicate": "works_at", "object": o, "confidence": 0.9});
+    let (err, v) = call(&s, "remember", fact("org:acme")).await;
+    assert!(!err, "{v}");
+    let (err, v) = call(&s, "remember", fact("org:globex")).await;
+    assert!(!err, "{v}");
+    let (err, v) = call(&s, "aql_query", json!({"query": r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE "works_at""#})).await;
+    assert!(!err, "{v}");
+    assert_eq!(v["data"]["count"], json!(1), "{v}");
+    assert_eq!(v["data"]["records"][0]["id"], json!("org:globex"), "{v}");
+    // A fact is SEMANTIC.
+    let (err, _) = call(&s, "remember", json!({"content": "x", "memory_type": "episodic", "subject": "a", "predicate": "p", "object": "b"})).await;
+    assert!(err);
+}

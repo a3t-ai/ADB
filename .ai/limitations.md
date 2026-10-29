@@ -131,7 +131,10 @@ Since P1.1–P1.2 (29 Oct): multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` /
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
 | GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | Only if a use case needs it (post-MVP). |
-| GR-9 | **Edge properties beyond type and weight** (e.g. provenance, validity) aren't readable in AQL. | Links can't say where they came from. | With entities and facts (P1.4). |
+| GR-9 | **Edge properties beyond type and weight** (e.g. provenance) aren't readable on `LINK` edges. Facts carry `source` and any other fields. | Plain links can't say where they came from. | Use facts for knowledge with provenance. |
+| GR-11 | **Fact links can't be changed with `UPDATE LINK` / `UNLINK`** (P1.4): the fact row is the link. | Change the fact: store a new one (supersedes) or FORGET it. | By design. |
+| GR-12 | **No entity resolution**: `person:ada` and `person:ada-lovelace` are two entities; entity stubs hold only key and name. | Duplicates until callers agree on keys. | Phase 3 consolidation (GOALS). |
+| GR-13 | **Forgetting an entity leaves facts pointing at it**; traversal skips the missing record. | Dangling facts stay until forgotten. | Cascade on FORGET of an entity, if needed. |
 | GR-10 | **The playground ignores direction and `MIN_WEIGHT`** (it parses v0.8). | Browser results differ from ADB for v0.8 link reads. | With GR-8. |
 | GR-6 | **Agents don't use links**: FlowR's memory phase never follows them into the prompt. | Links help AQL users, not chat agents. | Link weight as a ranking signal in hybrid recall (W4 T10), related facts pulled in. |
 | GR-8 | **The WASM playground's built `pkg/` predates v0.6 / v0.7** (source updated; no wasm-pack here). | The browser playground rejects the new statements. | `wasm-pack build crates/clawdb-wasm` where the toolchain is. |

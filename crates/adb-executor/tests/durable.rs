@@ -19,6 +19,11 @@ const WRITES: &[&str] = &[
     r#"FORGET FROM EPISODIC WHERE bid_id = "e2""#,
     r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
     r#"LINK FROM PROCEDURAL WHERE pattern = "oom" TO EPISODIC WHERE bid_id = "e1" TYPE "applied_to" WEIGHT 0.95"#,
+    // Facts (P1.4): links between entities, one superseded, one MULTI, one literal.
+    r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:acme", confidence = 0.9)"#,
+    r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:globex", confidence = 0.7)"#,
+    r#"STORE INTO SEMANTIC FACT MULTI (subject = "person:ada", predicate = "knows", object = "person:bob")"#,
+    r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "born", value = 1815)"#,
 ];
 
 /// Reads whose results must be identical before and after a restart.
@@ -29,6 +34,9 @@ const READS: &[&str] = &[
     r#"LOOKUP FROM PROCEDURAL WHERE pattern = "oom" WITH LINKS ALL"#,
     r#"LOAD FROM TOOLS WHERE ranking > 0.5 ORDER BY ranking DESC"#,
     r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#,
+    r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS ALL DEPTH 2"#,
+    r#"LOOKUP FROM SEMANTIC KEY id = "org:globex" FOLLOW LINKS INBOUND"#,
+    r#"RECALL FROM SEMANTIC WHERE subject = "person:ada""#,
 ];
 
 /// Log records `WRITES` makes: one per write, plus the marker each FORGET's
@@ -155,15 +163,16 @@ async fn lance_table_mirrors_the_engine() {
     assert_eq!(applied, log_records(), "every log record applied");
     let s = summary(&rows);
     // working t1 (t2 forgotten), semantic acme, episodic e1 (e2 forgotten),
-    // procedural oom-fix, tools search, two edges.
-    assert_eq!(rows.len(), 7, "{s:?}");
+    // procedural oom-fix, tools search, two edges; three current facts (works_at
+    // superseded) and the four entities they made (ada, acme, globex, bob).
+    assert_eq!(rows.len(), 14, "{s:?}");
     let e1 = rows.iter().find(|r| r.data.value.get("bid_id").and_then(|v| v.as_str()) == Some("e1")).unwrap();
     assert_eq!(e1.data.value["won"], true, "UPDATE applied in Lance");
     assert_eq!(e1.data.value["brand_lift"], 0.04);
     let t1 = rows.iter().find(|r| r.data.value.get("task").and_then(|v| v.as_str()) == Some("t1")).unwrap();
     assert_eq!(t1.data.value["step"], 5);
     assert!(t1.data.ttl_at.is_some(), "TTL carried into Lance");
-    assert_eq!(rows.iter().filter(|r| r.data.link_type.is_some()).count(), 2, "{s:?}");
+    assert_eq!(rows.iter().filter(|r| r.data.kind == adb_core::log::Kind::Edge).count(), 2, "{s:?}");
 }
 
 #[tokio::test]

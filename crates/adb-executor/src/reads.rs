@@ -83,7 +83,11 @@ pub fn to_record(r: &StoredRow) -> MemoryRecord {
 /// An edge row as a link: ends back to their record ids, `created_at` its commit.
 pub fn to_link(r: &StoredRow) -> Option<Link> {
     let d = &r.data;
-    let to: Memory = d.value.get("to_memory").cloned().and_then(|v| serde_json::from_value(v).ok())?;
+    // A fact with an entity object is a link of its predicate (P1.4).
+    let to: Memory = match d.kind {
+        adb_core::log::Kind::Fact => d.memory,
+        _ => d.value.get("to_memory").cloned().and_then(|v| serde_json::from_value(v).ok())?,
+    };
     Some(Link {
         id: r.key().to_string(),
         from_type: d.memory.into(),

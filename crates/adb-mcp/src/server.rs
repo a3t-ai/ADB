@@ -177,7 +177,9 @@ impl McpServer {
     /// in use (D3 S4).
     async fn remember(&self, args: &Value) -> Result<Value, String> {
         let aql = remember(args)?;
-        let Some(key) = args.get("key").and_then(Value::as_str) else {
+        // A fact has its own key (subject, predicate) and supersedes by itself.
+        let fact = args.get("subject").is_some() && args.get("predicate").is_some();
+        let Some(key) = args.get("key").and_then(Value::as_str).filter(|_| !fact) else {
             return self.run(Ok(aql)).await;
         };
         match self.engine.query(&aql, None).await {
@@ -325,6 +327,26 @@ fn remember(args: &Value) -> Result<String, String> {
     let content = args.get("content").and_then(Value::as_str).ok_or("Missing required: content")?;
     let mut fields = obj(args, "fields");
     fields.insert("content".into(), json!(content));
+    // With subject + predicate: a fact (AQL v0.8 STORE … FACT, P1.4).
+    if let (Some(subject), Some(predicate)) = (args.get("subject"), args.get("predicate")) {
+        if mt != "SEMANTIC" {
+            return Err("A fact (subject + predicate) is SEMANTIC".into());
+        }
+        fields.insert("subject".into(), subject.clone());
+        fields.insert("predicate".into(), predicate.clone());
+        for f in ["object", "value", "confidence"] {
+            if let Some(v) = args.get(f) {
+                fields.insert(f.into(), v.clone());
+            }
+        }
+        let multi = if args.get("multi").and_then(Value::as_bool).unwrap_or(false) { " MULTI" } else { "" };
+        let mut q = format!("STORE INTO SEMANTIC FACT{multi} {}", payload(&fields)?);
+        if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
+            q.push_str(&format!(" NAMESPACE {}", quote(ns)));
+        }
+        q.push_str(&in_scope(args));
+        return Ok(q);
+    }
     if let Some(key) = args.get("key").and_then(Value::as_str) {
         fields.insert("key".into(), json!(key));
     }

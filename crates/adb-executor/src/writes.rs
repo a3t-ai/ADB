@@ -52,6 +52,23 @@ pub trait Writes: Send + Sync {
         in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord>;
 
+    /// `STORE INTO SEMANTIC FACT [MULTI]` (P1_GRAPH D2): `payload` has `subject`,
+    /// `predicate` and `object` (an entity key) or `value`. One current fact per
+    /// (subject, predicate) — or per (subject, predicate, object) with `multi` — so
+    /// a new one supersedes the old. Missing entities at its ends are created.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_fact(
+        &self,
+        _payload: serde_json::Value,
+        _multi: bool,
+        _scope: Scope,
+        _namespace: Option<&str>,
+        _ttl: Option<Duration>,
+        _in_scope: Option<&str>,
+    ) -> AdbResult<MemoryRecord> {
+        Err(AdbError::UnsupportedOperation("facts need a durable engine".into()))
+    }
+
     /// `in_scope`: only records in that named scope (`IN SCOPE`); `None`: every scope.
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64>;
 
@@ -847,6 +864,102 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         Ok(stored)
     }
 
+    async fn store_fact(
+        &self,
+        mut payload: serde_json::Value,
+        multi: bool,
+        scope: Scope,
+        namespace: Option<&str>,
+        ttl: Option<Duration>,
+        in_scope: Option<&str>,
+    ) -> AdbResult<MemoryRecord> {
+        let memory = MemoryType::Semantic;
+        check_scope(memory, in_scope)?;
+        let field = |f: &str| payload.get(f).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
+        let (Some(subject), Some(predicate)) = (field("subject"), field("predicate")) else {
+            return Err(AdbError::InvalidSyntax("FACT needs subject and predicate".into()));
+        };
+        let object = field("object");
+        let value = payload.get("value").cloned();
+        let shown = match (&object, &value) {
+            (Some(o), _) => o.clone(),
+            (None, Some(v)) => v.as_str().map(String::from).unwrap_or_else(|| v.to_string()),
+            (None, None) => return Err(AdbError::InvalidSyntax("FACT needs object or value".into())),
+        };
+        let key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
+        let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("key".into(), serde_json::json!(key));
+            obj.entry("content").or_insert_with(|| serde_json::json!(format!("{subject} {predicate} {shown}")));
+        }
+        let vector = match self.store.is_some() {
+            true => self.vector_of(crate::reads::embed_text(memory, &payload)).await,
+            false => None,
+        };
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let shaped = |kind: Kind, value: serde_json::Value| {
+            let mut d = row(memory, kind, value);
+            d.visibility = scope.into();
+            d.namespace = namespace.map(String::from);
+            if let Some(s) = in_scope {
+                d.scope = s.to_string();
+            }
+            d
+        };
+        let mut data = shaped(Kind::Fact, payload);
+        data.subject_id = Some(subject.clone());
+        data.predicate = Some(predicate.clone());
+        data.object_id = object.clone();
+        data.link_type = Some(predicate);
+        data.weight = Some(confidence);
+        data.embedding = vector;
+        data.ttl_at = ttl.map(|d| CommitTs(ts.0 + d.as_micros() as i64));
+        let mut effects = Vec::new();
+        // Entities at the fact's ends, created when missing (stubs: key and name).
+        let mut entities: Vec<String> = Vec::new();
+        for e in std::iter::once(&subject).chain(object.iter()) {
+            if !self.key_taken(memory.into(), e, ts) && !entities.contains(e) {
+                entities.push(e.clone());
+                let id = RecordId(e.clone());
+                let stub = shaped(Kind::Entity, serde_json::json!({ "key": e, "name": e }));
+                effects.push(Effect::PutEntity(NewRow { id: id.clone(), lineage_id: id, version: 1, data: stub }));
+            }
+        }
+        let new = match (self.key_taken(memory.into(), &key, ts), &self.store) {
+            (true, Some(store)) => {
+                if let Some(b) = self.barrier() {
+                    b.wait_for_committed().await;
+                }
+                let cur = store
+                    .current_version(memory.into(), &key, ts)
+                    .await
+                    .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+                    .ok_or_else(|| AdbError::Internal(format!("fact {key}: no current version in Lance")))?;
+                let new = NewRow { id: seq.new_id(ts), lineage_id: RecordId(key.clone()), version: cur.version + 1, data };
+                effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: new.clone() });
+                new
+            }
+            _ => {
+                let id = RecordId(key.clone());
+                let new = NewRow { id: id.clone(), lineage_id: id, version: 1, data };
+                effects.push(Effect::PutFact(new.clone()));
+                new
+            }
+        };
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        if self.store.is_some() {
+            let mut live = self.live.lock().unwrap();
+            live.insert((memory.into(), key.clone()), new.data.ttl_at);
+            for e in entities {
+                live.insert((memory.into(), e), None);
+            }
+        }
+        let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
+        self.to_store(&record, seq.log()).await;
+        Ok(stored)
+    }
+
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64> {
         // New `content` gets a new vector (T5), embedded before the sequencer.
         let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
@@ -1158,6 +1271,15 @@ pub fn store_id(memory: MemoryType, key: &str, payload: &serde_json::Value) -> S
 /// Memory types whose `UPDATE` writes a new version (D2 §2).
 fn supersedes(memory: MemoryType) -> bool {
     matches!(memory, MemoryType::Semantic | MemoryType::Procedural)
+}
+
+/// A fact's key: one current fact per (subject, predicate), or per (subject,
+/// predicate, object) for a `MULTI` predicate.
+pub fn fact_key(subject: &str, predicate: &str, object: Option<&str>) -> String {
+    match object {
+        Some(o) => format!("fact:{subject}|{predicate}|{o}"),
+        None => format!("fact:{subject}|{predicate}"),
+    }
 }
 
 /// The version after `cur` with `fields` merged in, under the new row id `id`.

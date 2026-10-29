@@ -802,10 +802,14 @@ impl Executor {
             .and_then(|v| v.as_u64())
             .map(std::time::Duration::from_millis);
 
-        let record = self
-            .writes
-            .store(step.memory_type, key, payload, scope, namespace, ttl, in_scope)
-            .await?;
+        let record = match data.get("fact") {
+            // STORE … FACT [MULTI] (P1_GRAPH D2): the writes give it its key.
+            Some(fact) if !fact.is_null() => {
+                let multi = fact.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
+                self.writes.store_fact(payload, multi, scope, namespace, ttl, in_scope).await?
+            }
+            _ => self.writes.store(step.memory_type, key, payload, scope, namespace, ttl, in_scope).await?,
+        };
 
         Ok(QueryResult::stored(
             record,

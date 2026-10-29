@@ -737,7 +737,7 @@ impl PartitionStore {
             let mut rows = Self::scan_in(open_state(&g), Some(&filter)).await?;
             rows.retain(|r| r.id != META_ID);
             if cache.config().edges {
-                let edges = "kind = 'edge' AND tombstone = false AND superseded_by IS NULL";
+                let edges = "(kind = 'edge' OR (kind = 'fact' AND object_id IS NOT NULL)) AND tombstone = false AND superseded_by IS NULL";
                 rows.extend(Self::scan_in(open_state(&g), Some(edges)).await?);
             }
             cache.load(rows);

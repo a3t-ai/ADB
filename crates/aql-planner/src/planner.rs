@@ -296,6 +296,7 @@ impl Planner {
             namespace: modifiers.namespace.clone().or_else(|| self.default_namespace.clone()),
             in_scope: modifiers.in_scope.clone(),
             ttl: modifiers.ttl,
+            fact: stmt.fact.map(|f| crate::plan::FactPlan { multi: f.multi }),
         };
 
         Ok(StepPlan::store(memory_type, store_data, modifiers))

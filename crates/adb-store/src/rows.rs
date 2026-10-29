@@ -42,6 +42,11 @@ pub fn qualified(n: &NewRow) -> NewRow {
     let m = n.data.memory;
     n.id.0 = row_id(m, &n.id.0);
     n.lineage_id.0 = row_id(m, &n.lineage_id.0);
+    // A fact's ends are records of its own memory type (P1.4).
+    if n.data.kind == Kind::Fact {
+        n.data.subject_id = n.data.subject_id.map(|s| row_id(m, &s));
+        n.data.object_id = n.data.object_id.map(|o| row_id(m, &o));
+    }
     if n.data.kind == Kind::Edge {
         n.data.subject_id = n.data.subject_id.map(|s| row_id(m, &s));
         let to = n.data.value.get("to_memory").and_then(|v| serde_json::from_value::<Memory>(v.clone()).ok());
