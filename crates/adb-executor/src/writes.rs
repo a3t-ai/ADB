@@ -1374,6 +1374,13 @@ pub fn fact_key(subject: &str, predicate: &str, object: Option<&str>) -> String 
 /// The version after `cur` with `fields` merged in, under the new row id `id`.
 fn next_version(cur: &adb_store::StoredRow, fields: &serde_json::Map<String, serde_json::Value>, id: RecordId) -> NewRow {
     let mut data = cur.data.clone();
+    // A fact's ends as the log carries them: the stored row has them qualified, and
+    // the store qualifies the new version again (GR-15 found them doubled).
+    if data.kind == Kind::Fact {
+        for e in [&mut data.subject_id, &mut data.object_id].into_iter().flatten() {
+            *e = adb_store::key_of(e).to_string();
+        }
+    }
     adb_core::merge_fields(&mut data.value, fields);
     if let Some(c) = fields.get("content") {
         data.text = c.as_str().map(String::from);

@@ -21,7 +21,7 @@ entities, provenance and validity should suit a triple feed to the model later.
 | Area | Open in the run |
 |---|---|
 | Memory / AQL | E-L12 keys per scope, F-L3 turns into facts, F-L2 FlowR on `PATTERN` |
-| Graph | GR-13 entity forget cascade, GR-12 entity resolution (one node), GR-15 triple feed; GR-4 paths (decide) |
+| Graph | GR-13 entity forget cascade, GR-12 entity resolution (one node); GR-4 paths (decide) |
 | Cluster | CL-1 replication, CL-2 leader routing, CL-3 owner-side checks, CL-4 per-process state on failover, L11 power-safe store, S1 partitions (decide), S5 CI |
 
 Gates that aren't limitations (W8 A3T pass, P1 step 1.6) are in `MVP_PLAN.md` and
@@ -52,7 +52,7 @@ delivered to subscribers; multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `
 | GR-13 | **Forgetting an entity leaves facts pointing at it**; traversal skips the missing record. | Dangling facts stay until forgotten. | **MVP**: cascade FORGET of an entity to its facts. |
 | GR-17 | **A fact stored with a future `valid_from` replaces the current one at once** (one current version per (subject, predicate)): until it begins, neither holds. `UPDATE` can't reach a fact outside its validity (it matches the current view). | Scheduling "price 12 from 1 Nov" hides today's price. | **Note**: store the change when it takes effect, or use `MULTI`; revisit (keep the replaced version current until the new one begins) if agents need scheduled changes. |
 | GR-12 | **No entity resolution**: `person:ada` and `person:ada-lovelace` are two entities; entity stubs hold only key and name. | Duplicates until callers agree on keys. | **MVP** on one node: aliases and merging entities (facts move to the survivor). Across agents' scopes: stitching, later. |
-| GR-15 | **No triple feed**: facts can be read with AQL, but nothing exports them as (subject, predicate, object / value, confidence, source, version) in order, for a consumer that keeps a copy. | The storage side of a KBLaM-style model input is missing. | **MVP**: a fact feed over Arrow Flight (snapshot + changes from an offset, superseded / forgotten facts as removals). Encoding to key / value vectors is GQ-3. |
+| GR-15-a | **The fact feed holds no log position**: a consumer isn't a subscription, so the log is purged past it as usual and its next read is a full snapshot; a remove names an id the consumer may not hold (a namespace filter isn't applied to removes). | A slow consumer re-reads every fact. | Later: register feed consumers like subscriptions (cursor in the log's retention). |
 | GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | **Decide**: in the MVP or not. |
 | GR-9 | **Properties beyond type and weight** (e.g. provenance) aren't readable on `LINK` links. Facts carry `source` and any other fields. | Plain links can't say where they came from. | **Note**: use facts for knowledge with provenance. |
 | GR-11 | **Fact links can't be changed with `UPDATE LINK` / `UNLINK`** (P1.4): the fact row is the link. | Change the fact: store a new one (supersedes) or FORGET it. | **Note**: by design. |
@@ -230,6 +230,7 @@ must be settled before its phase is designed.
 | Was | Fixed in |
 |---|---|
 | GR-14: facts had no validity range; W6-L6: no timer for `valid_to`; L9: no history reads | AQL v0.10 (30 Oct): `valid_from` / `valid_to` on `STORE … FACT` (and `UPDATE`), facts outside their range leave the current view (links too), the validity timer commits `begin` / `end` (also for bounds passed while down); `AS OF`, `VALID AT`, `WITH HISTORY` on RECALL / LOOKUP; MCP `remember` takes the bounds; suite 27 |
+| GR-15: no triple feed | Fact feed over Arrow Flight (30 Oct): `do_get` ticket `{"feed": "facts", "from"?, "scope"?, "namespace"?, "max"?, "wait_ms"?}`; a snapshot of the current facts, then `add` / `remove` rows (supersede = remove + add; forget, expire, `valid_to` = remove; `valid_from` = add) in log order, with subject, predicate, object / value, confidence, source, version, bounds; `next` / `tip` / `snapshot` in the schema metadata; a `from` past log retention gives a snapshot again (GR-15-a). Found on the way: `UPDATE` of a fact doubled the memory prefix on its subject / object ids, so links from an updated fact broke; fixed |
 | AQL-1: no `GROUP BY` | AQL v0.9 §1 (AQL `9c4ee2c`, ADB `7a08843`, 30 Oct): one row per group, `HAVING` / `ORDER BY` / `LIMIT` / `RETURN` on groups; parser enforces `HAVING` and `GROUP BY` need `AGGREGATE`; suite 24. The runner now checks `values` (two stale T13 expectations fixed) |
 | AQL-3: `WINDOW` accepted on any statement, ignored outside `SCAN` | AQL v0.9 §2 (AQL `a0511ef`, ADB `e76fef2`): valid on `SCAN FROM WORKING` and `RECALL FROM EPISODIC` only (parse error elsewhere); on EPISODIC over episodes in commit order, before `ORDER BY` / `LIMIT` / `AGGREGATE` / `LIKE`; suite 25 |
 | AQL-4: v0.5 §14 listed `WEIGHT` / `THRESHOLD` / `FROM` modifiers the grammar never had | AQL v0.9 §4: withdrawn (user: as recommended); v0.5 §14 points there |

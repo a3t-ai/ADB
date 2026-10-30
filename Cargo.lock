@@ -186,6 +186,7 @@ dependencies = [
  "adb-core",
  "adb-embed",
  "adb-executor",
+ "adb-gateway",
  "adb-mcp",
  "adb-platform",
  "arrow-array",

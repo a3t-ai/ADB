@@ -213,3 +213,64 @@ async fn sql_over_memory_and_platform_tables() {
     assert_eq!(get(&mut c, sql("SELECT id FROM agent_configs")).await.unwrap().len(), 3);
     server.abort();
 }
+
+/// One fact-feed read: its rows (as JSON) and its schema metadata.
+async fn feed(c: &mut FlightServiceClient<Channel>, ticket: Value) -> (Vec<Value>, std::collections::HashMap<String, String>) {
+    let s = c.do_get(Ticket { ticket: ticket.to_string().into() }).await.unwrap().into_inner();
+    let mut s = FlightRecordBatchStream::new_from_flight_data(s.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))));
+    let mut batches = Vec::new();
+    while let Some(b) = s.next().await {
+        batches.push(b.unwrap());
+    }
+    let meta = s.schema().map(|s| s.metadata().clone()).unwrap_or_default();
+    // Every column as text, so the numbers come through too.
+    let text: Vec<RecordBatch> = batches
+        .iter()
+        .map(|b| {
+            let cols = b.columns().iter().map(|c| arrow_cast::cast(c, &DataType::Utf8).unwrap()).collect();
+            let fields: Vec<Field> = b.schema().fields().iter().map(|f| Field::new(f.name(), DataType::Utf8, true)).collect();
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+        })
+        .collect();
+    (adb_platform::batches_to_json(&text), meta)
+}
+
+/// GR-15 over the wire: a snapshot, then changes from `next`.
+#[tokio::test(flavor = "multi_thread")]
+async fn fact_feed_over_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, server) = start(dir.path()).await;
+    let aql = |q: &str| json!({ "query": q });
+    action(&mut c, "aql", aql(r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:acme", confidence = 0.9)"#)).await.unwrap();
+    let (rows, meta) = feed(&mut c, json!({ "feed": "facts" })).await;
+    assert_eq!(meta["snapshot"], "true");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!((r["op"].as_str(), r["id"].as_str(), r["subject"].as_str(), r["object"].as_str()), (Some("add"), Some("fact:person:ada|works_at"), Some("person:ada"), Some("org:acme")));
+    assert!((r["confidence"].as_str().unwrap().parse::<f64>().unwrap() - 0.9).abs() < 1e-6, "{r}");
+    let next: u64 = meta["next"].parse().unwrap();
+
+    action(&mut c, "aql", aql(r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:globex")"#)).await.unwrap();
+    // Changes after the snapshot's tip may repeat it first (it is read from the
+    // table a little later); read on until the new version arrives.
+    let (mut rows, mut next) = (Vec::new(), next);
+    for _ in 0..20 {
+        let (r, meta) = feed(&mut c, json!({ "feed": "facts", "from": next, "wait_ms": 500 })).await;
+        assert_eq!(meta["snapshot"], "false");
+        next = meta["next"].parse().unwrap();
+        rows.extend(r.into_iter().filter(|r| r["offset"] != "1"));
+        if rows.iter().any(|r| r["version"] == "2") {
+            break;
+        }
+    }
+    let ops: Vec<(&str, &str)> = rows.iter().map(|r| (r["op"].as_str().unwrap(), r["version"].as_str().unwrap())).collect();
+    assert_eq!(ops, [("remove", "1"), ("add", "2")], "{rows:?}");
+    assert!(rows[0]["subject"].is_null(), "a remove carries only its id: {rows:?}");
+    // Nothing more yet: no rows, the same position.
+    let (rows, meta) = feed(&mut c, json!({ "feed": "facts", "from": next })).await;
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(meta["next"], next.to_string());
+    let err = c.do_get(Ticket { ticket: json!({ "feed": "edges" }).to_string().into() }).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    server.abort();
+}

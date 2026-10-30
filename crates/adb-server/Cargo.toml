@@ -19,6 +19,7 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 # Arrow Flight: FlowR's native call:adb wire (stage G; spike G1)
 adb-core = { path = "../adb-core" }
 adb-platform = { path = "../adb-platform" }
+adb-gateway = { path = "../adb-gateway" }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-cast = "58"

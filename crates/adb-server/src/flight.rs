@@ -6,6 +6,7 @@
 //! |---|---|---|
 //! | `do_get` | ticket `{"table", "filter"?, "limit"?}` (Lance SQL filter, default limit 100) | the matching rows as Arrow batches |
 //! | `do_get` | ticket `{"sql", "limit"?}`: read-only SQL over memory and platform tables (superadmin debug view, `adb_executor::sql`; default limit 1,000, max 10,000) | the result as Arrow batches |
+//! | `do_get` | ticket `{"feed": "facts", "from"?, "scope"?, "namespace"?, "max"?, "wait_ms"?}`: the fact feed (GR-15, `adb_gateway::facts`); no `from`, or one the log no longer holds, gives a snapshot | fact rows as Arrow batches ([`fact_schema`]); schema metadata `next` (the next `from`), `tip` and `snapshot` (`"true"`: replace the copy) |
 //! | `do_put` | descriptor path `[table]`, Arrow batches | one `PutResult`, metadata `{"inserted", "offset"}` |
 //! | `do_put` | descriptor path `[table, "replace"]`, Arrow batches | the table replaced (its columns = the batches'), `{"inserted", "offset"}` |
 //! | `do_action("replace_table")` | `{"table", "columns"}` | the table replaced by an empty one, `{"replaced": true, "offset"}` |
@@ -26,7 +27,9 @@ use std::sync::Arc;
 
 use adb_core::log::Effect;
 use adb_executor::Engine;
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::builder::{Float32Builder, StringBuilder, UInt32Builder, UInt64Builder};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -123,7 +126,116 @@ fn batches_to_rows(batches: &[RecordBatch]) -> Vec<serde_json::Map<String, Value
     rows
 }
 
+/// Fact rows per Arrow batch.
+const FACT_BATCH: usize = 4096;
+/// Default changes per fact-feed read.
+const FACT_MAX: usize = 10_000;
+
+/// The fact feed's columns; `next`, `tip` and `snapshot` go in the metadata. A
+/// `remove` sets `op` through `scope`; the rest is null.
+pub fn fact_schema(next: u64, tip: u64, snapshot: bool) -> SchemaRef {
+    let s = |n: &str, null: bool| Field::new(n, DataType::Utf8, null);
+    let fields = vec![
+        s("op", false),
+        Field::new("offset", DataType::UInt64, false),
+        s("commit_ts", false),
+        s("id", false),
+        Field::new("version", DataType::UInt32, true),
+        s("scope", false),
+        s("namespace", true),
+        s("subject", true),
+        s("predicate", true),
+        s("object", true),
+        // JSON text.
+        s("value", true),
+        Field::new("confidence", DataType::Float32, true),
+        s("source", true),
+        s("agent", true),
+        s("valid_from", true),
+        s("valid_to", true),
+        // The whole payload, JSON text.
+        s("data", true),
+    ];
+    let meta = HashMap::from([
+        ("next".to_string(), next.to_string()),
+        ("tip".to_string(), tip.to_string()),
+        ("snapshot".to_string(), snapshot.to_string()),
+    ]);
+    Arc::new(Schema::new_with_metadata(fields, meta))
+}
+
+fn fact_batch(schema: &SchemaRef, changes: &[adb_gateway::FactChange]) -> Result<RecordBatch, Status> {
+    let n = changes.len();
+    let strings = || StringBuilder::with_capacity(n, n * 16);
+    let (mut op, mut ts, mut id, mut scope) = (strings(), strings(), strings(), strings());
+    let (mut ns, mut subject, mut predicate, mut object, mut value) = (strings(), strings(), strings(), strings(), strings());
+    let (mut source, mut agent, mut from, mut to, mut data) = (strings(), strings(), strings(), strings(), strings());
+    let (mut offset, mut version, mut confidence) = (UInt64Builder::with_capacity(n), UInt32Builder::with_capacity(n), Float32Builder::with_capacity(n));
+    for c in changes {
+        op.append_value(c.op);
+        offset.append_value(c.offset);
+        ts.append_value(c.commit_ts.to_datetime().to_rfc3339());
+        id.append_value(&c.id);
+        version.append_option(c.version);
+        scope.append_value(&c.scope);
+        let f = c.fact.as_ref();
+        ns.append_option(f.and_then(|f| f.namespace.as_deref()));
+        subject.append_option(f.map(|f| f.subject.as_str()));
+        predicate.append_option(f.map(|f| f.predicate.as_str()));
+        object.append_option(f.and_then(|f| f.object.as_deref()));
+        value.append_option(f.and_then(|f| f.value.as_ref()).map(|v| v.to_string()));
+        confidence.append_option(f.map(|f| f.confidence));
+        source.append_option(f.and_then(|f| f.source.as_deref()));
+        agent.append_option(f.and_then(|f| f.agent.as_deref()));
+        from.append_option(f.and_then(|f| f.valid_from.as_deref()));
+        to.append_option(f.and_then(|f| f.valid_to.as_deref()));
+        data.append_option(f.map(|f| f.data.to_string()));
+    }
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(op.finish()),
+        Arc::new(offset.finish()),
+        Arc::new(ts.finish()),
+        Arc::new(id.finish()),
+        Arc::new(version.finish()),
+        Arc::new(scope.finish()),
+        Arc::new(ns.finish()),
+        Arc::new(subject.finish()),
+        Arc::new(predicate.finish()),
+        Arc::new(object.finish()),
+        Arc::new(value.finish()),
+        Arc::new(confidence.finish()),
+        Arc::new(source.finish()),
+        Arc::new(agent.finish()),
+        Arc::new(from.finish()),
+        Arc::new(to.finish()),
+        Arc::new(data.finish()),
+    ];
+    RecordBatch::try_new(Arc::clone(schema), columns).map_err(|e| Status::internal(e.to_string()))
+}
+
 impl AdbFlight {
+    /// The fact feed (GR-15): one read, as Arrow batches.
+    async fn fact_feed(&self, q: &Value) -> Result<BoxStream<FlightData>, Status> {
+        let gateway = self.engine.gateway().ok_or_else(|| Status::failed_precondition("the fact feed needs a durable engine (start ADB with --data-dir)"))?;
+        let s = |k: &str| q.get(k).and_then(|v| v.as_str()).map(String::from);
+        let query = adb_gateway::FactQuery {
+            from: q.get("from").and_then(|v| v.as_u64()),
+            scope: s("scope"),
+            namespace: s("namespace"),
+            max: q.get("max").and_then(|v| v.as_u64()).map(|m| m as usize).unwrap_or(FACT_MAX).max(1),
+            wait: std::time::Duration::from_millis(q.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(0).min(60_000)),
+        };
+        let b = gateway.facts(&query).await.map_err(|e| Status::internal(e.to_string()))?;
+        let schema = fact_schema(b.next, b.tip, b.snapshot);
+        let batches = b.changes.chunks(FACT_BATCH).map(|c| fact_batch(&schema, c)).collect::<Result<Vec<_>, _>>()?;
+        tracing::debug!(rows = b.changes.len(), snapshot = b.snapshot, next = b.next, "fact feed read");
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(batches.into_iter().map(Ok)))
+            .map_err(|e| Status::internal(e.to_string()));
+        Ok(Box::pin(stream))
+    }
+
     fn platform(&self) -> Result<Arc<adb_platform::PlatformStore>, Status> {
         self.engine
             .platform()
@@ -214,6 +326,11 @@ impl FlightService for AdbFlight {
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let q = body(&req.into_inner().ticket)?;
+        match q.get("feed").and_then(|f| f.as_str()) {
+            Some("facts") => return Ok(Response::new(self.fact_feed(&q).await?)),
+            Some(other) => return Err(Status::invalid_argument(format!("unknown feed {other} (the feed is \"facts\")"))),
+            None => {}
+        }
         if let Some(sql) = q.get("sql").and_then(|s| s.as_str()) {
             let limit = q.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
             let r = self.engine.sql(sql, limit).await.map_err(Status::invalid_argument)?;
