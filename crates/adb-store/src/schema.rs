@@ -20,8 +20,9 @@ pub const RECORD_KINDS: &str = "kind IN ('entity', 'fact', 'episode', 'tool')";
 /// Id of the control row (D3 `kind = meta`).
 pub const META_ID: &str = "_meta";
 /// Schema version written into `_meta` (D3 §4).
-/// v2: `value` is JSONB; v3: row ids qualified by memory type (`rows::row_id`).
-pub const SCHEMA_VERSION: u32 = 3;
+/// v2: `value` is JSONB; v3: row ids qualified by memory type (`rows::row_id`);
+/// v4: record ids in a named scope carry it (`rows::scoped_id`).
+pub const SCHEMA_VERSION: u32 = 4;
 
 fn ts() -> DataType {
     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))

@@ -35,6 +35,29 @@ pub fn key_of(row_id: &str) -> &str {
     }
 }
 
+/// The named scope a row is in when the statement names none (D3 S6, without an
+/// agent identity).
+pub const DEFAULT_SCOPE: &str = "tenant:default";
+
+/// Separates a named scope from a key in a record id (E-L12): scope names can't
+/// contain it (`IN SCOPE` checks), and keys don't.
+pub const SCOPE_SEP: char = '~';
+
+/// The record id for `key` in named scope `scope`: keys are unique per (scope,
+/// memory type) (D3 S4, schema v4), so a key in a named scope is `<scope>~<key>`;
+/// in the default scope it is the key itself. A key already in that form stays.
+pub fn scoped_id(scope: &str, key: &str) -> String {
+    match scope == DEFAULT_SCOPE || key.strip_prefix(scope).is_some_and(|r| r.starts_with(SCOPE_SEP)) {
+        true => key.to_string(),
+        false => format!("{scope}{SCOPE_SEP}{key}"),
+    }
+}
+
+/// The key a record id was made from (`scoped_id`'s inverse).
+pub fn unscoped(id: &str) -> &str {
+    id.split_once(SCOPE_SEP).map_or(id, |(_, k)| k)
+}
+
 /// `n` as the table stores it: id and lineage qualified by its memory type, and an
 /// edge's ends by the memory types they belong to.
 pub fn qualified(n: &NewRow) -> NewRow {

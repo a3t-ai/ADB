@@ -145,6 +145,15 @@ impl Executor {
     /// Execute a single step
     async fn execute_step(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
+        // Record ids in a named scope carry it (E-L12).
+        let scoped;
+        let step = match step.modifiers.in_scope.as_deref() {
+            Some(s) if s != adb_store::DEFAULT_SCOPE => {
+                scoped = StepPlan { predicate: crate::reads::scope_ids(&step.predicate, s), ..step.clone() };
+                &scoped
+            }
+            _ => step,
+        };
 
         let result = match step.operation {
             Operation::Scan => self.execute_scan(step).await?,
@@ -353,6 +362,15 @@ impl Executor {
 
     /// Execute a fan-out query across ALL memory types
     async fn execute_fanout(&self, fanout: &FanOutPlan) -> ExecutorResult<QueryResult> {
+        // Record ids in a named scope carry it (E-L12).
+        let scoped;
+        let fanout = match fanout.modifiers.in_scope.as_deref() {
+            Some(s) if s != adb_store::DEFAULT_SCOPE => {
+                scoped = FanOutPlan { predicate: crate::reads::scope_ids(&fanout.predicate, s), ..fanout.clone() };
+                &scoped
+            }
+            _ => fanout,
+        };
         let start = Instant::now();
 
         match fanout.operation {

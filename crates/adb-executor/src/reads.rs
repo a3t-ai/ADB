@@ -129,6 +129,37 @@ pub fn check_scope(memory: MemoryType, in_scope: Option<&str>) -> AdbResult<()> 
     Ok(())
 }
 
+/// `predicate` with the record ids it names (`KEY id` / `KEY key`, `WHERE id`) as
+/// ids in named scope `scope` (E-L12): a key there is `<scope>~<key>`. Payload
+/// fields (`key`, `subject`, …) stay as stored: bare keys.
+pub fn scope_ids(predicate: &Predicate, scope: &str) -> Predicate {
+    fn value(v: &adb_core::Value, scope: &str) -> adb_core::Value {
+        match v {
+            adb_core::Value::String(k) => adb_core::Value::String(adb_store::scoped_id(scope, k)),
+            adb_core::Value::Array(items) => adb_core::Value::Array(items.iter().map(|i| value(i, scope)).collect()),
+            other => other.clone(),
+        }
+    }
+    fn conditions(cs: &[adb_core::Condition], scope: &str) -> Vec<adb_core::Condition> {
+        cs.iter()
+            .map(|c| match c {
+                adb_core::Condition::Simple { field, operator, value: v, logical_op } if field == "id" => {
+                    adb_core::Condition::Simple { field: field.clone(), operator: *operator, value: value(v, scope), logical_op: *logical_op }
+                }
+                adb_core::Condition::Group { conditions: g, logical_op } => {
+                    adb_core::Condition::Group { conditions: conditions(g, scope), logical_op: *logical_op }
+                }
+                other => other.clone(),
+            })
+            .collect()
+    }
+    match predicate {
+        Predicate::Key { field, value: v } if matches!(field.as_str(), "id" | "key") => Predicate::Key { field: field.clone(), value: value(v, scope) },
+        Predicate::Where { conditions: cs } => Predicate::Where { conditions: conditions(cs, scope) },
+        other => other.clone(),
+    }
+}
+
 /// The text ADB embeds for a record (D3 S3 / W4 T3): `content`; for PROCEDURAL
 /// without it, `pattern` and `steps`.
 pub fn embed_text(memory: MemoryType, value: &serde_json::Value) -> Option<String> {

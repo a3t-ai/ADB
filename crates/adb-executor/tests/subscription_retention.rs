@@ -56,7 +56,7 @@ async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
     assert!(b.deliveries.is_empty());
     assert_eq!(b.next, reset.offset + 1);
     let ids: Vec<&str> = reset.changes.iter().map(|c| c.id.as_str()).collect();
-    assert_eq!(ids, vec!["kept"], "{:?}", reset.changes);
+    assert_eq!(ids, vec!["team:r~kept"], "{:?}", reset.changes);
     assert_eq!(reset.changes[0].value.as_ref().unwrap()["v"], 2);
     assert_eq!(reset.changes[0].op, "put");
 
@@ -65,7 +65,7 @@ async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
     let b = gw.next(&scope_sub, Some(b.next), 10, Duration::from_secs(2)).await.unwrap();
     assert!(b.reset.is_none());
     let later: Vec<&str> = b.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| c.id.as_str())).collect();
-    assert!(later.contains(&"later"), "{later:?}");
+    assert!(later.contains(&"team:r~later"), "{later:?}");
 
     // The topic subscriber: the retained message.
     let b = gw.next(&topic_sub, None, 10, Duration::from_millis(300)).await.unwrap();

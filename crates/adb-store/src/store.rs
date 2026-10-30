@@ -32,8 +32,8 @@ use lance_index::IndexType;
 use uuid::Uuid;
 
 use crate::hot::HotCache;
-use crate::rows::{decode, encode, qualified, row_id, StoredRow};
-use crate::schema::{memory_schema, META_ID, RECORD_KINDS};
+use crate::rows::{decode, encode, key_of, qualified, row_id, scoped_id, StoredRow};
+use crate::schema::{memory_schema, META_ID, RECORD_KINDS, SCHEMA_VERSION};
 use crate::{StoreError, StoreResult};
 
 /// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
@@ -103,6 +103,8 @@ pub struct PartitionStore {
     hot: std::sync::RwLock<Option<Arc<HotCache>>>,
     /// Odd while a put and its cache update are under way (`apply_seq`).
     apply_seq: std::sync::atomic::AtomicU64,
+    /// The schema version `_meta` gets (`schema_version`).
+    layout: std::sync::atomic::AtomicU32,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -222,10 +224,73 @@ impl PartitionStore {
         Ok(stats)
     }
 
+    /// The schema version `_meta` records (D3 §4): 3 until `scope_row_ids` ran.
+    pub fn schema_version(&self) -> u32 {
+        self.layout.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Tests: treat the table as schema `v` (`scope_row_ids` runs again below 4).
+    #[doc(hidden)]
+    pub fn set_schema_version(&self, v: u32) {
+        self.layout.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Whether the vectors came from another embedding model than the configured one
     /// (W9.10): the caller applies the log's tail, then [`Self::clear_vectors`].
     pub fn model_changed(&self) -> bool {
         self.model_changed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Schema v3 → v4 (E-L12): give record rows in a named scope ids that carry it
+    /// (`rows::scoped_id`), and point facts and links at their ends' new ids, as an
+    /// online rewrite (the caller makes sure nothing is being applied; it runs after
+    /// the log's tail, which an older ADB wrote with bare ids). Version ids after
+    /// the first are ULIDs and stay. Returns how many rows changed.
+    pub async fn scope_row_ids(&self) -> StoreResult<usize> {
+        use std::collections::HashMap;
+        if self.schema_version() >= 4 {
+            return Ok(0);
+        }
+        let mut moved: HashMap<String, String> = HashMap::new();
+        for r in self.scan(Some(RECORD_KINDS)).await? {
+            let key = key_of(&r.lineage_id);
+            let scoped = scoped_id(&r.data.scope, key);
+            if scoped != key {
+                moved.insert(r.lineage_id.clone(), row_id(r.data.memory, &scoped));
+            }
+        }
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let keep = |mut r: StoredRow| {
+            if r.id == META_ID {
+                if let serde_json::Value::Object(v) = &mut r.data.value {
+                    v.insert("schema_version".into(), 4.into());
+                }
+                return Some(r);
+            }
+            let before = (r.id.clone(), r.lineage_id.clone(), r.data.subject_id.clone(), r.data.object_id.clone());
+            let to = |id: &str| moved.get(id).cloned();
+            if let Some(l) = to(&r.lineage_id) {
+                if r.id == r.lineage_id {
+                    r.id = l.clone();
+                }
+                r.lineage_id = l;
+            }
+            if matches!(r.data.kind, Kind::Fact | Kind::Edge) {
+                r.data.subject_id = r.data.subject_id.map(|s| to(&s).unwrap_or(s));
+                r.data.object_id = r.data.object_id.map(|o| to(&o).unwrap_or(o));
+            }
+            if (r.id.clone(), r.lineage_id.clone(), r.data.subject_id.clone(), r.data.object_id.clone()) != before {
+                n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Some(r)
+        };
+        self.rewrite_online(&keep, false).await?;
+        self.layout.store(4, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.hot().filter(|_| !moved.is_empty()) {
+            let g = self.state.write().await;
+            Self::fill_cache(&g, &h).await?;
+        }
+        Ok(n.into_inner())
     }
 
     /// Drop every vector and record the configured model in `_meta` (W9.10), as an
@@ -312,7 +377,7 @@ impl PartitionStore {
     /// What `_meta` records about the table besides offsets: its embedding size and
     /// (W9.10) the model its vectors came from.
     fn meta_extra(&self) -> serde_json::Value {
-        let mut v = serde_json::json!({ "embedding_dim": self.dim });
+        let mut v = serde_json::json!({ "embedding_dim": self.dim, "schema_version": self.schema_version() });
         if let Some(m) = &self.cfg.embedding_model {
             v["embedding_model"] = m.clone().into();
         }
@@ -427,11 +492,17 @@ impl PartitionStore {
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
+            layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
         store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
-        if meta.data.value.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0) < 3 {
+        let version = meta.data.value.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0);
+        if version < 4 {
+            // v4's ids come after the log's tail (`scope_row_ids`): until then `_meta` says v3.
+            store.layout.store(3, std::sync::atomic::Ordering::SeqCst);
+        }
+        if version < 3 {
             store.qualify_row_ids(&meta).await?;
         }
         {
@@ -743,6 +814,14 @@ impl PartitionStore {
             *self.hot.write().unwrap() = None;
             return Ok(());
         };
+        Self::fill_cache(&g, &cache).await?;
+        *self.hot.write().unwrap() = Some(Arc::new(cache));
+        drop(g);
+        Ok(())
+    }
+
+    /// Fill `cache` from the table's current rows (the caller holds the store lock).
+    async fn fill_cache(g: &tokio::sync::RwLockWriteGuard<'_, Option<Inner>>, cache: &HotCache) -> StoreResult<()> {
         let tracked = cache.tracked();
         let started = std::time::Instant::now();
         if !tracked.is_empty() {
@@ -758,8 +837,6 @@ impl PartitionStore {
         }
         let st = cache.stats();
         tracing::info!(rows = st.rows, bytes = st.bytes, took = ?started.elapsed(), "hot cache loaded");
-        *self.hot.write().unwrap() = Some(Arc::new(cache));
-        drop(g);
         Ok(())
     }
 

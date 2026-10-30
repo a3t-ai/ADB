@@ -81,11 +81,12 @@ pub struct FactBatch {
     pub tip: u64,
 }
 
-/// The fact in `d`, with bare entity ids: the table qualifies them by memory type,
-/// and so does a version an `UPDATE` made from a stored row.
+/// The fact in `d`, with bare entity keys: the table qualifies ids by memory type
+/// (and so does a version an `UPDATE` made from a stored row), and a named scope's
+/// ids carry the scope (E-L12; the change has its own `scope`).
 fn fact_of(d: &RowData) -> Fact {
     let s = |k: &str| d.value.get(k).and_then(|v| v.as_str()).map(String::from);
-    let bare = |id: &Option<String>| id.as_deref().map(|i| adb_store::key_of(i).to_string());
+    let bare = |id: &Option<String>| id.as_deref().map(|i| adb_store::unscoped(adb_store::key_of(i)).to_string());
     Fact {
         namespace: d.namespace.clone(),
         subject: bare(&d.subject_id).unwrap_or_default(),

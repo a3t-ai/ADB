@@ -168,6 +168,21 @@ fn caller_keyed(memory: MemoryType, payload: &serde_json::Value) -> bool {
             || (memory == MemoryType::Procedural && payload.get("pattern_id").is_some()))
 }
 
+/// The record id of caller key `key` in the statement's scope (E-L12): keys are
+/// unique per (scope, memory type), so a named scope's keys are `<scope>~<key>`. A
+/// key already in that form is taken as it is; any other `~` is refused.
+fn scoped_key(in_scope: Option<&str>, key: &str) -> AdbResult<String> {
+    let scope = in_scope.unwrap_or(adb_store::DEFAULT_SCOPE);
+    let id = adb_store::scoped_id(scope, key);
+    let bare = if scope == adb_store::DEFAULT_SCOPE { id.as_str() } else { &id[scope.len() + 1..] };
+    if bare.contains(adb_store::SCOPE_SEP) {
+        return Err(AdbError::QueryError(format!(
+            "key {key:?}: a key can't contain '~' (a record in a named scope has the id <scope>~<key>)"
+        )));
+    }
+    Ok(id)
+}
+
 fn key_exists(memory: MemoryType, key: &str) -> AdbError {
     AdbError::KeyExists { memory_type: format!("{memory:?}").to_uppercase(), key: key.to_string() }
 }
@@ -607,6 +622,12 @@ impl<L: Log + 'static> DurableWrites<L> {
             let c = store.clear_vectors().await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
             tracing::info!(rows = c.kept, took = ?c.took, "embedding model changed: vectors cleared");
         }
+        // Schema v4 (E-L12): rows an older ADB wrote in a named scope get ids that
+        // carry it, now the tail it may have written is applied.
+        if store.schema_version() < 4 {
+            let n = store.scope_row_ids().await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            tracing::info!(rows = n, "schema v4: record ids in named scopes carry the scope");
+        }
         let caught_up_in = t.elapsed();
         let (hydrated_rows, live) = hydrate(&store).await?;
         tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
@@ -931,7 +952,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
-        let id = RecordId(store_id(memory_type, key, &payload));
+        let id = RecordId(scoped_key(in_scope, &store_id(memory_type, key, &payload))?);
         if memory_type == MemoryType::Semantic {
             if let Some(to) = self.alias_of(&id.0) {
                 return Err(AdbError::QueryError(format!("{} was merged into {to}: store into {to}", id.0)));
@@ -982,10 +1003,14 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let (Some(subject), Some(predicate)) = (field("subject"), field("predicate")) else {
             return Err(AdbError::InvalidSyntax("FACT needs subject and predicate".into()));
         };
-        let object = field("object");
-        // A merged entity's key names the entity it merged into (GR-12).
-        let subject = self.alias_of(&subject).unwrap_or(subject);
-        let object = object.map(|o| self.alias_of(&o).unwrap_or(o));
+        // The ends' record ids in the fact's scope (E-L12); a merged entity's key
+        // names the entity it merged into (GR-12).
+        let subject_id = scoped_key(in_scope, &subject)?;
+        let subject_id = self.alias_of(&subject_id).unwrap_or(subject_id);
+        let object_id = field("object").map(|o| scoped_key(in_scope, &o)).transpose()?;
+        let object_id = object_id.map(|o| self.alias_of(&o).unwrap_or(o));
+        let subject = adb_store::unscoped(&subject_id).to_string();
+        let object = object_id.as_deref().map(|o| adb_store::unscoped(o).to_string());
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("subject".into(), serde_json::json!(subject));
             if let Some(o) = &object {
@@ -998,7 +1023,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             (None, Some(v)) => v.as_str().map(String::from).unwrap_or_else(|| v.to_string()),
             (None, None) => return Err(AdbError::InvalidSyntax("FACT needs object or value".into())),
         };
-        let key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
+        let bare_key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
+        let key = adb_store::scoped_id(in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
         if let Some(obj) = payload.as_object_mut() {
             normalize_validity(obj, None)?;
             // On STORE a null bound is no bound.
@@ -1006,7 +1032,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("key".into(), serde_json::json!(key));
+            obj.insert("key".into(), serde_json::json!(bare_key));
             obj.entry("content").or_insert_with(|| serde_json::json!(format!("{subject} {predicate} {shown}")));
         }
         let vector = match self.store.is_some() {
@@ -1025,9 +1051,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             d
         };
         let mut data = shaped(Kind::Fact, payload);
-        data.subject_id = Some(subject.clone());
+        data.subject_id = Some(subject_id.clone());
         data.predicate = Some(predicate.clone());
-        data.object_id = object.clone();
+        data.object_id = object_id.clone();
         data.link_type = Some(predicate);
         data.weight = Some(confidence);
         data.embedding = vector;
@@ -1035,11 +1061,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let mut effects = Vec::new();
         // Entities at the fact's ends, created when missing (stubs: key and name).
         let mut entities: Vec<String> = Vec::new();
-        for e in std::iter::once(&subject).chain(object.iter()) {
+        for e in std::iter::once(&subject_id).chain(object_id.iter()) {
             if !self.key_taken(memory.into(), e, ts) && !entities.contains(e) {
                 entities.push(e.clone());
                 let id = RecordId(e.clone());
-                let stub = shaped(Kind::Entity, serde_json::json!({ "key": e, "name": e }));
+                let bare = adb_store::unscoped(e);
+                let stub = shaped(Kind::Entity, serde_json::json!({ "key": bare, "name": bare }));
                 effects.push(Effect::PutEntity(NewRow { id: id.clone(), lineage_id: id, version: 1, data: stub }));
             }
         }
@@ -1175,6 +1202,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
 
     async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
         let Some(store) = &self.store else { return Err(needs_table("MERGE")) };
+        if [from, into].iter().any(|k| k.contains(adb_store::SCOPE_SEP)) {
+            return Err(AdbError::UnsupportedOperation("MERGE of entities in a named scope (E-L12-a): MERGE works in the default scope".into()));
+        }
         let memory = Memory::Semantic;
         let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
         let mut seq = self.seq.lock().await;

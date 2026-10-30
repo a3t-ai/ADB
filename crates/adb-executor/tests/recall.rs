@@ -88,7 +88,7 @@ async fn like_ranks_by_meaning_and_honours_the_modifiers() {
     // IN SCOPE and a vector query.
     q(&engine, r#"STORE INTO SEMANTIC (key = "scoped", content = "Acme renews in November") IN SCOPE "team:crm""#).await;
     let r = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q IN SCOPE "team:crm" LIMIT 5"#, "Acme").await;
-    assert_eq!(keys(&r), ["scoped"]);
+    assert_eq!(keys(&r), ["team:crm~scoped"], "a named scope's ids carry it (E-L12)");
 }
 
 #[tokio::test]

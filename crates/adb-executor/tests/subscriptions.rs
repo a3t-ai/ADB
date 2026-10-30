@@ -238,9 +238,10 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
         q(&engine, r#"STORE INTO SEMANTIC (key = "c", topic = "none")"#).await;
         q(&engine, r#"STORE INTO EPISODIC (key = "e", topic = "sales") IN SCOPE "team:sales""#).await;
 
-        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:billing" ALL"#).await), ["a"]);
-        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC ALL"#).await), ["a", "b", "c"], "no IN SCOPE: every scope");
-        assert_eq!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:sales" KEY id = "b""#).await), ["b"]);
+        // A named scope's record ids carry it (E-L12).
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:billing" ALL"#).await), ["team:billing~a"]);
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC ALL"#).await), ["c", "team:billing~a", "team:sales~b"], "no IN SCOPE: every scope");
+        assert_eq!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:sales" KEY id = "b""#).await), ["team:sales~b"]);
         assert!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:billing" KEY id = "b""#).await).is_empty());
 
         // UPDATE / FORGET only touch their scope.
@@ -253,7 +254,7 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
 
         // The scope subscription sees only its scope's records.
         let ids: Vec<String> = drain(&gw, &sales_sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect();
-        assert_eq!(ids, ["put:b", "put:e"], "SUBSCRIBE SCOPE team:sales");
+        assert_eq!(ids, ["put:team:sales~b", "put:team:sales~e"], "SUBSCRIBE SCOPE team:sales");
 
         // Refused, not ignored.
         for bad in [
@@ -265,12 +266,12 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
         }
     }
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales" ALL"#).await), ["b"], "scope survives a restart");
-    assert_eq!(keys(&q(&engine, r#"RECALL FROM EPISODIC IN SCOPE "team:sales" ALL"#).await), ["e"]);
+    assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales" ALL"#).await), ["team:sales~b"], "scope survives a restart");
+    assert_eq!(keys(&q(&engine, r#"RECALL FROM EPISODIC IN SCOPE "team:sales" ALL"#).await), ["team:sales~e"]);
 
     let mem = LocalEngine::temporary().await.unwrap();
     q(&mem, r#"STORE INTO SEMANTIC (key = "t", k = 1) IN SCOPE "team:x""#).await;
-    assert_eq!(keys(&q(&mem, r#"RECALL FROM SEMANTIC IN SCOPE "team:x" ALL"#).await), ["t"], "a temporary engine has named scopes");
+    assert_eq!(keys(&q(&mem, r#"RECALL FROM SEMANTIC IN SCOPE "team:x" ALL"#).await), ["team:x~t"], "a temporary engine has named scopes");
 }
 
 /// AQL v0.7: UPDATE LINK makes a new version of the edge, UNLINK tombstones it;
