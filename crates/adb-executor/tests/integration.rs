@@ -686,6 +686,35 @@ async fn group_by_aggregates_per_group() {
     assert_eq!(values, json!({"n": 7}));
 }
 
+/// AQL v0.9 `WINDOW` on `RECALL FROM EPISODIC`: over episodes in commit order,
+/// before ORDER BY / LIMIT; results newest first as usual.
+#[tokio::test]
+async fn window_on_episodic_recall() {
+    let adb = Mem::new().await;
+    for (n, sev) in [(1, 3), (2, 9), (3, 1), (4, 7), (5, 5)] {
+        adb.execute(&format!(r#"STORE INTO EPISODIC (pod = "api", n = {n}, sev = {sev})"#)).await.unwrap();
+    }
+    let ns = |q: &'static str| {
+        let adb = adb.clone();
+        async move {
+            let r = adb.execute(q).await.unwrap();
+            r.get_records().unwrap_or_else(|| panic!("{q}")).iter().map(|r| r.data["n"].as_i64().unwrap()).collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW LAST 2"#).await, [5, 4]);
+    assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW LAST 1h"#).await, [5, 4, 3, 2, 1]);
+    assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW SINCE n = 3"#).await, [5, 4, 3]);
+    let mut top = ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW TOP 2 BY sev"#).await;
+    top.sort();
+    assert_eq!(top, [2, 4]);
+    // The window first, then ORDER BY and LIMIT over what it kept.
+    assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW LAST 3 ORDER BY sev DESC LIMIT 1"#).await, [4]);
+    // And before aggregates.
+    let r = adb.execute(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW LAST 3 AGGREGATE COUNT(*) AS c, MAX(sev) AS top"#).await.unwrap();
+    let adb_executor::ResultSet::Aggregation { values } = r.data else { panic!() };
+    assert_eq!(values, json!({"c": 3, "top": 7.0}));
+}
+
 // ============================================================================
 // LINK tests (B16: Link validation)
 // ============================================================================

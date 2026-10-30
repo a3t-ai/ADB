@@ -277,13 +277,17 @@ pub fn order_by<R: Borrow<MemoryRecord>>(records: &mut Vec<R>, order: &OrderBy) 
     records.extend(keyed.into_iter().map(|(_, r)| r));
 }
 
-/// The order without `ORDER BY`: EPISODIC newest first, the others oldest first;
-/// ties by id.
-pub fn default_order<R: Borrow<MemoryRecord>>(memory: MemoryType, records: &mut [R]) {
+fn oldest_first<R: Borrow<MemoryRecord>>(records: &mut [R]) {
     records.sort_by(|a, b| {
         let (a, b) = (a.borrow(), b.borrow());
         (a.metadata.created_at, &a.id).cmp(&(b.metadata.created_at, &b.id))
     });
+}
+
+/// The order without `ORDER BY`: EPISODIC newest first, the others oldest first;
+/// ties by id.
+pub fn default_order<R: Borrow<MemoryRecord>>(memory: MemoryType, records: &mut [R]) {
+    oldest_first(records);
     if memory == MemoryType::Episodic {
         records.reverse();
     }
@@ -315,6 +319,13 @@ pub fn window<R: Borrow<MemoryRecord>>(mut records: Vec<R>, w: &Window) -> Vec<R
             records.split_off(start)
         }
     }
+}
+
+/// `WINDOW` on `RECALL FROM EPISODIC` (AQL v0.9): over the episodes in commit order,
+/// before `ORDER BY`, `LIMIT` and ranking.
+fn in_window<R: Borrow<MemoryRecord>>(mut records: Vec<R>, w: &Window) -> Vec<R> {
+    oldest_first(&mut records);
+    window(records, w)
 }
 
 /// `RETURN` (dotted paths as `metadata.scope` too).
@@ -537,6 +548,13 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
     if let Some(v) = &modifiers.scope {
         records.retain(|r| &r.metadata.scope == v);
     }
+    if let Some(w) = &modifiers.window {
+        // A window needs every episode it might start from.
+        if c.floor.is_some() {
+            return Ok(Answer::Insufficient);
+        }
+        records = in_window(records, w);
+    }
     default_order(memory, &mut records);
     if let Some(o) = &modifiers.order_by {
         order_by(&mut records, o);
@@ -690,6 +708,20 @@ async fn similar_from(
     }
     // One order whatever the source (ranking breaks ties by position).
     rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
+    if let Some(w) = &modifiers.window {
+        struct At(usize, MemoryRecord);
+        impl Borrow<MemoryRecord> for At {
+            fn borrow(&self) -> &MemoryRecord {
+                &self.1
+            }
+        }
+        let keep: HashSet<usize> = in_window(rows.iter().enumerate().map(|(i, r)| At(i, record(r))).collect(), w).into_iter().map(|a| a.0).collect();
+        let mut i = 0;
+        rows.retain(|_| {
+            i += 1;
+            keep.contains(&(i - 1))
+        });
+    }
     let vectors: Vec<Option<Vec<f32>>> = rows.iter().map(|r| r.data.embedding.as_ref().map(|e| e.iter().map(|x| x.to_f32()).collect())).collect();
     let texts: Vec<Option<String>> = rows.iter().map(|r| crate::reads::embed_text(r.data.memory.into(), &r.data.value)).collect();
     let candidates: Vec<crate::rank::Candidate> =
