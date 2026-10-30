@@ -346,6 +346,21 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                     offset: None,
                 }
             }
+            // A fact began or stopped holding (AQL v0.10): `begin` / `end`.
+            Effect::Validity { memory, lineage_id, holds } => {
+                let Some((scope, kind)) = lineages.lineage(*memory, &lineage_id.0).await else { continue };
+                Change {
+                    op: if *holds { "begin" } else { "end" }.into(),
+                    memory: Some(*memory),
+                    kind,
+                    id: lineage_id.0.clone(),
+                    version: None,
+                    scope,
+                    topic: None,
+                    value: None,
+                    offset: None,
+                }
+            }
             // A vector attached to a row is not a change of its content.
             Effect::Embed { .. } => continue,
             // Registrations and cursors are not changes anyone subscribes to.

@@ -61,7 +61,9 @@ pub fn tool_list() -> Value {
                 "object": { "type": "string", "description": "The entity the fact points at, e.g. \"org:acme\" — a link you can follow (or give value)" },
                 "value": { "description": "The fact's literal value, e.g. 1815 (or give object)" },
                 "confidence": { "type": "number", "description": "How sure, 0-1 (the link's weight; default 1)" },
-                "multi": { "type": "boolean", "description": "The predicate holds several values (e.g. knows): keep one fact per object" }
+                "multi": { "type": "boolean", "description": "The predicate holds several values (e.g. knows): keep one fact per object" },
+                "valid_from": { "type": "string", "description": "The fact holds from this date or time, e.g. \"2026-11-01\" (optional; before it, recall doesn't return it)" },
+                "valid_to": { "type": "string", "description": "The fact holds until this date or time (optional; from then on, recall doesn't return it)" }
             }, "required": ["content"] }
         },
         {

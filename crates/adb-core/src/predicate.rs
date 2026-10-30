@@ -535,6 +535,42 @@ pub struct Modifiers {
     /// Follow links to other memory types
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_links: Option<FollowLinks>,
+    /// `AS OF t` (AQL v0.10): the records as they were at t
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<TimePoint>,
+    /// `VALID AT t` (AQL v0.10): facts that held at t, as known now
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<TimePoint>,
+    /// `WITH HISTORY` (AQL v0.10): every version, current and replaced
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_history: bool,
+}
+
+/// A point in time in a history read (AQL v0.10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TimePoint {
+    /// A date or RFC 3339 string.
+    At { time: String },
+    /// `$t`, bound by the caller or an earlier pipeline stage.
+    Variable { name: String },
+    /// `7d AGO`.
+    Ago {
+        #[serde(with = "duration_millis")]
+        duration: Duration,
+    },
+}
+
+impl TimePoint {
+    /// The instant, against `now` for `AGO`; `None` for an unbound variable or a
+    /// string that isn't a date.
+    pub fn resolve(&self, now: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            TimePoint::At { time } => crate::time::parse_instant(time),
+            TimePoint::Variable { .. } => None,
+            TimePoint::Ago { duration } => chrono::Duration::from_std(*duration).ok().map(|d| now - d),
+        }
+    }
 }
 
 impl Modifiers {

@@ -268,6 +268,10 @@ pub enum Effect {
     Forget { memory: Memory, lineage_id: RecordId },
     /// TTL expiry, committed by the owner's timer (D2 §4).
     Expire { memory: Memory, lineage_id: RecordId },
+    /// A fact's `valid_from` (`holds`) or `valid_to` (not `holds`) passed (AQL
+    /// v0.10, GR-14), committed by the owner's timer. Changes no row — reads test
+    /// validity themselves — so subscribers and continuous queries see the boundary.
+    Validity { memory: Memory, lineage_id: RecordId, holds: bool },
     /// `SUBSCRIBE` / `WATCH` registration (`kind = sub | cq` row).
     Register(NewRow),
     /// Batched cursor advance for a subscription.
@@ -367,6 +371,7 @@ mod tests {
                 Effect::Supersede { old, new },
                 Effect::UpdateSubCursor { sub_id: ids.next(ts), cursor: LogOffset(41) },
                 Effect::Expire { memory: Memory::Working, lineage_id: ids.next(ts) },
+                Effect::Validity { memory: Memory::Semantic, lineage_id: ids.next(ts), holds: false },
             ],
         };
         let json = serde_json::to_string(&record).unwrap();

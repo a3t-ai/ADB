@@ -110,7 +110,9 @@ impl WatchSet {
             }
             Effect::PutEdge(n) => self.memory(n.data.memory),
             // Patches, forgets and expiries name no scope: the memory type decides.
-            Effect::Patch { memory, .. } | Effect::Forget { memory, .. } | Effect::Expire { memory, .. } => self.memory(*memory),
+            Effect::Patch { memory, .. } | Effect::Forget { memory, .. } | Effect::Expire { memory, .. } | Effect::Validity { memory, .. } => {
+                self.memory(*memory)
+            }
             Effect::Embed { memory, .. } => self.like && self.memory(*memory),
             _ => false,
         })

@@ -544,7 +544,19 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         window: mods.window.as_ref().and_then(|w| convert_window(w).ok()),
         with_links: mods.with_links.as_ref().map(convert_with_links),
         follow_links: mods.follow_links.as_ref().map(convert_follow_links),
+        as_of: mods.as_of.as_ref().map(convert_time_point),
+        valid_at: mods.valid_at.as_ref().map(convert_time_point),
+        with_history: mods.with_history,
     })
+}
+
+fn convert_time_point(t: &aql_parser::ast::TimePoint) -> adb_core::TimePoint {
+    use aql_parser::ast::TimePoint as T;
+    match t {
+        T::At { time } => adb_core::TimePoint::At { time: time.clone() },
+        T::Variable { name } => adb_core::TimePoint::Variable { name: name.clone() },
+        T::Ago { duration } => adb_core::TimePoint::Ago { duration: *duration },
+    }
 }
 
 fn link_select(

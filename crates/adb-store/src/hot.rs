@@ -583,20 +583,22 @@ impl HotCache {
         Self::trim(&mut st, now);
     }
 
-    /// Drop rows past their time window, TTL or validity (the expiry tick).
+    /// Drop rows past their time window, TTL or supersede (the expiry tick). A fact
+    /// outside its validity stays: it is still the lineage's live version, and
+    /// reads test validity (it may begin later).
     pub fn sweep(&self) {
         let mut st = self.state.write().unwrap();
         let now = now();
         let gone: Vec<String> = st
             .buckets
             .values()
-            .flat_map(|b| b.rows.values().filter(|e| !e.row.is_current(now)).map(|e| e.row.id.clone()))
+            .flat_map(|b| b.rows.values().filter(|e| !e.row.is_live(now)).map(|e| e.row.id.clone()))
             .collect();
         for id in gone {
             // Not current any more, so never selected again: no floor change.
             Self::remove(&mut st, &id);
         }
-        let gone: Vec<String> = st.edges.rows.values().filter(|r| !r.is_current(now)).map(|r| r.id.clone()).collect();
+        let gone: Vec<String> = st.edges.rows.values().filter(|r| !r.is_live(now)).map(|r| r.id.clone()).collect();
         for id in gone {
             st.edges.remove(&id);
         }

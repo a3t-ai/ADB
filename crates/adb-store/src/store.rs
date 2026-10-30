@@ -650,6 +650,27 @@ impl PartitionStore {
             .collect())
     }
 
+    /// The live rows (transaction time, [`StoredRow::is_live`]) at `now`, without
+    /// `_meta`: what writes and key checks see, facts outside their validity included.
+    pub async fn live(&self, filter: Option<&str>, now: CommitTs) -> StoreResult<Vec<StoredRow>> {
+        Ok(self
+            .scan(filter)
+            .await?
+            .into_iter()
+            .filter(|r| r.id != META_ID && r.data.kind != Kind::Meta && r.is_live(now))
+            .collect())
+    }
+
+    /// Every version of `memory`'s records that isn't forgotten or expired, current
+    /// and superseded (AQL v0.10 history reads; `filter` narrows it).
+    pub async fn versions(&self, memory: adb_core::log::Memory, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
+        let mut f = format!("memory = {} AND {RECORD_KINDS} AND tombstone = false", sql_str(memory.tag()));
+        if let Some(x) = filter {
+            f.push_str(&format!(" AND ({x})"));
+        }
+        self.scan(Some(&f)).await
+    }
+
     /// The current edges leaving record `from` of memory type `memory`, of
     /// `link_type` if given, oldest first (D4.1: links are read from the table, so
     /// a forgotten record's edges are gone, live and after a restart alike).
@@ -670,17 +691,10 @@ impl PartitionStore {
     }
 
     /// The current version of record `key` of memory type `memory` (its lineage's
-    /// current row, D2 T1), if any.
+    /// live row, D2 T1; a fact outside its validity too), if any.
     pub async fn current_version(&self, memory: adb_core::log::Memory, key: &str, now: CommitTs) -> StoreResult<Option<StoredRow>> {
         let filter = format!("lineage_id = {} AND {RECORD_KINDS}", sql_str(&row_id(memory, key)));
-        Ok(self.current(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
-    }
-
-    /// `memory`'s superseded record versions that are not forgotten: what FORGET
-    /// must also match (D2 T5).
-    pub async fn superseded(&self, memory: adb_core::log::Memory) -> StoreResult<Vec<StoredRow>> {
-        let filter = format!("memory = {} AND {RECORD_KINDS} AND superseded_by IS NOT NULL AND tombstone = false", sql_str(memory.tag()));
-        self.scan(Some(&filter)).await
+        Ok(self.live(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
     }
 
     /// Current versions of records with a TTL whose expiry isn't logged yet (the
@@ -867,6 +881,8 @@ impl PartitionStore {
                         out.insert(r.id.clone(), r);
                     }
                 }
+                // A validity boundary is an event; reads test validity (AQL v0.10).
+                Effect::Validity { .. } => {}
                 // Platform tables live in their own datasets (adb-platform); the
                 // memory table only moves its applied offset past them.
                 Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableReplace { .. } => {}

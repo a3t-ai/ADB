@@ -21,6 +21,6 @@ pub mod time;
 pub use error::{AdbError, AdbResult};
 pub use link::{Link, LinkPredicate};
 pub use memory::{merge_fields, MemoryRecord, MemoryType, Metadata};
-pub use predicate::{evaluate_conditions, get_nested_field, evaluate_conditions_on_record, AggregateFunc, AggregateFuncType, Condition, FollowLinks, LinkDirection, LinkSelect, LogicalOp, Modifiers, Operator, OrderBy, Predicate, Value, Window, WithLinks};
+pub use predicate::{evaluate_conditions, get_nested_field, evaluate_conditions_on_record, AggregateFunc, AggregateFuncType, Condition, FollowLinks, LinkDirection, LinkSelect, LogicalOp, Modifiers, Operator, OrderBy, Predicate, TimePoint, Value, Window, WithLinks};
 pub use scope::{Namespace, Scope};
 pub use time::Ttl;

@@ -252,6 +252,14 @@ impl Executor {
                 bound_step.predicate = Predicate::Pattern { pattern_var: pattern_var.clone(), threshold: *threshold, text: Some(text) };
             }
         }
+        // `AS OF $t` / `VALID AT $t` (AQL v0.10): the bound value is the time.
+        for t in [&mut bound_step.modifiers.as_of, &mut bound_step.modifiers.valid_at].into_iter().flatten() {
+            if let adb_core::TimePoint::Variable { name } = t {
+                if let Some(serde_json::Value::String(time)) = bindings.get(name.as_str()).map(|v| v.to_json()) {
+                    *t = adb_core::TimePoint::At { time };
+                }
+            }
+        }
         bound_step
     }
 

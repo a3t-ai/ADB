@@ -144,6 +144,35 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     Some(duration)
 }
 
+/// An instant as AQL writes it (v0.10): `"2026-11-01"` (midnight UTC),
+/// `"2026-11-01T09:30:00"` (UTC) or RFC 3339 with an offset.
+pub fn parse_instant(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&Utc));
+    }
+    if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(t.and_utc());
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().and_then(|d| d.and_hms_opt(0, 0, 0)).map(|t| t.and_utc())
+}
+
+/// An instant in the one form ADB stores validity in: RFC 3339, UTC
+/// (`2026-11-01T00:00:00Z`), with microseconds only when it has a fraction.
+pub fn format_instant(t: DateTime<Utc>) -> String {
+    match t.timestamp_subsec_micros() {
+        0 => t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        _ => t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+    }
+}
+
+/// A fact's validity (AQL v0.10): the payload's `valid_from` / `valid_to`, as micros.
+/// `None` for a bound that is absent (unbounded).
+pub fn validity(value: &serde_json::Value) -> (Option<i64>, Option<i64>) {
+    let bound = |f: &str| value.get(f).and_then(|v| v.as_str()).and_then(parse_instant).map(|t| t.timestamp_micros());
+    (bound("valid_from"), bound("valid_to"))
+}
+
 /// Format a duration as a human-readable string
 pub fn format_duration(d: Duration) -> String {
     Ttl(d).to_string()

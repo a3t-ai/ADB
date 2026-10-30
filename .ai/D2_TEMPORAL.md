@@ -153,6 +153,10 @@ overwrites in place, `delete` removes the row, no lineages, no TTL. `commit_ts` 
 
 ## 8. Deferred (v0.6 proposals for the AQL repo)
 
+> *30 Oct: all four are done — AQL v0.9 (`WINDOW` on EPISODIC, field removal) and v0.10
+> (`AS OF` / `VALID AT` / `WITH HISTORY`, agent-set `valid_from` / `valid_to` on facts, held in
+> the payload; the row columns stay transaction time). See `AQL/spec/AQL_SPEC_v0.10_additions.md`.*
+
 - `AS OF <time>` / `WITH HISTORY` on reads (data already kept).
 - Agent-supplied valid time: reserved `valid_from` / `valid_to` payload fields on
   `STORE` for facts with known validity ("price valid until 1 Nov"); `valid_to` in

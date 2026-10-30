@@ -578,6 +578,72 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
     Ok(Answer::of(&c, records))
 }
 
+/// Whether a read asks for history (AQL v0.10): `AS OF`, `VALID AT` or `WITH HISTORY`.
+pub fn is_history(modifiers: &Modifiers) -> bool {
+    modifiers.as_of.is_some() || modifiers.valid_at.is_some() || modifiers.with_history
+}
+
+/// A history read's time, at `now` for `AGO`.
+fn instant(t: &adb_core::TimePoint, what: &str, now: CommitTs) -> AdbResult<CommitTs> {
+    t.resolve(now.to_datetime()).map(CommitTs::from_datetime).ok_or_else(|| match t {
+        adb_core::TimePoint::Variable { name } => AdbError::QueryError(format!("{what} ${name}: the variable has no value (pass a date or time in `variables`)")),
+        _ => AdbError::QueryError(format!("{what}: not a date (\"2026-11-01\") or an RFC 3339 time")),
+    })
+}
+
+/// `RECALL` / `LOOKUP` with `AS OF`, `VALID AT` or `WITH HISTORY` (AQL v0.10, L9 /
+/// GR-14) over SEMANTIC or PROCEDURAL, from Lance (the hot cache holds current rows
+/// only). `AS OF t`: each record's version at t, if it held at t; `VALID AT v`: facts
+/// holding at v, from the versions current at `AS OF` (default now); `WITH HISTORY`:
+/// every version recorded by `AS OF`, whatever its validity. Each record carries
+/// `_recorded_at` (its version's commit) and `_replaced_at` (when a newer version
+/// replaced it, by `AS OF`; else null). Versions superseded more than
+/// `writes::HISTORY` ago are compacted away; forgotten and expired records have none.
+pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
+    if !matches!(memory, MemoryType::Semantic | MemoryType::Procedural) {
+        return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY are only valid on SEMANTIC and PROCEDURAL".into()));
+    }
+    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, VALID AT, WITH HISTORY)".into()));
+    }
+    let tx = modifiers.as_of.as_ref().map(|t| instant(t, "AS OF", now)).transpose()?.unwrap_or(now);
+    let valid = modifiers.valid_at.as_ref().map(|t| instant(t, "VALID AT", now)).transpose()?.unwrap_or(tx);
+    let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
+    let rows = store.versions(memory.into(), None).await.map_err(store_err)?;
+    let micros = |t: CommitTs| serde_json::json!(t.to_datetime().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+    let mut records: Vec<MemoryRecord> = rows
+        .iter()
+        .filter(|r| in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns)))
+        .filter(|r| match modifiers.with_history {
+            true => r.commit_ts <= tx && (modifiers.valid_at.is_none() || r.holds_at(valid)),
+            false => r.is_current_at(tx, valid),
+        })
+        .map(|r| {
+            let mut rec = record(r);
+            if let Some(obj) = rec.data.as_object_mut() {
+                obj.insert("_recorded_at".into(), micros(r.commit_ts));
+                obj.insert("_replaced_at".into(), r.valid_to.filter(|t| *t <= tx).map_or(serde_json::Value::Null, micros));
+            }
+            rec
+        })
+        .filter(|r| matches(memory, r, predicate))
+        .collect();
+    if let Some(v) = &modifiers.scope {
+        records.retain(|r| &r.metadata.scope == v);
+    }
+    default_order(memory, &mut records);
+    if let Some(o) = &modifiers.order_by {
+        order_by(&mut records, o);
+    }
+    if let Some(n) = modifiers.limit {
+        records.truncate(n);
+    }
+    if let Some(f) = &modifiers.return_fields {
+        project(&mut records, f);
+    }
+    Ok(records)
+}
+
 /// `SCAN FROM WORKING [WINDOW …]`: oldest first, then the window, `LIMIT`, `RETURN`.
 pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
     served(store, "scan", |source| scan_from(store, modifiers, now, source), same_records, show_records).await

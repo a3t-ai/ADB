@@ -96,13 +96,39 @@ impl StoredRow {
         key_of(&self.lineage_id)
     }
 
-    /// In the current view at `now` (D2 §3): not superseded, not closed, not expired,
-    /// not forgotten.
+    /// In the current view at `now` (D2 §3): live, and a fact holds at `now`.
     pub fn is_current(&self, now: CommitTs) -> bool {
+        self.is_live(now) && self.holds_at(now)
+    }
+
+    /// The lineage's version at `now` in transaction time: not superseded, not
+    /// closed, not expired, not forgotten — whatever a fact's own validity says.
+    /// Writes (supersede, key checks) and the hot cache work on live rows.
+    pub fn is_live(&self, now: CommitTs) -> bool {
         !self.tombstone
             && self.superseded_by.is_none()
             && self.valid_to.is_none_or(|t| t > now)
             && self.data.ttl_at.is_none_or(|t| t > now)
+    }
+
+    /// A fact holds at `t` when `t` is within its `valid_from` / `valid_to` (AQL
+    /// v0.10); every other record, and a fact without them, always holds.
+    pub fn holds_at(&self, t: CommitTs) -> bool {
+        if self.data.kind != Kind::Fact {
+            return true;
+        }
+        let (from, to) = adb_core::time::validity(&self.data.value);
+        from.is_none_or(|f| f <= t.0) && to.is_none_or(|u| u > t.0)
+    }
+
+    /// The version ADB held at `tx` (`AS OF`), if it holds at `valid` (D2 §8): a
+    /// history read. Forgotten and expired records have no history.
+    pub fn is_current_at(&self, tx: CommitTs, valid: CommitTs) -> bool {
+        !self.tombstone
+            && self.commit_ts <= tx
+            && self.valid_to.is_none_or(|t| t > tx)
+            && self.data.ttl_at.is_none_or(|t| t > tx)
+            && self.holds_at(valid)
     }
 
     /// The `_meta` control row carrying the applied log offset (§9.3).

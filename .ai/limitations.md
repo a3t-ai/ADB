@@ -20,8 +20,8 @@ entities, provenance and validity should suit a triple feed to the model later.
 
 | Area | Open in the run |
 |---|---|
-| Memory / AQL | L9 history reads, E-L12 keys per scope, F-L3 turns into facts, F-L2 FlowR on `PATTERN` |
-| Graph | GR-14 fact validity, GR-13 entity forget cascade, GR-12 entity resolution (one node), GR-15 triple feed; GR-4 paths (decide) |
+| Memory / AQL | E-L12 keys per scope, F-L3 turns into facts, F-L2 FlowR on `PATTERN` |
+| Graph | GR-13 entity forget cascade, GR-12 entity resolution (one node), GR-15 triple feed; GR-4 paths (decide) |
 | Cluster | CL-1 replication, CL-2 leader routing, CL-3 owner-side checks, CL-4 per-process state on failover, L11 power-safe store, S1 partitions (decide), S5 CI |
 
 Gates that aren't limitations (W8 A3T pass, P1 step 1.6) are in `MVP_PLAN.md` and
@@ -31,13 +31,13 @@ Gates that aren't limitations (W8 A3T pass, P1 step 1.6) are in `MVP_PLAN.md` an
 
 | # | Limitation | Effect | Plan |
 |---|---|---|---|
-| L9 | **History is not readable through AQL** (no `AS OF` / `WITH HISTORY`), by design in D2 v1. The rows are kept. | Audit / time travel only by reading the table directly. | **MVP**, with GR-14 (fact validity reads the same history). D2 §8. |
 | E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | **MVP**: scope in the row id (schema v4). |
 | F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | **MVP**: reflection / consolidation of turns into facts (on one node; across agents is stitching, later). |
 | F-L2 | **FlowR matches procedures itself** (token overlap). ADB takes `PATTERN "text"` and a bound `PATTERN $p` (W9.3); FlowR doesn't use it yet. | Two matchers. | **MVP**: switch FlowR's procedure lookup to `PATTERN`. |
 | AQL-2 | **No `STREAM BATCH` or `MERGE`** (v0.5 §22 open questions 4, 5). | Long histories are paged with `LIMIT`; cross-memory joins are a `PIPELINE`. | **Note**: not planned; nothing needs them. |
+| L9-a | **History reads cover SEMANTIC and PROCEDURAL only, without `LIKE`, `PATTERN` or links** (AQL v0.10): EPISODIC, WORKING and TOOLS change in place, so they have no versions; links aren't read as of a time. Replaced versions are kept 90 days (`HISTORY`); forgotten and expired records have none. History reads scan the memory type's versions in Lance (not the hot cache). | No time travel over episodes or the graph's shape. | **Later**: links `AS OF` if the graph needs it; retention per scope with D5. |
 | W9-L1 | **`PIPELINE … TIMEOUT` is enforced only with `ADB_ENFORCE_TIMEOUT=1`** (user, 28 Oct): reads take 10–100 ms, so tight budgets would return partial results. When on, each stage gets what is left of the budget; the stage that runs out is dropped (its own partial rows aren't kept), later stages are skipped, and the result carries `timed_out: true`. `TIMEOUT` on a single statement is ignored. | Budgets aren't honoured by default. | **Later**: on by default with the performance work. |
-| L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update; it is in the history rows. | **Note**; revisit if A3T needs first-creation time (with L9 it is readable). |
+| L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update; it is in the history rows. | **Note**; revisit if A3T needs first-creation time (readable with `WITH HISTORY`, AQL v0.10). |
 
 ## Graph
 
@@ -49,8 +49,8 @@ delivered to subscribers; multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `
 
 | # | Limitation | Effect | Plan |
 |---|---|---|---|
-| GR-14 | **Facts have no validity range**: a fact holds from its commit until superseded or forgotten; there is no user-set `valid_from` / `valid_to` (D2 has the columns) and no "as of" read of facts. W6-L6's timer wheel waits on this. | A knowledge graph can't say when a triple held; a model fed from it can't invalidate by time. | **MVP**: validity on `STORE … FACT`, reads current at a time, expiry by timer, with L9. |
 | GR-13 | **Forgetting an entity leaves facts pointing at it**; traversal skips the missing record. | Dangling facts stay until forgotten. | **MVP**: cascade FORGET of an entity to its facts. |
+| GR-17 | **A fact stored with a future `valid_from` replaces the current one at once** (one current version per (subject, predicate)): until it begins, neither holds. `UPDATE` can't reach a fact outside its validity (it matches the current view). | Scheduling "price 12 from 1 Nov" hides today's price. | **Note**: store the change when it takes effect, or use `MULTI`; revisit (keep the replaced version current until the new one begins) if agents need scheduled changes. |
 | GR-12 | **No entity resolution**: `person:ada` and `person:ada-lovelace` are two entities; entity stubs hold only key and name. | Duplicates until callers agree on keys. | **MVP** on one node: aliases and merging entities (facts move to the survivor). Across agents' scopes: stitching, later. |
 | GR-15 | **No triple feed**: facts can be read with AQL, but nothing exports them as (subject, predicate, object / value, confidence, source, version) in order, for a consumer that keeps a copy. | The storage side of a KBLaM-style model input is missing. | **MVP**: a fact feed over Arrow Flight (snapshot + changes from an offset, superseded / forgotten facts as removals). Encoding to key / value vectors is GQ-3. |
 | GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | **Decide**: in the MVP or not. |
@@ -102,7 +102,6 @@ delivered to subscribers; multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `
 | W6-L2 | **Frames are buffered in memory** (last 1,000 per watch). | After a restart, or past the buffer, a resuming client gets a `reset`, not the diffs. | **Note** for the MVP (see CL-4). |
 | W6-L3 | **A frame's `offset` is a lower bound under concurrent writes**: the result may hold a few records just after it. | Exact at quiet times; converges under load. | **Later**: reads at an exact offset. |
 | W6-L4 | **FORGET and watches**: frames buffered in ADB are scrubbed when the watcher reaches the `Forget`; clients that already received a record keep it until the `removed` diff. | Never on disk; clients must apply `removed`. | **Note**. |
-| W6-L6 | **No timer wheel for validity**: TTL expiry is committed on time (W9.12), but there is no user-set `valid_to` yet. | — | **MVP** with GR-14. |
 
 ## Recall
 
@@ -230,6 +229,7 @@ must be settled before its phase is designed.
 
 | Was | Fixed in |
 |---|---|
+| GR-14: facts had no validity range; W6-L6: no timer for `valid_to`; L9: no history reads | AQL v0.10 (30 Oct): `valid_from` / `valid_to` on `STORE … FACT` (and `UPDATE`), facts outside their range leave the current view (links too), the validity timer commits `begin` / `end` (also for bounds passed while down); `AS OF`, `VALID AT`, `WITH HISTORY` on RECALL / LOOKUP; MCP `remember` takes the bounds; suite 27 |
 | AQL-1: no `GROUP BY` | AQL v0.9 §1 (AQL `9c4ee2c`, ADB `7a08843`, 30 Oct): one row per group, `HAVING` / `ORDER BY` / `LIMIT` / `RETURN` on groups; parser enforces `HAVING` and `GROUP BY` need `AGGREGATE`; suite 24. The runner now checks `values` (two stale T13 expectations fixed) |
 | AQL-3: `WINDOW` accepted on any statement, ignored outside `SCAN` | AQL v0.9 §2 (AQL `a0511ef`, ADB `e76fef2`): valid on `SCAN FROM WORKING` and `RECALL FROM EPISODIC` only (parse error elsewhere); on EPISODIC over episodes in commit order, before `ORDER BY` / `LIMIT` / `AGGREGATE` / `LIKE`; suite 25 |
 | AQL-4: v0.5 §14 listed `WEIGHT` / `THRESHOLD` / `FROM` modifiers the grammar never had | AQL v0.9 §4: withdrawn (user: as recommended); v0.5 §14 points there |

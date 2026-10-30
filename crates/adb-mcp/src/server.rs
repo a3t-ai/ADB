@@ -334,7 +334,7 @@ fn remember(args: &Value) -> Result<String, String> {
         }
         fields.insert("subject".into(), subject.clone());
         fields.insert("predicate".into(), predicate.clone());
-        for f in ["object", "value", "confidence"] {
+        for f in ["object", "value", "confidence", "valid_from", "valid_to"] {
             if let Some(v) = args.get(f) {
                 fields.insert(f.into(), v.clone());
             }

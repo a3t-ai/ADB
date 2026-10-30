@@ -297,6 +297,10 @@ pub struct DurableWrites<L: Log> {
     /// instead of scanning the table; each is checked against the table before it
     /// expires (an UPDATE may have moved its TTL, a FORGET removed it).
     timers: std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>,
+    /// Validity timers (AQL v0.10, GR-14): `(valid_from or valid_to, row lineage id)`
+    /// of facts whose bound is still ahead, seeded at open; the tick commits a
+    /// `Validity` event for each once it passes (checked against the table first).
+    bounds: std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>,
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
@@ -606,8 +610,18 @@ impl<L: Log + 'static> DurableWrites<L> {
             .into_iter()
             .filter_map(|r| r.data.ttl_at.map(|t| (t.0, r.lineage_id)))
             .collect();
+        // Bounds after the last commit: one that passed while ADB was down has no
+        // event yet, and gets it on the first tick.
+        let after = stats.last_commit_ts.map_or(i64::MIN, |t| t.0);
+        let bounds = store
+            .live(Some("kind = 'fact'"), CommitTs::from_datetime(time::now()))
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+            .into_iter()
+            .flat_map(|r| validity_bounds(&r.data.value).into_iter().filter(|t| *t > after).map(move |t| (t, r.lineage_id.clone())))
+            .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -629,8 +643,9 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     /// The records an UPDATE (`forget = false`) or FORGET matches, as lineage ids:
     /// from Lance for the types it owns, with the backends' own matching code over
-    /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches superseded versions, so
-    /// a value surviving only in an old version is forgotten too (D2 T5).
+    /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches every other version, so
+    /// a value surviving only in an old version is forgotten too (D2 T5), and so is a
+    /// fact outside its validity (AQL v0.10).
     async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
         check_scope(memory, in_scope)?;
         let Some(store) = &self.store else { return Err(needs_table("UPDATE / FORGET")) };
@@ -640,7 +655,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         let mut ids = crate::query::targets(store, memory, predicate, in_scope, ts).await?;
         if forget && supersedes(memory) {
-            let mut old = store.superseded(memory.into()).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            let mut old = store.versions(memory.into(), None).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
             if let Some(s) = in_scope {
                 old.retain(|r| r.data.scope == s);
             }
@@ -662,7 +677,8 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub async fn expire_due(&self) -> AdbResult<u64> {
         let Some(store) = &self.store else { return Ok(0) };
         let now = CommitTs::from_datetime(time::now());
-        if !self.timers.lock().unwrap().first().is_some_and(|(t, _)| *t <= now.0) {
+        let due = |set: &std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>| set.lock().unwrap().first().is_some_and(|(t, _)| *t <= now.0);
+        if !due(&self.timers) && !due(&self.bounds) {
             return Ok(0);
         }
         let mut seq = self.seq.lock().await;
@@ -684,6 +700,27 @@ impl<L: Log + 'static> DurableWrites<L> {
             if let Some(r) = store.ttl_version(lineage).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? {
                 if r.data.ttl_at.is_some_and(|t| t <= ts) {
                     effects.push(Effect::Expire { memory: r.data.memory, lineage_id: RecordId(r.key().to_string()) });
+                }
+            }
+        }
+        let bounds: Vec<(i64, String)> = {
+            let mut bounds = self.bounds.lock().unwrap();
+            let mut out = Vec::new();
+            while out.len() < EXPIRE_BATCH && bounds.first().is_some_and(|(t, _)| *t <= ts.0) {
+                out.push(bounds.pop_first().expect("checked"));
+            }
+            out
+        };
+        for (t, lineage) in &bounds {
+            // Still the live version's bound (a newer version or FORGET may have moved it).
+            let Some(r) = store.ttl_version(lineage).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? else { continue };
+            if r.data.kind != Kind::Fact || effects.iter().any(|e| matches!(e, Effect::Expire { lineage_id, .. } if lineage_id.0 == r.key())) {
+                continue;
+            }
+            let (from, to) = adb_core::time::validity(&r.data.value);
+            for (bound, holds) in [(from, true), (to, false)] {
+                if bound == Some(*t) {
+                    effects.push(Effect::Validity { memory: r.data.memory, lineage_id: RecordId(r.key().to_string()), holds });
                 }
             }
         }
@@ -749,11 +786,19 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
     async fn to_store(&self, record: &LogRecord, log: &L) {
         let (Some(s), Some(applier)) = (&self.store, &self.applier) else { return };
-        // TTL timers (W9.12) for records written with one.
+        // TTL timers (W9.12) for records written with one; validity timers for facts
+        // with a bound ahead (AQL v0.10).
         for e in &record.effects {
             if let Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) | Effect::Supersede { new: n, .. } = e {
                 if let Some(t) = n.data.ttl_at {
                     self.timers.lock().unwrap().insert((t.0, adb_store::row_id(n.data.memory, &n.lineage_id.0)));
+                }
+                if n.data.kind == Kind::Fact {
+                    let lineage = adb_store::row_id(n.data.memory, &n.lineage_id.0);
+                    let mut bounds = self.bounds.lock().unwrap();
+                    for t in validity_bounds(&n.data.value).into_iter().filter(|t| *t > record.commit_ts.0) {
+                        bounds.insert((t, lineage.clone()));
+                    }
                 }
             }
         }
@@ -887,6 +932,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             (None, None) => return Err(AdbError::InvalidSyntax("FACT needs object or value".into())),
         };
         let key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
+        if let Some(obj) = payload.as_object_mut() {
+            normalize_validity(obj, None)?;
+            // On STORE a null bound is no bound.
+            obj.retain(|k, v| !(matches!(k.as_str(), "valid_from" | "valid_to") && v.is_null()));
+        }
         let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("key".into(), serde_json::json!(key));
@@ -972,7 +1022,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if ids.is_empty() {
             return Ok(0);
         }
-        let fields = match &data {
+        let mut fields = match &data {
             serde_json::Value::Object(map) => map.clone(),
             other => {
                 let mut m = serde_json::Map::new();
@@ -980,6 +1030,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                 m
             }
         };
+        if memory_type == MemoryType::Semantic {
+            normalize_validity(&mut fields, None)?;
+        }
         if let (Some(store), true) = (&self.store, supersedes(memory_type)) {
             // `targets` waited for the applier, so the current versions read here
             // are the ones this update follows.
@@ -991,6 +1044,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                     .map_err(|e| AdbError::Internal(format!("store: {e}")))?
                     .ok_or_else(|| AdbError::Internal(format!("{memory_type:?} {key}: no current version in Lance")))?;
                 let mut new = next_version(&cur, &fields, seq.new_id(ts));
+                if let (Kind::Fact, (Some(from), Some(to))) = (new.data.kind, time::validity(&new.data.value)) {
+                    if from >= to {
+                        return Err(AdbError::InvalidSyntax(format!("{key}: valid_from must be before valid_to")));
+                    }
+                }
                 if vector.is_some() {
                     new.data.embedding = vector.clone();
                 }
@@ -1247,7 +1305,8 @@ pub struct ReplayStats {
 /// for the D3 S4 key check. Returns how many current records it read.
 pub async fn hydrate(store: &PartitionStore) -> AdbResult<(u64, LiveKeys)> {
     let now = CommitTs::from_datetime(time::now());
-    let rows = store.current(None, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+    // Live, not current: a fact outside its validity still holds its key.
+    let rows = store.live(None, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
     let records: Vec<_> = rows.iter().filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool)).collect();
     let live: LiveKeys = records
         .iter()
@@ -1271,6 +1330,36 @@ pub fn store_id(memory: MemoryType, key: &str, payload: &serde_json::Value) -> S
 /// Memory types whose `UPDATE` writes a new version (D2 §2).
 fn supersedes(memory: MemoryType) -> bool {
     matches!(memory, MemoryType::Semantic | MemoryType::Procedural)
+}
+
+/// A fact's `valid_from` / `valid_to`, the bounds it has (AQL v0.10).
+fn validity_bounds(value: &serde_json::Value) -> Vec<i64> {
+    let (from, to) = adb_core::time::validity(value);
+    from.into_iter().chain(to).collect()
+}
+
+/// `valid_from` / `valid_to` in `fields` checked and stored in one form (RFC 3339,
+/// UTC: `time::format_instant`); `null` stays (UPDATE removes the bound).
+/// With `whole`, the record they'll be part of: `valid_from` must be before `valid_to`.
+pub fn normalize_validity(fields: &mut serde_json::Map<String, serde_json::Value>, whole: Option<&serde_json::Value>) -> AdbResult<()> {
+    for f in ["valid_from", "valid_to"] {
+        match fields.get(f) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(s)) => {
+                let t = time::parse_instant(s).ok_or_else(|| AdbError::InvalidSyntax(format!("{f}: \"{s}\" is not a date (\"2026-11-01\") or an RFC 3339 time")))?;
+                fields.insert(f.into(), serde_json::json!(time::format_instant(t)));
+            }
+            Some(other) => return Err(AdbError::InvalidSyntax(format!("{f}: a date or time string, not {other}"))),
+        }
+    }
+    let mut merged = whole.cloned().unwrap_or(serde_json::json!({}));
+    adb_core::merge_fields(&mut merged, fields);
+    if let (Some(from), Some(to)) = adb_core::time::validity(&merged) {
+        if from >= to {
+            return Err(AdbError::InvalidSyntax("valid_from must be before valid_to".into()));
+        }
+    }
+    Ok(())
 }
 
 /// A fact's key: one current fact per (subject, predicate), or per (subject,

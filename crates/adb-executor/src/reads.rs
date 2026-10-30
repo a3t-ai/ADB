@@ -203,7 +203,11 @@ impl LanceReads {
 
     /// A non-`LIKE` RECALL / LOOKUP.
     async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
-        crate::query::read(&self.store, memory, predicate, modifiers, self.committed().await).await
+        let now = self.committed().await;
+        if crate::query::is_history(modifiers) {
+            return crate::query::history(&self.store, memory, predicate, modifiers, now).await;
+        }
+        crate::query::read(&self.store, memory, predicate, modifiers, now).await
     }
 }
 
@@ -253,6 +257,9 @@ impl Reads for LanceReads {
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         if matches!(predicate, Predicate::Like { .. }) {
+            if crate::query::is_history(modifiers) {
+                return Err(AdbError::UnsupportedOperation("LIKE doesn't read history (AS OF, VALID AT, WITH HISTORY)".into()));
+            }
             if !Self::serves(memory) {
                 return Err(AdbError::UnsupportedOperation(format!("LIKE on {memory:?} (supported on SEMANTIC, EPISODIC and PROCEDURAL)")));
             }
