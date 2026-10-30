@@ -715,6 +715,29 @@ async fn window_on_episodic_recall() {
     assert_eq!(values, json!({"c": 3, "top": 7.0}));
 }
 
+/// AQL v0.9: `field = null` in UPDATE removes the field, on superseding types
+/// (SEMANTIC) and patched ones (EPISODIC, WORKING).
+#[tokio::test]
+async fn update_null_removes_a_field() {
+    let adb = Mem::new().await;
+    adb.execute(r#"STORE INTO SEMANTIC (key = "s1", concept = "c", note = "old", n = 1)"#).await.unwrap();
+    adb.execute(r#"STORE INTO EPISODIC (ep = "e1", note = "old", n = 1)"#).await.unwrap();
+    adb.execute(r#"STORE INTO WORKING (key = "w1", note = "old", n = 1)"#).await.unwrap();
+    for (memory, field, id) in [("SEMANTIC", "concept", "c"), ("EPISODIC", "ep", "e1"), ("WORKING", "key", "w1")] {
+        let r = adb.execute(&format!(r#"UPDATE INTO {memory} WHERE {field} = "{id}" (note = null, n = 2)"#)).await.unwrap();
+        assert!(r.success, "{memory}: {r:?}");
+        let r = adb.execute(&format!(r#"RECALL FROM {memory} WHERE {field} = "{id}""#)).await.unwrap();
+        let recs = r.get_records().unwrap();
+        assert_eq!(recs.len(), 1, "{memory}");
+        let data = &recs[0].data;
+        assert!(data.get("note").is_none(), "{memory}: note still there: {data}");
+        assert_eq!(data["n"], 2, "{memory}: {data}");
+        // A removed field no longer matches.
+        let r = adb.execute(&format!(r#"RECALL FROM {memory} WHERE note = "old""#)).await.unwrap();
+        assert!(r.get_records().unwrap().is_empty(), "{memory}");
+    }
+}
+
 // ============================================================================
 // LINK tests (B16: Link validation)
 // ============================================================================

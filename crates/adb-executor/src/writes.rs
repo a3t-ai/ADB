@@ -1285,12 +1285,9 @@ pub fn fact_key(subject: &str, predicate: &str, object: Option<&str>) -> String 
 /// The version after `cur` with `fields` merged in, under the new row id `id`.
 fn next_version(cur: &adb_store::StoredRow, fields: &serde_json::Map<String, serde_json::Value>, id: RecordId) -> NewRow {
     let mut data = cur.data.clone();
-    match &mut data.value {
-        serde_json::Value::Object(v) => v.extend(fields.clone()),
-        other => *other = serde_json::Value::Object(fields.clone()),
-    }
-    if let Some(c) = fields.get("content").and_then(|v| v.as_str()) {
-        data.text = Some(c.to_string());
+    adb_core::merge_fields(&mut data.value, fields);
+    if let Some(c) = fields.get("content") {
+        data.text = c.as_str().map(String::from);
     }
     // The embedded text changed: the old vector no longer describes it (the caller
     // or the backfill embeds the new one).

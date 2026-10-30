@@ -20,7 +20,7 @@ entities, provenance and validity should suit a triple feed to the model later.
 
 | Area | Open in the run |
 |---|---|
-| Memory / AQL | L9 history reads, E-L12 keys per scope, F-L3 turns into facts, F-L2 FlowR on `PATTERN`, AQL-1 `GROUP BY`, AQL-3 `WINDOW` on EPISODIC, AQL-4 spec drift, AQL-5 field removal |
+| Memory / AQL | L9 history reads, E-L12 keys per scope, F-L3 turns into facts, F-L2 FlowR on `PATTERN` |
 | Graph | GR-14 fact validity, GR-13 entity forget cascade, GR-12 entity resolution (one node), GR-15 triple feed; GR-4 paths (decide) |
 | Cluster | CL-1 replication, CL-2 leader routing, CL-3 owner-side checks, CL-4 per-process state on failover, L11 power-safe store, S1 partitions (decide), S5 CI |
 
@@ -35,10 +35,6 @@ Gates that aren't limitations (W8 A3T pass, P1 step 1.6) are in `MVP_PLAN.md` an
 | E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | **MVP**: scope in the row id (schema v4). |
 | F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | **MVP**: reflection / consolidation of turns into facts (on one node; across agents is stitching, later). |
 | F-L2 | **FlowR matches procedures itself** (token overlap). ADB takes `PATTERN "text"` and a bound `PATTERN $p` (W9.3); FlowR doesn't use it yet. | Two matchers. | **MVP**: switch FlowR's procedure lookup to `PATTERN`. |
-| AQL-1 | **No `GROUP BY`**: `AGGREGATE` / `HAVING` work over the whole result only (v0.5 §22 open question 1). | Counts per value need one query per value. | **MVP**: AQL grammar, planner and conformance suite. |
-| AQL-3 | **`WINDOW` on `RECALL FROM EPISODIC` runs but isn't specified**: the grammar accepts `WINDOW` on any read and ADB applies it, while v0.5 §19 says it is an error outside `SCAN FROM WORKING`; v0.5 §22 / D2 §8 propose allowing it on EPISODIC (by `commit_ts`). No conformance test. | Behaviour depends on the implementation. | **MVP**: specify (EPISODIC allowed, others an error), validate, test. |
-| AQL-4 | **v0.5 §14's modifier BNF lists `WEIGHT field`, `THRESHOLD float` and `FROM id, …` (source)**, which the grammar doesn't have (`THRESHOLD` exists only after `PATTERN`). No example uses them as modifiers. | Spec and grammar disagree. | **MVP**: drop them from the spec (recommended) or define them. |
-| AQL-5 | **`UPDATE` can't remove a field** (D2 §8 deferred); setting `field = null` stores a null. | A field can only be blanked, not removed. | **MVP**: specify removal (e.g. `field = null` removes, or `UNSET field`). |
 | AQL-2 | **No `STREAM BATCH` or `MERGE`** (v0.5 §22 open questions 4, 5). | Long histories are paged with `LIMIT`; cross-memory joins are a `PIPELINE`. | **Note**: not planned; nothing needs them. |
 | W9-L1 | **`PIPELINE … TIMEOUT` is enforced only with `ADB_ENFORCE_TIMEOUT=1`** (user, 28 Oct): reads take 10–100 ms, so tight budgets would return partial results. When on, each stage gets what is left of the budget; the stage that runs out is dropped (its own partial rows aren't kept), later stages are skipped, and the result carries `timed_out: true`. `TIMEOUT` on a single statement is ignored. | Budgets aren't honoured by default. | **Later**: on by default with the performance work. |
 | L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update; it is in the history rows. | **Note**; revisit if A3T needs first-creation time (with L9 it is readable). |
@@ -234,6 +230,10 @@ must be settled before its phase is designed.
 
 | Was | Fixed in |
 |---|---|
+| AQL-1: no `GROUP BY` | AQL v0.9 §1 (AQL `9c4ee2c`, ADB `7a08843`, 30 Oct): one row per group, `HAVING` / `ORDER BY` / `LIMIT` / `RETURN` on groups; parser enforces `HAVING` and `GROUP BY` need `AGGREGATE`; suite 24. The runner now checks `values` (two stale T13 expectations fixed) |
+| AQL-3: `WINDOW` accepted on any statement, ignored outside `SCAN` | AQL v0.9 §2 (AQL `a0511ef`, ADB `e76fef2`): valid on `SCAN FROM WORKING` and `RECALL FROM EPISODIC` only (parse error elsewhere); on EPISODIC over episodes in commit order, before `ORDER BY` / `LIMIT` / `AGGREGATE` / `LIKE`; suite 25 |
+| AQL-4: v0.5 §14 listed `WEIGHT` / `THRESHOLD` / `FROM` modifiers the grammar never had | AQL v0.9 §4: withdrawn (user: as recommended); v0.5 §14 points there |
+| AQL-5: `UPDATE` couldn't remove a field | AQL v0.9 §3: `field = null` in `UPDATE` removes it (`adb_core::merge_fields`, both the supersede and patch paths); suite 26 |
 | GR-1, GR-7 / L6: DEPTH ignored; LOOKUP … FOLLOW LINKS returned the source | P1.1 (`0f9ff6a`, 29 Oct): every record within n hops by hop then path weight, `_hop` / `_path_weight`, cycle-safe, capped at 5 hops / 1,000 records; LOOKUP and REFLECT the same |
 | GR-2, GR-3: outbound links only, no conditions on links | P1.2 (29 Oct, AQL v0.8 `fa6d0d2`): `INBOUND` / `BOTH`, `MIN_WEIGHT`, `TYPE IN` / `ALL` on FOLLOW and WITH LINKS; REFLECT honours FOLLOW's type |
 | W10-L2: links weren't cached | P1.3 (`cbdf06b`): every current link (edges and fact links) in the hot cache by both ends |

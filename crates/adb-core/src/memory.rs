@@ -471,3 +471,36 @@ mod tests {
         assert_eq!(parsed.memory_type, record.memory_type);
     }
 }
+
+/// `UPDATE`'s fields merged into a record's payload (AQL v0.9): each field replaces
+/// the payload's, and a `null` field removes it. A payload that isn't an object is
+/// replaced by the fields.
+pub fn merge_fields(value: &mut serde_json::Value, fields: &serde_json::Map<String, serde_json::Value>) {
+    if !value.is_object() {
+        *value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = value.as_object_mut().expect("object");
+    for (k, v) in fields {
+        if v.is_null() {
+            obj.remove(k);
+        } else {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_fields;
+    use serde_json::json;
+
+    #[test]
+    fn null_removes_a_field() {
+        let mut v = json!({"a": 1, "b": 2});
+        merge_fields(&mut v, json!({"a": null, "b": 3, "c": 4}).as_object().unwrap());
+        assert_eq!(v, json!({"b": 3, "c": 4}));
+        let mut s = json!("text");
+        merge_fields(&mut s, json!({"x": null, "y": 1}).as_object().unwrap());
+        assert_eq!(s, json!({"y": 1}));
+    }
+}

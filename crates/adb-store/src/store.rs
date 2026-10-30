@@ -823,12 +823,9 @@ impl PartitionStore {
                 }
                 Effect::Patch { memory, id, fields, .. } => {
                     if let Some(mut cur) = Self::row(inner, &out, &row_id(*memory, &id.0)).await? {
-                        match &mut cur.data.value {
-                            serde_json::Value::Object(v) => v.extend(fields.clone()),
-                            other => *other = serde_json::Value::Object(fields.clone()),
-                        }
-                        if let Some(c) = fields.get("content").and_then(|v| v.as_str()) {
-                            cur.data.text = Some(c.to_string());
+                        adb_core::merge_fields(&mut cur.data.value, fields);
+                        if let Some(c) = fields.get("content") {
+                            cur.data.text = c.as_str().map(String::from);
                             // The vector described the old text; an `Embed` may follow.
                             cur.data.embedding = None;
                         }
