@@ -1,29 +1,129 @@
 # Known limitations — left out on purpose, to revisit
 
-What the implementation deliberately skipped or worked around (started at stage
-D4, 25 Oct 2026; kept current — last pass 29 Oct, W10b). Each entry says what is missing, what it affects, and where it
-should be picked up. Items fixed later move to the bottom with the commit.
+What the implementation deliberately skipped or worked around (started at stage D4,
+25 Oct 2026; last pass 30 Oct). Grouped by area. Each entry says what is missing, what
+it affects, and its plan, tagged:
 
-## Correctness gaps
+- **MVP**: closed in the first MVP run (below);
+- **Decide**: needs a decision from the user first;
+- **Later**: after the first MVP run;
+- **Note**: by design or no action; kept so nobody trips on it.
 
-| # | Limitation | Effect | Revisit |
+IDs are stable (other docs cite them); fixed items move to the bottom with the commit.
+
+## First MVP run (30 Oct 2026, user)
+
+**In:** the graph complete, every memory feature complete, then a Raft cluster (M3).
+**Out:** edge ADB (phase 2), scope / edge caching, stitching across partitions,
+central KG. KBLaM is the use case ADB is designed for, not built in this run: facts,
+entities, provenance and validity should suit a triple feed to the model later.
+
+| Area | Open in the run |
+|---|---|
+| Memory / AQL | L9 history reads, E-L12 keys per scope, F-L3 turns into facts, F-L2 FlowR on `PATTERN`, AQL-1 `GROUP BY` |
+| Graph | GR-14 fact validity, GR-13 entity forget cascade, GR-12 entity resolution (one node), GR-15 triple feed; GR-4 paths (decide) |
+| Cluster | CL-1 replication, CL-2 leader routing, CL-3 owner-side checks, CL-4 per-process state on failover, L11 power-safe store, S1 partitions (decide), S5 CI |
+
+Gates that aren't limitations (W8 A3T pass, P1 step 1.6) are in `MVP_PLAN.md` and
+`P1_GRAPH.md`.
+
+## Memory and AQL
+
+| # | Limitation | Effect | Plan |
 |---|---|---|---|
-| L5 | **Records that shared a key across memory types before schema v3 were already one Lance row.** The v2→v3 migration keeps the survivor under the type it was last written as; the overwritten one can't be recovered. | Only data written before 25 Oct. vc-dev had one record and migrated cleanly. | None — note for anyone migrating an old data dir. |
-| L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update. Lineage creation time is in the history rows if needed. | Revisit if A3T needs first-creation time (add a column or read v1). |
-| L9 | **History is not readable through AQL** (no `AS OF` / `WITH HISTORY`), by design in D2 v1. The rows are kept. | Audit / time travel only by reading the table directly. | AQL v0.6 proposal (D2 §8). |
-| L11 | **Lance on local disk is not power-safe by itself** (risk K8): its local writer writes data files without fsync. ADB `syncfs`es the store before every log purge and (W9.8) before any compaction deletes the old table or old platform versions, so nothing the log no longer holds depends on unsynced files. Still open: a power cut can leave Lance's *newest* MemWAL / manifest state referring to unsynced files, and opening a damaged table has no fallback (the log only covers what came after the last sync). | Process crashes are safe (tested); power loss or a node reboot could need manual repair of the newest state. Object storage is unaffected. | Open recovery: roll the MemWAL back to the state synced at the last purge and replay the log from there (needs Lance MemWAL internals); or object storage / replicas (M3). |
+| L9 | **History is not readable through AQL** (no `AS OF` / `WITH HISTORY`), by design in D2 v1. The rows are kept. | Audit / time travel only by reading the table directly. | **MVP**, with GR-14 (fact validity reads the same history). D2 §8. |
+| E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | **MVP**: scope in the row id (schema v4). |
+| F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | **MVP**: reflection / consolidation of turns into facts (on one node; across agents is stitching, later). |
+| F-L2 | **FlowR matches procedures itself** (token overlap). ADB takes `PATTERN "text"` and a bound `PATTERN $p` (W9.3); FlowR doesn't use it yet. | Two matchers. | **MVP**: switch FlowR's procedure lookup to `PATTERN`. |
+| AQL-1 | **No `GROUP BY`**: `AGGREGATE` / `HAVING` work over the whole result only (v0.5 §22 open question 1). | Counts per value need one query per value. | **MVP**: AQL grammar, planner and conformance suite. |
+| AQL-2 | **No `STREAM BATCH` or `MERGE`** (v0.5 §22 open questions 4, 5). | Long histories are paged with `LIMIT`; cross-memory joins are a `PIPELINE`. | **Note**: not planned; nothing needs them. |
+| W9-L1 | **`PIPELINE … TIMEOUT` is enforced only with `ADB_ENFORCE_TIMEOUT=1`** (user, 28 Oct): reads take 10–100 ms, so tight budgets would return partial results. When on, each stage gets what is left of the budget; the stage that runs out is dropped (its own partial rows aren't kept), later stages are skipped, and the result carries `timed_out: true`. `TIMEOUT` on a single statement is ignored. | Budgets aren't honoured by default. | **Later**: on by default with the performance work. |
+| L8 | **`created_at` of an updated SEMANTIC / PROCEDURAL record is its current version's commit time** (D3 §5 maps it to `commit_ts`); `accessed_at` is the last write, not the last read (D3 drops read tracking). | Callers expecting first-creation time see the last update; it is in the history rows. | **Note**; revisit if A3T needs first-creation time (with L9 it is readable). |
 
-## Performance shortcuts (fine for dev-sized data)
+## Graph
 
-**Status (29 Oct 2026):** performance work resumed with W10 (hot cache) and W10b
-(reads in place, `LIKE` from the cache). Reads the cache answers are 1–17 ms at
-10k facts; reads that miss it go to Lance and cost what they did (W7-L1, W7-L5,
-W7-L6, W10-L7). Which reads hit is set by the rules (W10-L3).
+What links give today: typed, weighted, directed links between records of any memory
+type; `LINK`, `UPDATE LINK`, `UNLINK` (v0.7), versioned, forgotten with their records,
+delivered to subscribers; multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `ALL`
+(AQL v0.8); entities and facts, where a fact with an object is a link (P1, 29 Oct,
+`P1_GRAPH.md`). A property graph for agent memory, not a graph database.
 
-Where reads stand (release, 10k facts, median ms, `tests/bench-reads.mjs` over
-HTTP, 29 Oct; LanceDB / Postgres columns from the W7 comparison, 28 Oct: embedded
-LanceDB 0.40 after `optimize()`, Postgres 18.4 over localhost TCP with typed columns
-and B-tree indexes):
+| # | Limitation | Effect | Plan |
+|---|---|---|---|
+| GR-14 | **Facts have no validity range**: a fact holds from its commit until superseded or forgotten; there is no user-set `valid_from` / `valid_to` (D2 has the columns) and no "as of" read of facts. W6-L6's timer wheel waits on this. | A knowledge graph can't say when a triple held; a model fed from it can't invalidate by time. | **MVP**: validity on `STORE … FACT`, reads current at a time, expiry by timer, with L9. |
+| GR-13 | **Forgetting an entity leaves facts pointing at it**; traversal skips the missing record. | Dangling facts stay until forgotten. | **MVP**: cascade FORGET of an entity to its facts. |
+| GR-12 | **No entity resolution**: `person:ada` and `person:ada-lovelace` are two entities; entity stubs hold only key and name. | Duplicates until callers agree on keys. | **MVP** on one node: aliases and merging entities (facts move to the survivor). Across agents' scopes: stitching, later. |
+| GR-15 | **No triple feed**: facts can be read with AQL, but nothing exports them as (subject, predicate, object / value, confidence, source, version) in order, for a consumer that keeps a copy. | The storage side of a KBLaM-style model input is missing. | **MVP**: a fact feed over Arrow Flight (snapshot + changes from an offset, superseded / forgotten facts as removals). Encoding to key / value vectors is GQ-3. |
+| GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | **Decide**: in the MVP or not. |
+| GR-9 | **Properties beyond type and weight** (e.g. provenance) aren't readable on `LINK` links. Facts carry `source` and any other fields. | Plain links can't say where they came from. | **Note**: use facts for knowledge with provenance. |
+| GR-11 | **Fact links can't be changed with `UPDATE LINK` / `UNLINK`** (P1.4): the fact row is the link. | Change the fact: store a new one (supersedes) or FORGET it. | **Note**: by design. |
+| GR-16 | **Links don't cross partitions**: a link's target is a record in the same partition (one partition today, S1). | Fine on one partition. | **Later**: stitching (target by global id). |
+
+## Durability and storage
+
+| # | Limitation | Effect | Plan |
+|---|---|---|---|
+| L11 | **Lance on local disk is not power-safe by itself** (risk K8): its local writer writes data files without fsync. ADB `syncfs`es the store before every log purge and (W9.8) before any compaction deletes the old table or old platform versions, so nothing the log no longer holds depends on unsynced files. Still open: a power cut can leave Lance's *newest* MemWAL / manifest state referring to unsynced files, and opening a damaged table has no fallback (the log only covers what came after the last sync). | Process crashes are safe (tested); power loss or a node reboot could need manual repair of the newest state. Object storage is unaffected. | **MVP** with M3 (user, W9.8): rebuild a damaged replica from its peers, or roll the MemWAL back to the last synced state and replay. |
+| S4 | **Lance MemWAL bug parked** (K7, `lancebug.md`): generations sealed during WAL replay lack `_pk_index`, breaking LSM reads. ADB-driven seals avoid it. | Must stay on ADB-driven seals until fixed upstream. | **Later**: file the report; re-check on each Lance upgrade. |
+| W5-L1 | **FORGET rewrites the whole table before it returns** (immediate erasure, user 27 Oct): reads and writes wait for it. Measured (debug): 0.33 s at 1k row versions, 1.4 s at 10k; release several times faster. Concurrent FORGETs share one rewrite. | FORGET latency, and a pause for everyone, grow with the table. Fine for MVP sizes. | **Later**: crypto-shredding (per-lineage keys; FORGET deletes a key) or in-place generation merges, before large tenants. |
+| W5-L2 | **A forgotten record leaves a payload-free stub** (id, memory, kind, scope — no value, text or vector) so subscribers get its `forget` and replay finds the tombstone; the log keeps its `Forget` record. Stubs are never pruned. | The record's **key / id** stays as an identifier. Choose keys without personal data. | **Later**: prune stubs older than the log's retention. |
+| W5-L3 | **Only FORGET erases at once.** Expired rows, unlinked links and topic messages go at the next compaction (thresholds, nightly 03:00 UTC); their payloads stay in the log until its normal purge. | TTL / unlink are housekeeping, not erasure. | **Note**. |
+| W5-L7 | **A platform DELETE leaves disk at the next compaction, not at once** (nightly, after 256 versions of a table, or the admin `compact`); the deleted row's values stay in the log until its normal purge. | Data deleted in A3T (a user, a key) is on disk for up to a day. | **Later**: erase on DELETE for tables marked sensitive, like FORGET. |
+| W5-L5 | **`FORGET FROM ALL` compacts once per memory type that matched.** | Slower than one compaction. | **Later**: one compaction per statement. |
+| W5-L6 | **Compaction thresholds count MemWAL generations only** (> 16); the share of tombstones isn't measured. | Many expirations wait for the nightly run. | **Later**: count tombstones in `_meta`. |
+| L5 | **Records that shared a key across memory types before schema v3 were already one Lance row.** The v2→v3 migration keeps the survivor under the type it was last written as. | Only data written before 25 Oct; vc-dev migrated cleanly. | **Note** for anyone migrating an old data dir. |
+| S6 | **`LocalEngine::replay_only` (test oracle) needs the complete log**; the log is purged below Lance's durable offset every 256 records. | Only usable in tests with < 256 records. | **Note**: not for real data. |
+| W7-L4 | **ADB without `--data-dir` writes to a temporary directory** (removed when it stops) instead of memory. | Needs disk; same engine as durable. | **Note**. |
+
+## Cluster (M3) and partitions
+
+| # | Limitation | Effect | Plan |
+|---|---|---|---|
+| CL-1 | **No replication**: one node; `adb-log` has the log trait but `adb-cluster` is empty and openraft isn't a dependency. The crash tests (R11 / R12, the 1,000-kill run) are single node; there are no Raft, failover or partition tests (R6, R10). | A node or disk loss loses the service and possibly data. | **MVP** (M3): openraft behind `adb-log`, a 3-node replica set, snapshots, membership, archive / purge, fault harness as the gate (DELIVERY_PLAN M3). |
+| CL-2 | **Clients know one ADB URL**: FlowR, runtimes, MCP clients and the CLI have no node list, leader discovery or redirect. | A cluster would need every client to find the leader itself. | **MVP**: followers forward or redirect writes; clients take a node list (or one Service in front). |
+| CL-3 | **Checks that must run at the owner** run in the one sequencer today: key uniqueness (live-key index), `UPDATE … WHERE metadata.version = n` compare-and-set, LINK end checks, fact supersede. | Correct on one node only by construction. | **MVP**: keep them at the partition owner / leader, tested under failover. |
+| CL-4 | **State held only in the process**: subscription registry and cursors in flight, watch frame buffers (W6-L2), TTL timers, the live-key index, the hot cache, idle clocks (W9-L3). | Rebuilt at open from the table and log on one node. | **MVP**: rebuilt by the new leader on failover; subscribers resume by offset. |
+| S1 | **One partition** (`PartitionId(0)`); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per memory type. | Not atomic across types. | **Decide**: the first cluster as one replica set with one partition (recommended; no cross-partition work) or several. |
+| G-L3 | **Platform writes are serialised with memory writes** (one sequencer). | Fine for registry traffic; a heavy writer would queue behind memory writes. | **Later**: a separate partition for platform tables. |
+| W6-L7 | **Watches are single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). Conformance `19_watch.yaml` covers registration; diffs are covered by ADB tests. | — | **Later**: cross-partition watches. |
+| E-L1 | **Each subscriber reads the log itself** (tails the applied log) instead of a matcher at apply fanning out. | Cost grows with subscribers × writes; fine for tens of subscribers on one node. | **Later**: M4 gateway (matcher at apply). |
+
+## Subscriptions and watches
+
+| # | Limitation | Effect | Plan |
+|---|---|---|---|
+| E-L4 | **Every `ACK` is a log record.** | Log volume with many subscribers acking often. | **Later**: batched or gateway-held cursors. |
+| E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | **Later**: with watch sets that honour `WHERE` (W6-L1). |
+| E-L8 | **A patch / forget delivery looks up the record's scope and kind in Lance**; if compaction removed all its rows, the change is skipped. Forgotten records keep a stub (W5-L2), so this needs a record compaction dropped entirely. | Rare. | **Later**: carry scope in `Patch` / `Forget` effects. |
+| E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. (FlowR's `adb_topic` trigger starts flows on a message.) | MCP agents poll. | **Later**: MCP notifications when clients support them. |
+| E-L10 | **Topic messages' TTL is a read filter only**: the expiry timer commits `Expire` for memory records, not for `event` rows. | Subscribers aren't told a message expired. | **Later**. |
+| W9-L2 | **A scope subscription's `reset` carries the scope's whole current state** in one batch and says nothing about rows deleted while the subscriber was away — it replaces what the subscriber holds. (A topic's reset is exact.) | A large scope gives a large first batch after a long absence. | **Later**: page the reset if scopes get big. |
+| W9-L3 | **A subscription's idle clock is in memory**: a restart starts every subscription's 7 days (`ADB_SUB_IDLE`) again. | An abandoned subscription survives longer if ADB restarts often. | **Later** (see CL-4). |
+| W6-L1 | **Every write to a watched memory type (and scope) re-runs the watch** after its debounce: the watch set ignores `WHERE`, and nothing is maintained incrementally. | One query per watch per debounce window while its type is written. | **Later**: `WHERE` pre-filter; incremental filter / count classes. |
+| W6-L2 | **Frames are buffered in memory** (last 1,000 per watch). | After a restart, or past the buffer, a resuming client gets a `reset`, not the diffs. | **Note** for the MVP (see CL-4). |
+| W6-L3 | **A frame's `offset` is a lower bound under concurrent writes**: the result may hold a few records just after it. | Exact at quiet times; converges under load. | **Later**: reads at an exact offset. |
+| W6-L4 | **FORGET and watches**: frames buffered in ADB are scrubbed when the watcher reaches the `Forget`; clients that already received a record keep it until the `removed` diff. | Never on disk; clients must apply `removed`. | **Note**. |
+| W6-L6 | **No timer wheel for validity**: TTL expiry is committed on time (W9.12), but there is no user-set `valid_to` yet. | — | **MVP** with GR-14. |
+
+## Recall
+
+| # | Limitation | Effect | Plan |
+|---|---|---|---|
+| W4-L2 | **Relevance recall scans its candidates** (brute force): no ANN (IVF_RQ) or inverted (BM25) index. | Fine below ~10k rows per memory type and filter; slower above. | **Later** (performance): Lance IVF_RQ + inverted index past the threshold. |
+| W4-L3 | **Word matching is English-only and has no synonyms**: Snowball English stemming and a short stop list (W9.11); BM25 statistics computed over the candidates per query. | Words only back up meaning (weight 0.2). | **Later**: per-language analyzers with the inverted index. |
+| W4-L4 | **The evaluation set is small and synthetic** (93 facts, 42 queries, English); the weights were set on it. | Real agent memory may rank differently. | **Later**: grow it from real (anonymised) A3T queries. |
+| W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | **Later**: calibrate per model. |
+| W9-L4 | **Embedding settings apply by restarting ADB**, and a new model or size clears every vector at once: `LIKE` is partial until the backfill re-embeds (64 records a second; progress in `GET /admin/embedding`). | A few seconds down, then degraded `LIKE` for a large store. | **Note** (user chose clear-and-re-embed, 28 Oct). |
+
+## Performance and the hot cache (deferred)
+
+Performance work is deferred until the feature matrix is complete (user, 28 Oct), and
+scope / edge caching is out of the first MVP run (user, 30 Oct). Everything in this
+section is **Later**.
+
+Where reads stand (release, 10k facts, median ms, `tests/bench-reads.mjs` over HTTP,
+29 Oct; LanceDB / Postgres from the W7 comparison, 28 Oct: embedded LanceDB 0.40 after
+`optimize()`, Postgres 18.4 over localhost TCP with typed columns and B-tree indexes):
 
 | Read | ADB, Lance (cache miss) | ADB, from the cache (W10b) | LanceDB + scalar indexes | Postgres |
 |---|---|---|---|---|
@@ -35,231 +135,138 @@ and B-tree indexes):
 | LIKE (words, 10k) | 143 | 44 | — | — |
 | SCAN WORKING WINDOW | 44 | 1.0 | 5.9 | 0.27 |
 | EPISODIC newest 10 | 53 | 0.9 | — | — |
-| WITH LINKS (50 records) | 61 | 50 (edges from Lance) | 10.4 | 1.2 |
-| FOLLOW LINKS | 112 | 54 (edges from Lance) | 31.0 | 0.91 |
+| WITH LINKS (50 records) | 61 | 50 (links from Lance; before P1.3) | 10.4 | 1.2 |
+| FOLLOW LINKS | 112 | 54 (links from Lance; before P1.3) | 31.0 | 0.91 |
 
-Lance figures are between compactions (W7-L6: about half right after one). From
-the cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the
-bucket for reads that select from all of it (W10-L10).
-
-| # | Shortcut | Effect | Revisit |
-|---|---|---|---|
-| W7-L1 | **A cache miss scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations, so a Lance read costs about the same whatever it selects. Scalar indexes were tried in W10 and didn't help (W10-L7). | Misses (and memory types without a rule) grow with the partition, not the result. | Fewer, larger LSM sources; one table per memory type; or cache rules that keep the memory type. |
-| W7-L2 | **ORDER BY / LIMIT on Lance run after decoding** the candidates (no TopK in the scan). From the cache they sort in memory (17 ms at 10k). | A miss with `ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns and a TopK plan, if misses matter. |
-| W7-L5 | **A payload `WHERE` on Lance parses every row's JSON in the scan** (`adb_json_scalar`): ~40 ms at 10k facts in release. From the cache the JSON is already decoded. | Payload filters on a miss cost the same on small and large results. | Frequently filtered fields as typed columns (payload-field promotion, W10 doc). |
-| W7-L6 | **Lance reads are fastest just after a compaction**: between compactions, small MemWAL batches and generations add ~2× (LOOKUP 24 vs 10 ms). Compaction runs after max(2,000, rows/4) writes. | Miss latency saw-tooths with the write rate. | Merge memtable batches in Lance; incremental compaction. |
-| P2 | **Filter pushdown covers only** `=`, `<`, `<=`, `>`, `>=`, `IN` on top-level scalar fields, `id`, `data.x` and `KEY id`; every condition is then checked exactly on the decoded rows (W7). Not pushed: `!=`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `metadata.*`, nested paths, variables, nulls, other `KEY` fields. | Those predicates decode every current row of the memory type (without vectors). | More operators in `adb_store::filter`. |
-| P3 | **No payload pushdown for PROCEDURAL and TOOLS**: their conditions see the shaped record (defaults the payload may lack). | Each read of them decodes all their rows. | Push down fields the shaping keeps as stored. |
-| P5 | **Stats count by loading every current row** (`count_current`). | `stats` cost grows with data. | Keep counts in `_meta`, or a Lance count query. |
-| P6 | **`FORGET` on SEMANTIC / PROCEDURAL scans all superseded versions** of the type to honour D2 T5; PROCEDURAL builds one view per old version. | Forget cost grows with history size. | With compaction (history pruned) or a pushed-down history filter. |
-| P8 | **Writes hold the sequencer while their record is synced**, so a write waits for its own `fdatasync`; the WAL still group-commits what queues behind the lock. Measured 26 Oct (debug build, local disk): ~2.6 ms per write sequential, ~1,000 writes/s with 16 concurrent writers. | Fine for MVP traffic. | Release the sequencer before the sync with a pending overlay (later writes see in-flight ones), if a workload needs more. |
-| P10 | **Startup scans every current row twice** (hydrate + subscription registry) after Lance and the WAL open: 6.9 s with 4,000 episodes in the debug build, most of it opening the store. | Slow restarts of big partitions (the crash test takes ~95 s for 20 restarts). | Compaction (W5) and a persisted live-key / registry snapshot. |
-| P9 | **Release builds take ~40 min from clean** (fat LTO, 4 jobs in the pod). | Slow deploy loop after a cache wipe. | Thin LTO for dev images, or a build node. |
-
-## Scope cut for now
-
-| # | Item | Notes | Revisit |
-|---|---|---|---|
-| S1 | **One partition** (`PartitionId(0)`); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per memory type. | Not atomic across types. | M3 placement / multi-partition txns. |
-| S3 | ~~Lance R11/R12 crash tests not ported~~ — ported 25 Oct as `adb-store/tests/crash_recovery.rs` (SIGKILL mid-apply → table = model at `_meta`; `_meta` ≥ every claimed durable offset; fenced writer can't change the table). Still single node, local disk, no power-loss test. | — | M3 adds the Raft / multi-node variants (R6, R10). |
-| S4 | **Lance MemWAL bug parked** (K7, `lancebug.md`): generations sealed during WAL replay lack `_pk_index`, breaking LSM reads. ADB-driven seals avoid it. | Must stay on ADB-driven seals until fixed upstream. | File the report; re-check on each Lance upgrade. |
-| S5 | **CI deferred** (user, 24 Oct): build, workspace tests, AQL conformance, FlowR integration and the crash test run by hand before commits. | Easy to miss a regression. | Before M1 ends. |
-| S6 | **`LocalEngine::replay_only` (test oracle) needs the complete log**; the log is purged below Lance's durable offset every 256 records. | Only usable in tests with < 256 records. | Fine as is; noted so nobody uses it on real data. |
-| S8 | **Lance logs at INFO by default**, noisy at startup. | Log volume. | Set `RUST_LOG=info,lance=warn` in the manifest. |
-
-## Subscriptions (stage E)
+Lance figures are between compactions (about half right after one, W7-L6). From the
+cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the bucket.
 
 | # | Limitation | Effect | Revisit |
 |---|---|---|---|
-| E-L1 | **Each subscriber reads the log itself** (tails the applied log) instead of a matcher at apply fanning out. | Cost grows with subscribers × writes; fine for tens of subscribers on one node. | M4 cluster gateway (spec §6 matcher at apply). |
-| E-L4 | **Every `ACK` is a log record.** | Log volume with many subscribers acking often. | Batch cursors (one effect, many subscriptions) or gateway-held cursors (spec open question). |
-| E-L5 | **No authorization at registration or delivery** (ADB has no credentials yet). | Anyone who can reach ADB can subscribe to any topic or scope. | §14.4 auth, with the SaaS control plane. |
-| E-L7 | **`WHERE` on a subscription tests values of puts / supersedes / publishes only**; patches, forgets and links pass if scope and kind match. | A filtered scope subscription can see patches of records outside its filter. | With CQ watch sets (M2). |
-| E-L8 | **A patch / forget delivery looks up the record's scope and kind in Lance**; if compaction ever removes all its rows, the change is skipped. | Only matters once compaction exists (D5 / M2). | Carry scope in `Patch` / `Forget` effects. |
-| E-L9 | **No MCP server push** (`notifications/*`); MCP clients long-poll `next_events`. (FlowR's `adb_topic` trigger, stage F, starts flows on a message.) | MCP agents poll. | MCP server notifications when clients support them. |
-| E-L10 | **Topic messages' TTL is a read filter only**: the expiry timer (L3, fixed) commits `Expire` for memory records, not for `event` rows. | Subscribers aren't told a message expired. | Expire events with compaction (W5). |
-| E-L12 | **Keys are unique per memory type, not per (scope, memory)** as D3 S4 says: row ids are `<memory>:<key>`, so the same key in two scopes is `key_exists`. Named scopes don't apply to WORKING / TOOLS; reads without `IN SCOPE` see every scope (D3 S6's default-to-the-agent's-scope isn't applied). | Use scope-distinct keys. | Scope in the row id (schema v4) with tenancy (M4). |
+| W7-L1 | **A cache miss scans the partition's LSM**: no index serves `memory`, `kind`, `lineage_id` or payload filters in the memtable / generations. Scalar indexes didn't help (W10-L7). | Misses grow with the partition, not the result. | Fewer, larger LSM sources; one table per memory type; cache rules. |
+| W10-L7 | **Scalar indexes didn't help** (W10 spike): misses still cost 25–180 ms at 10k rows in release. | Cache misses are as slow as before. | As W7-L1. |
+| W7-L2 | **ORDER BY / LIMIT on Lance run after decoding** the candidates (no TopK in the scan). | A miss with `ORDER BY x LIMIT 10` decodes the whole memory type. | Sort keys as columns and a TopK plan. |
+| W7-L5 | **A payload `WHERE` on Lance parses every row's JSON in the scan** (`adb_json_scalar`): ~40 ms at 10k facts. | Payload filters on a miss cost the same on small and large results. | Frequently filtered fields as typed columns. |
+| W7-L6 | **Lance reads are fastest just after a compaction**: small MemWAL batches and generations add ~2× between compactions (after max(2,000, rows/4) writes). | Miss latency saw-tooths with the write rate. | Merge memtable batches; incremental compaction. |
+| P2 | **Filter pushdown covers only** `=`, `<`, `<=`, `>`, `>=`, `IN` on top-level scalar fields, `id`, `data.x` and `KEY id`; every condition is then checked exactly on the decoded rows. Not pushed: `!=`, `CONTAINS`, `STARTS_WITH`, `ENDS_WITH`, `metadata.*`, nested paths, variables, nulls, other `KEY` fields. | Those predicates decode every current row of the memory type. | More operators in `adb_store::filter`. |
+| P3 | **No payload pushdown for PROCEDURAL and TOOLS**: their conditions see the shaped record. | Each read of them decodes all their rows. | Push down fields the shaping keeps as stored. |
+| P5 | **Stats count by loading every current row** (`count_current`). | `stats` cost grows with data. | Counts in `_meta`, or a Lance count query. |
+| P6 | **`FORGET` on SEMANTIC / PROCEDURAL scans all superseded versions** of the type (D2 T5). | Forget cost grows with history size. | A pushed-down history filter. |
+| P8 | **Writes hold the sequencer while their record is synced**; the WAL still group-commits what queues behind the lock. ~2.6 ms per write sequential, ~1,000 writes/s with 16 writers (debug, 26 Oct). | Fine for MVP traffic. | Pending overlay, if a workload needs more. |
+| P10 | **Startup scans every current row twice** (hydrate + subscription registry): 6.9 s with 4,000 episodes (debug). | Slow restarts of big partitions. | A persisted live-key / registry snapshot. |
+| W10-L3 | **Reads that need every row use the cache only when the bucket is complete**; from an incomplete one only EPISODIC newest-first `LIMIT k` and WORKING `WINDOW`. A read without `IN SCOPE` needs every scope's bucket complete. | A `last: n` rule speeds up recent-first reads only. | `all` (or a large `bytes`) for types read that way. |
+| W10-L4 | **A rules change rebuilds the cache with applies and reads held.** | A pause of one scan on `PUT /admin/cache`. | Build beside the old cache. |
+| W10-L5 | **Cache sizes are estimates** (payload JSON + ids + 256 B a row); the cache is per process. | The pod limit must leave room for `max_bytes` plus overhead. | Measure real heap per row. |
+| W10-L6 | **Cache warm-up at open scans the kept memory types.** | Adds to P10. | Snapshot the cache, or warm lazily. |
+| W10-L10 | **Reads over a kept bucket are one pass over it**: 8–17 ms at 10k rows, 44 ms for `LIKE`. | Linear past ~10k rows per bucket. | Per-field maps in buckets; cached BM25 statistics; ANN (W4-L2). |
+| W10-L11 | **Vectors make cached rows ~3× larger** (768 B a row at 384 dims). | A `keep: all` SEMANTIC bucket of 100k facts is ~110 MB. | `"vectors": false` when `LIKE` isn't used on cached types. |
 
-## FlowR wiring (stage F)
+## Platform tables, FlowR and runtimes
 
-| # | Limitation | Effect | Revisit |
+| # | Limitation | Effect | Plan |
 |---|---|---|---|
-| F-L2 | **FlowR matches procedures itself** (token overlap). ADB now takes `PATTERN "text"` and a bound `PATTERN $p` (W9.3); FlowR doesn't use it yet. | FlowR does its own matching. | Switch FlowR's procedure lookup to `PATTERN`. |
-| F-L3 | **The agent's own turns are stored as WORKING (user) / EPISODIC (assistant)**, but nothing summarises them into facts. | Long-term memory grows only through the `remember` tool. | Reflection / summarisation (M2 lifecycle). |
-| F-L4 | **`adb_topic` triggers can only be created through the API / `create_trigger`** — A3T's Triggers page lists webhook and cron. | No UI to set one up yet. | A3T UI. |
-| F-L5 | **`adb_topic` delivers to workflow targets only** (FlowR has no agent inbox). | Point the trigger at an agent's flow. | — |
-| F-L6 | **Topic trigger flows run without a caller** (`principal: None`, the runtime service). | Cedar policies for those runs apply to the service principal. | Give triggers an owner principal (as agents have). |
-| F-L7 | `a3t/backend/resources/a3t-resources.yaml` is gitignored; its ADB URLs were updated to `http://adb:3000` locally only. | A fresh A3T install from another checkout still points at `clawdb`. | Commit a template without secrets. |
+| G-L5 | **Switching a running install to ADB is manual**: `import-lancedb`, then `a3t/a3t-platform-db` `backend: adb`, then restart FlowR. Writes between the import and the restart go to the embedded copy. | Plan a short write freeze. | **Note** for the W8 switch; a follow-the-writes import later. |
+| G-L2 | **Every platform column is UTF-8**, as in A3T's embedded LanceDB; no vector search. | Same as today. | **Later**: when A3T needs typed / vector columns. |
+| G-L6 | **FlowR's own state**: registry and `agent:*` state are on ADB (W2c); executions, queue, checkpoints, settings and non-runtime triggers stay local. | Execution history is per FlowR. | **Later**: when FlowR clusters. |
+| G-L7 | `call:rotate`'s knowledge-graph database (`a3t-kg.lance`) stays embedded. | — | **Later**: with the central KG. |
+| G-L8 | **SQL console has no memory cap**: bounded by its row limit (≤ 10,000) and a 30 s timeout. | Superadmin-only, a deliberate risk. | **Later**: a DataFusion memory pool. |
+| G-L9 | **SQL console results reach FlowR as text**; nested values as their display form. | Fine for reading. | **Later**: typed JSON if an export is wanted. |
+| W2-L1 | **Shared-registry writes aren't transactions**: a state `set` and a workflow `register` are delete + insert; two FlowRs writing one key race; `incr` isn't atomic. | Fine for one console plus runtimes that own their keys. | **Later**: an ADB upsert action. |
+| W2-L2 | **Registry reads go to ADB every time** (a Flight `do_get` per lookup). | A few ms per lookup in-cluster. | **Later**: cache invalidated by a `table` subscription. |
+| W2-L3 | **Replies carry the run output as JSON text** (`output_json`): topic messages hold AQL scalars. | Consumers `fromjson` it. | **Later**: object / list literals in `PUBLISH`. |
+| W2-L4 | **One runtime pod per deployment**: two replicas would both read the subscription and run each request twice. | Isolated canvases have one pod, so fine today. | **Later**: consumer groups. |
+| W2-L5 | **Shared placement** (`mode: shared`, a `Runtime` pool) isn't routed. | Shared canvases still run on the console. | **Later**. |
+| W2-L6 | **Chat isn't relayed** to deployed canvases; no token streaming from a runtime. | Chat with a deployed agent runs in the console. | **Later**: chat relay over topics. |
+| W2-L7 | **A runtime's run history is local to its pod.** | Runs on a deleted pod are visible only through replies / memory. | **Later**, with G-L6. |
+| W2-L8 | **Switching the console off the shared registry** returns it to its local registry as of the switch. | Copy back by hand if needed. | **Later**. |
+| W2-L11 | **Concurrent reconciles of one changed Sandbox can recreate it 2–3 times** in the first second. | A few extra seconds of restart per template change. | **Later**: serialise per object. |
+| F-L4 | **`adb_topic` triggers can only be created through the API / `create_trigger`**. | No A3T UI for them. | **Later**: A3T Triggers page. |
+| F-L5 | **`adb_topic` delivers to workflow targets only** (no agent inbox). | Point the trigger at an agent's flow. | **Note**. |
+| F-L6 | **Topic trigger flows run without a caller** (`principal: None`). | Cedar policies apply to the service principal. | **Later**: trigger owner principal. |
+| F-L7 | `a3t/backend/resources/a3t-resources.yaml` is gitignored; its ADB URLs were changed locally only. | A fresh install still points at `clawdb`. | **Later**: commit a template without secrets. |
 
-## Platform tables (stage G)
+## Security and tenancy (M4)
 
-| # | Limitation | Effect | Revisit |
+| # | Limitation | Effect | Plan |
 |---|---|---|---|
-| G-L2 | **Every platform column is UTF-8**, as in A3T's embedded LanceDB; no vector search (`call:lancedb` `search` is unsupported on both backends). | Same as today. | When A3T needs typed / vector platform columns. |
-| G-L3 | **Platform writes are synchronous and serialised with memory writes** (one sequencer). | Fine for registry traffic; a heavy writer would queue behind memory writes. | Separate partition for platform tables (M3 placement). |
-| G-L5 | **Switching a running install to ADB is manual**: `import-lancedb` then edit `a3t/a3t-platform-db` (`backend: adb`) and restart FlowR. Writes between the import and the restart go to the embedded copy. | Plan a short write freeze for the switch. | An import mode that follows FlowR writes, or a switch flow. |
-| G-L6 | **FlowR's own state**: the registry (workflows, resources) and `agent:*` state (configs, sessions) are on ADB with `FLOWR_REGISTRY_ADB` (W2c); executions, queue, checkpoints, settings and non-runtime triggers stay local. | Execution history is per FlowR. | When FlowR clusters. |
-| G-L7 | `call:rotate`'s knowledge-graph database (`a3t-kg.lance`) stays embedded. | — | When needed. |
-| G-L8 | **SQL console has no memory cap**: a query is bounded by its row limit (≤ 10,000) and a 30 s timeout, not by memory; a large join or sort can use a lot of RAM on the ADB pod. | Superadmin-only, so a deliberate risk. | A DataFusion memory pool on the SQL session. |
-| G-L9 | **SQL console results reach FlowR as text** (every value formatted), and nested values (lists, structs) as their display form. | Fine for reading; no typed export. | Typed JSON if an export is wanted. |
-| G-L10 | **ADB has one admin token**: anything holding `ADB_AUTH_TOKEN` (FlowR, the CLI) can run SQL; the superadmin check is in FlowR. | Same trust as today's Flight writes. | Per-caller tokens / roles in ADB (M4 tenancy). |
+| G-L10 | **ADB has one admin token** (`ADB_AUTH_TOKEN`): anything holding it (FlowR, the CLI) can read, write and run SQL; the superadmin check is in FlowR. | One trust level. | **Later**: per-caller tokens / roles (M4). |
+| E-L5 | **No authorization at subscription registration or delivery** beyond the token. | Any token holder can subscribe to any topic or scope. | **Later**: §14.4 with M4. |
+| W6-L5 | **No per-tenant limits, metering or per-watch permissions.** | Fine on one trusted node. | **Later**: M4. |
+| W2-L9 | **Runtime pods serve FlowR's full API** though nothing calls them; `/message` can write the shared registry for a caller with a valid token. | Same trust as the console. | **Later**: a runtime mode that serves only `/health`. |
 
-## Runtimes on ADB (MVP W2)
+## Tooling
 
-| # | Limitation | Effect | Revisit |
+| # | Limitation | Effect | Plan |
 |---|---|---|---|
-| W2-L1 | **Shared-registry writes aren't transactions**: a state `set` and a workflow `register` are delete + insert (two log records); two FlowRs writing one key race, last write wins; `incr` isn't atomic. | A reader can briefly miss a key mid-write. Fine for one console plus runtimes that own their keys. | An ADB upsert action (one effect). |
-| W2-L2 | **Reads go to ADB every time** (no cache): each `resources().get` / `workflows().get` is a Flight `do_get` with a filter (full scan of a small table). | A few ms per lookup in-cluster. | Cache with invalidation from a `table` subscription. |
-| W2-L3 | **Replies carry the run output as JSON text** (`output_json`): ADB topic messages hold AQL scalars, so the MCP `publish` tool stringifies nested values. | Consumers `fromjson` it. | Object / list literals in AQL `PUBLISH`. |
-| W2-L4 | **One runtime pod per deployment**: the subscription is per deployment (kept in ADB under `runtime:<ns>/<name>:triggers`), so two replicas would both read it and run each request twice. | Isolated canvases have one Sandbox pod, so fine today. | Consumer groups (competing consumers) on a subscription. |
-| W2-L5 | **Shared placement** (`mode: shared`, a `Runtime` pool) isn't routed: only isolated canvases get a runtime that takes work from their topic. | Shared canvases still run on the console. | Pool runtimes subscribing to each placed canvas's topic. |
-| W2-L6 | **Chat isn't relayed**: the console's chat runs agents in the console; deployed canvases take work only from their topic (`a3t/canvas-dispatch`, or any `PUBLISH` to `canvas.<ns>.<name>`). No token streaming from a runtime. | Chat with a deployed agent still runs in the console. | Chat relay over topics (request topic + reply topic with partial tokens). |
-| W2-L7 | **A runtime's run history is local to its pod** (executions stay local, decision W2c); the reply and ADB memory are what survive a pod. | Runs on a deleted pod are only visible through replies / memory. | With G-L6. |
-| W2-L8 | **Switching the console back off the shared registry** (unset `FLOWR_REGISTRY_ADB`) returns it to its local registry as of the switch; changes made since live only in ADB. | Copy back by hand if needed. | A switch-back that copies `flowr_*` tables to local. |
-| W2-L11 | **Concurrent reconciles of one changed Sandbox can recreate it 2–3 times** in the first second (each sees the old hash before the first apply lands). | A few extra seconds of runtime restart once per template change; settles (18 recreations for 5 sandboxes on 27 Oct, then none). | Serialise per object, or re-read after the delete. |
-| W2-L9 | **Runtime pods' inbound API**: they run FlowR EE with the console's policy hook / OIDC settings via the controller's `A3T_RUNTIME_ENV_*`, but nothing calls them; a runtime's `/message` endpoint can still write the shared registry for a caller with a valid token. | Same trust as the console. | A runtime mode that serves only `/health`. |
+| S5 | **No CI** (user, 24 Oct): `tests/check-all.sh` is run by hand before commits and images. | Easy to miss a regression. | **MVP**, before M3: the fault harness runs on every replication change. Needs the branches pushed. |
+| P9 | **Release builds take ~40 min from clean** (fat LTO, 4 jobs in the pod). | Slow deploy loop after a cache wipe. | **Later**: thin LTO for dev images, or a build node. |
+| S8 | **Lance logs at INFO by default**; every read logs a `plan_run` line. | Log volume. | **Later**: `RUST_LOG=info,lance=warn` in the manifest. |
+| GR-8 | **The WASM playground's built `pkg/` predates v0.6** (source updated; no wasm-pack here). | The browser playground rejects newer statements. | **Later**: `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
+| GR-10 | **The playground ignores direction and `MIN_WEIGHT`** (it parses v0.8). | Browser results differ from ADB for v0.8 link reads. | **Later**, with GR-8. |
 
-## AQL / Graph (links)
+## Deferred phases — open questions (29 Oct)
 
-What links give today (26 Oct): typed, weighted, directed edges between records of any
-memory type; `LINK`, `UPDATE LINK`, `UNLINK` (v0.7), versioned, forgotten with their
-records, delivered to subscribers; one-hop reads `WITH LINKS ALL | TYPE`, `FOLLOW LINKS
-TYPE`, `REFLECT … FOLLOW LINKS`. A light property graph, not a graph database.
-Since P1.1–P1.2 (29 Oct): multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `ALL`
-(AQL v0.8, `P1_GRAPH.md`).
-
-| # | Limitation | Effect | Revisit |
-|---|---|---|---|
-| GR-4 | **No paths / shortest path / link counts or aggregates over links.** | No graph analytics. | Only if a use case needs it (post-MVP). |
-| GR-9 | **Edge properties beyond type and weight** (e.g. provenance) aren't readable on `LINK` edges. Facts carry `source` and any other fields. | Plain links can't say where they came from. | Use facts for knowledge with provenance. |
-| GR-11 | **Fact links can't be changed with `UPDATE LINK` / `UNLINK`** (P1.4): the fact row is the link. | Change the fact: store a new one (supersedes) or FORGET it. | By design. |
-| GR-12 | **No entity resolution**: `person:ada` and `person:ada-lovelace` are two entities; entity stubs hold only key and name. | Duplicates until callers agree on keys. | Phase 3 consolidation (GOALS). |
-| GR-13 | **Forgetting an entity leaves facts pointing at it**; traversal skips the missing record. | Dangling facts stay until forgotten. | Cascade on FORGET of an entity, if needed. |
-| GR-10 | **The playground ignores direction and `MIN_WEIGHT`** (it parses v0.8). | Browser results differ from ADB for v0.8 link reads. | With GR-8. |
-| GR-8 | **The WASM playground's built `pkg/` predates v0.6 / v0.7** (source updated; no wasm-pack here). | The browser playground rejects the new statements. | `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
-
-## Recall (W4)
-
-| # | Limitation | Effect | Revisit |
-|---|---|---|---|
-| W4-L2 | **Relevance recall scans its candidates** (brute force): every `LIKE` loads the current rows passing the filters, with their vectors, and ranks them in Rust; no ANN (IVF_RQ) or inverted (BM25) index yet. | Fine below ~10k rows per memory type and filter (S8); slower above. | Lance IVF_RQ + inverted index past the threshold, with the W7 query engine. |
-| W4-L3 | **Word matching is English-only and has no synonyms**: Snowball English stemming and a short stop list (W9.11; a longer stop list scored worse — "down", "out", "not" matter in agent memory); BM25 statistics are computed over the candidate set per query. | Words only back up meaning (weight 0.2). | Per-language analyzers with the inverted index (W4-L2). |
-| W4-L4 | **The evaluation set is small and synthetic** (93 facts, 42 queries, English); the weights were set on it. | Real agent memory may rank differently. | Grow it from real (anonymised) A3T queries. |
-| W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | Calibrate per model (W4-L1). |
-
-## Lifecycle (W5)
-
-| # | Limitation | Effect | Revisit |
-|---|---|---|---|
-| W5-L1 | **FORGET rewrites the whole table before it returns** (immediate erasure, user 27 Oct): reads and writes wait for it. Measured (debug): 0.33 s at 1k row versions, 1.4 s at 10k; release several times faster. Concurrent FORGETs share one rewrite. | FORGET latency, and a pause for everyone, grow with the table. Fine for MVP sizes. | Crypto-shredding (per-lineage keys; FORGET deletes a key) or in-place generation merges with Lance support, before large tenants. |
-| W5-L2 | **A forgotten record leaves a payload-free stub** (id, memory, kind, scope — no value, text or vector) so subscribers get its `forget` and replay finds the tombstone; the log keeps its `Forget` record. Stubs are never pruned. | The record's **key / id** stays as an identifier. Choose keys without personal data. | Prune stubs older than the log's retention. |
-| W5-L3 | **Only FORGET erases at once.** Expired rows, unlinked edges and topic messages go at the next compaction (thresholds, nightly 03:00 UTC); their payloads stay in the log until its normal purge. | TTL / unlink are housekeeping, not erasure. | — |
-| W5-L7 | **A platform DELETE leaves disk at the next compaction, not at once** (nightly 03:00 UTC, after 256 versions of a table, or the admin `compact`); the deleted row's values stay in the log until its normal purge (as W5-L3). | Data deleted in A3T (a user, a key) is on disk for up to a day. | Erase on platform DELETE for tables marked sensitive, like FORGET. |
-| W5-L5 | **`FORGET FROM ALL` compacts once per memory type that matched.** | Slower than one compaction. | One compaction per statement. |
-| W5-L6 | **Compaction doesn't change the size threshold logic for tombstones**: thresholds are MemWAL generations > 16 only (tombstone share isn't measured). | Many expirations wait for the nightly run. | Count tombstones in `_meta`. |
-
-## Continuous queries (W6)
-
-| # | Limitation | Effect | Fix |
-|---|---|---|---|
-| W6-L1 | **Every write to a watched memory type (and scope) re-runs the watch** after its debounce: the watch set ignores `WHERE`, and nothing is maintained incrementally. | One query per watch per debounce window while its memory type is written; many watches on a busy type cost CPU. | `WHERE` pre-filter on put values; incremental filter / count classes with the query engine (W7). |
-| W6-L2 | **Frames are buffered in memory** (last 1,000 per watch). | After an ADB restart, or past the buffer, a resuming client gets a `reset` (full result), not the diffs. | Fine for MVP; persist frames only if clients need it. |
-| W6-L3 | **A frame's `offset` is a lower bound under concurrent writes**: the result holds every record up to it, and may hold a few just after (they then cause an empty or smaller next diff). | Exact at quiet times; converges under load. | Reads at an exact offset (snapshot reads, W7). |
-| W6-L4 | **FORGET and watches**: frames buffered in ADB are scrubbed when the watcher reaches the `Forget` (milliseconds); clients that already received a record keep their copy until the `removed` diff. | Never on disk; clients must apply `removed`. | — |
-| W6-L5 | **No per-tenant limits, metering or per-watch permissions**: anyone with the ADB token can watch anything. | Fine on one trusted node. | Tenancy limits with the cluster gateway (M4). |
-| W6-L6 | **No timer wheel**: results change on committed records only. TTL expiry is committed on time (timers per expiry, W9.12), so TTL'd rows leave results; there is no user-set `valid_to` yet that would need a timer. | — | When user-set validity ranges arrive. |
-| W6-L7 | **Single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). Conformance `19_watch.yaml` covers registration; diffs are covered by ADB tests. | — | Cross-partition watches (spec v2). |
-
-## Spec completion (W9)
-
-| # | Limitation | Effect | Fix |
-|---|---|---|---|
-| W9-L1 | **`PIPELINE … TIMEOUT` is enforced only with `ADB_ENFORCE_TIMEOUT=1`** (user, 28 Oct): reads take 10–100 ms, so tight budgets would return partial results. When on, each stage gets what is left of the budget; the stage that runs out is dropped (its own partial rows aren't kept), later stages are skipped, and the result carries `timed_out: true`. `TIMEOUT` on a single statement is ignored. | Budgets aren't honoured by default. | Turn it on by default with the performance work. |
-| W9-L2 | **A scope subscription's `reset` carries the scope's whole current state** (every current row, after its filter) in one batch, and says nothing about which rows were deleted while the subscriber was away — it replaces what the subscriber holds. (A topic's reset is exact: the retained messages after the subscriber's position.) | A large scope gives a large first batch after a long absence. | Page the reset (`next` cursor over the table) if scopes get big. |
-| W9-L3 | **A subscription's idle clock is in memory**: a restart of ADB starts every subscription's 7 days (`ADB_SUB_IDLE`) again. | An abandoned subscription survives longer if ADB restarts often. | Persist the last read with the cursor, if it matters. |
-| W9-L4 | **Embedding settings apply by restarting ADB** (it stops itself after saving; Kubernetes starts it again, a local `adb serve` must be restarted by hand), and a new model or size clears every vector at once: recall by meaning (`LIKE`) is partial until the backfill re-embeds (64 records a second; progress in `GET /admin/embedding`). | A few seconds down, then degraded `LIKE` for a large store. | Side-by-side re-embedding into a second column, if it matters (user chose clear-and-re-embed, 28 Oct). |
-
-## Hot cache (W10)
-
-| # | Limitation | Effect | Revisit |
-|---|---|---|---|
-| W10-L3 | **Reads that need every row use the cache only when the bucket is complete**; from an incomplete one only EPISODIC newest-first `LIMIT k` (no ORDER BY) and WORKING `WINDOW LAST n` / `LAST <duration>`. A read without `IN SCOPE` needs every scope's bucket complete. | A `last: n` rule speeds up recent-first reads, not WHERE / ORDER BY / AGGREGATE over the whole memory type. | `all` (or a large `bytes`) for memory types read that way; per-field ordered indexes in buckets if needed. |
-| W10-L4 | **A rules change rebuilds the cache with applies and reads held** (one scan of the kept memory types under the store's exclusive lock). | A pause of a scan's length (ms to seconds) on `PUT /admin/cache`. | Build beside the old cache and replay the applies in between. |
-| W10-L5 | **Sizes are estimates** (payload JSON + ids + 256 B a row), and the cache is per process. | The pod's memory limit must leave room for `max_bytes` plus overhead. | Measure real heap per row; size `max_bytes` from the pod limit. |
-| W10-L6 | **Warm-up at open scans the kept memory types** (after the catch-up, before serving). | Adds to slow restarts of big partitions (P10). | Snapshot the cache with the store, or warm lazily. |
-| W10-L10 | **Reads over a kept bucket are one pass over it**: no per-field index inside buckets, so `WHERE` / `ORDER BY` / `AGGREGATE` / `LIKE` cost O(bucket rows) — 8–17 ms at 10k rows, 44 ms for `LIKE` (BM25 statistics recomputed per query, W4-L3). | Fine to ~10k rows per bucket; linear above. | Per-field ordered maps in buckets for filtered / sorted fields; cached term statistics for BM25; ANN past ~50k rows (W4-L2). |
-| W10-L11 | **Vectors make cached rows ~3× larger** (768 B a row at 384 dims, f16, on ~300 B of payload). | A `keep: all` SEMANTIC bucket of 100k facts is ~110 MB with vectors. | `"vectors": false` (A3T Settings checkbox) when `LIKE` isn't used on cached types; per-rule vectors if needed. |
-| W10-L7 | **Scalar indexes didn't help** (spike, W10 doc): Lance reads that miss the cache still cost 25–180 ms at 10k rows in release (W7-L1 stands for misses). | Cache misses and SEMANTIC without a rule are as slow as before. | Fewer, larger LSM sources (merge generations), one table per memory type, or SEMANTIC rules. |
-
-## Query engine (W7)
-
-Read-speed items W7-L1, L2, L5 and L6 are under Performance shortcuts (W7-L3 fixed by the hot cache).
-
-| # | Limitation | Effect | Fix |
-|---|---|---|---|
-| W7-L4 | **ADB without `--data-dir` writes to a temporary directory** (removed when it stops) instead of memory. | Needs disk; same engine as durable. | — |
-
-## End goals — open questions (29 Oct)
-
-Unanswered questions from setting the end goals and priority order (`GOALS.md`).
-Each must be settled before its phase is designed.
+Edge ADB and the central KG are out of the first MVP run (user, 30 Oct). Each question
+must be settled before its phase is designed.
 
 | # | Question | Blocks | Recommendation so far |
 |---|---|---|---|
-| GQ-1 | **Can an edge serve a read that is a little behind?** | Phase 2 (edge ADB) | Yes for other agents' writes to shared scopes; an agent's own writes always wait for their commit offset (read-your-writes). |
-| GQ-2 | **Where is query text embedded for `LIKE` on an edge?** The model is ~130 MB of memory in every runtime container. | Phase 2 | Embed on the core (~1 ms round trip); local embedding as an option. |
-| GQ-3 | **Who produces the KBLaM key / value vectors?** ADB (needs the agentLM / harnessLM encoder and adapters), or ADB exports triples and the model side encodes. | Phase 4 | — |
-| GQ-4 | **Where are agentLM / harnessLM specified?** Nothing in the workspace describes them. | Phase 4 | — |
-| GQ-5 | **The edge role isn't in ARCHITECTURE.md yet**; §13 still says "no embedded production profile" (7 Oct). | Phase 2 | Design §8 / §13 / §15 when phase 2 starts (user, 29 Oct: don't change the architecture yet). |
+| GQ-1 | **Can an edge serve a read that is a little behind?** | Edge ADB | Yes for other agents' writes to shared scopes; an agent's own writes always wait for their commit offset. |
+| GQ-2 | **Where is query text embedded for `LIKE` on an edge?** The model is ~130 MB in every runtime container. | Edge ADB | Embed on the core (~1 ms round trip); local as an option. |
+| GQ-3 | **Who produces the KBLaM key / value vectors?** ADB (needs the agentLM / harnessLM encoder and adapters), or the model side from ADB's triple feed (GR-15). | Central KG | — |
+| GQ-4 | **Where are agentLM / harnessLM specified?** Nothing in the workspace describes them. | Central KG | — |
+| GQ-5 | **The edge role isn't in ARCHITECTURE.md**; §13 still says "no embedded production profile" (7 Oct). | Edge ADB | Design §8 / §13 / §15 when the phase starts. |
 
 ## Outside ADB (FlowR / A3T), found while testing
 
 | # | Item | Notes |
 |---|---|---|
 | F1 | `a3t/a3t-chat-engine` (stored flow) falls back to LLM `a3t/austra`, which doesn't exist (`default/Austra` does). | Chat with an agent that has no LLM fails. User to edit. |
-| F2 | Agents / templates saved with `enabled_tools: []` before the 25 Oct UI fix (`4c988de`) deny every tool. | Re-save each affected agent (turn "Restrict tools" off or pick tools). |
-| F3 | When an agent has no tool list, the chat engine passes `enabled_tools: null` into `system/agent-engine`'s config; whether that overrides a list set on the template wasn't checked. | Check if template-level restrictions seem not to apply. |
+| F2 | Agents / templates saved with `enabled_tools: []` before the 25 Oct UI fix (`4c988de`) deny every tool. | Re-save each affected agent. |
+| F3 | When an agent has no tool list, the chat engine passes `enabled_tools: null` into `system/agent-engine`; whether that overrides a template's list wasn't checked. | Check if template restrictions seem not to apply. |
 | F4 | `a3t-chat-engine` hard-codes `mcp_servers` `[a3t/agent-flows]` as its fallback. | Should be `${ .mcp_servers // [...] }`. |
-| F5 | FlowR on vc-dev (`flowr:2026-10-28-ee8`) rejects the registry's Cedar policies at start (policy12–21 use `flow:deploy`, `flow:terminate`, `runtime:hibernate`, … which the schema doesn't define) and falls back to the embedded base schema (`registry_policies=0`). | Registry policies aren't applied on vc-dev. | Add the actions to the AESOP schema or fix the policies (FlowR). |
+| F5 | FlowR on vc-dev rejects the registry's Cedar policies at start (policy12–21 use `flow:deploy`, `flow:terminate`, `runtime:hibernate`, … which the schema doesn't define) and falls back to the embedded base schema (`registry_policies=0`). | Add the actions to the AESOP schema or fix the policies (FlowR). |
 
 ## Fixed (moved here when done)
 
 | Was | Fixed in |
 |---|---|
+| GR-1, GR-7 / L6: DEPTH ignored; LOOKUP … FOLLOW LINKS returned the source | P1.1 (`0f9ff6a`, 29 Oct): every record within n hops by hop then path weight, `_hop` / `_path_weight`, cycle-safe, capped at 5 hops / 1,000 records; LOOKUP and REFLECT the same |
+| GR-2, GR-3: outbound links only, no conditions on links | P1.2 (29 Oct, AQL v0.8 `fa6d0d2`): `INBOUND` / `BOTH`, `MIN_WEIGHT`, `TYPE IN` / `ALL` on FOLLOW and WITH LINKS; REFLECT honours FOLLOW's type |
+| W10-L2: links weren't cached | P1.3 (`cbdf06b`): every current link (edges and fact links) in the hot cache by both ends |
+| No entities or facts (subject–predicate–object) | P1.4 (`4241735`, AQL `b03451b`): `STORE INTO SEMANTIC FACT [MULTI]`, one current fact per (subject, predicate), entity stubs, a fact with an object is a link; MCP `remember` with subject / predicate |
+| GR-6: agents didn't use links | P1.5 (flowr `ff3e349`, 29 Oct): related facts about recalled entities and linked records in the prompt (weight ≥ 0.5, up to 5), fact confidence in the rank; `memory_config.semantic.{related, related_min_weight}` |
+| S3: Lance R11/R12 crash tests not ported | 25 Oct: `adb-store/tests/crash_recovery.rs` (SIGKILL mid-apply → table = model at `_meta`; `_meta` ≥ every claimed durable offset; fenced writer can't change the table). Multi-node variants: CL-1 |
 | W7-L3: WORKING read from the table (no in-memory tier) | W10 (`40f1949`): the hot cache keeps WORKING (10 MB per scope by default); `SCAN … WINDOW` 44 → 1.0 ms in release |
 | P11: no in-memory index or row cache of ADB's own | W10 / W10b: per-node hot cache per memory type and scope, rules in `cache.json` / `PUT /admin/cache` / A3T Settings; key reads ~1 ms, scans of a kept memory type 8–17 ms at 10k. Misses: W7-L1 |
-| P7: only `id` has a scalar index | W10 spike: BTrees on `lineage_id`, `memory`, `scope`, `subject_id`, `commit_ts` (MemWAL-maintained) made no difference — the cost is per-source LSM overhead (W10-L7); the cache serves key lookups instead |
-| W10-L1: `LIKE` not served from the cache (no vectors kept) | W10b (29 Oct): the cache keeps vectors (`vectors`, default on, 2 B a dimension); `LIKE` over a complete bucket ranks in memory (release, 10k facts: 143 → 44 ms, the rest is the word ranking) |
-| W10-L8: a read copied its bucket's rows out of the cache | W10b (29 Oct): rows and their records shared with the cache, copied only when returned; ORDER BY sort keys computed once (release, 10k kept: WHERE 45 → 8 ms, ORDER BY LIMIT 97 → 17 ms) |
-| W10-L9: SEMANTIC not cached by default | 29 Oct: default rule keeps the newest 64 MB of facts per scope (user: as recommended, rolled with W10b); a saved `cache.json` keeps its own rules |
+| P7: only `id` has a scalar index | W10 spike: BTrees on `lineage_id`, `memory`, `scope`, `subject_id`, `commit_ts` made no difference (W10-L7); the cache serves key lookups instead |
+| W10-L1: `LIKE` not served from the cache (no vectors kept) | W10b (29 Oct): the cache keeps vectors (default on, 2 B a dimension); `LIKE` over a complete bucket ranks in memory (143 → 44 ms) |
+| W10-L8: a read copied its bucket's rows out of the cache | W10b (29 Oct): rows shared with the cache, copied only when returned (WHERE 45 → 8 ms, ORDER BY LIMIT 97 → 17 ms) |
+| W10-L9: SEMANTIC not cached by default | 29 Oct: default rule keeps the newest 64 MB of facts per scope; a saved `cache.json` keeps its own rules |
 | Same key in two memory types was one Lance row (data loss on restart) | `d4f0573` (schema v3) |
 | Links to a forgotten record lingered until restart | `310a3d1` (D4.1) |
 | Procedural `ORDER BY` / `RETURN` ignored | `18f7a25` (D4.2) |
 | `UPDATE` overwrote facts in place (no history) | `4003984` (D4.3) |
 | `FORGET` missed values only in old versions (D2 T5) | `b367ac4` (D4.4a) |
 | Links couldn't be changed or removed (LINK again added a parallel link) | 26 Oct: AQL v0.7 `UPDATE LINK` / `UNLINK`, re-LINK updates the weight; MCP `unlink`; subscribers get `supersede` / `unlink` of kind `edge` |
-| `ORDER BY created_at` ignored on SEMANTIC (sorted on payload fields only) | `9bcec26` |
+| `ORDER BY created_at` ignored on SEMANTIC | `9bcec26` |
 | W2-L10: Sandbox pods kept their old template | flowr `a3t-controller`: template hash annotation; a changed hash recreates the Sandbox |
-| L10: FORGET was logical only | W5 (27 Oct): FORGET compacts before it returns — table rewritten without the record (old table, versions and MemWAL files deleted), its payload redacted from the log (offsets and subscribers kept); the spike and `forget_erases_from_disk_before_it_returns` check no file holds it |
+| L10: FORGET was logical only | W5 (27 Oct): FORGET compacts before it returns — table rewritten without the record, its payload redacted from the log; `forget_erases_from_disk_before_it_returns` checks no file holds it |
 | L1: no embeddings; `RECALL … LIKE` found nothing | W4 (`d82f05d`): local bge-small embeddings on write, in the log; backfill; hybrid ranking; MCP `recall` `like` |
 | F-L1: agents got the newest 5 facts | W4: `RECALL … LIKE $message` with `memory_config.semantic.{limit, min_confidence}` |
 | L2: STORE with a key in use replaced the record | W3 (26 Oct): `key_exists` for SEMANTIC / EPISODIC / PROCEDURAL; MCP `remember` updates |
 | E-L6: every row had scope `tenant:default` | W3 (26 Oct): `IN SCOPE` on STORE / RECALL / LOOKUP / UPDATE / FORGET, MCP `scope` |
 | L3: TTL expiry was a read filter only | W3 (26 Oct): expiry timer commits `Expire`, delivered as `expire` |
-| G-L4 / W5-L4: platform datasets never compacted (DELETE logical, a version per write) | W5-L4 (27 Oct): `PlatformStore::compact` (`compact_files` materialising deletions + `cleanup_old_versions`), nightly, after 256 versions, and in the admin `compact` |
-| P1: a throwaway backend per read | W7 (`97e04ee`): AQL reads as one DataFusion scan of an LSM snapshot, semantics once in `adb_executor::query` |
-| GR-1, GR-7 / L6: DEPTH ignored; LOOKUP … FOLLOW LINKS returned the source | P1.1 (`0f9ff6a`, 29 Oct): every record within n hops by hop then path weight, `_hop` / `_path_weight`, cycle-safe, capped at 5 hops / 1,000 records; LOOKUP and REFLECT the same |
-| GR-2, GR-3: outbound links only, no conditions on links | P1.2 (29 Oct, AQL v0.8 `fa6d0d2`): `INBOUND` / `BOTH`, `MIN_WEIGHT`, `TYPE IN` / `ALL` on FOLLOW and WITH LINKS; REFLECT honours FOLLOW's type |
-| GR-6: agents didn't use links | P1.5 (flowr, 29 Oct): related facts about recalled entities and linked records in the prompt (weight ≥ 0.5, up to 5), fact confidence in the rank; `memory_config.semantic.{related, related_min_weight}` |
-| W10-L2: links weren't cached | P1.3: every current link (edges and fact links) in the hot cache by both ends |
-| P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all edges of a result in one scan, targets in one scan per memory type |
+| G-L4 / W5-L4: platform datasets never compacted | W5-L4 (27 Oct): `PlatformStore::compact`, nightly, after 256 versions, and in the admin `compact` |
+| P1: a throwaway backend per read | W7 (`97e04ee`): AQL reads as one DataFusion scan of an LSM snapshot |
+| P4 / GR-5: N+1 link reads | W7: `WITH LINKS` / `FOLLOW LINKS` read all links of a result in one scan, targets in one scan per memory type |
 | S2: `adb-backends` not deleted | W7 (`c7846d4`): deleted; the table is the only copy and read path |
-| G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; per-tenant credentials and scope checks stay with E-L5 (M4) |
-| L7 / W4-L5: PROCEDURAL kept only its node fields | W9.1: extra payload fields kept and matched (`WHERE`, `KEY` on any field); `LIKE` returns shaped procedures since W7 |
-| S7: `PATTERN` needed a variable (and ADB matched the variable's name) | W9.3: `PATTERN "text"` (AQL v0.7 grammar) and `$p` bound from request / pipeline variables |
-| v0.6 conformance suite missing | W9.4: AQL `tests/suites/18_subscriptions.yaml`, `19_watch.yaml`, `20_in_scope.yaml` (42 tests); ADB 182/182. `IN SCOPE` on WORKING / TOOLS now says so (it said "needs a durable engine") |
-| E-L2: no table catch-up past log retention (`cursor_expired`) | W9.5: the gateway answers with a `reset` (current rows of the target, as of the applied tip) and continues with deliveries; `SUBSCRIBE … FROM OFFSET` past retention registers and starts with it; SSE `event: reset`, MCP `next_events.reset`; retention cap `ADB_LOG_RETAIN` (default 100,000) |
-| E-L3: an abandoned subscription pins the log | W9.6: subscriptions nobody reads or acks for 7 days (`ADB_SUB_IDLE`, seconds) are unsubscribed (checked each minute); FlowR's `adb_topic` triggers subscribe again when theirs is gone |
-| L4: no optimistic concurrency; references checked outside the sequencer | W9.7: `UPDATE … WHERE … AND metadata.version = n` is a compare-and-set (WHERE evaluated under the sequencer after every earlier write is applied; 20 concurrent updaters → exactly one wins, `tests/concurrency.rs`); LINK checks both ends under the sequencer; PROCEDURAL conditions see `metadata.*`. M3 must keep the WHERE at the partition owner |
-| W4-L1: one fixed embedding model | W9.10: local model or an OpenAI-compatible endpoint, model and dimension in `<data dir>/embedding.json`, set from A3T Settings → ADB Embeddings (through FlowR `/registry/adb-embedding`); the API key comes from ADB's environment (`api_key_env`, a Secret) |
-| E-L11: the expiry timer scanned for due rows every second | W9.12: TTL timers in memory (fed by every committed write with a TTL, seeded from the table at open); a tick with nothing due costs nothing; each due record is checked against the table before its `Expire` commits |
+| G-L1: Flight unauthenticated | W3: one bearer token (`ADB_AUTH_TOKEN`) on HTTP (all but `/health`) and Flight; finer roles: G-L10, E-L5 |
+| L7 / W4-L5: PROCEDURAL kept only its node fields | W9.1: extra payload fields kept and matched (`WHERE`, `KEY` on any field) |
+| S7: `PATTERN` needed a variable | W9.3: `PATTERN "text"` (AQL v0.7 grammar) and bound `$p` |
+| v0.6 conformance suite missing | W9.4: AQL suites 18–20 (42 tests); now 216/216 with suites 21–23 |
+| E-L2: no table catch-up past log retention (`cursor_expired`) | W9.5: `reset` with the current rows, then deliveries; `ADB_LOG_RETAIN` (default 100,000) |
+| E-L3: an abandoned subscription pins the log | W9.6: subscriptions idle for 7 days (`ADB_SUB_IDLE`) are dropped; FlowR's `adb_topic` triggers subscribe again |
+| L4: no optimistic concurrency; references checked outside the sequencer | W9.7: `UPDATE … WHERE … AND metadata.version = n` is a compare-and-set under the sequencer (20 concurrent updaters → one wins); LINK checks both ends under the sequencer. In a cluster: CL-3 |
+| W4-L1: one fixed embedding model | W9.10: local model or an OpenAI-compatible endpoint, set from A3T Settings → ADB Embeddings; API key from ADB's environment |
+| E-L11: the expiry timer scanned for due rows every second | W9.12: TTL timers in memory, seeded from the table at open |
