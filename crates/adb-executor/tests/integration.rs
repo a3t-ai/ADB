@@ -955,7 +955,7 @@ async fn pipeline_timeout_is_a_hard_budget_when_enforced() {
 }
 
 /// S7 (W9): `PATTERN "text"` and `PATTERN $p` with `$p` bound both match
-/// procedures by their pattern text.
+/// procedures by their pattern text; the score is `metadata.confidence`.
 #[tokio::test]
 async fn pattern_takes_a_literal_or_a_bound_variable() {
     let adb = Mem::new().await;
@@ -964,6 +964,8 @@ async fn pattern_takes_a_literal_or_a_bound_variable() {
     let ids = |r: QueryResult| r.get_records().unwrap().iter().map(|r| r.id.clone()).collect::<Vec<_>>();
 
     let r = adb.execute(r#"LOOKUP FROM PROCEDURAL PATTERN "pod OOMKilled restart" THRESHOLD 0.5"#).await.unwrap();
+    // The overlap is the match's confidence (F-L2): 3 of 4 words.
+    assert_eq!(r.get_records().unwrap()[0].metadata.confidence, Some(0.75));
     assert_eq!(ids(r), vec!["oom"]);
 
     let vars = std::collections::HashMap::from([("p".to_string(), json!("node disk pressure"))]);

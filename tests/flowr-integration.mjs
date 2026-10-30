@@ -238,6 +238,7 @@ try {
   // A stub OpenAI-compatible LLM that answers with the system prompt it was given, so
   // the test sees what memory reached the agent, and counts its calls.
   let llmCalls = 0;
+  const reflections = [];
   const llm = createHttpServer((req, res) => {
     let body = '';
     req.on('data', d => { body += d; });
@@ -245,7 +246,12 @@ try {
       llmCalls++;
       const b = JSON.parse(body || '{}');
       const system = (b.messages ?? []).find(m => m.role === 'system')?.content ?? '';
-      const content = `ECHO ${system}`;
+      // A reflection (F-L3): the facts of the exchange, as JSON in prose.
+      const said = (b.messages ?? []).filter(m => m.role === 'user').map(m => m.content).join('\n');
+      if (system.startsWith('You maintain an assistant\'s long-term memory')) reflections.push(said);
+      const content = !system.startsWith('You maintain an assistant\'s long-term memory') ? `ECHO ${system}`
+        : said.includes('Lisbon') ? 'Here you go: {"facts": [{"subject": "user", "predicate": "lives_in", "object": "city:lisbon", "content": "The user lives in Lisbon", "confidence": 0.9}, {"subject": "user"}]}'
+        : '{"facts": []}';
       if (b.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`);
@@ -332,6 +338,31 @@ do:
   r = await ask('f-s3', 'please reset my password now', { memory_config: { procedural: { read: true } } });
   const out = flowOutput(r.text);
   check('a matching procedure answers without the LLM when enabled', llmCalls === before2 && out?.content === 'Open Settings; Choose Reset password' && out?.procedural_hit === true, r.text.slice(0, 400));
+  // F-L3: with semantic.reflect, the exchange's lasting facts become SEMANTIC facts
+  // after the turn, about `user:<owner>`, with the owner; off by default.
+  const reflect = { memory_config: { semantic: { reflect: true } } };
+  r = await ask('f-r1', 'I moved to Lisbon last month', reflect);
+  check('F-L3: a reflecting turn answers as usual', !r.isError && JSON.stringify(flowOutput(r.text)).includes('ECHO'), r.text.slice(0, 400));
+  let lives;
+  for (let i = 0; i < 50 && !lives; i++) {
+    lives = (await adbQ('RECALL FROM SEMANTIC WHERE predicate = "lives_in" NAMESPACE "f-test"'))?.records?.[0];
+    if (!lives) await new Promise(res => setTimeout(res, 100));
+  }
+  check('F-L3: the turn\'s fact is stored', lives?.data?.object === 'city:lisbon' && lives?.data?.source === 'reflection'
+    && String(lives?.data?.subject).startsWith('user:') && lives?.data?.owner && lives?.data?.session_id === 'f-r1', JSON.stringify(lives));
+  check('F-L3: the reflection saw the exchange', reflections.length === 1 && reflections[0].includes('user: I moved to Lisbon last month'), JSON.stringify(reflections));
+  r = await ask('f-r2', 'Where do I live?');
+  check('F-L3: a reflected fact is recalled in a later session', JSON.stringify(flowOutput(r.text)).includes('The user lives in Lisbon'), r.text.slice(0, 600));
+  r = await ask('f-r3', 'Nothing much to say', reflect);
+  await new Promise(res => setTimeout(res, 500));
+  check('F-L3: nothing lasting, nothing stored', reflections.length === 2
+    && (await adbQ('RECALL FROM SEMANTIC WHERE source = "reflection" NAMESPACE "f-test"'))?.records?.length === 1);
+  check('F-L3: off by default (no reflection call)', !reflections.some(x => x.includes('Where do I live?')));
+  // Another owner's reflected facts stay out of this user's prompt.
+  await adbQ('STORE INTO SEMANTIC FACT (subject = "user:someone-else", predicate = "likes", object = "thing:zebra", content = "The user likes zebras", owner = "someone-else", source = "reflection") NAMESPACE "f-test"');
+  r = await ask('f-r4', 'What do I like? zebras?');
+  check('F-L3: another owner\'s facts aren\'t recalled', !JSON.stringify(flowOutput(r.text)).includes('likes zebras'), r.text.slice(0, 600));
+
   // A broken memory resource never fails the turn.
   r = await ask('f-s4', 'hello', { memory_resource: 'a3t/no-such-adb' });
   check('a missing memory resource doesn\'t fail the turn', !r.isError && JSON.stringify(flowOutput(r.text)).includes('ECHO'), r.text.slice(0, 400));

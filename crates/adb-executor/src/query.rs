@@ -512,7 +512,8 @@ async fn candidates(
 }
 
 /// `RECALL` / `LOOKUP` (not `LIKE`): candidates → exact predicate → visibility →
-/// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap.
+/// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap, its
+/// score in `metadata.confidence`.
 pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
     served(store, "read", |source| read_from(store, memory, predicate, modifiers, now, source), same_records, show_records).await
 }
@@ -538,11 +539,19 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
-        let mut out: Vec<Arc<MemoryRecord>> = scored.into_iter().map(|(_, r)| r).collect();
         if let Some(n) = modifiers.limit {
-            out.truncate(n);
+            scored.truncate(n);
         }
-        return Ok(Answer::of(&c, owned(out)));
+        // The overlap score is the match's confidence, as LIKE's similarity is (F-L2).
+        let out = scored
+            .into_iter()
+            .map(|(s, r)| {
+                let mut r = (*r).clone();
+                r.metadata.confidence = Some(s);
+                r
+            })
+            .collect();
+        return Ok(Answer::of(&c, out));
     }
     let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
     if let Some(v) = &modifiers.scope {
