@@ -105,6 +105,8 @@ pub enum Operation {
     UpdateLink,
     /// Remove links (AQL v0.7 UNLINK)
     Unlink,
+    /// Merge one SEMANTIC entity into another (AQL v0.10 MERGE ENTITY)
+    Merge,
 }
 
 impl std::fmt::Display for Operation {
@@ -120,6 +122,7 @@ impl std::fmt::Display for Operation {
             Self::Link => write!(f, "LINK"),
             Self::UpdateLink => write!(f, "UPDATE LINK"),
             Self::Unlink => write!(f, "UNLINK"),
+            Self::Merge => write!(f, "MERGE ENTITY"),
         }
     }
 }
@@ -307,6 +310,17 @@ impl StepPlan {
     /// UPDATE LINK (`unlink` false) or UNLINK (`unlink` true) over `link_data`'s ends.
     pub fn link_edit(link_data: LinkData, unlink: bool) -> Self {
         Self { operation: if unlink { Operation::Unlink } else { Operation::UpdateLink }, ..Self::link(link_data) }
+    }
+
+    /// MERGE ENTITY `from` INTO `into` (SEMANTIC)
+    pub fn merge(from: &str, into: &str) -> Self {
+        Self {
+            operation: Operation::Merge,
+            memory_type: MemoryType::Semantic,
+            predicate: Predicate::All,
+            modifiers: Modifiers::default(),
+            data: Some(serde_json::json!({ "from": from, "into": into })),
+        }
     }
 
     /// Create a new link plan

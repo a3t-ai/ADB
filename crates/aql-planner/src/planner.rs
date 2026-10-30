@@ -72,6 +72,8 @@ impl Planner {
                 d.type_filter = u.link_type.clone();
                 Ok(ExecutionPlan::Single(StepPlan::link_edit(d, true)))
             }
+            // AQL v0.10 — entity resolution (GR-12)
+            Statement::Merge(m) => Ok(ExecutionPlan::Single(StepPlan::merge(&m.from, &m.into))),
             // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
             Statement::Subscribe(s) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
                 target: match &s.target {

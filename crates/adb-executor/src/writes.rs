@@ -108,6 +108,17 @@ pub trait Writes: Send + Sync {
         link_type: Option<&str>,
     ) -> AdbResult<u64>;
 
+    /// AQL v0.10 MERGE ENTITY (GR-12): SEMANTIC entity `from` merges into `into`.
+    /// Returns how many facts and links moved.
+    async fn merge(&self, _from: &str, _into: &str) -> AdbResult<u64> {
+        Err(needs_table("MERGE"))
+    }
+
+    /// The entity a merged entity's key is now an alias of (GR-12).
+    fn alias_of(&self, _key: &str) -> Option<String> {
+        None
+    }
+
     /// `PUBLISH TOPIC`: a committed `event` row (stage E). Returns its id and offset.
     async fn publish(&self, _topic: &str, _payload: serde_json::Value, _ttl: Option<Duration>) -> AdbResult<(String, u64)> {
         Err(needs_log())
@@ -304,6 +315,9 @@ pub struct DurableWrites<L: Log> {
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
+    /// Entity aliases (GR-12): a merged entity's key → the entity it merged into,
+    /// from the survivors' `aliases` fields at open, kept by MERGE and FORGET.
+    aliases: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// Records written since the last compaction that make one due (W7, user 28 Oct:
@@ -571,9 +585,14 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     fn keys_gone(&self, effects: &[Effect]) {
         let mut live = self.live.lock().unwrap();
+        let mut aliases = self.aliases.lock().unwrap();
         for e in effects {
             if let Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } = e {
                 live.remove(&(*memory, lineage_id.0.clone()));
+                // A forgotten entity's aliases go with it.
+                if *memory == Memory::Semantic && !aliases.is_empty() {
+                    aliases.retain(|_, to| *to != lineage_id.0);
+                }
             }
         }
     }
@@ -620,8 +639,15 @@ impl<L: Log + 'static> DurableWrites<L> {
             .into_iter()
             .flat_map(|r| validity_bounds(&r.data.value).into_iter().filter(|t| *t > after).map(move |t| (t, r.lineage_id.clone())))
             .collect();
+        let aliases = store
+            .live(Some("kind = 'entity'"), CommitTs::from_datetime(time::now()))
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+            .iter()
+            .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
+            .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -906,6 +932,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let id = RecordId(store_id(memory_type, key, &payload));
+        if memory_type == MemoryType::Semantic {
+            if let Some(to) = self.alias_of(&id.0) {
+                return Err(AdbError::QueryError(format!("{} was merged into {to}: store into {to}", id.0)));
+            }
+        }
         // Checked under the sequencer lock, so two STOREs of one key can't both pass.
         if caller_keyed(memory_type, &payload) {
             if self.key_taken(memory_type.into(), &id.0, ts) {
@@ -952,6 +983,15 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             return Err(AdbError::InvalidSyntax("FACT needs subject and predicate".into()));
         };
         let object = field("object");
+        // A merged entity's key names the entity it merged into (GR-12).
+        let subject = self.alias_of(&subject).unwrap_or(subject);
+        let object = object.map(|o| self.alias_of(&o).unwrap_or(o));
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("subject".into(), serde_json::json!(subject));
+            if let Some(o) = &object {
+                obj.insert("object".into(), serde_json::json!(o));
+            }
+        }
         let value = payload.get("value").cloned();
         let shown = match (&object, &value) {
             (Some(o), _) => o.clone(),
@@ -1123,6 +1163,156 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             })?;
         }
         Ok(removed)
+    }
+
+    fn alias_of(&self, key: &str) -> Option<String> {
+        let aliases = self.aliases.lock().unwrap();
+        if aliases.is_empty() {
+            return None;
+        }
+        aliases.get(key).cloned()
+    }
+
+    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
+        let Some(store) = &self.store else { return Err(needs_table("MERGE")) };
+        let memory = Memory::Semantic;
+        let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        // Every earlier record is in Lance first.
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        if let Some(to) = self.alias_of(from) {
+            return Err(AdbError::QueryError(format!("MERGE: {from} was already merged into {to}")));
+        }
+        let into = self.alias_of(into).unwrap_or_else(|| into.to_string());
+        if from == into {
+            return Err(AdbError::QueryError(format!("MERGE: {from} is {into}")));
+        }
+        let entity = |key: String| async move {
+            match store.current_version(memory, &key, ts).await {
+                Ok(Some(r)) if r.data.kind == Kind::Entity => Ok(r),
+                Ok(_) => Err(AdbError::QueryError(format!("MERGE: no entity {key}"))),
+                Err(e) => Err(err(e)),
+            }
+        };
+        let (dup, survivor) = (entity(from.to_string()).await?, entity(into.clone()).await?);
+        let end = adb_store::sql_str(&adb_store::row_id(memory, from));
+        let about = |kind: &str| format!("kind = '{kind}' AND (subject_id = {end} OR object_id = {end})");
+
+        // The duplicate's facts, written again about the survivor: of two facts for
+        // one key, the newer is current (the older stays as history, user 30 Oct).
+        let mut facts = store.live(Some(&about("fact")), ts).await.map_err(err)?;
+        facts.sort_by_key(|r| r.commit_ts);
+        let mut effects = Vec::new();
+        // New key → the newest of the duplicate's facts that land on it. A fact whose
+        // key doesn't change (the duplicate is its single-valued object) gets a new
+        // version; the others move to a new key, and their old one is forgotten.
+        let mut moved: Vec<(String, RowData, CommitTs)> = Vec::new();
+        for f in &facts {
+            let (key, d) = moved_fact(&f.data, f.key(), from, &into);
+            if key != f.key() {
+                effects.push(Effect::Forget { memory, lineage_id: RecordId(f.key().to_string()) });
+            }
+            moved.retain(|(k, ..)| *k != key);
+            moved.push((key, d, f.commit_ts));
+        }
+        // Its links, moved to the survivor (the old ones go with the entity).
+        let edges = store.live(Some(&about("edge")), ts).await.map_err(err)?;
+        let theirs: std::collections::HashSet<(String, String, Option<String>)> = {
+            let mine = adb_store::sql_str(&adb_store::row_id(memory, &into));
+            let f = format!("kind = 'edge' AND (subject_id = {mine} OR object_id = {mine})");
+            store.live(Some(&f), ts).await.map_err(err)?.into_iter().map(|e| (e.data.subject_id.unwrap_or_default(), e.data.object_id.unwrap_or_default(), e.data.link_type)).collect()
+        };
+        let mut new_edges = Vec::new();
+        for e in &edges {
+            let swap = |id: &Option<String>| match id.as_deref() {
+                Some(i) if adb_store::sql_str(i) == end => into.clone(),
+                Some(i) => adb_store::key_of(i).to_string(),
+                None => String::new(),
+            };
+            let (s, o) = (swap(&e.data.subject_id), swap(&e.data.object_id));
+            let mut d = e.data.clone();
+            d.subject_id = Some(s);
+            d.object_id = Some(o);
+            let n = NewRow { id: seq.new_id(ts), lineage_id: RecordId(String::new()), version: 1, data: d };
+            let q = adb_store::qualified(&n);
+            if q.data.subject_id == q.data.object_id || theirs.contains(&(q.data.subject_id.clone().unwrap_or_default(), q.data.object_id.clone().unwrap_or_default(), q.data.link_type.clone())) {
+                continue;
+            }
+            new_edges.push(NewRow { lineage_id: n.id.clone(), ..n });
+        }
+        // The survivor takes the duplicate's key (and aliases) as aliases, and the
+        // fields it doesn't have.
+        let mut aliases = aliases_of(&survivor.data.value);
+        for a in std::iter::once(from.to_string()).chain(aliases_of(&dup.data.value)) {
+            if !aliases.contains(&a) {
+                aliases.push(a);
+            }
+        }
+        let mut fields = serde_json::Map::new();
+        if let (Some(d), Some(s)) = (dup.data.value.as_object(), survivor.data.value.as_object()) {
+            for (k, v) in d {
+                if !s.contains_key(k) && k != "aliases" {
+                    fields.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        fields.insert("aliases".into(), serde_json::json!(aliases));
+        let survivor_next = next_version(&survivor, &fields, seq.new_id(ts));
+        effects.push(Effect::Forget { memory, lineage_id: RecordId(from.to_string()) });
+        effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&survivor.id).to_string()), new: survivor_next });
+
+        let mut n = 0u64;
+        let mut put_keys = Vec::new();
+        for (key, d, at) in moved {
+            let in_place = facts.iter().any(|f| f.key() == key);
+            match store.current_version(memory, &key, ts).await.map_err(err)? {
+                // The survivor's own fact is newer: it stays.
+                Some(cur) if !in_place && cur.commit_ts >= at => {}
+                Some(cur) => {
+                    effects.push(Effect::Supersede {
+                        old: RecordId(adb_store::key_of(&cur.id).to_string()),
+                        new: NewRow { id: seq.new_id(ts), lineage_id: RecordId(key.clone()), version: cur.version + 1, data: d },
+                    });
+                    n += 1;
+                }
+                None => {
+                    put_keys.push((key.clone(), d.ttl_at));
+                    let id = RecordId(key);
+                    effects.push(Effect::PutFact(NewRow { id: id.clone(), lineage_id: id, version: 1, data: d }));
+                    n += 1;
+                }
+            }
+        }
+        n += new_edges.len() as u64;
+        effects.extend(new_edges.into_iter().map(Effect::PutEdge));
+        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        self.keys_gone(&effects);
+        {
+            let mut live = self.live.lock().unwrap();
+            for (k, ttl) in put_keys {
+                live.insert((memory, k), ttl);
+            }
+            let mut a = self.aliases.lock().unwrap();
+            for to in a.values_mut().filter(|to| to.as_str() == from) {
+                *to = into.clone();
+            }
+            for alias in &aliases {
+                a.insert(alias.clone(), into.clone());
+            }
+        }
+        let gone = effects.iter().filter_map(|e| match e {
+            Effect::Forget { memory, lineage_id } => Some((*memory, lineage_id.0.clone())),
+            _ => None,
+        });
+        self.forgotten.lock().unwrap().extend(gone);
+        self.to_store(&record, seq.log()).await;
+        drop(seq);
+        // The duplicate's old rows are gone from disk before MERGE returns (W5).
+        self.erase().await.map_err(|e| AdbError::Internal(format!("merged, but the old rows are not yet erased from disk: {e}; the next compaction erases them")))?;
+        Ok(n)
     }
 
     async fn link(
@@ -1394,6 +1584,44 @@ pub fn normalize_validity(fields: &mut serde_json::Map<String, serde_json::Value
 
 /// A fact's key: one current fact per (subject, predicate), or per (subject,
 /// predicate, object) for a `MULTI` predicate.
+/// An entity's `aliases` (GR-12): the keys of the entities merged into it.
+fn aliases_of(value: &serde_json::Value) -> Vec<String> {
+    value.get("aliases").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
+/// `d`, a fact about entity `from` as the table holds it, as a fact about `into`:
+/// bare ends with `from` replaced, its payload and default `content` to match.
+/// Returns its key (one per (subject, predicate) unless the old key had the object).
+fn moved_fact(d: &RowData, key: &str, from: &str, into: &str) -> (String, RowData) {
+    let mut d = d.clone();
+    let bare = |id: &Option<String>| id.as_deref().map(|i| adb_store::key_of(i).to_string());
+    let swap = |id: Option<String>| id.map(|i| if i == from { into.to_string() } else { i });
+    let (old_s, old_o) = (bare(&d.subject_id).unwrap_or_default(), bare(&d.object_id));
+    let (subject, object) = (swap(Some(old_s.clone())).unwrap_or_default(), swap(old_o.clone()));
+    let predicate = d.predicate.clone().unwrap_or_default();
+    let shown = |o: &Option<String>| o.clone().unwrap_or_else(|| d.value.get("value").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).unwrap_or_default());
+    let multi = key != fact_key(&old_s, &predicate, None);
+    let new_key = fact_key(&subject, &predicate, multi.then(|| shown(&object)).as_deref());
+    let old_content = format!("{old_s} {predicate} {}", shown(&old_o));
+    let new_content = format!("{subject} {predicate} {}", shown(&object));
+    if let Some(v) = d.value.as_object_mut() {
+        v.insert("subject".into(), serde_json::json!(subject));
+        if let Some(o) = &object {
+            v.insert("object".into(), serde_json::json!(o));
+        }
+        v.insert("key".into(), serde_json::json!(new_key));
+        if v.get("content").and_then(|c| c.as_str()) == Some(old_content.as_str()) {
+            v.insert("content".into(), serde_json::json!(new_content));
+            d.text = Some(new_content);
+            // Embedded again by the backfill.
+            d.embedding = None;
+        }
+    }
+    d.subject_id = Some(subject);
+    d.object_id = object;
+    (new_key, d)
+}
+
 pub fn fact_key(subject: &str, predicate: &str, object: Option<&str>) -> String {
     match object {
         Some(o) => format!("fact:{subject}|{predicate}|{o}"),
