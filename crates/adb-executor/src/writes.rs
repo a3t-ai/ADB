@@ -670,6 +670,33 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(ids)
     }
 
+    /// GR-13: the facts about the entities among `ids` (as subject or object), every
+    /// version, not already in `ids`: forgetting an entity forgets them too, in the
+    /// same record. With `in_scope`, only facts of that scope.
+    async fn entity_facts(&self, ids: &[String], in_scope: Option<&str>) -> AdbResult<Vec<String>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+        let in_list = |keys: &[String]| keys.iter().map(|k| adb_store::sql_str(&adb_store::row_id(Memory::Semantic, k))).collect::<Vec<_>>().join(", ");
+        let entities = store.versions(Memory::Semantic, Some(&format!("kind = 'entity' AND lineage_id IN ({})", in_list(ids)))).await.map_err(err)?;
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = entities.iter().map(|r| r.key().to_string()).collect();
+        let ends = in_list(&keys);
+        let mut filter = format!("kind = 'fact' AND (subject_id IN ({ends}) OR object_id IN ({ends}))");
+        if let Some(s) = in_scope {
+            filter.push_str(&format!(" AND scope = {}", adb_store::sql_str(s)));
+        }
+        let mut out: Vec<String> = Vec::new();
+        for r in store.versions(Memory::Semantic, Some(&filter)).await.map_err(err)? {
+            let key = r.key().to_string();
+            if !ids.contains(&key) && !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
     /// Commit `Expire` for the records whose TTL has passed (D2 §4, L3): one log
     /// record per tick, so every subscriber sees those expiries at one offset.
     /// Reads hide expired records already; this makes expiry an event and marks the
@@ -1074,9 +1101,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
-        let ids = self.targets(memory_type, predicate, ts, true, in_scope).await?;
+        let mut ids = self.targets(memory_type, predicate, ts, true, in_scope).await?;
         if ids.is_empty() {
             return Ok(0);
+        }
+        if memory_type == MemoryType::Semantic {
+            ids.extend(self.entity_facts(&ids, in_scope).await?);
         }
         let effects: Vec<Effect> =
             ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
