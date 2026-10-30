@@ -537,6 +537,7 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         aggregate: mods.aggregate.as_ref().map(|aggs| {
             aggs.iter().map(convert_aggregate).collect()
         }),
+        group_by: mods.group_by.clone(),
         having: mods.having.as_ref().map(|conds| {
             conds.iter().filter_map(|c| convert_condition(c).ok()).collect()
         }),

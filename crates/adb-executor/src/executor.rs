@@ -605,6 +605,11 @@ impl Executor {
             // Create modifiers without return_fields to preserve all fields for aggregation
             let mut mods_for_recall = step.modifiers.clone();
             mods_for_recall.return_fields = None;
+            // With GROUP BY, ORDER BY and LIMIT apply to the groups, not the records.
+            if mods_for_recall.group_by.is_some() {
+                mods_for_recall.order_by = None;
+                mods_for_recall.limit = None;
+            }
             self.reads
                 .recall_with_modifiers(step.memory_type, &step.predicate, &mods_for_recall)
                 .await?
@@ -615,6 +620,10 @@ impl Executor {
         };
 
         // Handle aggregation if present - works for all memory types
+        if let (Some(fields), Some(_)) = (&step.modifiers.group_by, &step.modifiers.aggregate) {
+            let rows = crate::query::group_aggregate(&records, fields, &step.modifiers);
+            return Ok(QueryResult::aggregation(serde_json::Value::Array(rows), start.elapsed().as_millis() as u64));
+        }
         if let Some(agg_funcs) = &step.modifiers.aggregate {
             let agg_result = crate::query::aggregate(&records, agg_funcs);
 

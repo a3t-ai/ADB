@@ -643,6 +643,49 @@ async fn test_having_with_alias() {
     }
 }
 
+/// AQL v0.9 `GROUP BY`: one row per group; HAVING, ORDER BY, LIMIT and RETURN on
+/// the groups; a missing field groups as null; dotted fields nest.
+#[tokio::test]
+async fn group_by_aggregates_per_group() {
+    let adb = Mem::new().await;
+    for (i, (url, clicks)) in [("a", 1), ("b", 5), ("a", 3), ("c", 2), ("b", 4), ("a", 2)].iter().enumerate() {
+        adb.execute(&format!(r#"STORE INTO EPISODIC (n = {i}, kind = "visit", url = "{url}", clicks = {clicks})"#)).await.unwrap();
+    }
+    adb.execute(r#"STORE INTO EPISODIC (n = 9, kind = "visit", clicks = 7)"#).await.unwrap();
+    let rows = |q: &'static str| {
+        let adb = adb.clone();
+        async move {
+            let r = adb.execute(q).await.unwrap();
+            let adb_executor::ResultSet::Aggregation { values } = r.data else { panic!("{q}: not an aggregation") };
+            values.as_array().cloned().unwrap_or_else(|| panic!("{q}: {values}"))
+        }
+    };
+
+    let all = rows(r#"RECALL FROM EPISODIC WHERE kind = "visit" GROUP BY url AGGREGATE COUNT(*) AS n, SUM(clicks) AS clicks ORDER BY clicks DESC"#).await;
+    assert_eq!(
+        all,
+        vec![
+            json!({"url": "b", "n": 2, "clicks": 9.0}),
+            json!({"url": null, "n": 1, "clicks": 7.0}),
+            json!({"url": "a", "n": 3, "clicks": 6.0}),
+            json!({"url": "c", "n": 1, "clicks": 2.0}),
+        ]
+    );
+    let top = rows(r#"RECALL FROM EPISODIC WHERE kind = "visit" GROUP BY url AGGREGATE COUNT(*) AS n HAVING n > 1 ORDER BY n DESC LIMIT 1 RETURN url"#).await;
+    assert_eq!(top, vec![json!({"url": "a"})]);
+    assert!(rows(r#"RECALL FROM EPISODIC WHERE kind = "visit" GROUP BY url AGGREGATE COUNT(*) AS n HAVING n > 5"#).await.is_empty());
+    // Two fields, one dotted.
+    let two = rows(r#"RECALL FROM EPISODIC WHERE url = "a" GROUP BY url, metadata.scope AGGREGATE MAX(clicks) AS top"#).await;
+    assert_eq!(two.len(), 1);
+    assert_eq!(two[0]["url"], "a");
+    assert!(two[0]["metadata"]["scope"].is_string(), "{}", two[0]);
+    assert_eq!(two[0]["top"], 3.0);
+    // Without GROUP BY: one object, as before.
+    let r = adb.execute(r#"RECALL FROM EPISODIC WHERE kind = "visit" AGGREGATE COUNT(*) AS n"#).await.unwrap();
+    let adb_executor::ResultSet::Aggregation { values } = r.data else { panic!() };
+    assert_eq!(values, json!({"n": 7}));
+}
+
 // ============================================================================
 // LINK tests (B16: Link validation)
 // ============================================================================

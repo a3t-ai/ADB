@@ -763,6 +763,91 @@ pub fn aggregate(records: &[MemoryRecord], funcs: &[AggregateFunc]) -> serde_jso
     serde_json::Value::Object(out)
 }
 
+/// Sets `path` (dotted) in `row`, making the objects on the way.
+fn set_path(row: &mut serde_json::Value, path: &str, v: serde_json::Value) {
+    let mut cur = row;
+    let mut parts = path.split('.').peekable();
+    while let Some(p) = parts.next() {
+        let obj = cur.as_object_mut().expect("group rows are objects");
+        if parts.peek().is_none() {
+            obj.insert(p.to_string(), v);
+            return;
+        }
+        cur = obj.entry(p.to_string()).or_insert_with(|| serde_json::json!({}));
+        if !cur.is_object() {
+            *cur = serde_json::json!({});
+        }
+    }
+}
+
+/// `GROUP BY … AGGREGATE … [HAVING] [ORDER BY] [LIMIT] [RETURN]` (AQL v0.9): one row
+/// per distinct value of `fields` (a missing field groups as null), holding the group
+/// fields (dotted ones nested) and the aggregates. Groups come in the order their
+/// first record does; `HAVING`, `ORDER BY`, `LIMIT` and `RETURN` apply to the rows.
+pub fn group_aggregate(records: &[MemoryRecord], fields: &[String], modifiers: &Modifiers) -> Vec<serde_json::Value> {
+    let funcs = modifiers.aggregate.as_deref().unwrap_or_default();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(Vec<serde_json::Value>, Vec<MemoryRecord>)> = Vec::new();
+    for r in records {
+        let key: Vec<serde_json::Value> = fields.iter().map(|f| r.resolve_field(f).unwrap_or(serde_json::Value::Null)).collect();
+        let i = *index.entry(serde_json::Value::Array(key.clone()).to_string()).or_insert_with(|| {
+            groups.push((key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[i].1.push(r.clone());
+    }
+    let mut rows: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|(key, members)| {
+            let mut row = serde_json::json!({});
+            for (f, v) in fields.iter().zip(key) {
+                set_path(&mut row, f, v);
+            }
+            if let serde_json::Value::Object(aggs) = aggregate(&members, funcs) {
+                for (k, v) in aggs {
+                    row[k] = v;
+                }
+            }
+            row
+        })
+        .collect();
+    if let Some(having) = &modifiers.having {
+        rows.retain(|row| evaluate_conditions(row, having));
+    }
+    if let Some(o) = &modifiers.order_by {
+        let mut keyed: Vec<(Option<serde_json::Value>, serde_json::Value)> =
+            rows.into_iter().map(|r| (adb_core::get_nested_field(&r, &o.field).filter(|v| !v.is_null()).cloned(), r)).collect();
+        keyed.sort_by(|(a, _), (b, _)| {
+            let c = match (a, b) {
+                (Some(x), Some(y)) => cmp_json(x, y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            if o.ascending { c } else { c.reverse() }
+        });
+        rows = keyed.into_iter().map(|(_, r)| r).collect();
+    }
+    if let Some(n) = modifiers.limit {
+        rows.truncate(n);
+    }
+    if let Some(keep) = &modifiers.return_fields {
+        rows = rows
+            .into_iter()
+            .map(|r| {
+                let mut out = serde_json::json!({});
+                for f in keep {
+                    if let Some(v) = adb_core::get_nested_field(&r, f) {
+                        set_path(&mut out, f, v.clone());
+                    }
+                }
+                out
+            })
+            .collect();
+    }
+    rows
+}
+
 // ------------------------------------------------------------------ links
 
 /// The current links leaving each of `keys` (records of `memory`), of `link_type`

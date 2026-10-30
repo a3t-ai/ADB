@@ -208,7 +208,7 @@ impl Condition {
 
 /// Get a nested field value using dotted path notation
 /// e.g., "metadata.namespace" returns data["metadata"]["namespace"]
-fn get_nested_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+pub fn get_nested_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = data;
     for part in parts {
@@ -512,6 +512,9 @@ pub struct Modifiers {
     /// Aggregate functions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<Vec<AggregateFunc>>,
+    /// GROUP BY fields (AQL v0.9): with `aggregate`, one result row per group
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<Vec<String>>,
     /// HAVING clause (filter after aggregation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub having: Option<Vec<Condition>>,
