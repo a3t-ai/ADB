@@ -6,7 +6,7 @@
  * Starts one ADB and two FlowR (CE built with `--features adb-platform`):
  *   L — `a3t/a3t-platform-db` = embedded LanceDB, a copy of --lancedb
  *   A — `a3t/a3t-platform-db` = `backend: adb`, after `adb import-lancedb` of the same copy
- * loads A3T's own CRUD flows (a3t/backend/flows/*_crud.yaml) into both, and runs the
+ * loads A3T's own CRUD flows (a3t/backend/flows/a3t/*_crud.yaml) into both, and runs the
  * same calls on each: every list / get, then a template create → duplicate check →
  * update → delete cycle, a settings write, and a delete the integrity check refuses
  * (a template with agents). Every answer must match; then ADB is SIGKILLed and
@@ -80,7 +80,7 @@ async function flowrWith(name, resourceConfig) {
   const r = await tool(url, 'create_resource', { namespace: 'a3t', name: 'a3t-platform-db', type_ref: 'lancedb', config: resourceConfig });
   if (r.isError) throw new Error(`resource on ${name}: ${r.text}`);
   for (const f of ['templates', 'agents', 'canvas', 'users', 'settings', 'resources', 'audit']) {
-    const c = await tool(url, 'create_flow', { yaml: readFileSync(join(args.flows, `${f}_crud.yaml`), 'utf8') });
+    const c = await tool(url, 'create_flow', { yaml: readFileSync(join(args.flows, 'a3t', `${f}_crud.yaml`), 'utf8') });
     if (c.isError) throw new Error(`flow ${f} on ${name}: ${c.text}`);
   }
   return { name, url, child };

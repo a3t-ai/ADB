@@ -90,7 +90,7 @@ function flowOutput(text) {
   return out;
 }
 
-// A3T's a3t-test-resource flow (flowr-system/a3t/backend/flows/test_resource.yaml), MCP part.
+// A3T's a3t-test-resource flow (flowr-system/a3t/backend/flows/a3t/test_resource.yaml), MCP part.
 const TEST_RESOURCE_FLOW = `document:
   dsl: 1.0.3
   namespace: a3t

@@ -19,8 +19,8 @@
  * URLs (ADB_AUTH_URLS), so every path — Flight, MCP, topic triggers — is checked
  * with auth on.
  *
- * Then the console runs A3T's own test flow `a3t/canvas-dispatch` (flowr-system/a3t/
- * backend/flows/test/canvas_dispatch.yaml) against the runtime, as a user would.
+ * Then the console runs A3T's own test flow `system-tests/canvas-dispatch` (flowr-system/a3t/
+ * backend/flows/tests/system/canvas_dispatch.yaml) against the runtime, as a user would.
  *
  *   node tests/runtime-e2e.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)> [--flows <a3t flows dir>]
  */
@@ -126,7 +126,7 @@ do:
 
 // A3T's copies of the flows, when the flows dir is there (default: ../flowr-system).
 const flowsDir = args.flows ?? new URL('../../flowr-system/a3t/backend/flows', import.meta.url).pathname;
-const a3tFlow = f => existsSync(join(flowsDir, 'test', f)) ? readFileSync(join(flowsDir, 'test', f), 'utf8') : null;
+const a3tFlow = f => existsSync(join(flowsDir, 'tests/system', f)) ? readFileSync(join(flowsDir, 'tests/system', f), 'utf8') : null;
 const ECHO = a3tFlow('runtime_echo.yaml') ?? FLOW;
 const DISPATCH = a3tFlow('canvas_dispatch.yaml');
 
@@ -149,7 +149,7 @@ async function startFlowr(dataDir, env) {
   return { url, child };
 }
 
-const startRuntime = dataDir => startFlowr(dataDir, { A3T_CANVAS: `${CANVAS.ns}/${CANVAS.name}`, A3T_FLOW: 'a3t/runtime-echo' });
+const startRuntime = dataDir => startFlowr(dataDir, { A3T_CANVAS: `${CANVAS.ns}/${CANVAS.name}`, A3T_FLOW: 'system-tests/runtime-echo' });
 
 async function subscription(f) {
   for (let i = 0; i < 150; i++) {
@@ -204,7 +204,7 @@ try {
 
   // Runtime, as the controller starts it.
   let R = await startRuntime(join(tmp, 'runtime-1'));
-  const flows = await flowrTool(R.url, 'list_flows', { namespace: 'a3t' });
+  const flows = await flowrTool(R.url, 'list_flows', { namespace: 'system-tests' });
   check('runtime sees the console\'s flow (shared registry)', flows.includes('runtime-echo'), flows.slice(0, 300));
   const sub1 = await subscription(R);
   check('runtime subscribed to the canvas topic', !!sub1);
@@ -234,15 +234,15 @@ try {
 
   // A3T's dispatch flow, run on the console, round-trips through the runtime.
   if (DISPATCH) {
-    const text = await flowrTool(C.url, 'execute_flow', { namespace: 'a3t', name: 'canvas-dispatch', input: { input: { canvas: `${CANVAS.ns}/${CANVAS.name}`, text: 'via canvas-dispatch' } } });
+    const text = await flowrTool(C.url, 'execute_flow', { namespace: 'system-tests', name: 'canvas-dispatch', input: { input: { canvas: `${CANVAS.ns}/${CANVAS.name}`, text: 'via canvas-dispatch' } } });
     const o = flowOutput(text);
     check('a3t/canvas-dispatch: ok, echo and memory', o?.ok === true && o?.output?.echo === 'via canvas-dispatch' && o?.memory === 'via canvas-dispatch', text.slice(-600));
   } else {
-    console.log(`  (no ${flowsDir}/test/canvas_dispatch.yaml; dispatch flow skipped)`);
+    console.log(`  (no ${flowsDir}/tests/system/canvas_dispatch.yaml; dispatch flow skipped)`);
   }
 
   // The console still sees one flow (nothing duplicated by the runtimes).
-  const cflows = JSON.parse(await flowrTool(C.url, 'list_flows', { namespace: 'a3t' }) || '{}');
+  const cflows = JSON.parse(await flowrTool(C.url, 'list_flows', { namespace: 'system-tests' }) || '{}');
   const n = JSON.stringify(cflows).split('"runtime-echo"').length - 1;
   check('the registry holds the flow once', n === 1, JSON.stringify(cflows).slice(0, 300));
 } catch (e) {
