@@ -964,6 +964,8 @@ impl PartitionStore {
                 // Platform tables live in their own datasets (adb-platform); the
                 // memory table only moves its applied offset past them.
                 Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableReplace { .. } => {}
+                // FlowR's engine (stage H) keeps its own state and journal partition.
+                Effect::Engine { .. } => {}
             }
         }
         Ok(())

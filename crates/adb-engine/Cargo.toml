@@ -1,0 +1,23 @@
+[package]
+name = "adb-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FlowR's engine store on ADB's log: EngineCore per space, snapshots, the journal as EPISODIC rows in the engine's own partition (stage H, .ai/H_ENGINE_STORE.md)"
+
+[dependencies]
+adb-core.workspace = true
+adb-store = { path = "../adb-store" }
+adb-log = { path = "../adb-log" }
+flowr-storage.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

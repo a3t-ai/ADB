@@ -74,12 +74,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "adb-engine"
+version = "0.1.0"
+dependencies = [
+ "adb-core",
+ "adb-log",
+ "adb-store",
+ "chrono",
+ "flowr-storage",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "adb-executor"
 version = "0.1.0"
 dependencies = [
  "adb-core",
  "adb-cq",
  "adb-embed",
+ "adb-engine",
  "adb-gateway",
  "adb-log",
  "adb-platform",
@@ -90,6 +110,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "flowr-storage",
  "futures",
  "half",
  "rust-stemmers",
@@ -99,6 +120,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3020,6 +3042,20 @@ name = "float_next_after"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
+
+[[package]]
+name = "flowr-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "fnv"

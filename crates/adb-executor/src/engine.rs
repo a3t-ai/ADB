@@ -288,6 +288,12 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                     tracing::warn!(error = %e, "dropping idle subscriptions failed; retrying later");
                 }
             }
+            // Stage H: finished runs' journals leave memory; snapshots when due.
+            if ticks % 10 == 5 {
+                if let Err(e) = w.engine_maintain().await {
+                    tracing::warn!(error = %e, "engine upkeep failed; retrying later");
+                }
+            }
             w.sweep_cache();
             match w.expire_due().await {
                 Ok(0) => {}
@@ -358,6 +364,12 @@ impl LocalEngine {
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
         writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
+        // FlowR's engine store (stage H): its spaces under `<dir>/engine`.
+        let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?;
+        let replayed = writes.attach_engine(engine).await.map_err(|e| e.to_string())?;
+        if replayed > 0 {
+            tracing::info!(records = replayed, "engine spaces replayed");
+        }
         let barrier = writes.barrier();
         let watch_log: Arc<dyn adb_log::Log> = Arc::clone(&wal) as Arc<dyn adb_log::Log>;
         let gateway = barrier.as_ref().map(|b| {
@@ -436,6 +448,22 @@ impl LocalEngine {
 }
 
 impl LocalEngine {
+    /// FlowR's engine store, space `space` (stage H); `None` without a data dir.
+    pub fn engine_store(&self, space: &str) -> Option<crate::engine_store::AdbEngineStore<Arc<LocalWal>>> {
+        self.durable.as_ref().map(|d| crate::engine_store::AdbEngineStore::new(Arc::clone(d), space))
+    }
+
+    /// Engine upkeep now (tests and admin): evict finished journals, snapshot
+    /// every space that changed (`force`) or is due.
+    pub async fn engine_maintain(&self, force: bool) -> Result<(), String> {
+        let Some(d) = &self.durable else { return Ok(()) };
+        d.engine_maintain().await.map_err(|e| e.to_string())?;
+        if force {
+            d.engine_snapshot_now().await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     /// `WATCH` (register, snapshot) and `UNWATCH` (W6).
     async fn watch(&self, stmt: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         use aql_parser::ast::{StartPosition, Statement};

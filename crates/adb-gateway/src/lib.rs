@@ -390,6 +390,8 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
             Effect::Register(_) | Effect::UpdateSubCursor { .. } | Effect::Unregister { .. } => continue,
             // Platform tables (stage G) aren't memory: no subscription sees them.
             Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableReplace { .. } => continue,
+            // Nor is FlowR's engine (stage H): run state has its own notices.
+            Effect::Engine { .. } => continue,
         };
         if matches(spec, &change) {
             changes.push(change);

@@ -333,6 +333,10 @@ pub struct DurableWrites<L: Log> {
     /// Entity aliases (GR-12): a merged entity's key → the entity it merged into,
     /// from the survivors' `aliases` fields at open, kept by MERGE and FORGET.
     aliases: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// FlowR's engine store (stage H): its spaces, written under the sequencer.
+    engine: Option<Arc<Mutex<adb_engine::EngineHost>>>,
+    /// Its subscribers, reachable without the host lock.
+    engine_subs: Option<Arc<adb_engine::Subs>>,
 }
 
 /// Records written since the last compaction that make one due (W7, user 28 Oct:
@@ -668,7 +672,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -846,6 +850,152 @@ impl<L: Log + 'static> DurableWrites<L> {
     }
 
     /// The read barrier for Lance reads (stage D3.7), if there is a table.
+    /// Attach FlowR's engine store (stage H): replay the log above its
+    /// snapshots and journal partitions, then give every lease one fresh period.
+    pub async fn attach_engine(&mut self, mut host: adb_engine::EngineHost) -> AdbResult<u64> {
+        let eng = |e: adb_engine::EngineError| AdbError::Internal(e.to_string());
+        let seq = self.seq.lock().await;
+        let mut from = host.replay_from().await.map_err(eng)?;
+        let mut replayed = 0;
+        loop {
+            let batch = match seq.log().read(from, 1024).await {
+                Ok(b) => b,
+                // The log keeps every record the engine needs (`floor`): a purged
+                // stretch held none.
+                Err(LogError::Purged { oldest, .. }) if oldest.0 > from.0 => {
+                    from = oldest;
+                    continue;
+                }
+                Err(LogError::Purged { .. }) => break,
+                Err(e) => return Err(log_err(e)),
+            };
+            let Some(last) = batch.last().map(|r| r.offset) else { break };
+            for r in &batch {
+                if r.effects.iter().any(|e| matches!(e, Effect::Engine { .. })) {
+                    host.replay(r).await.map_err(eng)?;
+                    replayed += 1;
+                }
+            }
+            from = last.next();
+        }
+        host.replayed(chrono::Utc::now());
+        drop(seq);
+        self.engine_subs = Some(host.subscribers());
+        self.engine = Some(Arc::new(Mutex::new(host)));
+        Ok(replayed)
+    }
+
+    fn engine_host(&self) -> AdbResult<&Arc<Mutex<adb_engine::EngineHost>>> {
+        self.engine.as_ref().ok_or_else(|| AdbError::UnsupportedOperation("FlowR's engine store needs a durable engine (start ADB with --data-dir)".into()))
+    }
+
+    /// Run one engine operation on `space` (stage H): decided on the space's
+    /// core under the sequencer, its durable changes logged as one record, then
+    /// its journal episodes written and its notices delivered.
+    pub async fn engine_exec<T>(&self, space: &str, f: impl FnOnce(&mut flowr_storage::engine_core::EngineCore) -> T) -> AdbResult<T> {
+        let eng = |e: adb_engine::EngineError| AdbError::QueryError(e.to_string());
+        let host = self.engine_host()?;
+        let mut seq = self.seq.lock().await;
+        let mut h = host.lock().await;
+        let (out, effect, notices) = h.exec(space, f).await.map_err(eng)?;
+        if let Some(effect) = effect {
+            let ts = seq.begin();
+            match seq.append_record(ts, None, vec![effect]).await {
+                Ok(record) => {
+                    h.committed(&record).await.map_err(eng)?;
+                    drop(h);
+                    self.to_store(&record, seq.log()).await;
+                    h = host.lock().await;
+                }
+                Err(e) => {
+                    // The core holds changes the log never got: rebuild the space
+                    // from its snapshot and the log.
+                    tracing::error!(space, error = %e, "engine record not logged; rebuilding the space");
+                    if let Err(re) = Self::rebuild_space(&mut h, space, seq.log()).await {
+                        tracing::error!(space, error = %re, "engine space not rebuilt");
+                    }
+                    return Err(log_err(e));
+                }
+            }
+        }
+        h.notify(space, notices);
+        Ok(out)
+    }
+
+    async fn rebuild_space(h: &mut adb_engine::EngineHost, space: &str, log: &L) -> AdbResult<()> {
+        let eng = |e: adb_engine::EngineError| AdbError::Internal(e.to_string());
+        h.reopen(space).await.map_err(eng)?;
+        let mut from = h.replay_from().await.map_err(eng)?;
+        loop {
+            let batch = log.read(from, 1024).await.map_err(log_err)?;
+            let Some(last) = batch.last().map(|r| r.offset) else { break };
+            for r in batch.iter().filter(|r| r.effects.iter().any(|e| matches!(e, Effect::Engine { space: s, .. } if s == space))) {
+                h.replay(r).await.map_err(eng)?;
+            }
+            from = last.next();
+        }
+        Ok(())
+    }
+
+    /// Read `space`'s engine state (no log).
+    pub async fn engine_read<T>(&self, space: &str, f: impl FnOnce(&flowr_storage::engine_core::EngineCore) -> T) -> AdbResult<T> {
+        let eng = |e: adb_engine::EngineError| AdbError::QueryError(e.to_string());
+        self.engine_host()?.lock().await.read(space, f).await.map_err(eng)
+    }
+
+    /// A run's journal after `after_seq`: from memory while the core holds it,
+    /// else its EPISODIC history.
+    pub async fn engine_journal(&self, space: &str, run: flowr_storage::engine::RunId, after_seq: u64) -> AdbResult<Vec<flowr_storage::engine::JournalEntry>> {
+        let eng = |e: adb_engine::EngineError| AdbError::QueryError(e.to_string());
+        let mut h = self.engine_host()?.lock().await;
+        match h.read(space, |c| c.read_from(run, after_seq)).await.map_err(eng)? {
+            Some(entries) => Ok(entries),
+            None => h.archived(space, run, after_seq).await.map_err(eng),
+        }
+    }
+
+    /// The engine's subscribers (for `subscribe`, which can't wait on a lock).
+    pub fn engine_subscribers(&self) -> Option<Arc<adb_engine::Subs>> {
+        self.engine_subs.clone()
+    }
+
+    /// Publish a notice in `space` (FlowR's `Notifier::publish`).
+    pub async fn engine_notify(&self, space: &str, topic: &str, msg: serde_json::Value) -> AdbResult<()> {
+        self.engine_host()?.lock().await.notify(space, vec![(topic.to_string(), msg)]);
+        Ok(())
+    }
+
+    /// Engine upkeep (each tick): finished runs' journals leave memory, and
+    /// snapshots that are due are written.
+    pub async fn engine_maintain(&self) -> AdbResult<()> {
+        let Some(host) = &self.engine else { return Ok(()) };
+        let eng = |e: adb_engine::EngineError| AdbError::Internal(e.to_string());
+        let spaces = host.lock().await.spaces();
+        let now = chrono::Utc::now();
+        for space in spaces {
+            let runs = host.lock().await.evictable(&space, now).await.map_err(eng)?;
+            if !runs.is_empty() {
+                self.engine_exec(&space, |c| runs.iter().for_each(|r| c.evict_journal(*r))).await?;
+            }
+        }
+        host.lock().await.snapshot_due(false).await.map_err(eng)?;
+        Ok(())
+    }
+
+    /// Snapshot every engine space that changed since its last snapshot.
+    pub async fn engine_snapshot_now(&self) -> AdbResult<usize> {
+        let Some(host) = &self.engine else { return Ok(0) };
+        host.lock().await.snapshot_due(true).await.map_err(|e| AdbError::Internal(e.to_string()))
+    }
+
+    /// The spaces this engine holds.
+    pub async fn engine_spaces(&self) -> Vec<String> {
+        match &self.engine {
+            Some(h) => h.lock().await.spaces(),
+            None => Vec::new(),
+        }
+    }
+
     pub fn barrier(&self) -> Option<Arc<ApplyBarrier>> {
         self.applier.as_ref().map(|a| Arc::clone(a.barrier()))
     }
@@ -893,6 +1043,12 @@ impl<L: Log + 'static> DurableWrites<L> {
                     // record only if its apply failed (they catch up on the next open).
                     if let Some(p) = self.platform_floor().await {
                         floor = LogOffset(floor.0.min(p.0));
+                    }
+                    // FlowR's engine needs the records above its snapshots (stage H).
+                    if let Some(e) = &self.engine {
+                        if let Some(f) = e.lock().await.floor().await {
+                            floor = LogOffset(floor.0.min(f.0));
+                        }
                     }
                     if let Some(cursor) = self.subs.min_cursor() {
                         let cap = record.offset.0.saturating_sub(self.retain_max);

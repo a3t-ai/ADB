@@ -296,6 +296,10 @@ pub enum Effect {
     /// version (MVP W4): the backfill of rows stored before there was a model, and
     /// an in-place `Patch` of EPISODIC `content`. The vector travels in the log (§9.1).
     Embed { memory: Memory, id: RecordId, embedding: Vec<f16> },
+    /// FlowR's engine (stage H, `.ai/H_ENGINE_STORE.md`): the durable changes one
+    /// operation made in engine space `space` (`flowr_storage::engine_core::Change`
+    /// as JSON, applied in order by `adb-engine`; opaque here).
+    Engine { space: String, changes: serde_json::Value },
 }
 
 /// One committed transaction on one partition.

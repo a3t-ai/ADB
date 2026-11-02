@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 pub mod engine;
+pub mod engine_store;
 mod error;
 mod executor;
 mod result;
