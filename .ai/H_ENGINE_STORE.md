@@ -57,7 +57,7 @@ commits as one log record (§9). The engine becomes a third table family on that
 | H13 | **Notifications and live views** | The `Notifier` (task available on a pool, run changed) is ADB's subscription transport: a Flight stream fed from the engine's in-memory broadcast. Notices are not logged: they are hints, and claimers also poll. The same stream carries a run's new journal records, so the console's run views stream instead of polling (closes L25 once the UI uses it). |
 | H14 | **No extra components** | One ADB, polished (user). Iggy, Postgres and Dragonfly are not part of the engine. A high-volume export of lifecycle and metering events (L5's outbox) can be added later as an optional sink, if a customer needs one. |
 | H15 | **Who may read run history** | At first only the engine scope (H8): the `flowr:*` tenants are invisible to agent tokens, and AQL `FORGET`, `UPDATE`, TTL, consolidation and compaction leave them alone. Removal is retention only: the engine's purge physically deletes a finished run's episodes. Letting agents recall run history (their own runs, or a project's) is a later, explicit grant. |
-| H16 | **One Arrow / Lance stack** | Embedding ADB in FlowR (H1) needs the two repos on the same Arrow, DataFusion and Lance versions. Today FlowR CE is on LanceDB 0.26 (Arrow 57, DataFusion 51) and ADB on Lance 12 (Arrow 58, DataFusion 54). Linking both stacks works, but doubles build time and binary size on a pod with a tight disk budget. **Align FlowR on ADB's versions** (H-0) before embedding. FlowR's own LanceDB uses (registry, platform tables, state) either move to a LanceDB release on Lance 12 or, later, onto the embedded ADB's platform tables, which would make "one ADB" complete. |
+| H16 | **One Arrow / Lance stack, the latest** | Both repos on the **same, newest compatible versions** (user, 2 Nov): **Lance / lance-index =14.0.2, LanceDB 0.41.0, Arrow (and arrow-flight, -ipc, -cast) 58.4.1, DataFusion 54.1.0**, checked on crates.io 2 Nov 2026. Arrow 60 and DataFusion 55 are out, but Lance 14.0.2 and LanceDB 0.41 require Arrow ^58 and DataFusion ^54, so 58/54 is the newest set that fits together. Today ADB is on Lance 12 (Arrow 58.4.0, DataFusion 54.1) and FlowR on LanceDB 0.26 (Arrow 57, DataFusion 51). Bumped together in H-0, then kept in step: a check fails the build when the two lockfiles disagree on these crates. |
 
 ## How an operation runs
 
@@ -112,12 +112,22 @@ don't drop durability.
 Each step ends green on its own tests and is committed; nothing reaches vc-dev before
 H-6, which needs your OK to roll. Sizes are rough working days.
 
-### H-0 — dependency alignment (FlowR, ~1 day spike, then the bump)
+### H-0 — one stack, latest versions (both repos, ~2 days)
 
-Find the LanceDB release built on Lance 12 / Arrow 58 / DataFusion 54 and move
-FlowR's workspace to it (or, if none fits, plan FlowR's LanceDB uses onto ADB platform
-tables and keep two stacks only until then). Exit: FlowR builds and its test suites
-pass on ADB's versions; build size and time recorded against the 100 GB budget.
+1. **ADB:** Lance and lance-index `=12.0.0` → `=14.0.2`; Arrow to 58.4.1 (lockfile).
+   Fix API changes (MemWAL applier, merge-insert, compaction, scalar indexes, the
+   `LANCE_BYPASS_SPILLING` workaround K10, which may no longer be needed). Exit: ADB's
+   tests, AQL conformance, `gate --quick` and the crash tests pass; the 1,000-kill
+   crash run is repeated before vc-dev.
+2. **FlowR** (`flowr-ce` workspace and EE's `flowr-server`): LanceDB 0.26 → 0.41.0,
+   every Arrow crate 57 → 58.4.1 (including the `arrow-flight` client that talks to
+   ADB). Fix API changes in the LanceDB storage, `call:lancedb`, the platform DB and
+   the registry. Exit: FlowR's full test suites pass; existing `clawdflow.lance` and
+   `a3t-platform.lance` data open and read unchanged (tested on a copy of vc-dev's
+   data shape).
+3. A version check (script in both repos' test runs) that the two lockfiles resolve
+   these crates to the same versions.
+4. Build size and time recorded against the 100 GB budget.
 
 ### H-1 — `EngineCore` in FlowR (`flowr-storage`, ~2 days, no behaviour change)
 
