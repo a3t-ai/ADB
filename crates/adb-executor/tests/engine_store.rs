@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 const LEASE: Duration = Duration::from_secs(30);
 
-fn new_run(ns: &str) -> NewRun {
+pub fn new_run(ns: &str) -> NewRun {
     NewRun {
         run_id: uuid::Uuid::now_v7(),
         namespace: ns.into(),
@@ -220,4 +220,64 @@ async fn the_log_is_trimmed_only_below_the_engine_snapshot() {
     }
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     assert_eq!(count(&engine).await, 1000, "snapshot + the records above it");
+}
+
+/// H-6 bench, the same measures as FlowR's SQLite store had (run start → claim
+/// → release; step commit p50/p99; 8 concurrent runs). `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_embedded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = engine.engine_store("bench").unwrap();
+    bench(&s).await;
+}
+
+pub async fn bench<S: EngineStore + Clone + 'static>(s: &S) {
+    s.pending(DEFAULT_POOL).await.unwrap();
+    let n = 300;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let run = new_run("p");
+        let task = NewTask { visible_at: chrono::Utc::now() - chrono::Duration::seconds(1), ..NewTask::start(&run) };
+        s.start(run, task).await.unwrap();
+        let (lease, task, epoch) = s.claim_runs(DEFAULT_POOL, "w", 1, LEASE).await.unwrap().remove(0);
+        s.release(task.run_id, epoch, RunPhase::Completed, RunOutcome::default(), &lease).await.unwrap();
+    }
+    let per_run = t.elapsed() / n;
+    let run = new_run("p");
+    let id = run.run_id;
+    let task = NewTask { visible_at: chrono::Utc::now() - chrono::Duration::seconds(1), ..NewTask::start(&run) };
+    s.start(run, task).await.unwrap();
+    let (_, _, epoch) = s.claim_runs(DEFAULT_POOL, "w", 1, LEASE).await.unwrap().remove(0);
+    let mut lat = Vec::new();
+    for i in 0..1000 {
+        let t = std::time::Instant::now();
+        s.commit_step(id, epoch, StepCommit { records: vec![step(&format!("/s{i}"), i)], checkpoint: None, outbox: vec![] }).await.unwrap();
+        lat.push(t.elapsed());
+    }
+    lat.sort();
+    let t = std::time::Instant::now();
+    let mut hs = Vec::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        let run = new_run("p");
+        let id = run.run_id;
+        let task = NewTask { pool: format!("b-{id}"), visible_at: chrono::Utc::now() - chrono::Duration::seconds(1), ..NewTask::start(&run) };
+        let pool = task.pool.clone();
+        s.start(run, task).await.unwrap();
+        hs.push(tokio::spawn(async move {
+            let (_, _, epoch) = s.claim_runs(&pool, "w", 1, LEASE).await.unwrap().remove(0);
+            for i in 0..200 {
+                s.commit_step(id, epoch, StepCommit { records: vec![step(&format!("/s{i}"), i)], checkpoint: None, outbox: vec![] }).await.unwrap();
+            }
+        }));
+    }
+    for h in hs {
+        h.await.unwrap();
+    }
+    let conc = 1600.0 / t.elapsed().as_secs_f64();
+    println!("BENCH run start+claim+release: {per_run:?}/run ({:.0} runs/s)", 1.0 / per_run.as_secs_f64());
+    println!("BENCH step commit p50 {:?} p99 {:?} ({:.0} steps/s serial)", lat[500], lat[990], 1000.0 / lat.iter().sum::<Duration>().as_secs_f64());
+    println!("BENCH 8 concurrent runs: {conc:.0} steps/s");
 }

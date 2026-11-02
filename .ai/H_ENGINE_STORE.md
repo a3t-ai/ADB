@@ -221,6 +221,18 @@ SQLite file written by the `engine-sqlite` build and reads every run back identi
 
 ### H-6 — crash, bench, vc-dev (~2 days)
 
+> **Crash and bench done 2 Nov 2026** (this commit; vc-dev waits for the user's OK).
+> - **Crash** (`tests/engine-crash.mjs`, in `check-all`): FlowR on an ADB server over Flight; 20 runs of a flow with an HTTP call, a 6 s durable timer and a second call; ADB SIGKILLed 3 times and restarted: every run completes, every side effect happened once per idempotency key (0 repeats), journals intact. Also 40 runs × 6 kills.
+> - **Bench** (same measures as FlowR's SQLite store had, this pod): the first cut was 4–8× SQLite — every engine op wrote the journal's Lance partition under the sequencer, even ops without journal entries. Now a background writer per space writes episodes in log order (the log already holds them; replay rewrites what a crash lost), ops without journal entries don't touch Lance, archived reads wait for the writer, and the log floor holds back only for episodes pending or not yet durable. Result:
+>
+> | | SQLite (debug) | ADB embedded (debug) | ADB over Flight (release) |
+> |---|---|---|---|
+> | run start → claim → release | 1.5 ms | 2.4–2.6 ms | 2.5 ms |
+> | step commit p50 / p99 | 0.42 / 0.82 ms | 0.57–0.60 / 1.2–1.9 ms | 0.58 / 1.63 ms |
+> | 8 concurrent runs | 1,700 steps/s | 1,320–1,360 steps/s | 2,653 steps/s |
+>
+> Within 2× (p99 at 1.5–2.3× on a shared pod). Flight in a debug build costs ~1.75 ms a call (0.33 ms in release): debug numbers over Flight are not representative. Group commit not needed yet.
+
 1. Crash: SIGKILL ADB during runs (steps, timer, listener, approval); restart; all
    continue; nothing lost or repeated (a `tests/engine-crash.mjs` beside ADB's other
    crash tests).

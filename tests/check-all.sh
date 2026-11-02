@@ -75,7 +75,8 @@ if [ $QUICK = 0 ]; then
     step "subscriptions crash (10 kills)" node "$ROOT/tests/subscriptions-crash.mjs" --adb "$ADB" --rounds 10
     step "recall eval (W4)" node "$ROOT/tests/recall-eval.mjs" --adb "$ADB" --model "$ADB_EMBED_MODEL_DIR"
     if [ -d "$DEV/flowr-system/flowr-ce" ]; then
-        step "topic trigger (2 FlowR)" node "$ROOT/tests/topic-trigger.mjs" --adb "$ADB" --flowr "$FLOWR"
+        step "engine crash (FlowR runs, ADB killed 3x)" node "$ROOT/tests/engine-crash.mjs" --adb "$ADB" --flowr "$FLOWR" --runs 20 --kills 3
+    step "topic trigger (2 FlowR)" node "$ROOT/tests/topic-trigger.mjs" --adb "$ADB" --flowr "$FLOWR"
         step "runtime e2e (shared registry)" node "$ROOT/tests/runtime-e2e.mjs" --adb "$ADB" --flowr "$FLOWR"
         if [ -d "$LANCEDB" ]; then
             step "platform differential" node "$ROOT/tests/platform-differential.mjs" --adb "$ADB" --flowr "$FLOWR" \

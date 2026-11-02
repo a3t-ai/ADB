@@ -69,9 +69,24 @@ struct Snapshot {
     core: EngineCore,
 }
 
+/// Journal rows for the space's writer: one log record's episodes and the
+/// runs whose history retention removes.
+struct JournalJob {
+    offset: LogOffset,
+    epoch: Epoch,
+    commit_ts: CommitTs,
+    puts: Vec<Effect>,
+    purge: Vec<RunId>,
+}
+
 struct Space {
     core: EngineCore,
     journal: Arc<PartitionStore>,
+    /// The background writer of the journal partition (log order).
+    jobs: UnboundedSender<JournalJob>,
+    /// The last log offset handed to the writer, and how far it has written.
+    queued: u64,
+    written: tokio::sync::watch::Receiver<u64>,
     /// The last log offset the snapshot on disk includes.
     snapshot_offset: u64,
     /// The last log offset with this space's changes.
@@ -101,9 +116,56 @@ fn check_space(name: &str) -> EngineResult<()> {
     ok.then_some(()).ok_or_else(|| EngineError::BadSpace(name.to_string()))
 }
 
+/// Write a space's journal episodes in log order, off the sequencer (the log
+/// already holds them: after a crash, replay writes what is missing). A write
+/// that keeps failing stops the writer rather than skip past it.
+fn spawn_writer(space: String, journal: Arc<PartitionStore>, start: u64) -> (UnboundedSender<JournalJob>, tokio::sync::watch::Receiver<u64>) {
+    let (tx, mut rx) = unbounded::<JournalJob>();
+    let (done, written) = tokio::sync::watch::channel(start);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while let Some(job) = rx.next().await {
+            let mut tries = 0;
+            loop {
+                match write_job(&journal, &job).await {
+                    Ok(()) => break,
+                    Err(e) if tries < 5 => {
+                        tries += 1;
+                        tracing::warn!(space, offset = job.offset.0, error = %e, "journal write failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(200 << tries)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(space, offset = job.offset.0, error = %e, "journal writer stopped; the log keeps the records for the next open");
+                        return;
+                    }
+                }
+            }
+            let _ = done.send(job.offset.0);
+        }
+    });
+    (tx, written)
+}
+
+async fn write_job(journal: &PartitionStore, job: &JournalJob) -> EngineResult<()> {
+    if job.offset.0 <= journal.applied_offset().await.map_err(store_err)?.0 {
+        return Ok(());
+    }
+    let mut effects = job.puts.clone();
+    for id in &job.purge {
+        let now = CommitTs::from_datetime(Utc::now());
+        let rows = journal.current(Some(&format!("scope = '{id}'")), now).await.map_err(store_err)?;
+        effects.extend(rows.into_iter().map(|r| Effect::Forget { memory: Memory::Episodic, lineage_id: RecordId(adb_store::key_of(&r.lineage_id).to_string()) }));
+    }
+    let rec = LogRecord { partition: JOURNAL_PARTITION, offset: job.offset, epoch: job.epoch, commit_ts: job.commit_ts, txn_id: None, effects };
+    journal.apply(&rec).await.map_err(store_err)?;
+    Ok(())
+}
+
 async fn open_space(dir: &Path) -> EngineResult<Space> {
     std::fs::create_dir_all(dir).map_err(store_err)?;
     let journal = Arc::new(PartitionStore::open(&StoreConfig::new(dir.join("journal")), JOURNAL_PARTITION).await.map_err(store_err)?);
+    let applied = journal.applied_offset().await.map_err(store_err)?.0;
+    let (jobs, written) = spawn_writer(dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), Arc::clone(&journal), applied);
     let (core, snapshot_offset) = match std::fs::read(dir.join("snapshot.json")) {
         Ok(bytes) => {
             let s: Snapshot = serde_json::from_slice(&bytes).map_err(|e| EngineError::Snapshot(e.to_string()))?;
@@ -112,7 +174,7 @@ async fn open_space(dir: &Path) -> EngineResult<Space> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (EngineCore::new(), 0),
         Err(e) => return Err(EngineError::Snapshot(e.to_string())),
     };
-    Ok(Space { core, journal, snapshot_offset, last_offset: snapshot_offset, since_snapshot: 0, snapshot_at: Instant::now() })
+    Ok(Space { core, journal, jobs, queued: applied, written, snapshot_offset, last_offset: snapshot_offset, since_snapshot: 0, snapshot_at: Instant::now() })
 }
 
 /// A one-line summary of a journal record, the episode's text.
@@ -269,36 +331,47 @@ impl EngineHost {
         Ok(())
     }
 
-    /// The journal partition's share of a record: an episode per new entry,
-    /// a FORGET for each episode of a run that retention removed.
+    /// The journal partition's share of a record, queued for the space's
+    /// writer: an episode per new entry, and the runs whose history retention
+    /// removes. A record with neither costs the journal nothing.
     async fn write_journal(&mut self, space: &str, record: &LogRecord, changes: &[Change]) -> EngineResult<()> {
-        let s = self.spaces.get(space).expect("opened");
-        if record.offset.0 <= s.journal.applied_offset().await.map_err(store_err)?.0 {
-            return Ok(());
-        }
-        let mut effects = Vec::new();
+        let s = self.spaces.get_mut(space).expect("opened");
+        let mut puts = Vec::new();
+        let mut purge = Vec::new();
         for c in changes {
             match c {
                 Change::Journal { run, entries } => {
                     let ns = s.core.get(*run).map(|r| r.namespace).unwrap_or_default();
-                    effects.extend(entries.iter().map(|e| Effect::PutEpisode(episode(space, &ns, *run, e))));
+                    puts.extend(entries.iter().map(|e| Effect::PutEpisode(episode(space, &ns, *run, e))));
                 }
-                Change::Run { id, state: None } => {
-                    let now = CommitTs::from_datetime(Utc::now());
-                    let rows = s.journal.current(Some(&format!("scope = '{id}'")), now).await.map_err(store_err)?;
-                    effects.extend(rows.into_iter().map(|r| Effect::Forget { memory: Memory::Episodic, lineage_id: RecordId(adb_store::key_of(&r.lineage_id).to_string()) }));
-                }
+                Change::Run { id, state: None } => purge.push(*id),
                 _ => {}
             }
         }
-        // An empty record still moves the store's offset, so replay skips it.
-        let rec = LogRecord { partition: JOURNAL_PARTITION, offset: record.offset, epoch: record.epoch, commit_ts: record.commit_ts, txn_id: None, effects };
-        s.journal.apply(&rec).await.map_err(store_err)?;
+        if puts.is_empty() && purge.is_empty() {
+            return Ok(());
+        }
+        s.queued = record.offset.0;
+        s.jobs
+            .unbounded_send(JournalJob { offset: record.offset, epoch: record.epoch, commit_ts: record.commit_ts, puts, purge })
+            .map_err(|_| EngineError::Store(format!("space {space}: the journal writer stopped")))
+    }
+
+    /// Wait until `space`'s writer has written everything queued.
+    async fn journal_caught_up(&mut self, space: &str) -> EngineResult<()> {
+        let s = self.space(space).await?;
+        let want = s.queued;
+        let mut w = s.written.clone();
+        tokio::time::timeout(Duration::from_secs(30), w.wait_for(|v| *v >= want))
+            .await
+            .map_err(|_| EngineError::Store(format!("space {space}: journal not written after 30 s")))?
+            .map_err(|_| EngineError::Store(format!("space {space}: the journal writer stopped")))?;
         Ok(())
     }
 
     /// A run's journal history from the partition (its journal left memory).
     pub async fn archived(&mut self, space: &str, run: RunId, after_seq: u64) -> EngineResult<Vec<JournalEntry>> {
+        self.journal_caught_up(space).await?;
         let s = self.space(space).await?;
         let now = CommitTs::from_datetime(Utc::now());
         let rows = s.journal.current(Some(&format!("scope = '{run}'")), now).await.map_err(store_err)?;
@@ -352,7 +425,6 @@ impl EngineHost {
             if !due {
                 continue;
             }
-            s.journal.sync_to_disk().await.map_err(store_err)?;
             let snap = Snapshot { offset: s.last_offset, core: s.core.clone() };
             let bytes = serde_json::to_vec(&snap).map_err(|e| EngineError::Snapshot(e.to_string()))?;
             let dir = self.dir.join(&name);
@@ -381,8 +453,11 @@ impl EngineHost {
     pub async fn floor(&self) -> Option<LogOffset> {
         let mut floor: Option<u64> = None;
         for s in self.spaces.values() {
+            // Journal rows still queued, or written but not yet durable, need
+            // their records; with none pending, the journal holds nothing back.
             let durable = s.journal.durable_offset().await.map(|o| o.0).unwrap_or(0);
-            let needs = s.snapshot_offset.min(durable);
+            let pending = *s.written.borrow() < s.queued || durable < s.queued;
+            let needs = if pending { s.snapshot_offset.min(durable) } else { s.snapshot_offset };
             if needs < s.last_offset {
                 floor = Some(floor.map_or(needs + 1, |f| f.min(needs + 1)));
             }

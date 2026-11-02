@@ -152,3 +152,70 @@ async fn notices_and_typed_errors_over_flight() {
     let (_, _, epoch) = store.claim_runs(DEFAULT_POOL, "w", 1, Duration::from_secs(30)).await.unwrap().remove(0);
     assert!(matches!(store.append(id, epoch + 1, &[]).await, Err(StoreError::Fenced(r)) if r == id));
 }
+
+/// H-6 bench over Flight (EE: FlowR → ADB server), the same measures as the
+/// embedded one. `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_over_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path(), true).await;
+    let s = Arc::new(Client::new(FlightTransport { client: client(addr).await, space: "bench".into(), token: Some(ENGINE.into()) }));
+    let lease = Duration::from_secs(30);
+    let new_run = || NewRun {
+        run_id: uuid::Uuid::now_v7(), namespace: "p".into(), flow: "f".into(), version: "1".into(), def_hash: "h".into(),
+        parent_run_id: None, durability: Durability::Durable, debug: false, breakpoints: None, principal: json!({}),
+        trigger: "api".into(), input: json!({}), deadline_at: None, dedupe_key: None,
+    };
+    let step = |i: u64| Record::StepCompleted { step_key: format!("/s{i}"), attempt: 0, output: json!(i), context: Value::Null, class: StepClass::Pure, duration_us: 1, directive: String::new(), input: Value::Null, at: None };
+    s.pending(DEFAULT_POOL).await.unwrap();
+    let t = std::time::Instant::now();
+    for _ in 0..500 {
+        s.pending(DEFAULT_POOL).await.unwrap();
+    }
+    println!("BENCH(flight) a read-only call (pending): {:?}", t.elapsed() / 500);
+    let n = 300;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        let run = new_run();
+        let task = NewTask { visible_at: chrono::Utc::now() - chrono::Duration::seconds(1), ..NewTask::start(&run) };
+        s.start(run, task).await.unwrap();
+        let (l, task, epoch) = s.claim_runs(DEFAULT_POOL, "w", 1, lease).await.unwrap().remove(0);
+        s.release(task.run_id, epoch, RunPhase::Completed, RunOutcome::default(), &l).await.unwrap();
+    }
+    let per_run = t.elapsed() / n;
+    let run = new_run();
+    let id = run.run_id;
+    let task = NewTask { visible_at: chrono::Utc::now() - chrono::Duration::seconds(1), ..NewTask::start(&run) };
+    s.start(run, task).await.unwrap();
+    let (_, _, epoch) = s.claim_runs(DEFAULT_POOL, "w", 1, lease).await.unwrap().remove(0);
+    let mut lat = Vec::new();
+    for i in 0..1000 {
+        let t = std::time::Instant::now();
+        s.commit_step(id, epoch, StepCommit { records: vec![step(i)], checkpoint: None, outbox: vec![] }).await.unwrap();
+        lat.push(t.elapsed());
+    }
+    lat.sort();
+    let t = std::time::Instant::now();
+    let mut hs = Vec::new();
+    for _ in 0..8 {
+        let s = Arc::clone(&s);
+        let run = new_run();
+        let id = run.run_id;
+        let task = NewTask { pool: format!("b-{id}"), visible_at: chrono::Utc::now() - chrono::Duration::seconds(1), ..NewTask::start(&run) };
+        let pool = task.pool.clone();
+        s.start(run, task).await.unwrap();
+        hs.push(tokio::spawn(async move {
+            let (_, _, epoch) = s.claim_runs(&pool, "w", 1, lease).await.unwrap().remove(0);
+            for i in 0..200 {
+                s.commit_step(id, epoch, StepCommit { records: vec![step(i)], checkpoint: None, outbox: vec![] }).await.unwrap();
+            }
+        }));
+    }
+    for h in hs {
+        h.await.unwrap();
+    }
+    println!("BENCH(flight) run start+claim+release: {per_run:?}/run ({:.0} runs/s)", 1.0 / per_run.as_secs_f64());
+    println!("BENCH(flight) step commit p50 {:?} p99 {:?}", lat[500], lat[990]);
+    println!("BENCH(flight) 8 concurrent runs: {:.0} steps/s", 1600.0 / t.elapsed().as_secs_f64());
+}
