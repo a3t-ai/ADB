@@ -114,6 +114,8 @@ H-6, which needs your OK to roll. Sizes are rough working days.
 
 ### H-0 — one stack, latest versions (both repos, ~2 days)
 
+> **Done 2 Nov 2026** — ADB `cdc9058`, FlowR `743be77`. Every ADB test and the full `check-all` gate pass, and so do FlowR's suites; data written by Lance 12 (ADB memory and platform tables) and by LanceDB 0.26 (FlowR) opens and reads the same. Found on the way: Lance 14 reads `"…"` in SQL filters as a column, so FlowR's `PlatformDb` converts A3T's double-quoted values (`flowr_storage::filter::compat`); and a canvas sandbox's runs were routed to a pool it doesn't claim (fixed; the runtime e2e passes). EE's `flowr/Cargo.lock` is updated in the working tree, not committed (user's staged file).
+
 1. **ADB:** Lance and lance-index `=12.0.0` → `=14.0.2`; Arrow to 58.4.1 (lockfile).
    Fix API changes (MemWAL applier, merge-insert, compaction, scalar indexes, the
    `LANCE_BYPASS_SPILLING` workaround K10, which may no longer be needed). Exit: ADB's
