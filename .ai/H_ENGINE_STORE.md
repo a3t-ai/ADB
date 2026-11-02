@@ -213,6 +213,8 @@ for `run:<id>`, new journal records (H13); the `engine` token scope and secret
 
 ### H-5 — moving runs (`adb` CLI, ~1 day)
 
+> **Done 2 Nov 2026**. `adb import-flowr-engine <flowr.db> [--flight] [--space]` (ADB_ENGINE_TOKEN) reads FlowR's SQLite store (the `engine-sqlite` schema; `waits`, `events_seen`, `checkpoints`, `outbox` when present) and sends engine changes in batches — each run with its journal (≤ 500 entries a batch) and checkpoints, then tasks, waits, event ids, outbox — through `do_action("engine_restore")`, which runs `EngineCore::restore` under the sequencer (logged; journal episodes written). A space that already holds runs is refused. Checked: a unit test (runs, journals, a timer task, an open wait, event ids; a second import refused; restart), and a real local `flowr.db` (24 runs, 199 journal entries, 2 event ids) imported over Flight and read back through FlowR on ADB: every run's phase and journal identical. No export (no SQLite to go back to).
+
 `adb import-flowr-engine <flowr.db> [--space]`: tasks, runs, journals (to the core and
 to EPISODIC), waits, events seen; re-runnable (`--replace`); a test that imports a
 SQLite file written by the `engine-sqlite` build and reads every run back identically.

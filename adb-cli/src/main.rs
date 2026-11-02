@@ -18,6 +18,7 @@ use adb_mcp::McpServer;
 use clap::{Parser, Subcommand};
 
 mod import;
+mod import_engine;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -67,6 +68,19 @@ enum Commands {
         #[arg(long)]
         replace: bool,
     },
+    /// Copy a FlowR SQLite engine store (flowr.db: runs, journals, tasks, waits)
+    /// into an engine space of a running ADB over Arrow Flight (uses
+    /// ADB_ENGINE_TOKEN); the space must hold no runs yet
+    ImportFlowrEngine {
+        /// FlowR's flowr.db
+        path: std::path::PathBuf,
+        /// ADB's Flight endpoint
+        #[arg(long, default_value = "http://127.0.0.1:3001")]
+        flight: String,
+        /// The engine space (FlowR's FLOWR_ENGINE_SPACE)
+        #[arg(long, default_value = "default")]
+        space: String,
+    },
     /// Read-only SQL over a running ADB's memory and platform tables, over Arrow
     /// Flight (superadmin debug view; uses ADB_AUTH_TOKEN). Tables: memory,
     /// memory_current, memory_raw and each platform table.
@@ -93,6 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A client command: no engine of its own.
     if let Some(Commands::ImportLancedb { path, flight, replace }) = &cli.command {
         return import::import(path, flight, *replace).await.map_err(|e| e.into());
+    }
+    if let Some(Commands::ImportFlowrEngine { path, flight, space }) = &cli.command {
+        return import_engine::import(path, flight, space).await.map_err(|e| e.into());
     }
     if let Some(Commands::Sql { query, flight, limit }) = &cli.command {
         return import::sql(query, flight, *limit).await.map_err(|e| e.into());
@@ -149,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = adb_executor::restart_requested() => tracing::info!("ADB stopping to apply its new settings"),
             }
         }
-        Commands::ImportLancedb { .. } | Commands::Sql { .. } => unreachable!("handled before the engine opens"),
+        Commands::ImportLancedb { .. } | Commands::ImportFlowrEngine { .. } | Commands::Sql { .. } => unreachable!("handled before the engine opens"),
         Commands::Query { query } => match engine.query(&query, None).await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
             Err(e) => {

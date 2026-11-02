@@ -26,3 +26,12 @@ arrow-cast = "58"
 arrow-flight = "58"
 tonic = "0.14"
 futures.workspace = true
+# `adb import-flowr-engine`: a FlowR SQLite engine store into an ADB space (stage H-5)
+rusqlite = { version = "0.41", features = ["bundled"] }
+flowr-storage.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

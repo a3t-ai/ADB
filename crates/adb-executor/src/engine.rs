@@ -91,6 +91,13 @@ pub trait Engine: Send + Sync {
     fn flowr_engine(&self, _space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
         None
     }
+
+    /// Load another store's state into engine space `space` (H-5, `adb
+    /// import-flowr-engine`): `changes` are `engine_core::Change`s, logged like
+    /// any operation's. `first`: refuse a space that already holds runs.
+    async fn engine_restore(&self, _space: &str, _changes: Vec<Value>, _first: bool) -> Result<usize, String> {
+        Err("FlowR's engine store needs a durable engine (start ADB with --data-dir)".into())
+    }
 }
 
 /// `ADB_CACHE`: `on` (default), `off`, or `shadow` (every answer from the hot cache
@@ -514,6 +521,16 @@ impl LocalEngine {
 impl Engine for LocalEngine {
     fn flowr_engine(&self, space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
         self.engine_store(space).map(|s| Arc::new(s) as Arc<dyn flowr_storage::engine::EngineStore>)
+    }
+
+    async fn engine_restore(&self, space: &str, changes: Vec<Value>, first: bool) -> Result<usize, String> {
+        let Some(d) = &self.durable else { return Err("FlowR's engine store needs a durable engine (start ADB with --data-dir)".into()) };
+        let changes = changes
+            .into_iter()
+            .map(serde_json::from_value::<flowr_storage::engine_core::Change>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("not an engine change: {e}"))?;
+        d.engine_exec(space, |c| c.restore(changes, first)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {

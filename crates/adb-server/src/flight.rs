@@ -18,6 +18,7 @@
 //! | `do_action("aql")` | `{"query", "variables"?}` | the `POST /query` result (`{success, data, …}`) |
 //! | `do_action("engine")` | `{"space", "op", "args"}`: FlowR's engine store (stage H), one op per store method (`flowr_storage::engine_wire`, the same as FlowR's gateway) | `{"ok": result}` or `{"err": {"kind", "id"?, "message"}}` (`fenced`, `lease_lost`, `not_found`, `conflict`, `backend`) |
 //! | `do_action("engine_subscribe")` | `{"space", "topic"}` (`tasks:<pool>`, `run:<id>`) | a stream: one result per notice (JSON), until the client goes |
+//! | `do_action("engine_restore")` | `{"space", "changes": [..], "first"?}`: another store's state as engine changes (`adb import-flowr-engine`, H-5); `first` refuses a space that holds runs | `{"restored": n}` |
 //!
 //! Engine actions need the engine token (`ADB_ENGINE_TOKEN`) when ADB has tokens;
 //! the memory token (`ADB_AUTH_TOKEN`) doesn't open them, and the engine token
@@ -453,6 +454,14 @@ impl FlightService for AdbFlight {
             if a.r#type == "engine_subscribe" {
                 return Ok(Response::new(self.engine_subscribe(&b)?));
             }
+            if a.r#type == "engine_restore" {
+                let space = str_field(&b, "space")?;
+                let changes = b.get("changes").and_then(|c| c.as_array()).cloned().ok_or_else(|| Status::invalid_argument("engine_restore needs changes"))?;
+                let first = b.get("first").and_then(|f| f.as_bool()).unwrap_or(false);
+                let n = self.engine.engine_restore(space, changes, first).await.map_err(Status::failed_precondition)?;
+                let r = arrow_flight::Result { body: json!({ "restored": n }).to_string().into() };
+                return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
+            }
             if a.r#type != "engine" {
                 return Err(Status::invalid_argument(format!("unknown action {}", a.r#type)));
             }
@@ -478,6 +487,7 @@ impl FlightService for AdbFlight {
             ("aql", "Run AQL: {query, variables?} → the POST /query result"),
             ("engine", "FlowR's engine store: {space, op, args} → {ok} | {err} (engine token)"),
             ("engine_subscribe", "FlowR engine notices: {space, topic} → a stream of JSON notices (engine token)"),
+            ("engine_restore", "Load FlowR engine state: {space, changes, first?} → {restored} (engine token; adb import-flowr-engine)"),
         ]
         .map(|(t, d)| Ok(ActionType { r#type: t.into(), description: d.into() }));
         Ok(Response::new(Box::pin(futures::stream::iter(actions))))
