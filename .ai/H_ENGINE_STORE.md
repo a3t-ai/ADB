@@ -133,6 +133,8 @@ H-6, which needs your OK to roll. Sizes are rough working days.
 
 ### H-1 — `EngineCore` in FlowR (`flowr-storage`, ~2 days, no behaviour change)
 
+> **Done 2 Nov 2026** — FlowR `caa9078`. As planned, with these choices: changes are whole rows (task / run / wait set or deleted, journal entries appended, event seen, checkpoint, outbox), emitted through `apply`, the only mutation; typed methods on the core rather than an `Op` enum (the wire format stays the gateway's op JSON, mapped in H-3); a run remembers its last pool, used for resumes when the host has no router (ADB). The console's router still reads live pools from the gateway; switching it to `TaskQueue::live_pools` comes with H-4.
+
 1. `engine::core`: `Op` (one variant per store method, serde names = the gateway's op
    names), `Reply`, `Change` (each with `durable()`: false only for lease extensions,
    H4), `Notice` (topic + message), and `EngineCore` holding today's in-memory state.
