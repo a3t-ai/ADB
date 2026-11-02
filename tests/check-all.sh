@@ -57,6 +57,7 @@ trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$scratch"' EXIT
 ADB="$CARGO_TARGET_DIR/debug/adb"
 FLOWR="$FLOWR_TARGET/debug/flowr-ce"
 
+step "stack versions (H16)" "$ROOT/tests/stack-versions.sh"
 step "build adb" bash -c "cd '$ROOT' && cargo build -p adb-cli"
 step "rust tests (workspace)" bash -c "cd '$ROOT' && cargo test --workspace --no-fail-fast"
 step "AQL conformance (all suites)" bash -c "

@@ -1,6 +1,7 @@
 //! Integration tests for the full AQL pipeline
 //!
 //! Tests the complete flow: AQL query string -> parser -> planner -> executor -> results
+#![recursion_limit = "256"]
 
 use std::sync::Arc;
 

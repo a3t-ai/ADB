@@ -2,6 +2,9 @@
 //!
 //! Executes planned AQL against the partition log and its Lance table.
 
+// Lance 14's async types nest deeper than the default limit allows (H-0).
+#![recursion_limit = "256"]
+
 pub mod engine;
 mod error;
 mod executor;

@@ -882,7 +882,8 @@ impl PartitionStore {
         inner.puts.lock().unwrap().offsets.push_back(off);
         self.puts_since_compaction.fetch_add(records.len() as u64, std::sync::atomic::Ordering::SeqCst);
         if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
-            inner.writer.force_seal_active().await.map_err(lance)?;
+            // Queued for flush; nothing here waits on it (the fence is dropped).
+            inner.writer.force_freeze_active().await.map_err(lance)?;
         }
         Ok(records.len())
     }

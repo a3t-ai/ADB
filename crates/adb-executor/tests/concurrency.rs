@@ -3,6 +3,7 @@
 //! evaluated under the sequencer after every earlier write is applied, so of many
 //! concurrent updates from the same version exactly one wins. LINK checks that both
 //! ends exist at commit time.
+#![recursion_limit = "256"]
 
 use std::sync::Arc;
 

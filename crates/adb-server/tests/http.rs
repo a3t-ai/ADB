@@ -1,4 +1,5 @@
 //! HTTP tests over a real listener: REST, MCP streamable HTTP and MCP over SSE.
+#![recursion_limit = "256"]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

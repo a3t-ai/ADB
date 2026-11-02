@@ -1,4 +1,5 @@
 //! MCP protocol tests against the local engine.
+#![recursion_limit = "256"]
 
 use std::sync::Arc;
 
