@@ -4,8 +4,11 @@
 > path), §11 (replication), §15 ("the rest of FlowR's state"); FlowR's
 > `.ai/FLOWR_QUEUE_CHECKPOINT_SPEC.md` (the engine contract) and
 > `.ai/FLOWR_ENGINE_LIMITATIONS.md` (L23, L35). · **Product decision (user, 2 Nov):**
-> for FlowR **EE, ADB is the default engine store and SQLite the fallback**; CE keeps
-> SQLite. This replaces the spec's plan of Postgres for EE (spec §8, open question 7).
+> **ADB is FlowR's only engine store, for CE and EE** (revised 2 Nov: ADB will also have
+> a CE edition). CE runs ADB **embedded** in the FlowR process; EE talks to an ADB
+> server over Flight. The SQLite store is kept on FlowR's branch `engine-sqlite`
+> (07b16e6) and removed from `adb-integration` once the ADB store passes (end of H-4).
+> This replaces the spec's plan of Postgres for EE (spec §8, open question 7).
 
 ## What the engine store is
 
@@ -39,7 +42,7 @@ commits as one log record (§9). The engine becomes a third table family on that
 
 | # | Question | Recommendation |
 |---|---|---|
-| H1 | **Default and fallback** | EE uses ADB when the console is given an ADB engine resource (`FLOWR_ENGINE_ADB=<ns/name>` or `config.engine: true` on the ADB resource); otherwise it uses SQLite (`<data>/flowr.db`), exactly as today. **Fallback is configuration, not automatic failover**, as for platform tables (G3): if ADB is configured but unreachable, store calls retry with backoff and runs wait. They never switch to a local SQLite file, which would split runs, leases and journals into two diverging copies. CE builds ignore the setting. |
+| H1 | **One store, two ways to reach it** | **ADB only.** CE: ADB **embedded** in the FlowR process (ADB's engine and memory crates as a library, data in `<data>/adb`), so CE stays one process with no setup, and FlowR's tests run it in-process. EE: the console and runtimes reach an **ADB server** over Flight (H6), selected by the ADB engine resource. Both run the same `EngineCore` on the same ADB write path, so there is one implementation. **No SQLite fallback** (revised 2 Nov): the SQLite store lives on the branch `engine-sqlite` and leaves `adb-integration` when H-4's gate passes. An EE console whose ADB is unreachable retries with backoff and its runs wait; it never falls back to a local store. |
 | H2 | **One implementation of the rules** | Move the in-memory store's logic into a pure **`EngineCore`** in `flowr-storage` (no I/O, no clock, no random ids: `now` and new ids are passed in). The memory store becomes `EngineCore` behind a mutex, and **ADB embeds the same `EngineCore`** (path dependency on `flowr-system/shared/flowr-storage`, which pulls only serde, uuid, chrono and async-trait). The rules are written once; the conformance suite checks the ADB wiring, not a second copy of the semantics. SQLite keeps its own SQL implementation, and the suite keeps it in step. |
 | H3 | **What goes in the log** | **What changed, not the request**, as ADB does for memory writes (§9: validate in the sequencer, log typed effects). The sequencer runs the operation on `EngineCore` (`exec(op, now, ids) → (reply, changes)`) and logs the changes as one record: `Effect::Engine { space, changes }`, with `changes` opaque bytes to `adb-core` (JSON of `flowr-storage` change types). It applies them, then replies. Replay, catch-up and followers only ever `apply(change)`, so they never re-run decisions and never depend on the clock. Each change is small and explicit: `TaskEnqueued`, `TaskLeased`, `TaskAcked`, `RunStarted`, `RunOwned{epoch}`, `RunReleased`, `JournalAppended{run, seq, record}`, `WaitOpened`, `WaitClosed`, `EventSeen`, and so on. |
 | H4 | **Heartbeats** | **Not logged.** A `heartbeat` or `renew` extends a lease in the leader's memory only, and is answered from there. After an ADB restart or a leader change, every lease and ownership gets one fresh lease period from the moment the engine opened. Safety doesn't depend on lease times: a worker that lost its run is still refused by the epoch check on its next write. The cost is liveness only, and only after an ADB restart: a run whose worker died just before it waits one more lease period. This removes most of the log volume (each live run renews every few seconds). |
@@ -49,11 +52,12 @@ commits as one log record (§9). The engine becomes a third table family on that
 | H8 | **Access** | Engine operations need an ADB token with the **`engine` scope**, held by FlowR consoles and runtimes only (a new secret, `adb-engine`). Tokens used for agent memory (`adb-auth`) can't read or write the engine. Runs carry principals and journals carry step inputs and outputs, so this is not memory-level data. |
 | H9 | **Several FlowR installs on one ADB** | Each FlowR installation uses its own **space** (`config.space`, default `default`), with its own core, snapshot and journal dataset. Spaces share nothing, so one ADB can serve vc-dev and a staging console without mixing runs. |
 | H10 | **Live pools** | The router sends runs only to pools with a live worker; today the gateway sees the claims. With ADB, the core records each pool's last claim time (in memory, not logged) and answers a new op, `live_pools`. It's added to the `TaskQueue` contract with a default, so SQLite answers it too, and the console's runtime view reads it from the store instead of the gateway. |
-| H11 | **Moving existing runs** | `adb import-flowr-engine <flowr.db> [--space s]` (ADB CLI) copies tasks, runs, journals, waits and events seen from FlowR's SQLite file into the space through the log, once, with the console stopped. Then the console is started with the ADB resource. Re-runnable (`--replace`). vc-dev has live runs and a waiting test listener, so this is needed. Going back to SQLite is the reverse (`adb export-flowr-engine`), for the fallback to stay real. |
+| H11 | **Moving existing runs** | `adb import-flowr-engine <flowr.db> [--space s]` (ADB CLI) copies tasks, runs, journals, waits and events seen from a FlowR SQLite file into a space, once, with the console stopped (vc-dev, and any CE user upgrading). Re-runnable (`--replace`). No export: there is no SQLite to go back to (the branch keeps the code). |
 | H12 | **Not in this stage** | Raft. Stage H works on one ADB node, and replication comes with ADB M3 for free, because the engine is only log effects plus `apply`. More than one console replica also waits: chat and agent streams live in the console's memory (`token_stream`), so replicas need those streams over ADB topics first (a separate step). |
 | H13 | **Notifications and live views** | The `Notifier` (task available on a pool, run changed) is ADB's subscription transport: a Flight stream fed from the engine's in-memory broadcast. Notices are not logged: they are hints, and claimers also poll. The same stream carries a run's new journal records, so the console's run views stream instead of polling (closes L25 once the UI uses it). |
 | H14 | **No extra components** | One ADB, polished (user). Iggy, Postgres and Dragonfly are not part of the engine. A high-volume export of lifecycle and metering events (L5's outbox) can be added later as an optional sink, if a customer needs one. |
 | H15 | **Who may read run history** | At first only the engine scope (H8): the `flowr:*` tenants are invisible to agent tokens, and AQL `FORGET`, `UPDATE`, TTL, consolidation and compaction leave them alone. Removal is retention only: the engine's purge physically deletes a finished run's episodes. Letting agents recall run history (their own runs, or a project's) is a later, explicit grant. |
+| H16 | **One Arrow / Lance stack** | Embedding ADB in FlowR (H1) needs the two repos on the same Arrow, DataFusion and Lance versions. Today FlowR CE is on LanceDB 0.26 (Arrow 57, DataFusion 51) and ADB on Lance 12 (Arrow 58, DataFusion 54). Linking both stacks works, but doubles build time and binary size on a pod with a tight disk budget. **Align FlowR on ADB's versions** (H-0) before embedding. FlowR's own LanceDB uses (registry, platform tables, state) either move to a LanceDB release on Lance 12 or, later, onto the embedded ADB's platform tables, which would make "one ADB" complete. |
 
 ## How an operation runs
 
@@ -99,13 +103,21 @@ don't drop durability.
 - **vc-dev:** after `import-flowr-engine` and switching the console and runtimes to
   the ADB resource, the `a3t-test` flows pass (listen and emit, timeout, event
   trigger, durable approval), a run executes on `rt-worker`, and restarting the
-  console pod doesn't interrupt a run on `rt-worker`. Switching back to SQLite (export
-  and unset) still works.
+  console pod doesn't interrupt a run on `rt-worker`.
+- **CE:** a fresh CE install runs flows durably on the embedded ADB with no setup, and
+  survives a restart mid-run.
 
 ## Implementation plan
 
 Each step ends green on its own tests and is committed; nothing reaches vc-dev before
 H-6, which needs your OK to roll. Sizes are rough working days.
+
+### H-0 — dependency alignment (FlowR, ~1 day spike, then the bump)
+
+Find the LanceDB release built on Lance 12 / Arrow 58 / DataFusion 54 and move
+FlowR's workspace to it (or, if none fits, plan FlowR's LanceDB uses onto ADB platform
+tables and keep two stacks only until then). Exit: FlowR builds and its test suites
+pass on ADB's versions; build size and time recorded against the 100 GB budget.
 
 ### H-1 — `EngineCore` in FlowR (`flowr-storage`, ~2 days, no behaviour change)
 
@@ -157,24 +169,27 @@ H-6, which needs your OK to roll. Sizes are rough working days.
 for `run:<id>`, new journal records (H13); the `engine` token scope and secret
 (H8). Tests: conformance over Flight in `adb-server/tests`.
 
-### H-4 — FlowR EE on ADB (~2 days)
+### H-4 — FlowR on ADB, embedded and remote (~3 days)
 
-1. `AdbEngineStore`: the gateway client's op encoding over FlowR's existing Flight
-   client (the one `call:adb` and the platform tables use); errors keep their kind.
-2. The switch (H1): the ADB engine resource on the console and, through the
-   controller's runtime env, on runtimes, which then talk to ADB directly (H7). No
-   resource: SQLite and the gateway, exactly as today.
+1. **Embedded (CE, tests):** `init_storage` opens ADB's durable engine in
+   `<data>/adb` in-process and uses it as the engine store, with no network hop.
+2. **Remote (EE):** `AdbEngineStore`, the gateway client's op encoding over FlowR's
+   existing Flight client (the one `call:adb` and the platform tables use); errors keep
+   their kind. Selected by the ADB engine resource on the console and, through the
+   controller's runtime env, on runtimes, which then talk to ADB directly (H7).
 3. Run views: `get_run` / journal streaming from the subscription (H13), UI moves off
    polling (L25).
-4. Tests: every FlowR engine suite against a local ADB (`FLOWR_TEST_ADB=<url>`, a
-   script that starts `adb serve` on a temp dir), and against SQLite as before.
+4. Tests: every FlowR engine suite on the embedded ADB (the default in tests), and
+   once against a local ADB server over Flight (`FLOWR_TEST_ADB=<url>`).
+5. **Remove SQLite** from `adb-integration` (engine store, gateway's SQLite path,
+   the `rusqlite` dependency) in one commit once 1–4 are green. The branch
+   `engine-sqlite` keeps it.
 
 ### H-5 — moving runs (`adb` CLI, ~1 day)
 
-`adb import-flowr-engine <flowr.db> [--space]` and `adb export-flowr-engine <space>
-<flowr.db>`: tasks, runs, journals (to the core and to EPISODIC), waits, events seen;
-re-runnable (`--replace`); a round-trip test (SQLite → ADB → SQLite gives the same
-rows).
+`adb import-flowr-engine <flowr.db> [--space]`: tasks, runs, journals (to the core and
+to EPISODIC), waits, events seen; re-runnable (`--replace`); a test that imports a
+SQLite file written by the `engine-sqlite` build and reads every run back identically.
 
 ### H-6 — crash, bench, vc-dev (~2 days)
 
@@ -185,7 +200,7 @@ rows).
 3. **vc-dev (your OK to roll):** ADB image with the engine; FlowR image with the
    client; secret `adb-engine`; stop the console, `import-flowr-engine`, start it
    with the ADB resource; controller env for runtimes; run the gate (a3t-test flows,
-   a run on `rt-worker`, console restart during a run on `rt-worker`, switch back).
+   a run on `rt-worker`, console restart during a run on `rt-worker`).
 
 L2 (subflow journals) and L5 (outbox drain) don't depend on the store and can go in
 between. Both must still pass the conformance suite on every store.
@@ -199,4 +214,6 @@ between. Both must still pass the conformance suite on every store.
 | Memory growth in the sequencer | Only live runs' journals are in memory; finished runs leave after a few minutes; run rows are purged by retention. Add a size metric and a cap on journals kept in memory (spill to Lance early). |
 | One sequencer lock for memory, platform and engine writes | Engine operations are short (microseconds of `exec`, plus the fsync shared with group commit). The bench decides whether engine writes need their own partition and log. |
 | Lease reset after an ADB restart (H4) | It only delays dead-worker recovery by one lease period after a restart. The epoch fencing that keeps it safe is already tested by the conformance suite and the crash tests. |
-| Cross-repo dependency (ADB → `flowr-storage`) | A path dependency between the sibling repos (`../flowr-system/shared/flowr-storage`). `flowr-storage` stays free of FlowR's runtime: the CI check builds it alone. |
+| Two Arrow / Lance stacks in one binary (H16) | H-0 aligns versions first; if no LanceDB release fits, FlowR's LanceDB uses move onto embedded ADB platform tables. |
+| CE gets heavier (ADB's engine linked in) | FlowR already links Lance, Arrow and DataFusion; after H-0 they are shared. Record binary size and start time in H-4. |
+| Cross-repo dependency (ADB → `flowr-storage`, FlowR → ADB crates) | A path dependency between the sibling repos (`../flowr-system/shared/flowr-storage`). `flowr-storage` stays free of FlowR's runtime: the CI check builds it alone. |
