@@ -62,16 +62,16 @@ commits as one log record (§9). The engine becomes a third table family on that
    take), runs `EngineCore::exec(op, now, fresh ids)` on the space's core, and gets
    the reply and the changes.
 3. If there are no changes (a read, a refused write, a duplicate), it replies at once.
-   Otherwise it appends one log record (`Effect::Engine{space, changes}`, fsynced),
-   applies the changes to the core, hands journal appends to the Lance applier and
-   wakes subscribers.
+   Otherwise it appends one log record (`Effect::Engine{space, changes}` plus a
+   `PutEpisode` per new journal record, fsynced), applies the changes to the core,
+   lets the memory applier write the episodes, and wakes subscribers.
 4. It replies with the result, or with the error kind (`Fenced` and the others).
 
 Reads (`get`, `list`, `read_from` for a live run, `pending`, `approvals`) are answered
-from the core without the log. `read_from` for a finished run reads `journal.lance`.
+from the core without the log. `read_from` for a finished, evicted run reads its episodes from EPISODIC.
 `list` with filters over history (run lists, newest first, by project, flow or status)
 reads the in-memory run table. Run rows are small and are purged by retention
-(30 days), so they stay in memory. The Lance journal is the only large data.
+(30 days), so they stay in memory. The journal's episodes are the only large data.
 
 ## Performance target
 
