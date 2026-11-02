@@ -186,6 +186,8 @@ H-6, which needs your OK to roll. Sizes are rough working days.
 
 ### H-3 — Flight surface (`adb-server`, ~1 day)
 
+> **Done 2 Nov 2026** (ADB, this commit; FlowR `3ca21ad`). `do_action("engine")` `{space, op, args}` → `{ok}` / `{err: {kind…}}` through `flowr_storage::engine_wire::dispatch`. Notices are `do_action("engine_subscribe")` `{space, topic}`, a long-lived stream of JSON results, rather than a `do_get` ticket: actions can stream, and notices aren't Arrow data. Tokens (H8): `ADB_ENGINE_TOKEN` opens only the engine actions; `ADB_AUTH_TOKEN` opens everything but them; neither set = open (dev, CE). FlowR's gateway client is now `engine_wire::Client<HttpTransport>`, and ADB's test drives the same `Client` over a Flight transport. Tests (`adb-server/tests/engine_flight.rs`): the conformance suite over Flight, the tokens' scopes, notices and a fenced error across the wire.
+
 `do_action("engine")` `{space, op, args}` → the reply JSON or a typed error;
 `do_get` ticket `{"engine_subscribe": {space, topic}}` → a stream of notices and,
 for `run:<id>`, new journal records (H13); the `engine` token scope and secret

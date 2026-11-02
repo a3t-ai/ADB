@@ -20,6 +20,7 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 adb-core = { path = "../adb-core" }
 adb-platform = { path = "../adb-platform" }
 adb-gateway = { path = "../adb-gateway" }
+flowr-storage.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-cast = "58"
@@ -29,6 +30,9 @@ tonic = "0.14"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+flowr-storage = { workspace = true, features = ["conformance"] }
+async-trait.workspace = true
+chrono.workspace = true
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tempfile.workspace = true

@@ -18,7 +18,7 @@
 
 pub mod auth;
 pub mod flight;
-pub use flight::{serve_flight, serve_flight_with_token};
+pub use flight::{serve_flight, serve_flight_with_token, serve_flight_with_tokens};
 
 use std::collections::HashMap;
 use std::convert::Infallible;

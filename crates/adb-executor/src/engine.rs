@@ -86,6 +86,11 @@ pub trait Engine: Send + Sync {
     async fn sql(&self, _sql: &str, _limit: Option<usize>) -> Result<crate::sql::SqlResult, String> {
         Err("SQL needs a durable engine (start ADB with --data-dir)".into())
     }
+
+    /// FlowR's engine store, space `space` (stage H); `None` without a data dir.
+    fn flowr_engine(&self, _space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
+        None
+    }
 }
 
 /// `ADB_CACHE`: `on` (default), `off`, or `shadow` (every answer from the hot cache
@@ -507,6 +512,10 @@ impl LocalEngine {
 
 #[async_trait]
 impl Engine for LocalEngine {
+    fn flowr_engine(&self, space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
+        self.engine_store(space).map(|s| Arc::new(s) as Arc<dyn flowr_storage::engine::EngineStore>)
+    }
+
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         if let Some(stmt) = watch_statement(aql) {
             return self.watch(stmt, variables).await;

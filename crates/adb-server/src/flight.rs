@@ -16,6 +16,12 @@
 //! | `do_action("compact")` | `{}` | `{"total", "kept", "bytes_before", "bytes_after", "took_ms", "platform": {…}}` (W5, W5-L4) |
 //! | `do_action("list_tables")` | `{}` | `["table", …]` |
 //! | `do_action("aql")` | `{"query", "variables"?}` | the `POST /query` result (`{success, data, …}`) |
+//! | `do_action("engine")` | `{"space", "op", "args"}`: FlowR's engine store (stage H), one op per store method (`flowr_storage::engine_wire`, the same as FlowR's gateway) | `{"ok": result}` or `{"err": {"kind", "id"?, "message"}}` (`fenced`, `lease_lost`, `not_found`, `conflict`, `backend`) |
+//! | `do_action("engine_subscribe")` | `{"space", "topic"}` (`tasks:<pool>`, `run:<id>`) | a stream: one result per notice (JSON), until the client goes |
+//!
+//! Engine actions need the engine token (`ADB_ENGINE_TOKEN`) when ADB has tokens;
+//! the memory token (`ADB_AUTH_TOKEN`) doesn't open them, and the engine token
+//! opens nothing else (H8).
 //!
 //! Errors are gRPC statuses: `invalid_argument` for a bad request or write,
 //! `not_found` for a missing table, `failed_precondition` without `--data-dir`.
@@ -46,16 +52,21 @@ const MAX_MESSAGE: usize = 64 << 20;
 
 /// Serve Flight on `addr` until the process ends.
 pub async fn serve_flight(addr: SocketAddr, engine: Arc<dyn Engine>) -> std::io::Result<()> {
-    serve_flight_with_token(addr, engine, crate::auth::token_from_env()).await
+    serve_flight_with_tokens(addr, engine, crate::auth::token_from_env(), crate::auth::engine_token_from_env()).await
 }
 
-/// [`serve_flight`] with an explicit token (`None`: open).
+/// [`serve_flight`] with an explicit memory token (`None`: open) and no engine token.
 pub async fn serve_flight_with_token(addr: SocketAddr, engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> std::io::Result<()> {
-    tracing::info!(auth = token.is_some(), "ADB Flight on grpc://{addr}");
+    serve_flight_with_tokens(addr, engine, token, None).await
+}
+
+/// [`serve_flight`] with explicit tokens (both `None`: open).
+pub async fn serve_flight_with_tokens(addr: SocketAddr, engine: Arc<dyn Engine>, token: Option<Arc<str>>, engine_token: Option<Arc<str>>) -> std::io::Result<()> {
+    tracing::info!(auth = token.is_some(), engine_auth = engine_token.is_some(), "ADB Flight on grpc://{addr}");
     let svc = FlightServiceServer::new(AdbFlight { engine })
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE);
-    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth(token));
+    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth { memory: token, engine: engine_token });
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve(addr)
@@ -68,6 +79,20 @@ pub struct AdbFlight {
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+use crate::auth::Access;
+
+fn access<T>(req: &Request<T>) -> Access {
+    req.extensions().get::<Access>().copied().unwrap_or(Access::Open)
+}
+
+/// Memory, platform tables and AQL: not with the engine token (H8).
+fn not_engine_only<T>(req: &Request<T>) -> Result<(), Status> {
+    match access(req) {
+        Access::Engine => Err(Status::permission_denied("the engine token opens only FlowR's engine store")),
+        _ => Ok(()),
+    }
+}
 
 fn platform_err(e: adb_platform::PlatformError) -> Status {
     match e {
@@ -236,6 +261,32 @@ impl AdbFlight {
         Ok(Box::pin(stream))
     }
 
+    fn flowr_engine(&self, b: &Value) -> Result<Arc<dyn flowr_storage::engine::EngineStore>, Status> {
+        let space = str_field(b, "space")?;
+        self.engine
+            .flowr_engine(space)
+            .ok_or_else(|| Status::failed_precondition("FlowR's engine store needs a durable ADB (start it with --data-dir)"))
+    }
+
+    /// One engine store op, in the gateway's envelope (stage H).
+    async fn engine_op(&self, b: &Value) -> Result<Value, Status> {
+        let store = self.flowr_engine(b)?;
+        let op = str_field(b, "op")?;
+        let args = b.get("args").cloned().unwrap_or(Value::Null);
+        Ok(match flowr_storage::engine_wire::dispatch(store.as_ref(), op, &args).await {
+            Ok(v) => json!({ "ok": v }),
+            Err(e) => json!({ "err": flowr_storage::engine_wire::err_json(&e) }),
+        })
+    }
+
+    /// Engine notices on a topic, as a stream of results.
+    fn engine_subscribe(&self, b: &Value) -> Result<BoxStream<arrow_flight::Result>, Status> {
+        let store = self.flowr_engine(b)?;
+        let topic = str_field(b, "topic")?;
+        let notices = store.subscribe(topic).map(|v| Ok(arrow_flight::Result { body: v.to_string().into() }));
+        Ok(Box::pin(notices))
+    }
+
     fn platform(&self) -> Result<Arc<adb_platform::PlatformStore>, Status> {
         self.engine
             .platform()
@@ -325,6 +376,7 @@ impl FlightService for AdbFlight {
     type DoExchangeStream = BoxStream<FlightData>;
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
+        not_engine_only(&req)?;
         let q = body(&req.into_inner().ticket)?;
         match q.get("feed").and_then(|f| f.as_str()) {
             Some("facts") => return Ok(Response::new(self.fact_feed(&q).await?)),
@@ -356,6 +408,7 @@ impl FlightService for AdbFlight {
     }
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
+        not_engine_only(&req)?;
         let mut stream = req.into_inner().peekable();
         // The table comes in the first message's descriptor; `[table, "replace"]`
         // replaces the table with these rows instead of appending them.
@@ -390,7 +443,25 @@ impl FlightService for AdbFlight {
     }
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        let access = access(&req);
         let a = req.into_inner();
+        if a.r#type.starts_with("engine") {
+            if access == Access::Memory {
+                return Err(Status::permission_denied("FlowR's engine store needs the engine token (ADB_ENGINE_TOKEN)"));
+            }
+            let b = body(&a.body)?;
+            if a.r#type == "engine_subscribe" {
+                return Ok(Response::new(self.engine_subscribe(&b)?));
+            }
+            if a.r#type != "engine" {
+                return Err(Status::invalid_argument(format!("unknown action {}", a.r#type)));
+            }
+            let r = arrow_flight::Result { body: self.engine_op(&b).await?.to_string().into() };
+            return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
+        }
+        if access == Access::Engine {
+            return Err(Status::permission_denied("the engine token opens only FlowR's engine store"));
+        }
         let answer = self.action(&a.r#type, body(&a.body)?).await?;
         let r = arrow_flight::Result { body: answer.to_string().into() };
         Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
@@ -405,6 +476,8 @@ impl FlightService for AdbFlight {
             ("list_tables", "Platform table names"),
             ("replace_table", "Replace a table with an empty one: {table, columns}"),
             ("aql", "Run AQL: {query, variables?} → the POST /query result"),
+            ("engine", "FlowR's engine store: {space, op, args} → {ok} | {err} (engine token)"),
+            ("engine_subscribe", "FlowR engine notices: {space, topic} → a stream of JSON notices (engine token)"),
         ]
         .map(|(t, d)| Ok(ActionType { r#type: t.into(), description: d.into() }));
         Ok(Response::new(Box::pin(futures::stream::iter(actions))))
