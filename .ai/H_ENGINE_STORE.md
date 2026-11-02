@@ -195,6 +195,8 @@ for `run:<id>`, new journal records (H13); the `engine` token scope and secret
 
 ### H-4 — FlowR on ADB, embedded and remote (~3 days)
 
+> **Done 2 Nov 2026** (FlowR `0c4a881`, `3c08e5e`, `3ca21ad`). FlowR CE embeds ADB (`engine_adb::embedded`, `<data>/adb`, one engine per directory per process); `FLOWR_ENGINE_ADB_URL` + `FLOWR_ENGINE_ADB_TOKEN` select an ADB server over Flight; `FLOWR_ENGINE_SPACE` (default `default`). A runtime with both an ADB URL and the console's gateway URL keeps the gateway for its chat/agent streams only. The router learns live pools from the store (every 5 s). Every FlowR engine suite passes on embedded ADB and against an ADB server over Flight with the engine token. The SQLite store is removed (branch `engine-sqlite`). Found on ADB and fixed in the core (both stores, conformance check): a cancel asked for while a run was owned waited for its next wake-up when the owner let go to wait — the cause of FlowR's flaky `engine_runs` test (L40). **Not done:** step 3's UI side (run views streaming instead of polling) — the A3T UI is frozen until the Studio branch merges; the store already serves the stream.
+
 1. **Embedded (CE, tests):** `init_storage` opens ADB's durable engine in
    `<data>/adb` in-process and uses it as the engine store, with no network hop.
 2. **Remote (EE):** `AdbEngineStore`, the gateway client's op encoding over FlowR's
