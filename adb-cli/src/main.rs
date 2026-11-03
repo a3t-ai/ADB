@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Logs always go to stderr: stdout carries MCP messages in stdio mode.
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "adb=info,adb_server=info".into()))
+        .with(log_filter(std::env::var("RUST_LOG").ok()))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .init();
 
@@ -184,5 +184,39 @@ async fn shutdown_signal() -> &'static str {
     tokio::select! {
         _ = term.recv() => "SIGTERM",
         _ = tokio::signal::ctrl_c() => "SIGINT",
+    }
+}
+
+/// `RUST_LOG`, with Lance and DataFusion held at `warn` unless it names them:
+/// Lance 14 logs every query plan at INFO, which buries ADB's own logs under
+/// `RUST_LOG=info`.
+fn log_filter(env: Option<String>) -> tracing_subscriber::EnvFilter {
+    let spec = log_spec(env);
+    tracing_subscriber::EnvFilter::try_new(&spec).unwrap_or_else(|e| {
+        eprintln!("RUST_LOG {spec:?}: {e}; using the default");
+        tracing_subscriber::EnvFilter::new(log_spec(None))
+    })
+}
+
+fn log_spec(env: Option<String>) -> String {
+    let mut spec = env.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "adb=info,adb_server=info".into());
+    for quiet in ["lance", "datafusion"] {
+        if !spec.split(',').any(|d| d.trim().starts_with(quiet)) {
+            spec.push_str(&format!(",{quiet}=warn"));
+        }
+    }
+    spec
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::log_spec;
+
+    #[test]
+    fn lance_and_datafusion_stay_quiet_unless_named() {
+        assert_eq!(log_spec(None), "adb=info,adb_server=info,lance=warn,datafusion=warn");
+        assert_eq!(log_spec(Some("info".into())), "info,lance=warn,datafusion=warn");
+        assert_eq!(log_spec(Some("info,lance=debug".into())), "info,lance=debug,datafusion=warn");
+        assert_eq!(log_spec(Some(" ".into())), "adb=info,adb_server=info,lance=warn,datafusion=warn");
     }
 }
