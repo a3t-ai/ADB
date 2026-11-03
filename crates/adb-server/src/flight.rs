@@ -67,7 +67,11 @@ pub async fn serve_flight_with_tokens(addr: SocketAddr, engine: Arc<dyn Engine>,
     let svc = FlightServiceServer::new(AdbFlight { engine })
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE);
-    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth { memory: token, engine: engine_token });
+    let pools = crate::auth::pool_tokens_from_env();
+    if !pools.is_empty() {
+        tracing::info!(pools = ?pools.iter().map(|(p, _)| p.to_string()).collect::<Vec<_>>(), "engine pool tokens");
+    }
+    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth { memory: token, engine: engine_token, pools });
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve(addr)
@@ -445,12 +449,16 @@ impl FlightService for AdbFlight {
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let access = access(&req);
+        let pool = req.extensions().get::<crate::auth::EnginePool>().cloned();
         let a = req.into_inner();
         if a.r#type.starts_with("engine") {
             if access == Access::Memory {
                 return Err(Status::permission_denied("FlowR's engine store needs the engine token (ADB_ENGINE_TOKEN)"));
             }
             let b = body(&a.body)?;
+            if let Some(crate::auth::EnginePool(p)) = &pool {
+                crate::auth::pool_allows(p, &a.r#type, &b).map_err(Status::permission_denied)?;
+            }
             if a.r#type == "engine_subscribe" {
                 return Ok(Response::new(self.engine_subscribe(&b)?));
             }
