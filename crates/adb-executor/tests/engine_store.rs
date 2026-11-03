@@ -166,6 +166,28 @@ async fn run_history_is_not_agent_memory_and_retention_removes_it() {
     assert_eq!(gone, 1, "the finished run");
     assert!(s.get(b).await.unwrap().is_none());
     assert!(s.read_from(b, 0).await.unwrap().is_empty(), "its episodes are gone");
+
+    // Compaction drops the purged rows from disk; the journal keeps working.
+    let done = engine.engine_compact_journals().await.unwrap();
+    let (_, total, kept) = done.iter().find(|(space, ..)| space == "s").cloned().unwrap();
+    assert!(kept < total, "purged rows rewritten away: {total} read, {kept} kept");
+    let c = new_run("p");
+    let c_id = c.run_id;
+    let t = NewTask::start(&c);
+    s.start(c, t).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let claimed = s.claim_runs(DEFAULT_POOL, "w", 5, LEASE).await.unwrap();
+    let (lease, _, epoch) = claimed.into_iter().find(|(_, t, _)| t.run_id == c_id).unwrap();
+    s.append(c_id, epoch, &[step("/y", 3)]).await.unwrap();
+    s.release(c_id, epoch, RunPhase::Completed, RunOutcome::default(), &lease).await.unwrap();
+    s.evict_journal(c_id).await.unwrap();
+    assert_eq!(s.read_from(c_id, 0).await.unwrap().len(), 1, "written after the compaction, read from EPISODIC");
+    drop(s);
+    drop(engine);
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let s = engine.engine_store("s").unwrap();
+    assert_eq!(s.read_from(c_id, 0).await.unwrap().len(), 1, "and after a restart");
+    assert!(s.read_from(b, 0).await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

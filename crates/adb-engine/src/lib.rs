@@ -38,6 +38,11 @@ pub const EVICT_AFTER: Duration = Duration::from_secs(300);
 /// The lease every run and task gets after a restart (H4), as FlowR's default.
 pub const RESTART_LEASE: Duration = Duration::from_secs(30);
 
+/// Compact a space's journal after this many writes since the last compaction
+/// (or a quarter of the rows it kept, whichever is more), or past 16 MemWAL
+/// generations: retention's deletes are tombstones until then.
+pub const JOURNAL_COMPACT_AFTER: u64 = 2_000;
+
 /// The journal partition's id (row ids don't depend on it).
 const JOURNAL_PARTITION: PartitionId = PartitionId(1);
 
@@ -87,6 +92,8 @@ struct Space {
     /// The last log offset handed to the writer, and how far it has written.
     queued: u64,
     written: tokio::sync::watch::Receiver<u64>,
+    /// Held by the writer around each write and by a compaction throughout.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
     /// The last log offset the snapshot on disk includes.
     snapshot_offset: u64,
     /// The last log offset with this space's changes.
@@ -119,7 +126,12 @@ fn check_space(name: &str) -> EngineResult<()> {
 /// Write a space's journal episodes in log order, off the sequencer (the log
 /// already holds them: after a crash, replay writes what is missing). A write
 /// that keeps failing stops the writer rather than skip past it.
-fn spawn_writer(space: String, journal: Arc<PartitionStore>, start: u64) -> (UnboundedSender<JournalJob>, tokio::sync::watch::Receiver<u64>) {
+fn spawn_writer(
+    space: String,
+    journal: Arc<PartitionStore>,
+    start: u64,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+) -> (UnboundedSender<JournalJob>, tokio::sync::watch::Receiver<u64>) {
     let (tx, mut rx) = unbounded::<JournalJob>();
     let (done, written) = tokio::sync::watch::channel(start);
     tokio::spawn(async move {
@@ -127,7 +139,11 @@ fn spawn_writer(space: String, journal: Arc<PartitionStore>, start: u64) -> (Unb
         while let Some(job) = rx.next().await {
             let mut tries = 0;
             loop {
-                match write_job(&journal, &job).await {
+                let wrote = {
+                    let _held = write_lock.lock().await;
+                    write_job(&journal, &job).await
+                };
+                match wrote {
                     Ok(()) => break,
                     Err(e) if tries < 5 => {
                         tries += 1;
@@ -165,7 +181,9 @@ async fn open_space(dir: &Path) -> EngineResult<Space> {
     std::fs::create_dir_all(dir).map_err(store_err)?;
     let journal = Arc::new(PartitionStore::open(&StoreConfig::new(dir.join("journal")), JOURNAL_PARTITION).await.map_err(store_err)?);
     let applied = journal.applied_offset().await.map_err(store_err)?.0;
-    let (jobs, written) = spawn_writer(dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), Arc::clone(&journal), applied);
+    let write_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let (jobs, written) = spawn_writer(name, Arc::clone(&journal), applied, Arc::clone(&write_lock));
     let (core, snapshot_offset) = match std::fs::read(dir.join("snapshot.json")) {
         Ok(bytes) => {
             let s: Snapshot = serde_json::from_slice(&bytes).map_err(|e| EngineError::Snapshot(e.to_string()))?;
@@ -174,7 +192,7 @@ async fn open_space(dir: &Path) -> EngineResult<Space> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (EngineCore::new(), 0),
         Err(e) => return Err(EngineError::Snapshot(e.to_string())),
     };
-    Ok(Space { core, journal, jobs, queued: applied, written, snapshot_offset, last_offset: snapshot_offset, since_snapshot: 0, snapshot_at: Instant::now() })
+    Ok(Space { core, journal, jobs, queued: applied, written, write_lock, snapshot_offset, last_offset: snapshot_offset, since_snapshot: 0, snapshot_at: Instant::now() })
 }
 
 /// A one-line summary of a journal record, the episode's text.
@@ -414,6 +432,26 @@ impl EngineHost {
             .collect())
     }
 
+    /// The journals whose compaction is due, to compact without the host lock.
+    pub async fn journals_to_compact(&self) -> Vec<JournalCompaction> {
+        let mut out = Vec::new();
+        for (name, s) in &self.spaces {
+            let due = s.journal.writes_due(JOURNAL_COMPACT_AFTER) || s.journal.generation_count().await.is_ok_and(|n| n > 16);
+            if due {
+                out.push(JournalCompaction { space: name.clone(), journal: Arc::clone(&s.journal), write_lock: Arc::clone(&s.write_lock) });
+            }
+        }
+        out
+    }
+
+    /// Every space's journal, due or not (tests, admin).
+    pub fn journals(&self) -> Vec<JournalCompaction> {
+        self.spaces
+            .iter()
+            .map(|(name, s)| JournalCompaction { space: name.clone(), journal: Arc::clone(&s.journal), write_lock: Arc::clone(&s.write_lock) })
+            .collect()
+    }
+
     /// Write the snapshots that are due (every [`SNAPSHOT_EVERY`] records or
     /// [`SNAPSHOT_AFTER`]), after the journal partition is on disk.
     pub async fn snapshot_due(&mut self, force: bool) -> EngineResult<usize> {
@@ -502,5 +540,25 @@ impl EngineHost {
     /// The epoch the ADB log writes with (records need one).
     pub fn epoch() -> Epoch {
         Epoch(1)
+    }
+}
+
+/// One space's journal, ready to compact: the rewrite drops the rows retention
+/// deleted and folds the MemWAL
+/// generations. The writer waits meanwhile; engine operations don't (their
+/// episodes queue), and journal reads wait on the table lock.
+pub struct JournalCompaction {
+    pub space: String,
+    journal: Arc<PartitionStore>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl JournalCompaction {
+    pub async fn run(&self) -> EngineResult<adb_store::CompactStats> {
+        let _held = self.write_lock.lock().await;
+        // Journal rows are written once and never superseded: no history, and
+        // no marker for deleted rows (the writer skips anything at or below the
+        // applied offset, so nothing comes back).
+        self.journal.compact_append_only(CommitTs::from_datetime(Utc::now())).await.map_err(store_err)
     }
 }

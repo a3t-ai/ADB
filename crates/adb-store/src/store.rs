@@ -224,6 +224,19 @@ impl PartitionStore {
         Ok(stats)
     }
 
+    /// Compaction for a table whose rows are written once and never come back
+    /// (the engine journal, stage H): as [`Self::compact`], but deleted rows
+    /// leave no marker behind. Only safe where no record below the applied
+    /// offset is replayed again (writes at or below it are skipped).
+    pub async fn compact_append_only(&self, now: CommitTs) -> StoreResult<CompactStats> {
+        let base = compaction_row(Duration::ZERO, now);
+        let keep = move |r: StoredRow| if r.id != META_ID && r.tombstone { None } else { base(r) };
+        let stats = self.rewrite_online(&keep, false).await?;
+        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(stats)
+    }
+
     /// The schema version `_meta` records (D3 §4): 3 until `scope_row_ids` ran.
     pub fn schema_version(&self) -> u32 {
         self.layout.load(std::sync::atomic::Ordering::SeqCst)

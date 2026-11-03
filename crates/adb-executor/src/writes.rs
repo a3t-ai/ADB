@@ -979,7 +979,25 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
         }
         host.lock().await.snapshot_due(false).await.map_err(eng)?;
+        let due = host.lock().await.journals_to_compact().await;
+        for j in due {
+            match j.run().await {
+                Ok(st) => tracing::info!(space = %j.space, kept = st.kept, total = st.total, bytes_before = st.bytes_before, bytes_after = st.bytes_after, took = ?st.took, "engine journal compacted"),
+                Err(e) => tracing::warn!(space = %j.space, error = %e, "engine journal compaction failed"),
+            }
+        }
         Ok(())
+    }
+
+    /// Compact every engine space's journal now (tests, admin).
+    pub async fn engine_compact_journals(&self) -> AdbResult<Vec<(String, adb_store::CompactStats)>> {
+        let Some(host) = &self.engine else { return Ok(Vec::new()) };
+        let all = host.lock().await.journals();
+        let mut out = Vec::new();
+        for j in all {
+            out.push((j.space.clone(), j.run().await.map_err(|e| AdbError::Internal(e.to_string()))?));
+        }
+        Ok(out)
     }
 
     /// Snapshot every engine space that changed since its last snapshot.

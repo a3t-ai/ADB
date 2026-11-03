@@ -476,6 +476,14 @@ impl LocalEngine {
         Ok(())
     }
 
+    /// Compact every engine space's journal now (tests and admin): `(space,
+    /// row versions read, kept)`.
+    pub async fn engine_compact_journals(&self) -> Result<Vec<(String, usize, usize)>, String> {
+        let Some(d) = &self.durable else { return Ok(Vec::new()) };
+        let done = d.engine_compact_journals().await.map_err(|e| e.to_string())?;
+        Ok(done.into_iter().map(|(s, st)| (s, st.total, st.kept)).collect())
+    }
+
     /// `WATCH` (register, snapshot) and `UNWATCH` (W6).
     async fn watch(&self, stmt: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         use aql_parser::ast::{StartPosition, Statement};
