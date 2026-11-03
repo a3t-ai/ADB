@@ -27,7 +27,7 @@ entities, provenance and validity should suit a triple feed to the model later.
 Gates that aren't limitations (W8 A3T pass, P1 step 1.6 — the user's A3T check of the
 graph on vc-dev, still open on 3 Nov) are in `MVP_PLAN.md` and `P1_GRAPH.md`.
 
-**Order proposed 3 Nov** (what is left in ADB): S9 push → CL-7 leader-label routing →
+**Order proposed 3 Nov** (what is left in ADB; S9 push done): CL-7 leader-label routing →
 CL-5 fault harness → CA-24 group commit → CA-25 snapshots + CA-26 membership →
 P1 step 1.6 (user) → SEC-1 → CL-8 hibernation; then the post-MVP phases (edge ADB,
 stitching, central KG + KBLaM, M5).
@@ -205,7 +205,7 @@ cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the bucket.
 | # | Limitation | Effect | Plan |
 |---|---|---|---|
 | S5 | **No CI** (user, 24 Oct): `tests/check-all.sh` is run by hand before commits and images. | Easy to miss a regression. | **MVP**, before M3: the fault harness runs on every replication change. Needs the branches pushed. |
-| S9 | **The working branch is not on GitHub** (3 Nov): `m0-k5-deps`, with the Raft work, exists only on this pod; `origin` is `https://github.com/srirammails/ADB.git` (no token here). | Losing the pod's disk loses it. | **Now**: push over SSH (the user unlocks the key), or move ADB to `a3t-io/adb` as planned. |
+| S9 | **The working branch was not on GitHub** — fixed 3 Nov: `m0-k5-deps` pushed to `srirammails/ADB` (push URL SSH). | — | Done; move ADB to `a3t-io/adb` with the repo reorganisation. |
 | P9 | **Release builds take ~40 min from clean** (fat LTO, 4 jobs in the pod). | Slow deploy loop after a cache wipe. | **Later**: thin LTO for dev images, or a build node. |
 | S8 | **Lance logs at INFO by default**; every read logs a `plan_run` line. | Log volume. | **Later**: `RUST_LOG=info,lance=warn` in the manifest. |
 | GR-8 | **The WASM playground's built `pkg/` predates v0.6** (source updated; no wasm-pack here). | The browser playground rejects newer statements. | **Later**: `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
