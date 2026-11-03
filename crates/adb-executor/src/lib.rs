@@ -16,6 +16,7 @@ pub mod reads;
 pub mod rank;
 pub mod sql;
 pub mod writes;
+pub mod replica;
 
 pub use error::{ExecutorError, ExecutorResult};
 pub use executor::{Executor, MAX_DEPTH, MAX_REACHED};
@@ -24,3 +25,5 @@ pub use result::{QueryResult, ResultSet};
 pub use apply::ApplyBarrier;
 pub use reads::{LanceReads, Reads};
 pub use writes::{DurableWrites, ReplayStats, Writes};
+pub use replica::Replica;
+pub use engine::EngineLog;

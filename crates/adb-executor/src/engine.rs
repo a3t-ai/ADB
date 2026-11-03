@@ -14,6 +14,9 @@ use serde_json::{json, Map, Value};
 
 use adb_core::log::Epoch;
 use adb_log::{LocalWal, WalConfig};
+
+/// The log a durable engine runs on: the local WAL, or (cluster) the Raft log.
+pub type EngineLog = Arc<dyn adb_log::Log>;
 use adb_sequencer::Sequencer;
 use adb_store::{PartitionStore, StoreConfig};
 
@@ -173,7 +176,7 @@ pub struct LocalEngine {
     /// The TTL expiry timer (L3), stopped with the engine.
     expiry: Option<tokio::task::JoinHandle<()>>,
     /// The durable writes, for compaction on demand (W5).
-    durable: Option<Arc<DurableWrites<Arc<LocalWal>>>>,
+    durable: Option<Arc<DurableWrites<EngineLog>>>,
     /// Continuous queries (W6) and the task keeping them current.
     watcher: Option<(Arc<adb_cq::Watcher>, tokio::task::JoinHandle<()>)>,
     /// The data directory (W9.10: settings live there).
@@ -198,7 +201,7 @@ impl Drop for LocalEngine {
 /// Runs watched queries for the watcher (W6) and commits its idle `UNWATCH`es.
 struct WatchRunner {
     executor: Executor,
-    durable: Arc<DurableWrites<Arc<LocalWal>>>,
+    durable: Arc<DurableWrites<EngineLog>>,
 }
 
 #[async_trait]
@@ -237,6 +240,16 @@ async fn open_wal(dir: &std::path::Path) -> Result<LocalWal, String> {
             other => return other.map_err(|e| e.to_string()),
         }
     }
+}
+
+/// The partition's Lance table in `dir/store`, sized by the embedding settings
+/// (W9.10), and the embedder they name.
+pub(crate) async fn open_store(dir: &std::path::Path) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
+    let settings = adb_embed::EmbedConfig::load(dir)?;
+    let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
+    let store_cfg = StoreConfig { embedding_dim, embedding_model, ..StoreConfig::new(dir.join("store")) };
+    let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
+    Ok((store, embedder))
 }
 
 /// The nightly compaction time (UTC), `ADB_COMPACT_AT` = "HH:MM" (default 03:00;
@@ -358,14 +371,23 @@ impl LocalEngine {
     /// table (stage D3). Returns what the replay found.
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
+        let wal: EngineLog = Arc::new(open_wal(&dir).await?);
+        Self::durable_on(dir, wal).await
+    }
+
+    /// The local WAL in `dir/p0`, opened (a cluster node's state machine holds it).
+    pub async fn open_local_wal(dir: &std::path::Path) -> Result<Arc<LocalWal>, String> {
+        Ok(Arc::new(open_wal(dir).await?))
+    }
+
+    /// A durable engine over `wal`: the local WAL, or (cluster, M3) the Raft log,
+    /// whose appends commit through the replica set and whose reads are the
+    /// node's local WAL. Everything else is as [`Self::durable`].
+    pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
+        let dir = dir.into();
         // Shared: the sequencer appends, subscribers read (stage E).
-        let wal = Arc::new(open_wal(&dir).await?);
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
-        // W9.10: the embedding settings size the table's vectors.
-        let settings = adb_embed::EmbedConfig::load(&dir)?;
-        let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
-        let store_cfg = StoreConfig { embedding_dim, embedding_model, ..StoreConfig::new(dir.join("store")) };
-        let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
+        let (store, embedder) = open_store(&dir).await?;
         // W10: the hot cache follows every apply from here on (the catch-up too).
         let cache_cfg = match adb_store::CacheConfig::load(&dir)? {
             Some(c) => c,
@@ -383,7 +405,7 @@ impl LocalEngine {
             tracing::info!(records = replayed, "engine spaces replayed");
         }
         let barrier = writes.barrier();
-        let watch_log: Arc<dyn adb_log::Log> = Arc::clone(&wal) as Arc<dyn adb_log::Log>;
+        let watch_log: Arc<dyn adb_log::Log> = Arc::clone(&wal);
         let gateway = barrier.as_ref().map(|b| {
             let log: Arc<dyn adb_log::Log> = wal;
             let lineages: Arc<dyn adb_gateway::Lineages> = Arc::clone(&store) as Arc<dyn adb_gateway::Lineages>;
@@ -461,7 +483,7 @@ impl LocalEngine {
 
 impl LocalEngine {
     /// FlowR's engine store, space `space` (stage H); `None` without a data dir.
-    pub fn engine_store(&self, space: &str) -> Option<crate::engine_store::AdbEngineStore<Arc<LocalWal>>> {
+    pub fn engine_store(&self, space: &str) -> Option<crate::engine_store::AdbEngineStore<EngineLog>> {
         self.durable.as_ref().map(|d| crate::engine_store::AdbEngineStore::new(Arc::clone(d), space))
     }
 

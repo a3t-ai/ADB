@@ -1,0 +1,197 @@
+//! Raft RPCs between nodes: `POST <peer>/raft/{append,vote,snapshot,transfer}`,
+//! MessagePack bodies. A node's answer is the `Result` openraft returned, so a
+//! remote error comes back as itself; a failed HTTP call is "unreachable".
+
+use std::io::{self, Cursor};
+use std::time::Duration;
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::Router;
+use openraft::alias::{SnapshotMetaOf, SnapshotOf, VoteOf};
+use openraft::error::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse};
+use openraft::async_runtime::watch::WatchReceiver;
+use openraft::{BasicNode, OptionalSend};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::{AdbRaft, NodeId, TypeConfig as TC};
+
+#[derive(Clone)]
+pub struct Network {
+    http: reqwest::Client,
+}
+
+impl Network {
+    pub fn new() -> Self {
+        let http = reqwest::Client::builder().connect_timeout(Duration::from_millis(500)).pool_idle_timeout(Duration::from_secs(30)).build().expect("HTTP client");
+        Self { http }
+    }
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct Conn {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl RaftNetworkFactory<TC> for Network {
+    type Network = Conn;
+    async fn new_client(&mut self, _target: NodeId, node: &BasicNode) -> Self::Network {
+        Conn { http: self.http.clone(), base: node.addr.trim_end_matches('/').to_string() }
+    }
+}
+
+fn unreachable(e: impl std::fmt::Display) -> Unreachable<TC> {
+    Unreachable::new(&io::Error::other(e.to_string()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotReq {
+    vote: VoteOf<TC>,
+    meta: SnapshotMetaOf<TC>,
+}
+
+impl Conn {
+    /// POST `body` to `path`; the answer is openraft's `Result` on the peer.
+    async fn call<Req: Serialize, Resp: DeserializeOwned, E: DeserializeOwned>(&self, path: &str, body: &Req, timeout: Duration) -> Result<Result<Resp, E>, Unreachable<TC>> {
+        let bytes = rmp_serde::to_vec_named(body).map_err(unreachable)?;
+        let r = self
+            .http
+            .post(format!("{}/raft/{path}", self.base))
+            .timeout(timeout)
+            .header("content-type", "application/msgpack")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if !r.status().is_success() {
+            return Err(unreachable(format!("{} answered {}", self.base, r.status())));
+        }
+        let b = r.bytes().await.map_err(unreachable)?;
+        rmp_serde::from_slice(&b).map_err(unreachable)
+    }
+}
+
+impl RaftNetworkV2<TC> for Conn {
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn append_entries(&mut self, rpc: AppendEntriesRequest<TC>, o: RPCOption) -> Result<AppendEntriesResponse<TC>, RPCError<TC>> {
+        match self.call::<_, AppendEntriesResponse<TC>, RaftError<TC>>("append", &rpc, o.hard_ttl()).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(RPCError::Network(NetworkError::new(&e))),
+            Err(u) => Err(RPCError::Unreachable(u)),
+        }
+    }
+
+    async fn vote(&mut self, rpc: VoteRequest<TC>, o: RPCOption) -> Result<VoteResponse<TC>, RPCError<TC>> {
+        match self.call::<_, VoteResponse<TC>, RaftError<TC>>("vote", &rpc, o.hard_ttl()).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(RPCError::Network(NetworkError::new(&e))),
+            Err(u) => Err(RPCError::Unreachable(u)),
+        }
+    }
+
+    async fn transfer_leader(&mut self, req: TransferLeaderRequest<TC>, o: RPCOption) -> Result<TransferLeaderResponse<TC>, RPCError<TC>> {
+        match self.call::<_, TransferLeaderResponse<TC>, RaftError<TC>>("transfer", &req, o.hard_ttl()).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(RPCError::Network(NetworkError::new(&e))),
+            Err(u) => Err(RPCError::Unreachable(u)),
+        }
+    }
+
+    /// The snapshot is a pointer: only its meta travels.
+    async fn full_snapshot(
+        &mut self,
+        vote: VoteOf<TC>,
+        snapshot: SnapshotOf<TC, Self::SnapshotData>,
+        _cancel: impl std::future::Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        o: RPCOption,
+    ) -> Result<SnapshotResponse<TC>, StreamingError<TC>> {
+        let req = SnapshotReq { vote, meta: snapshot.meta };
+        match self.call::<_, SnapshotResponse<TC>, String>("snapshot", &req, o.hard_ttl()).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(StreamingError::Network(NetworkError::new(&io::Error::other(e)))),
+            Err(u) => Err(StreamingError::Unreachable(u)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- server side
+
+fn msgpack<T: Serialize>(v: &T) -> axum::response::Response {
+    match rmp_serde::to_vec_named(v) {
+        Ok(b) => ([(axum::http::header::CONTENT_TYPE, "application/msgpack")], b).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn decode<T: DeserializeOwned>(b: &Bytes) -> Result<T, axum::response::Response> {
+    rmp_serde::from_slice(b).map_err(|e| (StatusCode::BAD_REQUEST, format!("bad raft request: {e}")).into_response())
+}
+
+async fn append(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
+    match decode::<AppendEntriesRequest<TC>>(&body) {
+        Ok(req) => msgpack(&raft.append_entries(req).await),
+        Err(r) => r,
+    }
+}
+
+async fn vote(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
+    match decode::<VoteRequest<TC>>(&body) {
+        Ok(req) => msgpack(&raft.vote(req).await),
+        Err(r) => r,
+    }
+}
+
+async fn transfer(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
+    match decode::<TransferLeaderRequest<TC>>(&body) {
+        Ok(req) => msgpack(&raft.handle_transfer_leader(req).await),
+        Err(r) => r,
+    }
+}
+
+async fn snapshot(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
+    match decode::<SnapshotReq>(&body) {
+        Ok(req) => {
+            let snap = SnapshotOf::<TC, Cursor<Vec<u8>>> { meta: req.meta, snapshot: Cursor::new(Vec::new()) };
+            let r: Result<SnapshotResponse<TC>, String> = raft.install_full_snapshot(req.vote, snap).await.map_err(|e| e.to_string());
+            msgpack(&r)
+        }
+        Err(r) => r,
+    }
+}
+
+async fn metrics(State(raft): State<AdbRaft>) -> axum::response::Response {
+    let m = raft.metrics().borrow_watched().clone();
+    axum::Json(serde_json::json!({
+        "node": m.id,
+        "state": format!("{:?}", m.state),
+        "leader": m.current_leader,
+        "term": m.current_term,
+        "last_log_index": m.last_log_index,
+        "last_applied": m.last_applied.map(|l| l.index),
+    }))
+    .into_response()
+}
+
+/// The Raft endpoint (serve it on the node's Raft port, reachable by peers).
+pub fn router(raft: AdbRaft) -> Router {
+    Router::new()
+        .route("/raft/append", post(append))
+        .route("/raft/vote", post(vote))
+        .route("/raft/transfer", post(transfer))
+        .route("/raft/snapshot", post(snapshot))
+        .route("/raft/metrics", get(metrics))
+        .with_state(raft)
+}

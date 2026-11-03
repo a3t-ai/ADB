@@ -13,6 +13,8 @@ path = "src/main.rs"
 adb-server = { path = "../crates/adb-server" }
 adb-executor = { path = "../crates/adb-executor" }
 adb-mcp = { path = "../crates/adb-mcp" }
+adb-raft = { path = "../crates/adb-raft" }
+axum = "0.7"
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

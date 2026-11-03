@@ -1,0 +1,88 @@
+# ADB as a 3-node replica set (M3, .ai/M3_RAFT.md). Replaces deploy/k8s/adb.yaml's
+# single-node Deployment.
+#
+# - StatefulSet adb-0..2; node id = ordinal + 1; Raft between pods on port 3002
+#   through the headless Service `adb-raft` (published even when not ready).
+# - Service `adb` (what FlowR and the console use) selects the pods, but only the
+#   leader passes the readiness probe (`/ready`), so traffic goes to the leader.
+# - A leader that loses the lead exits (75); restartPolicy brings it back as a
+#   follower.
+#
+# Moving a single-node ADB into the replica set: stop it, copy its data
+# directory into all three pods' directories (node-1 = adb-0, …), then apply
+# this. Every node starts from the same WAL; Raft continues from there.
+#
+# On vc-dev (one Kubernetes node) the pods share the host path, each in its own
+# sub-directory ($(POD_NAME)). On real servers use a volumeClaimTemplate.
+apiVersion: v1
+kind: Service
+metadata:
+  name: adb-raft
+  namespace: a3t
+  labels: { app: adb }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: adb }
+  ports:
+    - { name: raft, port: 3002, targetPort: raft }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: adb
+  namespace: a3t
+  labels: { app: adb }
+spec:
+  serviceName: adb-raft
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: adb }
+  template:
+    metadata:
+      labels: { app: adb }
+    spec:
+      imagePullSecrets: [{ name: registry-credentials }]
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: adb
+          image: ghcr.io/srirammails/adb:CHANGE_ME
+          args: [adb, serve-http, --host, 0.0.0.0, --port, "3000"]
+          env:
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: ADB_DATA_DIR, value: /data/adb }
+            - { name: ADB_NODE_ID, value: from-hostname }
+            - name: ADB_PEERS
+              value: "1=http://adb-0.adb-raft.a3t.svc.cluster.local:3002,2=http://adb-1.adb-raft.a3t.svc.cluster.local:3002,3=http://adb-2.adb-raft.a3t.svc.cluster.local:3002"
+            - { name: ADB_RAFT_PORT, value: "3002" }
+            - { name: RUST_LOG, value: "info,lance=warn" }
+            - name: ADB_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: adb-auth, key: token, optional: true } }
+            - name: ADB_ENGINE_TOKEN
+              valueFrom: { secretKeyRef: { name: adb-engine, key: token } }
+          ports:
+            - { name: http, containerPort: 3000 }
+            - { name: flight, containerPort: 3001 }
+            - { name: raft, containerPort: 3002 }
+          # The leader only (Service `adb` routes to ready pods).
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 1
+            failureThreshold: 1
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: { path: /cluster/status, port: raft }
+            periodSeconds: 20
+          startupProbe:
+            httpGet: { path: /cluster/status, port: raft }
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 2Gi }
+          volumeMounts:
+            - { name: adb-data, mountPath: /data/adb, subPathExpr: $(POD_NAME) }
+      volumes:
+        - name: adb-data
+          hostPath: { path: /data/a3t-dev/adb-cluster, type: DirectoryOrCreate }

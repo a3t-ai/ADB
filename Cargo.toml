@@ -10,6 +10,7 @@ members = [
     "crates/adb-log",
     "crates/adb-sequencer",
     "crates/adb-cluster",
+    "crates/adb-raft",
     "crates/adb-cq",
     "crates/adb-gateway",
     "crates/adb-platform",

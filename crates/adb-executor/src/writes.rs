@@ -247,7 +247,7 @@ fn sub_idle() -> Duration {
     std::env::var("ADB_SUB_IDLE").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(SUB_IDLE)
 }
 
-fn retain_max() -> u64 {
+pub(crate) fn retain_max() -> u64 {
     std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
 }
 
