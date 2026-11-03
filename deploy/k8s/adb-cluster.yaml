@@ -37,6 +37,10 @@ spec:
   serviceName: adb-raft
   replicas: 3
   podManagementPolicy: Parallel
+  # Only the leader is Ready (the Service routes by readiness), so a rolling
+  # update would wait forever on the first follower. Roll with
+  # deploy/k8s/adb-roll.sh: followers first, then the leader.
+  updateStrategy: { type: OnDelete }
   selector:
     matchLabels: { app: adb }
   template:
@@ -47,7 +51,7 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: adb
-          image: ghcr.io/srirammails/adb:2026-11-03-j
+          image: ghcr.io/srirammails/adb:2026-11-03-k
           args: [adb, serve-http, --host, 0.0.0.0, --port, "3000"]
           env:
             - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
