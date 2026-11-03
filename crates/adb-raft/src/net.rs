@@ -1,4 +1,4 @@
-//! Raft RPCs between nodes: `POST <peer>/raft/{append,vote,snapshot,transfer}`,
+//! Raft RPCs between nodes: `POST <peer>/raft/{append,vote,pre_vote,snapshot,transfer}`,
 //! MessagePack bodies. A node's answer is the `Result` openraft returned, so a
 //! remote error comes back as itself; a failed HTTP call is "unreachable".
 
@@ -52,6 +52,9 @@ impl RaftNetworkFactory<TC> for Network {
     }
 }
 
+/// A peer without this route (an older build during a rolling update).
+const NOT_FOUND: &str = "raft route not found on the peer";
+
 fn unreachable(e: impl std::fmt::Display) -> Unreachable<TC> {
     Unreachable::new(&io::Error::other(e.to_string()))
 }
@@ -75,6 +78,9 @@ impl Conn {
             .send()
             .await
             .map_err(unreachable)?;
+        if r.status() == StatusCode::NOT_FOUND {
+            return Err(unreachable(NOT_FOUND));
+        }
         if !r.status().is_success() {
             return Err(unreachable(format!("{} answered {}", self.base, r.status())));
         }
@@ -98,6 +104,18 @@ impl RaftNetworkV2<TC> for Conn {
         match self.call::<_, VoteResponse<TC>, RaftError<TC>>("vote", &rpc, o.hard_ttl()).await {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(RPCError::Network(NetworkError::new(&e))),
+            Err(u) => Err(RPCError::Unreachable(u)),
+        }
+    }
+
+    /// Pre-Vote (`enable_pre_vote`): would the peer vote for us at the next term?
+    /// A peer too old to know the RPC counts as granting, as openraft's default
+    /// does, so a rolling update stays live.
+    async fn pre_vote(&mut self, rpc: VoteRequest<TC>, o: RPCOption) -> Result<VoteResponse<TC>, RPCError<TC>> {
+        match self.call::<_, VoteResponse<TC>, RaftError<TC>>("pre_vote", &rpc, o.hard_ttl()).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(RPCError::Network(NetworkError::new(&e))),
+            Err(u) if u.to_string().contains(NOT_FOUND) => Ok(VoteResponse::new(rpc.vote, None, true)),
             Err(u) => Err(RPCError::Unreachable(u)),
         }
     }
@@ -154,6 +172,13 @@ async fn vote(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Respo
     }
 }
 
+async fn pre_vote(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
+    match decode::<VoteRequest<TC>>(&body) {
+        Ok(req) => msgpack(&raft.pre_vote(req).await),
+        Err(r) => r,
+    }
+}
+
 async fn transfer(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
     match decode::<TransferLeaderRequest<TC>>(&body) {
         Ok(req) => msgpack(&raft.handle_transfer_leader(req).await),
@@ -190,6 +215,7 @@ pub fn router(raft: AdbRaft) -> Router {
     Router::new()
         .route("/raft/append", post(append))
         .route("/raft/vote", post(vote))
+        .route("/raft/pre_vote", post(pre_vote))
         .route("/raft/transfer", post(transfer))
         .route("/raft/snapshot", post(snapshot))
         .route("/raft/metrics", get(metrics))

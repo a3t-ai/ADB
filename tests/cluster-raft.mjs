@@ -9,16 +9,20 @@
  * leader). The leader is SIGKILLed K times; each time:
  *   - a new leader must answer /ready within the failover budget,
  *   - the killed node is restarted and must catch up as a follower.
+ *   - for --blackout-ms after its restart, peers cannot reach it while it can
+ *     reach them (as on Kubernetes, where the new pod's IP is not yet in the
+ *     leader's DNS): it must not depose the new leader (no exit 75), which
+ *     needs Pre-Vote.
  * At the end every acknowledged write must be readable on the final leader, and
  * every node's WAL must reach the same offset.
  *
- *   node tests/cluster-raft.mjs --adb <adb bin> [--kills 3] [--writers 4] [--budget-ms 5000]
+ *   node tests/cluster-raft.mjs --adb <adb bin> [--kills 3] [--writers 4] [--budget-ms 5000] [--blackout-ms 3000]
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer as netServer } from 'node:net';
+import net, { createServer as netServer } from 'node:net';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]]] : a), []));
 if (!args.adb) {
@@ -28,6 +32,7 @@ if (!args.adb) {
 const KILLS = Number(args.kills ?? 3);
 const WRITERS = Number(args.writers ?? 4);
 const BUDGET = Number(args['budget-ms'] ?? 5000);
+const BLACKOUT = Number(args['blackout-ms'] ?? 3000);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const freePort = () => new Promise(res => { const s = netServer().listen(0, () => { const p = s.address().port; s.close(() => res(p)); }); });
 let failures = 0;
@@ -37,8 +42,21 @@ const tmp = mkdtempSync(join(tmpdir(), 'cluster-raft-'));
 const nodes = [];
 let stopping = false;
 
-for (let id = 1; id <= 3; id++) nodes.push({ id, http: await freePort(), flight: await freePort(), raft: await freePort(), dir: join(tmp, `n${id}`), restarts: 0 });
-const peers = nodes.map(n => `${n.id}=http://127.0.0.1:${n.raft}`).join(',');
+for (let id = 1; id <= 3; id++) nodes.push({ id, http: await freePort(), flight: await freePort(), raft: await freePort(), dir: join(tmp, `n${id}`), restarts: 0, blackout: 0 });
+// Peers reach a node's Raft port through its own proxy, which drops every
+// connection while the node is blacked out (inbound only).
+for (const n of nodes) {
+  const srv = net.createServer(c => {
+    if (Date.now() < n.blackout) { c.destroy(); return; }
+    const up = net.connect(n.raft, '127.0.0.1');
+    const close = () => { c.destroy(); up.destroy(); };
+    c.on('error', close); up.on('error', close); c.on('close', close); up.on('close', close);
+    c.pipe(up).pipe(c);
+  });
+  n.proxy = await new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv)));
+  n.inbound = n.proxy.address().port;
+}
+const peers = nodes.map(n => `${n.id}=http://127.0.0.1:${n.inbound}`).join(',');
 
 function launch(n) {
   const c = spawn(args.adb, ['--data-dir', n.dir, 'serve-http', '--host', '127.0.0.1', '--port', String(n.http), '--flight-port', String(n.flight)], {
@@ -46,7 +64,11 @@ function launch(n) {
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   n.log = '';
-  c.stderr.on('data', d => { n.log = (n.log + d).slice(-20000); });
+  c.stderr.on('data', d => {
+    n.log = (n.log + d).slice(-20000);
+    // LOGS=<dir>: every node's full log, appended across restarts.
+    if (process.env.LOGS) appendFileSync(join(process.env.LOGS, `n${n.id}.log`), d);
+  });
   c.on('exit', (code, signal) => {
     n.exit = { code, signal };
     if (stopping || n.child !== c) return;
@@ -118,9 +140,21 @@ try {
     failovers.push(took);
     current = next;
     console.log(`  kill ${k + 1}: node ${old.id} killed with ${before} writes acked; node ${next.id} leads after ${took} ms`);
-    // The killed node comes back (as a follower).
+    // The killed node comes back (as a follower), unreachable for a while.
     await sleep(500);
+    old.blackout = Date.now() + BLACKOUT;
     launch(old);
+    // One fault at a time: the next kill waits until the restarted node is
+    // reachable again and has caught up with the leader.
+    await sleep(BLACKOUT);
+    const c0 = Date.now();
+    for (;;) {
+      const [mine, lead] = await Promise.all([status(old), status(current)]);
+      if (mine && lead && mine.wal_offset >= lead.wal_offset - 50) break;
+      if (Date.now() - c0 > 30000) { check(`kill ${k + 1}: node ${old.id} catches up`, false, `${mine?.wal_offset} vs ${lead?.wal_offset}`); break; }
+      await sleep(200);
+    }
+    console.log(`  node ${old.id} back and caught up ${Date.now() - c0} ms after its blackout`);
   }
   await sleep(2500);
   stopping = true;
@@ -131,8 +165,12 @@ try {
   const worst = Math.max(...failovers, 0);
   check(`every failover within ${BUDGET} ms (worst ${worst} ms; ${failovers.join(', ')})`, failovers.length === KILLS && worst <= BUDGET);
 
-  const L = await leader();
-  const r = await query(L, 'RECALL FROM EPISODIC WHERE kind = "raft" LIMIT 1000000 RETURN bid_id');
+  // Read on the leader (again on the next one if it changes meanwhile).
+  let r = {};
+  for (let t = 0; t < 5; t++) {
+    try { r = await query(await leader(), 'RECALL FROM EPISODIC WHERE kind = "raft" LIMIT 1000000 RETURN bid_id'); if (r.success !== false) break; } catch {}
+    await sleep(1000);
+  }
   const present = new Set((r.data?.data?.records ?? []).map(rec => rec.data?.bid_id));
   const lost = [...acked].filter(k => !present.has(k));
   check(`no acknowledged write lost (${lost.length} lost of ${acked.size})`, lost.length === 0, lost.slice(0, 10).join(', '));
@@ -146,13 +184,13 @@ try {
   }
   check(`all three WALs at the same offset (${offsets.join(', ')})`, offsets.every(o => o === offsets[0] && o > 0));
   const restarts = nodes.reduce((a, n) => a + n.restarts, 0);
-  console.log(`  nodes restarted after losing the lead (exit 75): ${restarts}`);
+  check(`no leader deposed by a rejoining node (${restarts} restarts after a lost lead)`, restarts === 0);
 } catch (e) {
   console.error(e);
   failures++;
 } finally {
   stopping = true;
-  for (const n of nodes) n.child?.kill('SIGKILL');
+  for (const n of nodes) { n.child?.kill('SIGKILL'); n.proxy?.close(); }
   await sleep(300);
   if (failures && process.env.KEEP) console.log(`  data kept in ${tmp}`);
   else rmSync(tmp, { recursive: true, force: true });

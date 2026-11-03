@@ -100,18 +100,23 @@ pub fn parse_peers(s: &str) -> Result<BTreeMap<NodeId, String>, String> {
     Ok(out)
 }
 
-/// Election and heartbeat as measured in R6 (150–300 ms / 30 ms); a snapshot
-/// (a pointer: the data is the WAL and the tables) every 50,000 entries, so
-/// openraft can trim its own log.
+/// Heartbeat 50 ms, election 500–1000 ms, Pre-Vote on. R6 measured 150–300 ms /
+/// 30 ms on one host; on Kubernetes that let one CPU-heavy request on the leader
+/// (or a slow node) look like a dead leader. Pre-Vote: a node that cannot win (one
+/// restarted with a new pod IP that the leader does not reach yet) does not raise
+/// its term, so it cannot depose a healthy leader when it is reached again. A
+/// snapshot (a pointer: the data is the WAL and the tables) every 50,000 entries,
+/// so openraft can trim its own log. Every value can be overridden by env.
 pub fn raft_config() -> Config {
     let ms = |var: &str, d: u64| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     Config {
         cluster_name: "adb".into(),
-        heartbeat_interval: ms("ADB_RAFT_HEARTBEAT_MS", 30),
-        election_timeout_min: ms("ADB_RAFT_ELECTION_MIN_MS", 150),
-        election_timeout_max: ms("ADB_RAFT_ELECTION_MAX_MS", 300),
+        heartbeat_interval: ms("ADB_RAFT_HEARTBEAT_MS", 50),
+        election_timeout_min: ms("ADB_RAFT_ELECTION_MIN_MS", 500),
+        election_timeout_max: ms("ADB_RAFT_ELECTION_MAX_MS", 1000),
         snapshot_policy: SnapshotPolicy::LogsSinceLast(ms("ADB_RAFT_SNAPSHOT_EVERY", 50_000)),
         max_in_snapshot_log_to_keep: ms("ADB_RAFT_LOG_KEEP", 20_000),
+        enable_pre_vote: Some(std::env::var("ADB_RAFT_PRE_VOTE").map_or(true, |v| v != "0" && v != "false")),
         ..Default::default()
     }
 }

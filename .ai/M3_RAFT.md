@@ -8,7 +8,11 @@ Limitations found on the way go to flowr-system `.ai/a3t-adb-cluster-limitations
 
 One replica set of 3 nodes, one Raft group, one partition (S1: one replica set, one
 partition — no cross-partition work). openraft `=0.10.0-alpha.36` (R1), election
-150–300 ms, heartbeat 30 ms (R6).
+500–1000 ms, heartbeat 50 ms, Pre-Vote on. R6 measured 150–300 / 30 ms on one host;
+on vc-dev (3 Nov) a pod recreated with a new IP, not yet reachable by the leader,
+raised its term in repeated elections and deposed the leader when it was reached
+(term 9 → 13 in 3.4 s, two lost-lead restarts). Pre-Vote stops that; the longer
+timeouts keep one CPU-heavy request on the leader from looking like a dead leader.
 
 **The Raft leader is the only active node.** It runs everything a single ADB runs
 today: the sequencer, the appliers, subscriptions, watches, TTL timers, the hot cache,
@@ -71,6 +75,9 @@ FlowR's engine spaces, the platform tables. Followers are hot standbys.
 | `ADB_NODE_ID` | This node's id (1, 2, 3) |
 | `ADB_PEERS` | `1=http://adb-0.adb:3000,2=http://adb-1.adb:3000,3=http://adb-2.adb:3000` (HTTP base of each node; Raft RPCs at `/raft/*`) |
 | `ADB_PEER_FLIGHT` | Same ids → Flight URLs, for forwarding Flight calls |
+| `ADB_RAFT_PORT` | Raft RPC port (default 3002); `/cluster/status` there too |
+| `ADB_RAFT_HEARTBEAT_MS`, `ADB_RAFT_ELECTION_MIN_MS`, `ADB_RAFT_ELECTION_MAX_MS` | 50, 500, 1000 |
+| `ADB_RAFT_PRE_VOTE` | On; `0` turns it off |
 | unset | Single node, as today |
 
 ## Gate
