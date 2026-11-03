@@ -20,6 +20,7 @@ use crate::writes::{catch_up, retain_max};
 pub struct Replica {
     log: EngineLog,
     store: Arc<PartitionStore>,
+    embedder: Option<Arc<adb_embed::Embedder>>,
     platform: Arc<adb_platform::PlatformStore>,
     engine: adb_engine::EngineHost,
     platform_next: LogOffset,
@@ -35,15 +36,21 @@ impl Replica {
     /// Open `dir`'s table, platform tables and engine spaces, and catch up with `log`.
     pub async fn open(dir: impl AsRef<std::path::Path>, log: EngineLog) -> Result<Self, String> {
         let dir = dir.as_ref();
-        let (store, _) = crate::engine::open_store(dir).await?;
+        let (store, embedder) = crate::engine::open_store(dir).await?;
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(s("platform"))?);
         let platform_next = LogOffset(platform.applied_offset().await + 1);
         let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;
         let engine_next = engine.replay_from().await.map_err(s("engine"))?;
-        let mut r = Self { log, store, platform, engine, platform_next, engine_next, retain_max: retain_max() };
+        let mut r = Self { log, store, embedder, platform, engine, platform_next, engine_next, retain_max: retain_max() };
         let n = r.step().await?;
         tracing::info!(records = n, offset = r.log.last_offset().0, "replica caught up");
         Ok(r)
+    }
+
+    /// Hand what this replica keeps open to the leader's engine
+    /// ([`crate::LocalEngine::durable_warm`]); call after a last [`Self::step`].
+    pub fn into_warm(self) -> crate::engine::Warm {
+        crate::engine::Warm { store: self.store, embedder: self.embedder, platform: self.platform, engine: self.engine }
     }
 
     /// Records from `from` on, skipping a purged stretch (its records were

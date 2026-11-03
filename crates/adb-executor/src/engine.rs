@@ -244,6 +244,15 @@ async fn open_wal(dir: &std::path::Path) -> Result<LocalWal, String> {
 
 /// The partition's Lance table in `dir/store`, sized by the embedding settings
 /// (W9.10), and the embedder they name.
+/// What a follower keeps open and applied (a [`crate::Replica`]), handed to the
+/// engine when the node becomes the leader.
+pub struct Warm {
+    pub(crate) store: Arc<PartitionStore>,
+    pub(crate) embedder: Option<Arc<adb_embed::Embedder>>,
+    pub(crate) platform: Arc<adb_platform::PlatformStore>,
+    pub(crate) engine: adb_engine::EngineHost,
+}
+
 pub(crate) async fn open_store(dir: &std::path::Path) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
     let settings = adb_embed::EmbedConfig::load(dir)?;
     let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
@@ -384,10 +393,28 @@ impl LocalEngine {
     /// whose appends commit through the replica set and whose reads are the
     /// node's local WAL. Everything else is as [`Self::durable`].
     pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
-        let dir = dir.into();
+        // Boxed: keeps the callers' future types shallow (the compiler's query depth).
+        Box::pin(Self::durable_with(dir.into(), wal, None)).await
+    }
+
+    /// As [`Self::durable_on`], taking over a follower's already-open table,
+    /// platform tables and engine spaces (CA-34: a new leader does not reopen
+    /// what its replica kept applied).
+    pub async fn durable_warm(dir: impl Into<std::path::PathBuf>, wal: EngineLog, warm: Warm) -> Result<(Self, ReplayStats), String> {
+        Box::pin(Self::durable_with(dir.into(), wal, Some(warm))).await
+    }
+
+    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, warm: Option<Warm>) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
-        let (store, embedder) = open_store(&dir).await?;
+        let (store, embedder, platform_open, engine_open) = match warm {
+            Some(w) => (w.store, w.embedder, Some(w.platform), Some(w.engine)),
+            None => {
+                let (store, embedder) = open_store(&dir).await?;
+                (store, embedder, None, None)
+            }
+        };
+
         // W10: the hot cache follows every apply from here on (the catch-up too).
         let cache_cfg = match adb_store::CacheConfig::load(&dir)? {
             Some(c) => c,
@@ -396,10 +423,16 @@ impl LocalEngine {
         store.set_cache(hot_cache(cache_cfg)).await.map_err(|e| e.to_string())?;
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
-        let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?);
+        let platform = match platform_open {
+            Some(p) => p,
+            None => Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?),
+        };
         writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
         // FlowR's engine store (stage H): its spaces under `<dir>/engine`.
-        let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?;
+        let engine = match engine_open {
+            Some(e) => e,
+            None => adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?,
+        };
         let replayed = writes.attach_engine(engine).await.map_err(|e| e.to_string())?;
         if replayed > 0 {
             tracing::info!(records = replayed, "engine spaces replayed");

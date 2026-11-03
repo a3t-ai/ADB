@@ -78,6 +78,7 @@ function launch(n) {
       setTimeout(() => { if (!stopping) launch(n); }, 200);
     }
   });
+  c.exited = new Promise(r => c.on('exit', r));
   n.child = c;
   return c;
 }
@@ -155,6 +156,32 @@ try {
       await sleep(200);
     }
     console.log(`  node ${old.id} back and caught up ${Date.now() - c0} ms after its blackout`);
+  }
+  // A planned stop: SIGTERM makes the leader hand the lead over first (R2a).
+  {
+    await sleep(2500);
+    const old = current;
+    current = null;
+    const t0 = Date.now();
+    old.child.kill('SIGTERM');
+    let next;
+    // A leader other than the stopping one (it may still answer /ready while it hands over).
+    const deadline = Date.now() + BUDGET * 4;
+    while (!next && Date.now() < deadline) {
+      for (const n of nodes) if (n !== old && await ready(n)) { next = n; break; }
+      if (!next) await sleep(20);
+    }
+    if (!next) check('graceful stop: a new leader', false, 'none');
+    if (next) {
+      const took = Date.now() - t0;
+      current = next;
+      console.log(`  graceful stop: node ${old.id} handed the lead to node ${next.id} in ${took} ms (kills: ${failovers.join(', ')} ms)`);
+      check(`a planned stop hands over faster than a kill (${took} ms vs fastest kill ${Math.min(...failovers)} ms)`, took < Math.min(...failovers));
+      await old.child.exited ?? null;
+      await sleep(500);
+      launch(old);
+      await sleep(BLACKOUT);
+    }
   }
   await sleep(2500);
   stopping = true;

@@ -161,6 +161,38 @@ impl<L: Log> Sequencer<L> {
     pub fn resume_after(&mut self, last: CommitTs) {
         self.clock = CommitClock::after(last);
     }
+
+    /// Recall the `txn_id`s of the last `window` records of the log, so a client
+    /// retrying a write after a restart or a failover (a new leader) still commits
+    /// it once (CA-27). Returns how many ids were recalled.
+    pub async fn recall_txns(&mut self, window: u64) -> LogResult<usize> {
+        let last = self.log.last_offset().0;
+        if last == 0 || window == 0 {
+            return Ok(0);
+        }
+        let mut from = last.saturating_sub(window - 1).max(1);
+        let mut n = 0;
+        while from <= last {
+            let batch = match self.log.read(LogOffset(from), 4096).await {
+                Ok(b) => b,
+                // Purged below the window's start: the window starts at the oldest kept.
+                Err(adb_log::LogError::Purged { oldest, .. }) if oldest.0 > from => {
+                    from = oldest.0;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let Some(end) = batch.last().map(|r| r.offset.0) else { break };
+            for r in batch {
+                if let Some(id) = r.txn_id {
+                    self.seen.insert(id, r.offset);
+                    n += 1;
+                }
+            }
+            from = end + 1;
+        }
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +253,24 @@ mod tests {
         let b = seq.commit(Some("txn-7".into()), forget).await.unwrap();
         assert_eq!(a, b);
         assert_eq!(seq.log().last_offset(), LogOffset(1));
+    }
+
+    #[tokio::test]
+    async fn a_new_sequencer_on_the_same_log_still_commits_a_retried_txn_once() {
+        let log = std::sync::Arc::new(MemLog::new(PartitionId(0)));
+        let mut first = Sequencer::new(std::sync::Arc::clone(&log), Epoch(1));
+        let a = first.commit(Some("txn-9".into()), forget).await.unwrap();
+        first.commit(None, forget).await.unwrap();
+        drop(first);
+        // A failover: a new sequencer over the same log, as a new leader opens it.
+        let mut second = Sequencer::new(std::sync::Arc::clone(&log), Epoch(1));
+        assert_eq!(second.recall_txns(1000).await.unwrap(), 1);
+        let b = second.commit(Some("txn-9".into()), forget).await.unwrap();
+        assert_eq!(a, b, "the retry answers with the first commit's offset");
+        assert_eq!(second.log().last_offset(), LogOffset(2), "nothing new was logged");
+        // A window that no longer covers it: committed again (bounded memory).
+        let mut third = Sequencer::new(std::sync::Arc::clone(&log), Epoch(1));
+        assert_eq!(third.recall_txns(1).await.unwrap(), 0);
     }
 
     #[tokio::test]

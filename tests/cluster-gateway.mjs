@@ -18,7 +18,7 @@
  *   node tests/cluster-gateway.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)> [--runs 6] [--raft]
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -57,7 +57,8 @@ let stopping = false;
 function start(bin, argv, env, onExit) {
   const c = spawn(bin, argv, { env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? 'warn,flowr_ce::gateway=info,flowr_ce::engine_worker=info', ...env }, stdio: ['ignore', 'ignore', 'pipe'] });
   let log = '';
-  c.stderr.on('data', d => { log = (log + d).slice(-60000); });
+  const tag = env.HOSTNAME ?? (env.ADB_NODE_ID ? `adb${env.ADB_NODE_ID}` : 'adb');
+  c.stderr.on('data', d => { log = (log + d).slice(-60000); if (process.env.LOGS) appendFileSync(join(process.env.LOGS, `${tag}.log`), d); });
   c.log = () => log.replace(/\x1b\[[0-9;]*m/g, '');
   c.exited = new Promise(r => c.on('exit', (code, signal) => { children.delete(c); if (onExit) onExit(code, signal); r(); }));
   children.add(c);
@@ -147,6 +148,8 @@ try {
   const G1 = await flowr('gw1', { FLOWR_WORKER_POOLS: 'gateway', FLOWR_GATEWAY_DENY: '/deny' });
   const G2 = await flowr('gw2', { FLOWR_WORKER_POOLS: 'gateway', FLOWR_GATEWAY_DENY: '/deny' });
   console.log(`  ADB ${RAFT ? 'replica set (3)' : 'single node'}; console, runtime (worker, FLOWR_GATEWAY=pool, no direct egress), gateways G1 + G2`);
+  // The router sends a run to a pool only once it has a live worker (one claim seen).
+  await sleep(4000);
 
   const flow = (name, path) => `document: { dsl: '1.0.3', namespace: acme, name: ${name}, version: '1.0.0' }
 do:

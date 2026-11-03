@@ -26,4 +26,4 @@ pub use apply::ApplyBarrier;
 pub use reads::{LanceReads, Reads};
 pub use writes::{DurableWrites, ReplayStats, Writes};
 pub use replica::Replica;
-pub use engine::EngineLog;
+pub use engine::{EngineLog, Warm};

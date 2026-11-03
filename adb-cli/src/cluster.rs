@@ -60,12 +60,23 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
     });
 
     tokio::pin!(shutdown);
+    // What the follower kept open, handed over when this node takes the lead (CA-34).
+    let mut warm: Option<adb_executor::Warm> = None;
     loop {
         if node.is_leader() && node.ready_to_lead().await {
-            tracing::info!(node = node.id, "leading the replica set: opening the engine");
+            let t0 = std::time::Instant::now();
             let log: EngineLog = node.log();
-            let (engine, stats) = LocalEngine::durable_on(dir, log).await?;
-            tracing::info!(records = stats.records, last_offset = stats.last_offset.0, "ADB engine open (leader)");
+            let (engine, stats) = match warm.take() {
+                Some(w) => {
+                    tracing::info!(node = node.id, "leading the replica set: taking over the replica's open engine");
+                    LocalEngine::durable_warm(dir, log, w).await?
+                }
+                None => {
+                    tracing::info!(node = node.id, "leading the replica set: opening the engine");
+                    LocalEngine::durable_on(dir, log).await?
+                }
+            };
+            tracing::info!(records = stats.records, last_offset = stats.last_offset.0, took_ms = t0.elapsed().as_millis() as u64, "ADB engine open (leader)");
             let engine: Arc<dyn Engine> = Arc::new(engine);
             let app = Router::new().route("/ready", get(|| async { "leader" })).merge(adb_server::router(Arc::clone(&engine)));
             let http = axum::serve(bind(SocketAddr::new(host, port)).await?, app);
@@ -84,6 +95,9 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
                 }
                 s = &mut shutdown => {
                     tracing::info!(signal = s, "ADB shutting down");
+                    let t0 = std::time::Instant::now();
+                    let moved = node.hand_over(Duration::from_secs(3)).await;
+                    tracing::info!(moved, took_ms = t0.elapsed().as_millis() as u64, leader = ?node.leader(), "lead handed over");
                     let _ = node.raft.shutdown().await;
                     return Ok(());
                 }
@@ -130,10 +144,15 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
                 }
             }
         }
-        // Becoming leader: catch up, then (next turn) open the engine.
-        if let Err(e) = replica.step().await {
-            tracing::warn!(error = %e, "last replica step before leading failed");
+        // Becoming leader: catch up, then (next turn) hand the open parts over.
+        let keep_warm = std::env::var("ADB_WARM_HANDOVER").map_or(true, |v| v != "0");
+        match replica.step().await {
+            Ok(_) if keep_warm => warm = Some(replica.into_warm()),
+            Ok(_) => drop(replica),
+            Err(e) => {
+                tracing::warn!(error = %e, "last replica step before leading failed; the engine will be reopened");
+                drop(replica);
+            }
         }
-        drop(replica);
     }
 }

@@ -179,6 +179,27 @@ impl Node {
         self.is_leader() && self.raft.ensure_linearizable(ReadPolicy::ReadIndex).await.is_ok() && self.is_leader()
     }
 
+    /// A leader that is about to stop (SIGTERM: a roll, a drain) hands the lead to
+    /// the most caught-up follower, so the replica set does not wait out an election
+    /// timeout. True once another node leads; false if none took over within `within`.
+    pub async fn hand_over(&self, within: std::time::Duration) -> bool {
+        if !self.is_leader() {
+            return true;
+        }
+        let m = self.raft.metrics().borrow_watched().clone();
+        let target = m
+            .replication
+            .as_ref()
+            .and_then(|r| r.iter().filter(|(id, _)| **id != self.id).max_by_key(|(_, l)| l.as_ref().map(|l| l.index)).map(|(id, _)| *id));
+        let Some(to) = target else { return false };
+        if let Err(e) = self.raft.trigger().transfer_leader(to).await {
+            tracing::warn!(error = %e, to, "leader transfer not started");
+            return false;
+        }
+        tracing::info!(node = self.id, to, "handing the lead over before stopping");
+        tokio::time::timeout(within, self.until_lead(false)).await.is_ok()
+    }
+
     /// The log the leader's engine runs on.
     pub fn log(&self) -> Arc<RaftLog> {
         Arc::new(RaftLog { raft: self.raft.clone(), wal: Arc::clone(&self.wal) })

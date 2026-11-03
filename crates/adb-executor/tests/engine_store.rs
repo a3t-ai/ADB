@@ -2,6 +2,7 @@
 //! an ADB engine space; a restart (with and without a snapshot) gives the same
 //! state; an evicted journal reads back from its EPISODIC history; run history
 //! is invisible to agents' AQL; retention removes it.
+#![recursion_limit = "256"]
 
 use std::time::Duration;
 

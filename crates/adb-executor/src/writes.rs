@@ -644,6 +644,13 @@ impl<L: Log + 'static> DurableWrites<L> {
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
         }
+        // CA-27: a retried txn_id commits once across a restart or a failover too.
+        let window = std::env::var("ADB_TXN_DEDUPE_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000u64);
+        let t_recall = std::time::Instant::now();
+        let recalled = Box::pin(seq.recall_txns(window)).await.map_err(log_err)?;
+        if recalled > 0 {
+            tracing::info!(recalled, window, took = ?t_recall.elapsed(), "transaction ids recalled from the log tail");
+        }
         // Caught up with the log: the applier starts from its end.
         let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
         let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
