@@ -65,6 +65,10 @@ spec:
               valueFrom: { secretKeyRef: { name: adb-auth, key: token, optional: true } }
             - name: ADB_ENGINE_TOKEN
               valueFrom: { secretKeyRef: { name: adb-engine, key: token } }
+            # Gateway step 1 (AC-8): {"<pool>": "<token>"}; a pool token claims and
+            # follows its own pool only. Optional: without it only the engine token works.
+            - name: ADB_ENGINE_POOL_TOKENS
+              valueFrom: { secretKeyRef: { name: adb-pool-tokens, key: pools, optional: true } }
           ports:
             - { name: http, containerPort: 3000 }
             - { name: flight, containerPort: 3001 }
