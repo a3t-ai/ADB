@@ -1,7 +1,7 @@
 # Known limitations — left out on purpose, to revisit
 
 What the implementation deliberately skipped or worked around (started at stage D4,
-25 Oct 2026; last pass 30 Oct). Grouped by area. Each entry says what is missing, what
+25 Oct 2026; last pass 3 Nov). Grouped by area. Each entry says what is missing, what
 it affects, and its plan, tagged:
 
 - **MVP**: closed in the first MVP run (below);
@@ -22,10 +22,15 @@ entities, provenance and validity should suit a triple feed to the model later.
 |---|---|
 | Memory / AQL | — (done 30 Oct) |
 | Graph | GR-4 paths (decide) |
-| Cluster | CL-1 replication, CL-2 leader routing, CL-3 owner-side checks, CL-4 per-process state on failover, L11 power-safe store, S1 partitions (decide), S5 CI |
+| Cluster | Built 3 Nov: 3-node Raft replica set on vc-dev (CL-1). Left: CL-5 fault harness (the M3 gate), CL-6 measure on 3 servers, CA-24 group commit, CA-25 snapshots, CA-26 membership, CA-27 write idempotency key, CA-28 erasure on followers, L11 power-safe store, CL-3 owner checks under failover, CL-7 leader-label routing, S1 partitions (decide), S5 CI |
 
-Gates that aren't limitations (W8 A3T pass, P1 step 1.6) are in `MVP_PLAN.md` and
-`P1_GRAPH.md`.
+Gates that aren't limitations (W8 A3T pass, P1 step 1.6 — the user's A3T check of the
+graph on vc-dev, still open on 3 Nov) are in `MVP_PLAN.md` and `P1_GRAPH.md`.
+
+**Order proposed 3 Nov** (what is left in ADB): S9 push → CL-7 leader-label routing →
+CL-5 fault harness → CA-24 group commit → CA-25 snapshots + CA-26 membership →
+P1 step 1.6 (user) → SEC-1 → CL-8 hibernation; then the post-MVP phases (edge ADB,
+stitching, central KG + KBLaM, M5).
 
 ## Memory and AQL
 
@@ -76,11 +81,15 @@ delivered to subscribers; multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `
 
 | # | Limitation | Effect | Plan |
 |---|---|---|---|
-| CL-1 | **No replication**: one node; `adb-log` has the log trait but `adb-cluster` is empty and openraft isn't a dependency. The crash tests (R11 / R12, the 1,000-kill run) are single node; there are no Raft, failover or partition tests (R6, R10). | A node or disk loss loses the service and possibly data. | **MVP** (M3): openraft behind `adb-log`, a 3-node replica set, snapshots, membership, archive / purge, fault harness as the gate (DELIVERY_PLAN M3). |
-| CL-2 | **Clients know one ADB URL**: FlowR, runtimes, MCP clients and the CLI have no node list, leader discovery or redirect. | A cluster would need every client to find the leader itself. | **MVP**: followers forward or redirect writes; clients take a node list (or one Service in front). |
-| CL-3 | **Checks that must run at the owner** run in the one sequencer today: key uniqueness (live-key index), `UPDATE … WHERE metadata.version = n` compare-and-set, LINK end checks, fact supersede. | Correct on one node only by construction. | **MVP**: keep them at the partition owner / leader, tested under failover. |
-| CL-4 | **State held only in the process**: subscription registry and cursors in flight, watch frame buffers (W6-L2), TTL timers, the live-key index, the hot cache, idle clocks (W9-L3). | Rebuilt at open from the table and log on one node. | **MVP**: rebuilt by the new leader on failover; subscribers resume by offset. |
+| CL-1 | **Replication — built (3 Nov), not yet gated.** openraft `=0.10.0-alpha.36` behind `adb-log` (`crates/adb-raft`, `.ai/M3_RAFT.md`): 3 voters, the leader runs the engine on the Raft log, followers apply it (`Replica`) and hand it over on taking the lead; Pre-Vote, election 500–1000 ms; a leader stopped with SIGTERM hands the lead over first. Tests: `tests/cluster-raft.mjs` (kills, rejoin blackouts, 0 lost writes), `cluster-a3t.mjs`, `cluster-gateway.mjs --raft`, `cluster-wake.mjs`. Open pieces are tracked as CA-22..28 in flowr-system `.ai/a3t-adb-cluster-limitations.md` and CL-5..CL-8 below. | A replica set survives a node loss; the gates below are not passed yet. | **MVP**: CL-5, CL-6, CA-24..28. |
+| CL-2 | **Leader routing is by readiness** (CA-22): one Kubernetes Service in front; `/ready` passes on the leader only, so followers show unready and a StatefulSet RollingUpdate stalls (`deploy/k8s/adb-roll.sh` instead). Followers do not forward. | Rancher shows two of three nodes unready; a leader change reaches clients after the 1 s probe. | **MVP**: CL-7. |
+| CL-3 | **Checks that must run at the owner** (key uniqueness, `UPDATE … WHERE metadata.version = n` compare-and-set, LINK end checks, fact supersede) run in the leader's one sequencer. Not yet tested across a failover. | Correct by construction while one sequencer writes; unproven under failover. | **MVP**: cover them in the fault harness (CL-5). |
+| CL-4 | **State held only in the process** (subscription registry and cursors in flight, watch buffers, TTL timers, live-key index, hot cache, idle clocks): a new leader rebuilds it when it opens the engine (from the follower's warm parts, 3 Nov); FlowR resubscribes within a second; notices published during the switch can be missed (CA-20), workers fall back to polling. | A short gap in wake-ups after a failover. | **MVP**: subscribers resume by offset (no gap). |
 | S1 | **One partition** (`PartitionId(0)`); `FORGET FROM ALL` / `UPDATE ALL` commit one transaction per memory type. | Not atomic across types. | **Decide**: the first cluster as one replica set with one partition (recommended; no cross-partition work) or several. |
+| CL-5 | **No fault harness (R10, the M3 gate)**: the tests kill, restart and black out nodes, but nothing injects network partitions, clock skew, disk-full or slow fsync, and no linearizability checker runs on the results. | Raft bugs that only those faults expose are unseen. | **MVP**: build it and run it on every replication change. |
+| CL-6 | **Measured on one host only**: vc-dev is one node (`cartize-dev`) and the local tests run on one pod; the M3 targets (leader election < 1 s, owner failover p95 < 5 s, commit latency R3, leader throughput R4) need 3 separate servers. Today: election 0.5–1 s, failover 2–3 s end to end, 0 lost writes. | Numbers may change with real network latency and disks. | **MVP**: measure on 3 servers. |
+| CL-7 | **Leader routing by label, not readiness** (proposed 3 Nov): readiness = healthy caught-up member (all three Ready, plain rolling updates); the leader labels its own pod `a3t.io/raft-role=leader` and the `adb` Service selects on it. Needs a Role letting ADB patch its pod. | Replaces CL-2's readiness trick. | **MVP**. |
+| CL-8 | **Hibernation (M4) only measured**: waking a stopped 3-node set takes 0.5–5.5 s to serve (release, 5,000 records; the first wake after writes is the slow one, likely replaying unflushed writes — not confirmed); one node alone never serves. No lazy wake on first request, no Sandbox-based ADB trio, no scheduled wakes. The core ADB (what A3T runs on) must stay always-on: everything that could wake it depends on it. | Per-tenant / per-agent ADB hibernation not available yet. | **Later** (M4): ADB trios as hibernating agent-sandbox Sandboxes woken by the edge; confirm and cut the first-wake replay. |
 | G-L3 | **Platform writes are serialised with memory writes** (one sequencer). | Fine for registry traffic; a heavy writer would queue behind memory writes. | **Later**: a separate partition for platform tables. |
 | W6-L7 | **Watches are single partition**; `FROM OFFSET` on a new `WATCH` is refused (resume by id). Conformance `19_watch.yaml` covers registration; diffs are covered by ADB tests. | — | **Later**: cross-partition watches. |
 | E-L1 | **Each subscriber reads the log itself** (tails the applied log) instead of a matcher at apply fanning out. | Cost grows with subscribers × writes; fine for tens of subscribers on one node. | **Later**: M4 gateway (matcher at apply). |
@@ -186,6 +195,7 @@ cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the bucket.
 | # | Limitation | Effect | Plan |
 |---|---|---|---|
 | G-L10 | **ADB has one admin token** (`ADB_AUTH_TOKEN`): anything holding it (FlowR, the CLI) can read, write and run SQL; the superadmin check is in FlowR. | One trust level. | **Later**: per-caller tokens / roles (M4). |
+| SEC-1 | **Pool tokens scope the engine only** (CA-40, 3 Nov): `ADB_ENGINE_POOL_TOKENS` limits a pool's token to claiming and following its own pool, but registry and platform-table calls use the one admin token (G-L10), which every FlowR pod holds. | A compromised runtime can still read and write the registry and platform tables. | **MVP**: per-pool scopes for registry and platform actions. |
 | E-L5 | **No authorization at subscription registration or delivery** beyond the token. | Any token holder can subscribe to any topic or scope. | **Later**: §14.4 with M4. |
 | W6-L5 | **No per-tenant limits, metering or per-watch permissions.** | Fine on one trusted node. | **Later**: M4. |
 | W2-L9 | **Runtime pods serve FlowR's full API** though nothing calls them; `/message` can write the shared registry for a caller with a valid token. | Same trust as the console. | **Later**: a runtime mode that serves only `/health`. |
@@ -195,6 +205,7 @@ cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the bucket.
 | # | Limitation | Effect | Plan |
 |---|---|---|---|
 | S5 | **No CI** (user, 24 Oct): `tests/check-all.sh` is run by hand before commits and images. | Easy to miss a regression. | **MVP**, before M3: the fault harness runs on every replication change. Needs the branches pushed. |
+| S9 | **The working branch is not on GitHub** (3 Nov): `m0-k5-deps`, with the Raft work, exists only on this pod; `origin` is `https://github.com/srirammails/ADB.git` (no token here). | Losing the pod's disk loses it. | **Now**: push over SSH (the user unlocks the key), or move ADB to `a3t-io/adb` as planned. |
 | P9 | **Release builds take ~40 min from clean** (fat LTO, 4 jobs in the pod). | Slow deploy loop after a cache wipe. | **Later**: thin LTO for dev images, or a build node. |
 | S8 | **Lance logs at INFO by default**; every read logs a `plan_run` line. | Log volume. | **Later**: `RUST_LOG=info,lance=warn` in the manifest. |
 | GR-8 | **The WASM playground's built `pkg/` predates v0.6** (source updated; no wasm-pack here). | The browser playground rejects newer statements. | **Later**: `wasm-pack build crates/clawdb-wasm` where the toolchain is. |
