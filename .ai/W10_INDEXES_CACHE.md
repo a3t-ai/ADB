@@ -167,3 +167,53 @@ eval run in shadow mode until the cache has run clean on vc-dev.
 
 Release, 10k facts: cache hits ~0.1–0.5 ms over HTTP (vs 10–100 ms now); misses with
 L1 in the LanceDB-with-indexes range (1.5–30 ms) instead of scanning.
+
+## W10b — memory budget, configurable and tunable (feature, recorded 4 Nov 2026)
+
+**Why (user, 4 Nov):** on vc-dev the ADB leader holds **1,326 MiB** at idle against a
+2 Gi pod limit (followers 560–585 MiB). The hot cache is capped at 256 MB, so most of
+it is outside the cache's budget and invisible: an OOM kill would be a failover. User:
+"ADB cache management should be configurable / tunable" — kept as a feature.
+
+**What holds memory today, and what can be set:**
+
+| Holder | Set today | Missing |
+|---|---|---|
+| Hot cache (L2) | `max_bytes` (256 MB), rules per `(memory, scope)`, vectors / edges on or off; live via `PUT /admin/cache`, `cache.json`, `ADB_CACHE_RULES` | its size is not reported per bucket outside `/admin/cache` |
+| Lance (MemWAL memtables, sealed generations, index and metadata caches, read buffers) | `memtable_rows` (store config) | a byte budget; Lance's own cache sizes are left at their defaults |
+| FlowR engine spaces (run rows, journals held in memory until archived) | — | a cap per space and node-wide; eviction of finished runs' journals to EPISODIC |
+| Platform tables, live-key index, aliases, subscription and watch state, TTL timers | — | measured sizes |
+| Raft (log store buffers, in-flight entries, the follower's warm parts) | `ADB_RAFT_LOG_KEEP`, snapshot interval | measured size |
+| Embedder (model weights, when `ADB_EMBED_MODEL_DIR` is set) | the model choice | reported size |
+
+**Feature:**
+
+1. **One process budget.** `ADB_MEMORY_BUDGET` (bytes or `%` of the cgroup limit,
+   *(default)* 60 % of the container's memory limit, read from
+   `/sys/fs/cgroup/memory.max`; no limit → 1 GiB), split into shares per holder
+   (*(default)* hot cache 40 %, Lance caches 30 %, engine spaces 20 %, the rest 10 %),
+   each overridable (`ADB_MEMORY_SHARES` or `memory.json`).
+2. **Every holder accounts its bytes** and gives memory back when over its share:
+   the hot cache evicts by its rules (as now), Lance caches are sized from their share
+   at open, engine spaces archive finished runs' journals to EPISODIC and drop them,
+   the rest are measured and reported (and warned about when they grow past their
+   share).
+3. **Observable.** `/stats` and `GET /admin/memory`: budget, share and bytes per
+   holder, cgroup usage and limit, evictions per holder; a summary line in the log
+   every minute when any holder is over 80 % of its share.
+4. **Tunable at runtime.** `PUT /admin/memory` changes the budget and shares without
+   a restart, as `PUT /admin/cache` already does for the cache rules; changes are
+   logged and kept in `memory.json`.
+5. **Kubernetes-aware defaults.** The budget follows the pod's limit, so raising the
+   limit in the StatefulSet raises ADB's working set with no other change; the
+   readiness / leader logic is unaffected.
+6. **Followers.** A follower's warm parts (table, platform tables, engine spaces it
+   hands over on taking the lead) count against the same budget, so a follower that
+   becomes leader does not jump past it.
+
+**Gate:** a load (`tests/perf-a3t.mjs` plus a recall-heavy mix) with the budget set
+below the working set keeps resident memory under the cgroup limit, answers stay equal
+to `ADB_CACHE=shadow`, and `/admin/memory` adds up to within 10 % of the process RSS.
+
+Tracked as **W10-L12** in `limitations.md`.
+

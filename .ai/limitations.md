@@ -165,6 +165,7 @@ cache, the remaining cost is HTTP + AQL (~0.8 ms) plus one pass over the bucket.
 | W10-L6 | **Cache warm-up at open scans the kept memory types.** | Adds to P10. | Snapshot the cache, or warm lazily. |
 | W10-L10 | **Reads over a kept bucket are one pass over it**: 8–17 ms at 10k rows, 44 ms for `LIKE`. | Linear past ~10k rows per bucket. | Per-field maps in buckets; cached BM25 statistics; ANN (W4-L2). |
 | W10-L11 | **Vectors make cached rows ~3× larger** (768 B a row at 384 dims). | A `keep: all` SEMANTIC bucket of 100k facts is ~110 MB. | `"vectors": false` when `LIKE` isn't used on cached types. |
+| W10-L12 | **Memory is not budgeted as a whole** (4 Nov, vc-dev): the leader holds 1,326 MiB at idle against a 2 Gi limit, the hot cache only up to its 256 MB cap; Lance caches and memtables, FlowR engine spaces, platform tables, indexes and Raft buffers have no budget and no measured size. | An OOM kill under load is a failover; nothing shows which holder grew. | **Feature** (user, 4 Nov): one process budget from the cgroup limit, shares per holder, `/admin/memory` to see and tune it at runtime — `W10_INDEXES_CACHE.md` §W10b. Raise the StatefulSet limit meanwhile (4 Gi). |
 
 ## Platform tables, FlowR and runtimes
 
