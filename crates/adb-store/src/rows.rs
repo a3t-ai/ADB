@@ -53,6 +53,51 @@ pub fn scoped_id(scope: &str, key: &str) -> String {
     }
 }
 
+/// Separates a namespace from the rest of a record id (NS, schema v5): a record in
+/// namespace `n` has the id `n|<scope part>~<key>`. Namespaces can't contain it or `~`.
+pub const NAMESPACE_SEP: char = '|';
+
+/// Whether `namespace` can be part of a record id (no `|`, no `~`, not empty).
+pub fn valid_namespace(namespace: &str) -> bool {
+    !namespace.is_empty() && !namespace.contains(NAMESPACE_SEP) && !namespace.contains(SCOPE_SEP)
+}
+
+/// The record id for `key` in `scope` and `namespace` (NS): keys are unique per
+/// (namespace, scope, memory type). Without a namespace it is [`scoped_id`].
+pub fn space_id(namespace: Option<&str>, scope: &str, key: &str) -> String {
+    namespaced(namespace, &scoped_id(scope, key))
+}
+
+/// `id` (a scoped id, `[<scope>~]<key>`) in `namespace`: `<ns>|[<scope>]~<key>`. An id
+/// already in a namespace stays.
+pub fn namespaced(namespace: Option<&str>, id: &str) -> String {
+    match namespace {
+        None => id.to_string(),
+        Some(_) if namespace_of(id).is_some() => id.to_string(),
+        Some(ns) => match id.contains(SCOPE_SEP) {
+            true => format!("{ns}{NAMESPACE_SEP}{id}"),
+            false => format!("{ns}{NAMESPACE_SEP}{SCOPE_SEP}{id}"),
+        },
+    }
+}
+
+/// The namespace a record id carries (the part before the first `~`, up to `|`).
+pub fn namespace_of(id: &str) -> Option<&str> {
+    let (head, _) = id.split_once(SCOPE_SEP)?;
+    head.split_once(NAMESPACE_SEP).map(|(ns, _)| ns)
+}
+
+/// `id` without its namespace: the scoped id (`[<scope>~]<key>`).
+pub fn without_namespace(id: &str) -> &str {
+    match namespace_of(id) {
+        None => id,
+        Some(ns) => {
+            let rest = &id[ns.len() + 1..];
+            rest.strip_prefix(SCOPE_SEP).unwrap_or(rest)
+        }
+    }
+}
+
 /// The key a record id was made from (`scoped_id`'s inverse).
 pub fn unscoped(id: &str) -> &str {
     id.split_once(SCOPE_SEP).map_or(id, |(_, k)| k)
@@ -404,4 +449,30 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
         });
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod ns_tests {
+    use super::*;
+
+    #[test]
+    fn namespaced_ids() {
+        assert_eq!(space_id(None, DEFAULT_SCOPE, "user:alice"), "user:alice");
+        assert_eq!(space_id(Some("acme--bot"), DEFAULT_SCOPE, "user:alice"), "acme--bot|~user:alice");
+        assert_eq!(space_id(Some("acme--bot"), "team:x", "user:alice"), "acme--bot|team:x~user:alice");
+        assert_eq!(space_id(None, "team:x", "user:alice"), "team:x~user:alice");
+        for id in ["acme--bot|~user:alice", "acme--bot|team:x~user:alice"] {
+            assert_eq!(namespaced(Some("acme--bot"), id), id, "idempotent");
+            assert_eq!(namespace_of(id), Some("acme--bot"));
+            assert_eq!(unscoped(id), "user:alice");
+        }
+        assert_eq!(without_namespace("acme--bot|~user:alice"), "user:alice");
+        assert_eq!(without_namespace("acme--bot|team:x~user:alice"), "team:x~user:alice");
+        // A fact key has `|` but no `~`: not namespaced.
+        assert_eq!(namespace_of("fact:a|p|b"), None);
+        assert_eq!(namespace_of("team:x~fact:a|p|b"), None);
+        assert_eq!(namespace_of("crm|~fact:a|p|b"), Some("crm"));
+        assert_eq!(unscoped("crm|~fact:a|p|b"), "fact:a|p|b");
+        assert!(!valid_namespace("a|b") && !valid_namespace("a~b") && valid_namespace("acme--bot"));
+    }
 }

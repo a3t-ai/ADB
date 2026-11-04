@@ -20,3 +20,88 @@ blog.a3t.io/agents-as-repos). ADB's part, by section of that spec:
 Why a row-level overlay and not Lance-level forks: ADB's history is per row
 (`valid_from` / `valid_to` / `superseded_by`, `AS OF`), the table is shared by every
 tenant of the partition, and compaction deletes old Lance versions (W5).
+
+## Design (revised 4 Nov 2026, user)
+
+**A branch is isolated from the production agent.** Each branch is its own ADB engine:
+its own WAL, its own sequencer, its own small Lance table (the *delta*). The org's
+engine only logs the branch's control records (created at point X, dropped) and answers
+reads of the parent's rows `AS OF` the point. Test and dev traffic never reaches the
+org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
+
+- **Placement**, same code: *hosted* — branch engines live in the org's ADB process,
+  under `<data dir>/branches/<namespace>__<name>`, parent reads in-process; *own pod* —
+  a separate ADB process (a hibernating Sandbox with its own volume), parent reads over
+  Flight.
+- **Reads on a branch** = the overlay: the branch's own rows (current now), then the
+  parent's rows `AS OF` the branch point (the parent being the org, or another branch
+  that answers the same way recursively); the nearest level wins per lineage; a
+  `_branch_deleted` row hides a lineage.
+- **Writes on a branch** go to the branch engine only: a new record in its table; a
+  change to a parent record = an override row in the branch table with the parent's
+  lineage; a delete = a marker row; a keyed STORE of a key the overlay already has is
+  refused (UPDATE it).
+- **Merge = promote as a new agent**: materialise the branch's view (SEMANTIC,
+  PROCEDURAL, TOOLS) into a new namespace in production through the org's sequencer.
+  The original agent is untouched. No merge into the parent.
+- **Fork / clone** = the same materialisation without a branch.
+- **Durability**: a hosted branch's engine is on the org leader's disk, not
+  Raft-replicated: after an ADB failover a hosted branch is unavailable until moved or
+  restored (dev and test data). Branches that must survive failovers run in their own pod.
+
+## Build slices (revised 4 Nov 2026)
+
+| Slice | Scope | Done when |
+|---|---|---|
+| B1 | Branch control records on the org log (`branch` rows), create / list / drop, AQL `BRANCH` | done (d734525) |
+| B2 | Branch engines: `ParentSource` (rows of a namespace `AS OF` t: the org engine, or a branch engine recursively); `BranchHost` opening branch engines under `<data dir>/branches/`; a statement with `BRANCH "b"` runs on b's engine | done (669e80d) |
+| B3 | Branch-engine writes: STORE, UPDATE (override rows), FORGET (markers), key checks against the overlay | done (669e80d) |
+| B4 | Retention pins (compaction keeps what open branches read); FORGET on main reaches every branch engine; dropping a branch deletes its engine | done (see below) |
+| NS | Record ids carry the namespace (schema v5, `.ai/NS_IDS.md`): needed by B5 | done (ns-ids) |
+| B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | done (see below) |
+| B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | The developer loop on vc-dev with the branch in its own pod |
+| B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |
+| later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches | — |
+
+### B4 as built
+
+- **Pins.** `PartitionStore::compact_pinned(history, now, pins)`: per namespace, the
+  horizon for superseded versions is never later than the pin, so a version current at
+  a branch point stays. The org's pins are the oldest point of each namespace's
+  branches cut from `main`; a branch engine's pins are its own child branches' points
+  (`Branches::pins`). Forgotten and expired rows still go: a pin keeps history, not
+  forgotten data.
+- **FORGET on main** tombstones every version of the lineage in the org table (so every
+  branch's view of the parent hides it at once), erases it from the org's disk, then
+  `BranchHost::forget` has each branch engine erase its own rows of those lineages —
+  overrides and edges — from its table, log and history (`forget_lineages`). FORGET
+  returns after all of them. Hosted placement only: synchronous and in-process. In
+  B6 (own pod) the org must deliver the FORGET to a remote branch, and a branch pod
+  that is hibernating applies it before it serves.
+- **Drop** deletes the branch engine's directory; a later branch of the same name is new
+  and empty.
+- Limits: FORGET opens every branch engine of the org (cost grows with the number of
+  branches); if one branch fails to erase, FORGET reports an error after main has
+  already erased, and that branch keeps its copy (a retried FORGET finds nothing on main
+  to target). Drop the branch to erase it; a durable pending-FORGET list per branch
+  comes with B6, where a remote branch needs one anyway.
+
+### B5 as built
+
+- `branch_promote(namespace, branch, into)` and `space_clone(namespace, into)` (Engine
+  trait; Flight actions `branch_promote {namespace, name, into}`, `space_clone
+  {namespace, into}`), on the org's engine only.
+- Source: promote reads the branch's view now (its rows, then the parent `AS OF` the
+  point; deleted lineages hidden); clone reads main now.
+- Copied: SEMANTIC, PROCEDURAL, TOOLS current records, as **new records at version 1**
+  (no history, no links). EPISODIC stays with the original agent; WORKING is session state.
+- Ids and FACT ends move to the new namespace (`.ai/NS_IDS.md`); entities are written
+  before the facts about them; 500 records per log record, through the org's sequencer.
+- `into` must be a valid namespace holding no records (checked under the sequencer
+  lock), and not the source namespace. The original agent and the branch are unchanged;
+  dropping the branch afterwards is the caller's choice.
+- Limits: links (`LINK`) are not copied; provenance stays as written (who wrote the
+  original record); a large space is copied in one call (no progress, no resume).
+
+The first B2/B3 build (branch rows in the org table, schema v5 `branch` column) is kept
+at tag `b2-in-org-rows` and not used: it left branch traffic on the org.

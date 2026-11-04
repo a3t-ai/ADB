@@ -32,7 +32,7 @@ use lance_index::IndexType;
 use uuid::Uuid;
 
 use crate::hot::HotCache;
-use crate::rows::{decode, encode, key_of, qualified, row_id, scoped_id, StoredRow};
+use crate::rows::{decode, encode, key_of, qualified, row_id, scoped_id, unscoped, StoredRow};
 use crate::schema::{memory_schema, META_ID, RECORD_KINDS, SCHEMA_VERSION};
 use crate::{StoreError, StoreResult};
 
@@ -217,7 +217,14 @@ impl PartitionStore {
     /// is applied first. The old table, its versions and MemWAL files, and any
     /// rewrite backups (`memory.dim*.bak`) are deleted: forgotten data is gone.
     pub async fn compact(&self, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
-        let keep = compaction_row(history, now);
+        self.compact_pinned(history, now, &Default::default()).await
+    }
+
+    /// [`Self::compact`] keeping, per namespace in `pins`, every version that was
+    /// current at or after the pinned commit time: the branch points of open memory
+    /// branches (`.ai/BRANCHING.md` B4), whose reads go `AS OF` them.
+    pub async fn compact_pinned(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>) -> StoreResult<CompactStats> {
+        let keep = compaction_row_pinned(history, now, pins.clone());
         let stats = self.rewrite_online(&keep, false).await?;
         self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
         self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
@@ -306,6 +313,126 @@ impl PartitionStore {
         Ok(n.into_inner())
     }
 
+    /// Schema v4 → v5 (NS, `.ai/NS_IDS.md`): record ids carry their namespace
+    /// (`rows::space_id`) — keys are unique per (namespace, scope, memory type). As an
+    /// online rewrite after the log's tail (the caller makes sure nothing is being
+    /// applied): every record in a namespace gets the id `<ns>|<scope part>~<key>`; a
+    /// FACT's ends become the entities of the fact's own namespace, with a stub entity
+    /// written there when it has none (today's shared stubs split); a LINK's ends
+    /// follow their records. Returns how many rows changed or were added.
+    pub async fn namespace_row_ids(&self) -> StoreResult<usize> {
+        use std::collections::{HashMap, HashSet};
+        if self.schema_version() >= 5 {
+            return Ok(0);
+        }
+        let all = self.scan(None).await?;
+        let mut moved: HashMap<String, String> = HashMap::new();
+        let mut entities: HashSet<String> = HashSet::new();
+        let new_lineage = |r: &StoredRow| -> String {
+            let key = key_of(&r.lineage_id);
+            match r.data.namespace.as_deref() {
+                Some(ns) if crate::rows::valid_namespace(ns) => row_id(r.data.memory, &crate::rows::namespaced(Some(ns), key)),
+                Some(ns) => {
+                    tracing::warn!(namespace = ns, id = %r.id, "schema v5: a namespace with '|' or '~' can't be part of an id: the record keeps its id");
+                    r.lineage_id.clone()
+                }
+                None => r.lineage_id.clone(),
+            }
+        };
+        for r in all.iter().filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool)) {
+            let l = new_lineage(r);
+            if r.data.kind == Kind::Entity && !r.tombstone {
+                entities.insert(l.clone());
+            }
+            if l != r.lineage_id {
+                moved.insert(r.lineage_id.clone(), l);
+            }
+        }
+        // A fact's end in the fact's own namespace.
+        let fact_end = |fact: &StoredRow, end: &str| -> String {
+            let ns = fact.data.namespace.as_deref().filter(|ns| crate::rows::valid_namespace(ns));
+            row_id(fact.data.memory, &crate::rows::namespaced(ns, crate::rows::without_namespace(key_of(end))))
+        };
+        let mut stubs: HashMap<String, StoredRow> = HashMap::new();
+        for f in all.iter().filter(|r| r.data.kind == Kind::Fact && !r.tombstone) {
+            for end in [f.data.subject_id.as_deref(), f.data.object_id.as_deref()].into_iter().flatten() {
+                let to = fact_end(f, end);
+                if entities.contains(&to) || stubs.contains_key(&to) {
+                    continue;
+                }
+                let bare = unscoped(key_of(&to)).to_string();
+                let mut data = f.data.clone();
+                data.kind = Kind::Entity;
+                data.key = Some(bare.clone());
+                data.subject_id = None;
+                data.predicate = None;
+                data.object_id = None;
+                data.link_type = None;
+                data.weight = None;
+                data.value = serde_json::json!({ "key": bare, "name": bare });
+                data.sealed = None;
+                data.text = None;
+                data.embedding = None;
+                data.ttl_at = None;
+                let stub = StoredRow {
+                    id: to.clone(),
+                    lineage_id: to.clone(),
+                    data,
+                    commit_ts: f.commit_ts,
+                    valid_from: f.commit_ts,
+                    valid_to: None,
+                    superseded_by: None,
+                    version: 1,
+                    tombstone: false,
+                    log_offset: f.log_offset,
+                    epoch: f.epoch,
+                };
+                stubs.insert(to, stub);
+            }
+        }
+        drop(all);
+        let n = std::sync::atomic::AtomicUsize::new(stubs.len());
+        let keep = |mut r: StoredRow| {
+            if r.id == META_ID {
+                if let serde_json::Value::Object(v) = &mut r.data.value {
+                    v.insert("schema_version".into(), 5.into());
+                }
+                return Some(r);
+            }
+            let before = (r.id.clone(), r.lineage_id.clone(), r.data.subject_id.clone(), r.data.object_id.clone());
+            if let Some(l) = moved.get(&r.lineage_id).cloned() {
+                if r.id == r.lineage_id {
+                    r.id = l.clone();
+                }
+                r.lineage_id = l;
+            }
+            match r.data.kind {
+                Kind::Fact => {
+                    let ends = (r.data.subject_id.clone(), r.data.object_id.clone());
+                    r.data.subject_id = ends.0.map(|s| fact_end(&r, &s));
+                    r.data.object_id = ends.1.map(|o| fact_end(&r, &o));
+                }
+                Kind::Edge => {
+                    r.data.subject_id = r.data.subject_id.map(|s| moved.get(&s).cloned().unwrap_or(s));
+                    r.data.object_id = r.data.object_id.map(|o| moved.get(&o).cloned().unwrap_or(o));
+                }
+                _ => {}
+            }
+            if (r.id.clone(), r.lineage_id.clone(), r.data.subject_id.clone(), r.data.object_id.clone()) != before {
+                n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Some(r)
+        };
+        let extra: Vec<StoredRow> = stubs.into_values().collect();
+        self.rewrite_online_with(&keep, &extra, false).await?;
+        self.layout.store(5, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.hot() {
+            let g = self.state.write().await;
+            Self::fill_cache(&g, &h).await?;
+        }
+        Ok(n.into_inner())
+    }
+
     /// Drop every vector and record the configured model in `_meta` (W9.10), as an
     /// online rewrite (the caller makes sure nothing is being applied). The
     /// backfill embeds the records again.
@@ -329,6 +456,12 @@ impl PartitionStore {
     /// exclusive lock (compaction, W5; clearing vectors, W9.10 — `vectors_cleared`:
     /// the hot cache drops its vectors in the same swap).
     async fn rewrite_online(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), vectors_cleared: bool) -> StoreResult<CompactStats> {
+        self.rewrite_online_with(keep, &[], vectors_cleared).await
+    }
+
+    /// [`Self::rewrite_online`] adding `extra` rows to the new table (a migration's
+    /// new rows: in the same swap, so all or nothing).
+    async fn rewrite_online_with(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), extra: &[StoredRow], vectors_cleared: bool) -> StoreResult<CompactStats> {
         let started = std::time::Instant::now();
         let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
         let staged = dir.with_file_name("memory.rewrite.lance");
@@ -338,7 +471,8 @@ impl PartitionStore {
         let bytes_before = dir_size(&dir);
         let all = Self::scan_in(open_state(&g), None).await?;
         let total = all.len();
-        let rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
+        let mut rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
+        rows.extend(extra.iter().cloned());
         // The new table, complete and closed, beside the old one.
         if staged.exists() {
             std::fs::remove_dir_all(&staged).map_err(err)?;
@@ -514,6 +648,9 @@ impl PartitionStore {
         if version < 4 {
             // v4's ids come after the log's tail (`scope_row_ids`): until then `_meta` says v3.
             store.layout.store(3, std::sync::atomic::Ordering::SeqCst);
+        } else if version < 5 {
+            // v5's ids (`namespace_row_ids`), likewise after the tail.
+            store.layout.store(4, std::sync::atomic::Ordering::SeqCst);
         }
         if version < 3 {
             store.qualify_row_ids(&meta).await?;
@@ -1073,8 +1210,18 @@ impl PartitionStore {
 /// sealed fields) — so its id still resolves to its memory, kind and scope:
 /// subscribers get the `forget` / `unlink` event, and replay finds the tombstone.
 fn compaction_row(history: Duration, now: CommitTs) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
-    let horizon = CommitTs(now.0 - history.as_micros() as i64);
+    compaction_row_pinned(history, now, Default::default())
+}
+
+/// [`compaction_row`] with per-namespace pins: a namespace's horizon is never later
+/// than its pin, so a superseded version that a branch reads at its point stays.
+fn compaction_row_pinned(history: Duration, now: CommitTs, pins: std::collections::HashMap<String, CommitTs>) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
+    let base = CommitTs(now.0 - history.as_micros() as i64);
     move |mut r: StoredRow| {
+        let horizon = match r.data.namespace.as_ref().and_then(|ns| pins.get(ns)) {
+            Some(p) if p.0 < base.0 => *p,
+            _ => base,
+        };
         if r.id == META_ID {
             return Some(r);
         }

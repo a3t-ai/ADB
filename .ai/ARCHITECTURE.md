@@ -822,6 +822,26 @@ and sequencer constraints, which need plaintext. So:
 - Every committed record carries tenant, scope, agent and `txn_id`; hash-chaining
   log records gives a tamper-evident trail.
 
+## 14.4b Record ids and namespaces (schema v5, 4 Nov 2026)
+
+Keys are unique per (namespace, scope, memory type): a record in a namespace has the id
+`<namespace>|<scope part>~<key>`; without one, the id is as before. AQL is unchanged
+(`NAMESPACE` scopes keys too); a v4 table is rewritten once at open. Details:
+`.ai/NS_IDS.md`.
+
+## 14.5 Memory branches (agents as repos, 4 Nov 2026)
+
+A branch of an agent's memory space is **its own engine** — WAL, sequencer, delta table —
+hosted beside the org's engine or in its own pod. The org logs only the branch's control
+records and serves its parent's rows `AS OF` the branch point; branch writes never use
+the org's sequencer, table or compaction. Reads overlay the branch's rows on the parent's
+(nearest level per lineage). Promote = materialise the branch's view as a new agent
+space in production. Retention pins keep the org's history the open branches read
+(per namespace, in compaction). A FORGET on main erases the record from the org and
+from every branch engine's own copies before it returns; dropping a branch deletes its
+engine.
+Details: `.ai/BRANCHING.md`; spec: flowr-system `.ai/A3T_AGENTS_AS_REPOS_SPEC.md` §2.3.
+
 ## 15. Relationship to FlowR
 
 - FlowR uses ADB for **agent memory** as a service (ADB is SaaS-only, §13), against

@@ -533,6 +533,7 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         min_confidence: mods.min_confidence,
         scope: mods.scope.map(convert_scope),
         namespace: mods.namespace.clone(),
+        branch: mods.branch.clone(),
         in_scope: mods.in_scope.clone(),
         like_query: None,
         ttl: mods.ttl,

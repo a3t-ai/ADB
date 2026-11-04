@@ -110,6 +110,8 @@ pub struct LanceReads {
     barrier: Option<Arc<ApplyBarrier>>,
     /// Embeds the text of `LIKE $q` (MVP W4); `None`: only vectors can be passed.
     embedder: Option<Arc<adb_embed::Embedder>>,
+    /// On a branch engine (B2): reads overlay the branch's rows on its parent's.
+    parent: Option<crate::branch_engine::ParentView>,
 }
 
 /// `IN SCOPE` (named scopes, AQL v0.6) is served on the long-term memory types.
@@ -132,30 +134,30 @@ pub fn check_scope(memory: MemoryType, in_scope: Option<&str>) -> AdbResult<()> 
 /// `predicate` with the record ids it names (`KEY id` / `KEY key`, `WHERE id`) as
 /// ids in named scope `scope` (E-L12): a key there is `<scope>~<key>`. Payload
 /// fields (`key`, `subject`, …) stay as stored: bare keys.
-pub fn scope_ids(predicate: &Predicate, scope: &str) -> Predicate {
-    fn value(v: &adb_core::Value, scope: &str) -> adb_core::Value {
+pub fn scope_ids(predicate: &Predicate, namespace: Option<&str>, scope: &str) -> Predicate {
+    fn value(v: &adb_core::Value, ns: Option<&str>, scope: &str) -> adb_core::Value {
         match v {
-            adb_core::Value::String(k) => adb_core::Value::String(adb_store::scoped_id(scope, k)),
-            adb_core::Value::Array(items) => adb_core::Value::Array(items.iter().map(|i| value(i, scope)).collect()),
+            adb_core::Value::String(k) => adb_core::Value::String(adb_store::space_id(ns, scope, k)),
+            adb_core::Value::Array(items) => adb_core::Value::Array(items.iter().map(|i| value(i, ns, scope)).collect()),
             other => other.clone(),
         }
     }
-    fn conditions(cs: &[adb_core::Condition], scope: &str) -> Vec<adb_core::Condition> {
+    fn conditions(cs: &[adb_core::Condition], ns: Option<&str>, scope: &str) -> Vec<adb_core::Condition> {
         cs.iter()
             .map(|c| match c {
                 adb_core::Condition::Simple { field, operator, value: v, logical_op } if field == "id" => {
-                    adb_core::Condition::Simple { field: field.clone(), operator: *operator, value: value(v, scope), logical_op: *logical_op }
+                    adb_core::Condition::Simple { field: field.clone(), operator: *operator, value: value(v, ns, scope), logical_op: *logical_op }
                 }
                 adb_core::Condition::Group { conditions: g, logical_op } => {
-                    adb_core::Condition::Group { conditions: conditions(g, scope), logical_op: *logical_op }
+                    adb_core::Condition::Group { conditions: conditions(g, ns, scope), logical_op: *logical_op }
                 }
                 other => other.clone(),
             })
             .collect()
     }
     match predicate {
-        Predicate::Key { field, value: v } if matches!(field.as_str(), "id" | "key") => Predicate::Key { field: field.clone(), value: value(v, scope) },
-        Predicate::Where { conditions: cs } => Predicate::Where { conditions: conditions(cs, scope) },
+        Predicate::Key { field, value: v } if matches!(field.as_str(), "id" | "key") => Predicate::Key { field: field.clone(), value: value(v, namespace, scope) },
+        Predicate::Where { conditions: cs } => Predicate::Where { conditions: conditions(cs, namespace, scope) },
         other => other.clone(),
     }
 }
@@ -184,7 +186,12 @@ pub fn lance_owned(memory: MemoryType) -> bool {
 
 impl LanceReads {
     pub fn new(store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { store, barrier, embedder: None }
+        Self { store, barrier, embedder: None, parent: None }
+    }
+
+    pub fn with_parent(mut self, parent: Option<crate::branch_engine::ParentView>) -> Self {
+        self.parent = parent;
+        self
     }
 
     pub fn with_embedder(mut self, embedder: Option<Arc<adb_embed::Embedder>>) -> Self {
@@ -235,6 +242,10 @@ impl LanceReads {
     /// A non-`LIKE` RECALL / LOOKUP.
     async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         let now = self.committed().await;
+        if let Some(p) = &self.parent {
+            let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
+            return crate::query::branch_read(rows.into_iter().map(|(r, _)| r).collect(), memory, predicate, modifiers);
+        }
         if crate::query::is_history(modifiers) {
             return crate::query::history(&self.store, memory, predicate, modifiers, now).await;
         }
@@ -288,6 +299,9 @@ impl Reads for LanceReads {
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         if matches!(predicate, Predicate::Like { .. }) {
+            if self.parent.is_some() {
+                return Err(AdbError::UnsupportedOperation("LIKE is not read on a branch yet".into()));
+            }
             if crate::query::is_history(modifiers) {
                 return Err(AdbError::UnsupportedOperation("LIKE doesn't read history (AS OF, VALID AT, WITH HISTORY)".into()));
             }

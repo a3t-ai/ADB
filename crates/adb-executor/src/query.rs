@@ -653,6 +653,38 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     Ok(records)
 }
 
+/// `RECALL` / `LOOKUP` on a branch engine (B2): the branch's view (its rows, then its
+/// parent's as of the point), then the predicate and modifiers as on main.
+pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+    if is_history(modifiers) {
+        return Err(AdbError::UnsupportedOperation("AS OF, VALID AT and WITH HISTORY are not read on a branch yet".into()));
+    }
+    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN are not read on a branch yet".into()));
+    }
+    let in_scope = modifiers.in_scope.as_deref();
+    let mut records: Vec<MemoryRecord> = rows
+        .iter()
+        .filter(|r| in_scope.is_none_or(|s| r.data.scope == s))
+        .map(record)
+        .filter(|r| matches(memory, r, predicate))
+        .collect();
+    if let Some(v) = &modifiers.scope {
+        records.retain(|r| &r.metadata.scope == v);
+    }
+    default_order(memory, &mut records);
+    if let Some(o) = &modifiers.order_by {
+        order_by(&mut records, o);
+    }
+    if let Some(n) = modifiers.limit {
+        records.truncate(n);
+    }
+    if let Some(f) = &modifiers.return_fields {
+        project(&mut records, f);
+    }
+    Ok(records)
+}
+
 /// `SCAN FROM WORKING [WINDOW …]`: oldest first, then the window, `LIMIT`, `RETURN`.
 pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
     served(store, "scan", |source| scan_from(store, modifiers, now, source), same_records, show_records).await
@@ -721,23 +753,29 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
 
 /// The keys (or, with `history`, the row ids of every version) that UPDATE /
 /// FORGET with `predicate` touch.
-pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<String>> {
+pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs) -> AdbResult<Vec<String>> {
     let sorted = |v: &Vec<String>| {
         let mut v = v.clone();
         v.sort();
         v
     };
-    served(store, "targets", |source| targets_from(store, memory, predicate, in_scope, now, source), |a, b| sorted(a) == sorted(b), |v| format!("{:?}", sorted(v)))
+    served(store, "targets", |source| targets_from(store, memory, predicate, in_scope, namespace, now, source), |a, b| sorted(a) == sorted(b), |v| format!("{:?}", sorted(v)))
         .await
 }
 
-async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
-    let modifiers = Modifiers { in_scope: in_scope.map(String::from), ..Default::default() };
+async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
+    let modifiers = Modifiers { in_scope: in_scope.map(String::from), namespace: namespace.map(String::from), ..Default::default() };
     let c = candidates(store, memory, predicate, &modifiers, now, source).await?;
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
-    let ids = c.records.iter().filter(|r| matches(memory, r, predicate)).map(|r| r.id.clone()).collect();
+    // A procedure's or tool's record id is its payload id (bare): its lineage carries
+    // the namespace (NS).
+    let lineage = |id: &str| match (memory, namespace) {
+        (MemoryType::Procedural | MemoryType::Tools, Some(_)) => adb_store::space_id(namespace, in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), id),
+        _ => id.to_string(),
+    };
+    let ids = c.records.iter().filter(|r| matches(memory, r, predicate)).map(|r| lineage(&r.id)).collect();
     Ok(Answer::of(&c, ids))
 }
 
