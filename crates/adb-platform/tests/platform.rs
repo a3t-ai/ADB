@@ -211,3 +211,26 @@ async fn compaction_erases_deleted_rows() {
     s.apply(&rec(7, vec![insert("users", json!([{"id": "u5", "email": "e@x", "hash": "h5"}]))])).await.unwrap();
     assert_eq!(ids(&select(&s, "users", None).await), ["u3", "u4", "u5"]);
 }
+
+/// CA-8: one upsert replaces the rows with the same key and inserts the rest, in one
+/// version; a key repeated in one upsert keeps its last row; a missing table is created.
+#[tokio::test]
+async fn upsert_replaces_by_key_in_one_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    let upsert = |v: Value| Effect::TableUpsert { table: "state".into(), key: vec!["key".into()], rows: rows(v) };
+    // Creates the table.
+    s.apply(&rec(1, vec![upsert(json!([{ "id": "1", "key": "a", "value": "1" }, { "id": "2", "key": "b", "value": "2" }]))])).await.unwrap();
+    let v1 = s.version("state").await.unwrap();
+    // Replaces b, adds c; c twice: the last row wins.
+    s.apply(&rec(2, vec![upsert(json!([{ "id": "2", "key": "b", "value": "20" }, { "id": "3", "key": "c", "value": "3" }, { "id": "3", "key": "c", "value": "30" }]))])).await.unwrap();
+    assert_eq!(s.version("state").await.unwrap(), v1 + 1, "one version for the upsert");
+    let all = select(&s, "state", None).await;
+    assert_eq!(ids(&all), ["1", "2", "3"]);
+    let by_key: std::collections::HashMap<&str, &str> = all.iter().map(|r| (r["key"].as_str().unwrap(), r["value"].as_str().unwrap())).collect();
+    assert_eq!(by_key["a"], "1");
+    assert_eq!(by_key["b"], "20");
+    assert_eq!(by_key["c"], "30");
+    // Validation: rows need their key column.
+    assert!(s.validate(&Effect::TableUpsert { table: "state".into(), key: vec!["key".into()], rows: rows(json!([{ "id": "9" }])) }).await.is_err());
+}

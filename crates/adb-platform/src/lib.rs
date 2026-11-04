@@ -219,6 +219,11 @@ impl PlatformStore {
         self.tables.read().await.get(table).cloned()
     }
 
+    /// The table's current Lance version (`None` if there is no such table).
+    pub async fn version(&self, table: &str) -> Option<u64> {
+        self.dataset(table).await.map(|d| d.version().version)
+    }
+
     /// Rows of `table` matching `filter` (Lance SQL), at most `limit`.
     pub async fn query(&self, table: &str, filter: Option<&str>, limit: usize) -> PlatformResult<Vec<RecordBatch>> {
         let _files = self.files.read().await;
@@ -269,6 +274,22 @@ impl PlatformStore {
                 }
                 Ok(())
             }
+            Effect::TableUpsert { table, key, rows } => {
+                check_name(table)?;
+                if key.is_empty() {
+                    return bad(format!("an upsert into {table} needs key columns"));
+                }
+                if let Some(k) = rows.iter().find_map(|r| key.iter().find(|k| !r.contains_key(k.as_str()))) {
+                    return bad(format!("a row upserted into {table} has no key column {k}"));
+                }
+                if let Some(ds) = self.dataset(table).await {
+                    let schema = Schema::from(ds.schema());
+                    if let Some(k) = rows.iter().flat_map(|r| r.keys()).chain(key.iter()).find(|k| schema.field_with_name(k).is_err()) {
+                        return bad(format!("table {table} has no column {k}"));
+                    }
+                }
+                Ok(())
+            }
             Effect::TableReplace { table, columns, rows } => {
                 check_name(table)?;
                 if let Some(k) = rows.iter().flat_map(|r| r.keys()).find(|k| !columns.contains(k)) {
@@ -315,6 +336,7 @@ impl PlatformStore {
             | Effect::TableInsert { table, .. }
             | Effect::TableUpdate { table, .. }
             | Effect::TableDelete { table, .. }
+            | Effect::TableUpsert { table, .. }
             | Effect::TableReplace { table, .. } => table.clone(),
             _ => return Ok(()),
         };
@@ -363,6 +385,45 @@ impl PlatformStore {
                 Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), &self.uri(&table), Some(params))
                     .await
                     .map_err(lance)?
+            }
+            Effect::TableUpsert { key, rows, .. } => {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                // merge_insert needs each key once in its source: the last row wins.
+                let mut seen = std::collections::HashSet::new();
+                let mut unique: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+                for r in rows.iter().rev() {
+                    let k: Vec<String> = key.iter().map(|c| r.get(c).map(|v| v.to_string()).unwrap_or_default()).collect();
+                    if seen.insert(k) {
+                        unique.push(r.clone());
+                    }
+                }
+                unique.reverse();
+                match self.dataset(&table).await {
+                    // A missing table is created with these rows, as an insert would.
+                    None => {
+                        let batch = rows_to_batch(&unique);
+                        let schema = batch.schema();
+                        let params = WriteParams { mode: WriteMode::Create, ..Default::default() };
+                        Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), &self.uri(&table), Some(params))
+                            .await
+                            .map_err(lance)?
+                    }
+                    Some(ds) => {
+                        let batch = rows_to_table_batch(Arc::new(Schema::from(ds.schema())), &unique);
+                        let schema = batch.schema();
+                        let mut b = lance::dataset::MergeInsertBuilder::try_new(ds, key.clone()).map_err(lance)?;
+                        b.when_matched(lance::dataset::WhenMatched::UpdateAll).when_not_matched(lance::dataset::WhenNotMatched::InsertAll);
+                        let (ds, _stats) = b
+                            .try_build()
+                            .map_err(lance)?
+                            .execute_reader(RecordBatchIterator::new([Ok(batch)], schema))
+                            .await
+                            .map_err(lance)?;
+                        Arc::try_unwrap(ds).unwrap_or_else(|a| (*a).clone())
+                    }
+                }
             }
             Effect::TableUpdate { filter, values, .. } => {
                 let ds = self.dataset(&table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;

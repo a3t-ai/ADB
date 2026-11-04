@@ -289,6 +289,10 @@ pub enum Effect {
     TableUpdate { table: String, filter: String, values: Vec<(String, String)> },
     /// Delete the rows matching `filter` (SQL).
     TableDelete { table: String, filter: String },
+    /// Insert `rows`, replacing the rows whose `key` columns match (one Lance
+    /// `merge_insert`, one version): FlowR's state and registry writes, which were
+    /// a delete then an insert (CA-8). A key repeated in `rows` keeps its last row.
+    TableUpsert { table: String, key: Vec<String>, rows: Vec<serde_json::Map<String, serde_json::Value>> },
     /// Replace the whole table — its columns and rows — in one step (copying a
     /// platform database across backends, FlowR's switch).
     TableReplace { table: String, columns: Vec<String>, rows: Vec<serde_json::Map<String, serde_json::Value>> },

@@ -353,6 +353,33 @@ impl AdbFlight {
                 let offset = self.write(Effect::TableDelete { table, filter }).await?;
                 Ok(json!({ "deleted": true, "offset": offset }))
             }
+            // CA-8 / CA-24: one write for an insert-or-replace by key (FlowR's state
+            // and registry writes). `{table, key: [cols], rows: [{…}]}`; values are
+            // kept as text, as the platform tables store them.
+            "upsert" => {
+                let table = str_field(&b, "table")?.to_string();
+                let key: Vec<String> = b
+                    .get("key")
+                    .and_then(|k| k.as_array())
+                    .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let rows: Vec<serde_json::Map<String, Value>> = b
+                    .get("rows")
+                    .and_then(|r| r.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|r| r.as_object())
+                            .map(|r| r.iter().map(|(k, v)| (k.clone(), match v { Value::String(_) | Value::Null => v.clone(), other => Value::String(other.to_string()) })).collect())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if rows.is_empty() {
+                    return Ok(json!({ "upserted": 0 }));
+                }
+                let n = rows.len();
+                let offset = self.write(Effect::TableUpsert { table, key, rows }).await?;
+                Ok(json!({ "upserted": n, "offset": offset }))
+            }
             // W5: compact now (admin; Flight is behind the token when ADB has one).
             "compact" => self.engine.compact().await.map_err(Status::failed_precondition),
             "aql" => {
@@ -416,13 +443,19 @@ impl FlightService for AdbFlight {
         not_engine_only(&req)?;
         let mut stream = req.into_inner().peekable();
         // The table comes in the first message's descriptor; `[table, "replace"]`
-        // replaces the table with these rows instead of appending them.
-        let (table, replace) = {
+        // replaces the table with these rows instead of appending them;
+        // `[table, "upsert", key…]` replaces the rows with the same key columns.
+        let (table, replace, upsert_key) = {
             let first = Pin::new(&mut stream).peek().await.ok_or_else(|| Status::invalid_argument("empty do_put"))?;
             let first = first.as_ref().map_err(|e| Status::invalid_argument(e.to_string()))?;
             let path = first.flight_descriptor.as_ref().map(|d| d.path.clone()).unwrap_or_default();
             let table = path.first().cloned().ok_or_else(|| Status::invalid_argument("do_put needs a descriptor path [table]"))?;
-            (table, path.get(1).map(|p| p == "replace").unwrap_or(false))
+            let mode = path.get(1).map(String::as_str);
+            let key: Vec<String> = if mode == Some("upsert") { path[2..].to_vec() } else { Vec::new() };
+            if mode == Some("upsert") && key.is_empty() {
+                return Err(Status::invalid_argument("an upsert needs key columns: [table, \"upsert\", key…]"));
+            }
+            (table, mode == Some("replace"), key)
         };
         let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
@@ -440,6 +473,8 @@ impl FlightService for AdbFlight {
             self.write(Effect::TableReplace { table, columns, rows }).await?
         } else if n == 0 {
             0
+        } else if !upsert_key.is_empty() {
+            self.write(Effect::TableUpsert { table, key: upsert_key, rows }).await?
         } else {
             self.write(Effect::TableInsert { table, rows }).await?
         };
