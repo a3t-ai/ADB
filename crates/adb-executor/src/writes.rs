@@ -70,9 +70,11 @@ pub trait Writes: Send + Sync {
     }
 
     /// `in_scope`: only records in that named scope (`IN SCOPE`); `None`: every scope.
-    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64>;
+    /// `namespace`: only records of that namespace (`NAMESPACE`; NS: keys repeat across
+    /// namespaces); `None`: every namespace.
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64>;
 
-    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64>;
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64>;
 
     async fn link(
         &self,
@@ -610,6 +612,68 @@ impl<L: Log + 'static> DurableWrites<L> {
         let _ = self.pins.set(pins);
     }
 
+    /// B5 (promote / clone): write `rows` — a space's records as a view sees them now —
+    /// into `namespace` as new records (version 1, no history), through this engine's
+    /// sequencer in batched records. Ids and a FACT's ends move to the new namespace
+    /// (NS ids); links and control rows are not copied. `namespace` must hold no
+    /// records yet. Returns how many records were written.
+    pub async fn materialise(&self, namespace: &str, rows: Vec<adb_store::StoredRow>) -> AdbResult<u64> {
+        if self.parent.is_some() {
+            return Err(AdbError::QueryError("a new agent is written on the org's engine, not a branch's".into()));
+        }
+        if !adb_store::valid_namespace(namespace) {
+            return Err(AdbError::QueryError(format!("namespace {namespace:?}: can't be empty or contain '|' or '~'")));
+        }
+        let Some(store) = &self.store else { return Err(needs_table("promote")) };
+        let into = |id: &str| adb_store::namespaced(Some(namespace), adb_store::without_namespace(adb_store::key_of(id)));
+        let mut rows: Vec<adb_store::StoredRow> = rows.into_iter().filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Tool | Kind::Episode | Kind::Fact)).collect();
+        // Entities before the facts about them.
+        rows.sort_by_key(|r| (r.data.kind == Kind::Fact, r.commit_ts));
+        let mut seq = self.seq.lock().await;
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let now = CommitTs::from_datetime(time::now());
+        let taken = store
+            .current(Some(&format!("namespace = {} AND {}", adb_store::sql_str(namespace), adb_store::RECORD_KINDS)), now)
+            .await
+            .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        if !taken.is_empty() {
+            return Err(AdbError::QueryError(format!("namespace {namespace:?} already holds {} records: promote into a new one", taken.len())));
+        }
+        let mut n = 0u64;
+        for chunk in rows.chunks(500) {
+            let ts = seq.begin();
+            let mut effects = Vec::with_capacity(chunk.len());
+            let mut keys = Vec::new();
+            for r in chunk {
+                let id = RecordId(into(&r.lineage_id));
+                let mut data = r.data.clone();
+                data.namespace = Some(namespace.to_string());
+                if data.kind == Kind::Fact {
+                    data.subject_id = data.subject_id.as_deref().map(into);
+                    data.object_id = data.object_id.as_deref().map(into);
+                }
+                let memory: MemoryType = data.memory.into();
+                if unique_keys(memory) {
+                    keys.push(((data.memory, id.0.clone()), data.ttl_at));
+                }
+                let new = NewRow { id: id.clone(), lineage_id: id, version: 1, data };
+                effects.push(match new.data.kind {
+                    Kind::Fact => Effect::PutFact(new),
+                    Kind::Tool => Effect::PutTool(new),
+                    Kind::Episode => Effect::PutEpisode(new),
+                    _ => Effect::PutEntity(new),
+                });
+            }
+            n += effects.len() as u64;
+            let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+            self.live.lock().unwrap().extend(keys);
+            self.to_store(&record, seq.log()).await;
+        }
+        Ok(n)
+    }
+
     /// The org's branch engines (B4): a FORGET on main erases their copies too.
     pub fn set_branch_host(&self, host: Arc<crate::branch_engine::BranchHost>) {
         let _ = self.branch_host.set(host);
@@ -916,18 +980,21 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// its rows; FORGET on SEMANTIC / PROCEDURAL also matches every other version, so
     /// a value surviving only in an old version is forgotten too (D2 T5), and so is a
     /// fact outside its validity (AQL v0.10).
-    async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>) -> AdbResult<Vec<String>> {
+    async fn targets(&self, memory: MemoryType, predicate: &Predicate, ts: CommitTs, forget: bool, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<Vec<String>> {
         check_scope(memory, in_scope)?;
         let Some(store) = &self.store else { return Err(needs_table("UPDATE / FORGET")) };
         // Every earlier record is in Lance first.
         if let Some(b) = self.barrier() {
             b.wait_for_committed().await;
         }
-        let mut ids = crate::query::targets(store, memory, predicate, in_scope, ts).await?;
+        let mut ids = crate::query::targets(store, memory, predicate, in_scope, namespace, ts).await?;
         if forget && supersedes(memory) {
             let mut old = store.versions(memory.into(), None).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
             if let Some(s) = in_scope {
                 old.retain(|r| r.data.scope == s);
+            }
+            if let Some(ns) = namespace {
+                old.retain(|r| r.data.namespace.as_deref() == Some(ns));
             }
             for r in &old {
                 if crate::query::matches(memory, &crate::query::record(r), predicate) {
@@ -1511,7 +1578,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         Ok(stored)
     }
 
-    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>) -> AdbResult<u64> {
+    async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         // New `content` gets a new vector (T5), embedded before the sequencer.
         let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
             true => self.vector_of(data.get("content").and_then(|c| c.as_str()).map(String::from)).await,
@@ -1533,7 +1600,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             }
             return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, vector).await;
         }
-        let ids = self.targets(memory_type, predicate, ts, false, in_scope).await?;
+        let ids = self.targets(memory_type, predicate, ts, false, in_scope, namespace).await?;
         if ids.is_empty() {
             return Ok(0);
         }
@@ -1586,7 +1653,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         Ok(ids.len() as u64)
     }
 
-    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
+    async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         // On a branch engine (B3): a delete marker hides the record on the branch; the
@@ -1596,7 +1663,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             fields.insert("_branch_deleted".into(), serde_json::Value::Bool(true));
             return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, None).await;
         }
-        let mut ids = self.targets(memory_type, predicate, ts, true, in_scope).await?;
+        let mut ids = self.targets(memory_type, predicate, ts, true, in_scope, namespace).await?;
         if ids.is_empty() {
             return Ok(0);
         }

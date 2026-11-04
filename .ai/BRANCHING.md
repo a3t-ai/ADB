@@ -58,7 +58,7 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
 | B3 | Branch-engine writes: STORE, UPDATE (override rows), FORGET (markers), key checks against the overlay | done (669e80d) |
 | B4 | Retention pins (compaction keeps what open branches read); FORGET on main reaches every branch engine; dropping a branch deletes its engine | done (see below) |
 | NS | Record ids carry the namespace (schema v5, `.ai/NS_IDS.md`): needed by B5 | done (ns-ids) |
-| B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | A promoted agent's memory equals the branch view; the original agent unchanged |
+| B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | done (see below) |
 | B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | The developer loop on vc-dev with the branch in its own pod |
 | B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |
 | later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches | — |
@@ -85,6 +85,23 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
   already erased, and that branch keeps its copy (a retried FORGET finds nothing on main
   to target). Drop the branch to erase it; a durable pending-FORGET list per branch
   comes with B6, where a remote branch needs one anyway.
+
+### B5 as built
+
+- `branch_promote(namespace, branch, into)` and `space_clone(namespace, into)` (Engine
+  trait; Flight actions `branch_promote {namespace, name, into}`, `space_clone
+  {namespace, into}`), on the org's engine only.
+- Source: promote reads the branch's view now (its rows, then the parent `AS OF` the
+  point; deleted lineages hidden); clone reads main now.
+- Copied: SEMANTIC, PROCEDURAL, TOOLS current records, as **new records at version 1**
+  (no history, no links). EPISODIC stays with the original agent; WORKING is session state.
+- Ids and FACT ends move to the new namespace (`.ai/NS_IDS.md`); entities are written
+  before the facts about them; 500 records per log record, through the org's sequencer.
+- `into` must be a valid namespace holding no records (checked under the sequencer
+  lock), and not the source namespace. The original agent and the branch are unchanged;
+  dropping the branch afterwards is the caller's choice.
+- Limits: links (`LINK`) are not copied; provenance stays as written (who wrote the
+  original record); a large space is copied in one call (no progress, no resume).
 
 The first B2/B3 build (branch rows in the org table, schema v5 `branch` column) is kept
 at tag `b2-in-org-rows` and not used: it left branch traffic on the org.

@@ -405,7 +405,7 @@ impl Executor {
 
                 let in_scope = fanout.modifiers.in_scope.as_deref();
                 for mem_type in MemoryType::all().iter().filter(|m| in_scope.is_none() || crate::reads::lance_owned(**m)) {
-                    let count = self.writes.forget(*mem_type, &fanout.predicate, in_scope).await?;
+                    let count = self.writes.forget(*mem_type, &fanout.predicate, in_scope, fanout.modifiers.namespace.as_deref()).await?;
                     total_count += count;
                 }
 
@@ -420,7 +420,7 @@ impl Executor {
                     for mem_type in MemoryType::all().iter().filter(|m| in_scope.is_none() || crate::reads::lance_owned(**m)) {
                         let count = self
                             .writes
-                            .update(*mem_type, &fanout.predicate, data.clone(), in_scope)
+                            .update(*mem_type, &fanout.predicate, data.clone(), in_scope, fanout.modifiers.namespace.as_deref())
                             .await?;
                         total_count += count;
                     }
@@ -891,7 +891,7 @@ impl Executor {
 
         let count = self
             .writes
-            .update(step.memory_type, &step.predicate, data, step.modifiers.in_scope.as_deref())
+            .update(step.memory_type, &step.predicate, data, step.modifiers.in_scope.as_deref(), step.modifiers.namespace.as_deref())
             .await?;
 
         Ok(QueryResult::count(count, start.elapsed().as_millis() as u64))
@@ -900,7 +900,7 @@ impl Executor {
     async fn execute_forget(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
 
-        let count = self.writes.forget(step.memory_type, &step.predicate, step.modifiers.in_scope.as_deref()).await?;
+        let count = self.writes.forget(step.memory_type, &step.predicate, step.modifiers.in_scope.as_deref(), step.modifiers.namespace.as_deref()).await?;
 
         Ok(QueryResult::count(count, start.elapsed().as_millis() as u64))
     }

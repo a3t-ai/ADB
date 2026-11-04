@@ -58,6 +58,17 @@ pub trait Engine: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// B5: promote branch `name` of `namespace` as a new agent in namespace `into`
+    /// (its view of SEMANTIC, PROCEDURAL and TOOLS, materialised in production); the
+    /// original agent and the branch are unchanged. `{namespace, records, from}`.
+    async fn branch_promote(&self, _namespace: &str, _name: &str, _into: &str) -> Result<Value, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    /// B5: clone `namespace` (main, now) as a new agent in namespace `into`.
+    async fn space_clone(&self, _namespace: &str, _into: &str) -> Result<Value, String> {
+        Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
+    }
+
     /// A platform-table write (`Table*` effect), committed through the log and
     /// applied before it returns. Returns its log offset.
     async fn platform_write(&self, _effect: adb_core::log::Effect) -> Result<u64, String> {
@@ -443,6 +454,22 @@ impl LocalEngine {
         })
     }
 
+    /// B5: what `source` sees of `namespace` now, in the memories a new agent takes
+    /// (SEMANTIC, PROCEDURAL, TOOLS — EPISODIC stays with the original agent, WORKING
+    /// is session state), written into `into`.
+    async fn materialise_from(&self, source: Arc<dyn crate::branch_engine::ParentSource>, namespace: &str, into: &str) -> Result<u64, String> {
+        let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
+        if namespace == into {
+            return Err(format!("promote into a new namespace, not {into:?} itself"));
+        }
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let mut rows = Vec::new();
+        for m in [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools] {
+            rows.extend(source.rows_as_of(m, namespace, now).await.map_err(|e| e.to_string())?);
+        }
+        d.materialise(into, rows).await.map_err(|e| e.to_string())
+    }
+
     /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
     pub(crate) fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
@@ -813,6 +840,23 @@ impl Engine for LocalEngine {
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
         Ok(self.durable.as_ref().map(|d| d.branches().list(namespace)).unwrap_or_default())
+    }
+
+    async fn branch_promote(&self, namespace: &str, name: &str, into: &str) -> Result<Value, String> {
+        let host = self.branch_host.as_ref().ok_or("branches are promoted on the org's engine")?;
+        let branch = host.engine(namespace, name).await?;
+        let source = branch.as_parent_source().ok_or("a branch engine has no table")?;
+        let n = self.materialise_from(source, namespace, into).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
+    }
+
+    async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {
+        if self.parent.is_some() {
+            return Err("spaces are cloned on the org's engine".into());
+        }
+        let source = self.as_parent_source().ok_or("cloning a memory space needs a durable engine (start ADB with --data-dir)")?;
+        let n = self.materialise_from(source, namespace, into).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {

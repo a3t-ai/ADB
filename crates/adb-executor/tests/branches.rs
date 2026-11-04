@@ -176,3 +176,58 @@ async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
     assert_eq!(on(&e, "deeper").await, ["a1"]);
 }
+
+/// B5: promote a branch as a new agent — the new namespace holds the branch's view
+/// (SEMANTIC, PROCEDURAL, TOOLS) as fresh records; EPISODIC stays; the original agent
+/// and the branch are unchanged; a clone copies main as it is now.
+#[tokio::test]
+async fn promote_a_branch_as_a_new_agent_and_clone_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let q = |aql: String| {
+        let e = &e;
+        async move { e.query(&aql, None).await.unwrap() }
+    };
+    for (k, v) in [("a", "a1"), ("b", "b1"), ("c", "c1")] {
+        q(format!(r#"STORE INTO SEMANTIC (key = "{k}", fact = "{v}") NAMESPACE "crm""#)).await;
+    }
+    q(r#"STORE INTO SEMANTIC FACT (subject = "user:alice", predicate = "plan", value = "pro") NAMESPACE "crm""#.into()).await;
+    q(r#"STORE INTO PROCEDURAL (key = "deploy", pattern = "deploy a service", steps = "build") NAMESPACE "crm""#.into()).await;
+    q(r#"STORE INTO EPISODIC (key = "ep1", event = "talked to alice") NAMESPACE "crm""#.into()).await;
+    e.branch_create("crm", "try", None, None).await.unwrap();
+    q(r#"UPDATE INTO SEMANTIC WHERE key = "b" (fact = "b-try") NAMESPACE "crm" BRANCH "try""#.into()).await;
+    q(r#"FORGET FROM SEMANTIC WHERE key = "c" NAMESPACE "crm" BRANCH "try""#.into()).await;
+    q(r#"STORE INTO SEMANTIC (key = "e", fact = "e1") NAMESPACE "crm" BRANCH "try""#.into()).await;
+    // Main moves on after the point: not in the promoted agent.
+    q(r#"STORE INTO SEMANTIC (key = "d", fact = "d1") NAMESPACE "crm""#.into()).await;
+
+    let p = e.branch_promote("crm", "try", "crm-v2").await.unwrap();
+    assert_eq!(p["namespace"], "crm-v2");
+    let in_ns = |ns: &'static str| {
+        let e = &e;
+        async move { values(&e.query(&format!(r#"RECALL FROM SEMANTIC WHERE fact != "" NAMESPACE "{ns}" LIMIT 100"#), None).await.unwrap(), "fact") }
+    };
+    assert_eq!(in_ns("crm-v2").await, ["a1", "b-try", "e1"], "the branch's view");
+    assert_eq!(main(&e).await, ["a1", "b1", "c1", "d1"], "the original agent unchanged");
+    assert_eq!(on(&e, "try").await, ["a1", "b-try", "e1"], "the branch unchanged");
+    // The new agent is a normal space: keyed lookups, its own fact and entity, its procedure, no episodes.
+    assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "b" NAMESPACE "crm-v2""#.into()).await, "fact"), ["b-try"]);
+    assert_eq!(values(&q(r#"RECALL FROM SEMANTIC WHERE subject = "user:alice" NAMESPACE "crm-v2""#.into()).await, "value"), ["pro"]);
+    assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "user:alice" NAMESPACE "crm-v2""#.into()).await, "key"), ["user:alice"]);
+    assert_eq!(q(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm-v2""#.into()).await.pointer("/data/count").and_then(|c| c.as_u64()), Some(1));
+    assert_eq!(q(r#"RECALL FROM EPISODIC ALL NAMESPACE "crm-v2""#.into()).await.pointer("/data/count").and_then(|c| c.as_u64()), Some(0), "episodes stay with the original agent");
+    // Writes to the new agent leave the original alone.
+    q(r#"UPDATE INTO SEMANTIC WHERE key = "a" (fact = "a-v2") NAMESPACE "crm-v2""#.into()).await;
+    assert_eq!(main(&e).await, ["a1", "b1", "c1", "d1"]);
+    assert!(e.branch_promote("crm", "try", "crm-v2").await.is_err(), "into a new namespace only");
+    assert!(e.branch_promote("crm", "try", "crm").await.is_err());
+
+    let c = e.space_clone("crm", "crm-copy").await.unwrap();
+    assert!(c["records"].as_u64().unwrap() >= 6, "{c}");
+    assert_eq!(in_ns("crm-copy").await, ["a1", "b1", "c1", "d1"]);
+
+    drop(e);
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let r = e.query(r#"RECALL FROM SEMANTIC WHERE fact != "" NAMESPACE "crm-v2" LIMIT 100"#, None).await.unwrap();
+    assert_eq!(values(&r, "fact"), ["a-v2", "b-try", "e1"], "after a restart");
+}

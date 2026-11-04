@@ -45,6 +45,9 @@ Keys are unique per **(namespace, scope, memory type)**. A record in a namespace
 - Reads and UPDATE / FORGET: `KEY "k"`, `WHERE id = "k"` are qualified with the
   statement's `NAMESPACE` and `IN SCOPE` (executor, as `IN SCOPE` is today).
   **Behaviour change:** without `NAMESPACE`, a key names a record that has no namespace.
+- UPDATE / FORGET by a payload field (`WHERE key = …`) touch only the statement's
+  `NAMESPACE` (without one: every namespace, as reads). Before NS this didn't matter —
+  a key was in one namespace — so the writes ignored `NAMESPACE`; now they apply it.
 - LINK / UPDATE LINK / UNLINK use the matched records' ids: unchanged (ids are full).
 - MERGE takes no `NAMESPACE` (AQL), so it reaches only records without a namespace
   (NS-L1); the executor refuses one if a planner ever passes it.

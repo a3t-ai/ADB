@@ -753,23 +753,29 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
 
 /// The keys (or, with `history`, the row ids of every version) that UPDATE /
 /// FORGET with `predicate` touch.
-pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<String>> {
+pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs) -> AdbResult<Vec<String>> {
     let sorted = |v: &Vec<String>| {
         let mut v = v.clone();
         v.sort();
         v
     };
-    served(store, "targets", |source| targets_from(store, memory, predicate, in_scope, now, source), |a, b| sorted(a) == sorted(b), |v| format!("{:?}", sorted(v)))
+    served(store, "targets", |source| targets_from(store, memory, predicate, in_scope, namespace, now, source), |a, b| sorted(a) == sorted(b), |v| format!("{:?}", sorted(v)))
         .await
 }
 
-async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
-    let modifiers = Modifiers { in_scope: in_scope.map(String::from), ..Default::default() };
+async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
+    let modifiers = Modifiers { in_scope: in_scope.map(String::from), namespace: namespace.map(String::from), ..Default::default() };
     let c = candidates(store, memory, predicate, &modifiers, now, source).await?;
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
-    let ids = c.records.iter().filter(|r| matches(memory, r, predicate)).map(|r| r.id.clone()).collect();
+    // A procedure's or tool's record id is its payload id (bare): its lineage carries
+    // the namespace (NS).
+    let lineage = |id: &str| match (memory, namespace) {
+        (MemoryType::Procedural | MemoryType::Tools, Some(_)) => adb_store::space_id(namespace, in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), id),
+        _ => id.to_string(),
+    };
+    let ids = c.records.iter().filter(|r| matches(memory, r, predicate)).map(|r| lineage(&r.id)).collect();
     Ok(Answer::of(&c, ids))
 }
 

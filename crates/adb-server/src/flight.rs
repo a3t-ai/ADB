@@ -372,6 +372,18 @@ impl AdbFlight {
                 let name = str_field(&b, "name")?;
                 Ok(json!({ "dropped": self.engine.branch_drop(ns, name).await.map_err(Status::invalid_argument)? }))
             }
+            // B5: a branch promoted as a new agent; a space cloned (main, now).
+            "branch_promote" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                let into = str_field(&b, "into")?;
+                self.engine.branch_promote(ns, name, into).await.map_err(Status::invalid_argument)
+            }
+            "space_clone" => {
+                let ns = str_field(&b, "namespace")?;
+                let into = str_field(&b, "into")?;
+                self.engine.space_clone(ns, into).await.map_err(Status::invalid_argument)
+            }
             // CA-8 / CA-24: one write for an insert-or-replace by key (FlowR's state
             // and registry writes). `{table, key: [cols], rows: [{…}]}`; values are
             // kept as text, as the platform tables store them.

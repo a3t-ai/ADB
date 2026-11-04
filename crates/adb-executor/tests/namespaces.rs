@@ -45,10 +45,26 @@ async fn two_agents_hold_the_same_key_apart() {
     let s = r.to_string();
     assert!(s.contains(r#""id":"acme--b|~pref""#) && s.contains(r#""key":"pref""#), "{s}");
     assert!(q(r#"STORE INTO SEMANTIC (key = "k", fact = "f") NAMESPACE "a|b""#.into()).await.is_err(), "'|' is reserved");
+    // UPDATE / FORGET by a payload field stay in the statement's namespace (the same
+    // key is in both).
+    q(r#"STORE INTO SEMANTIC (key = "pref", fact = "chai") NAMESPACE "acme--a""#.into()).await.unwrap();
+    q(r#"UPDATE INTO SEMANTIC WHERE key = "pref" (fact = "masala") NAMESPACE "acme--a""#.into()).await.unwrap();
+    assert_eq!(facts(&q(r#"LOOKUP FROM SEMANTIC KEY key = "pref" NAMESPACE "acme--b""#.into()).await.unwrap(), "fact"), ["latte"], "B untouched by A's UPDATE");
+    q(r#"FORGET FROM SEMANTIC WHERE key = "pref" NAMESPACE "acme--a""#.into()).await.unwrap();
+    assert_eq!(facts(&q(r#"LOOKUP FROM SEMANTIC KEY key = "pref" NAMESPACE "acme--b""#.into()).await.unwrap(), "fact"), ["latte"], "B untouched by A's FORGET");
+    // Procedures with a pattern_id: same id in two namespaces, updated apart.
+    for ns in ["acme--a", "acme--b"] {
+        q(format!(r#"STORE INTO PROCEDURAL (pattern_id = "deploy", pattern = "deploy {ns}", steps = "build") NAMESPACE "{ns}""#)).await.unwrap();
+    }
+    q(r#"UPDATE INTO PROCEDURAL WHERE pattern_id = "deploy" (pattern = "deploy v2") NAMESPACE "acme--a""#.into()).await.unwrap();
+    let b = q(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "acme--b""#.into()).await.unwrap().to_string();
+    let a = q(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "acme--a""#.into()).await.unwrap().to_string();
+    assert!(a.contains("deploy v2") && b.contains("deploy acme--b") && !b.contains("deploy v2"), "{a}\n{b}");
     // A restart keeps it all (ids hydrate from the table).
     drop(e);
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let r = e.query(r#"LOOKUP FROM SEMANTIC KEY key = "pref" NAMESPACE "acme--b""#, None).await.unwrap();
     assert_eq!(facts(&r, "fact"), ["latte"]);
     assert!(e.query(r#"STORE INTO SEMANTIC (key = "pref", fact = "again") NAMESPACE "acme--a""#, None).await.is_ok(), "A's was forgotten: the key is free there");
+    assert!(e.query(r#"STORE INTO SEMANTIC (key = "pref", fact = "again") NAMESPACE "acme--b""#, None).await.is_err(), "B's is still there");
 }
