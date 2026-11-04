@@ -113,3 +113,10 @@ opt-level = 3
 
 [profile.bench]
 lto = true
+
+# Benchmarks (perf-*.mjs): release optimisation without LTO, so it builds fast;
+# the shipped images keep [profile.release].
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16
