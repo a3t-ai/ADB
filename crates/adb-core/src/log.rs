@@ -160,6 +160,8 @@ pub enum Kind {
     Sub,
     Cq,
     Meta,
+    /// A memory branch (agents as repos, B1): a control row, never a record.
+    Branch,
 }
 
 /// AQL v0.5 `SCOPE private | shared | cluster`.

@@ -296,6 +296,7 @@ pub struct DurableWrites<L: Log> {
     applier: Option<Applier>,
     /// Live subscriptions (stage E), following registrations as they commit.
     subs: Arc<Registry>,
+    branches: Arc<crate::branches::Branches>,
     /// Platform tables (stage G), applied synchronously.
     platform: Option<Arc<adb_platform::PlatformStore>>,
     /// The live keys of SEMANTIC / EPISODIC / PROCEDURAL (D3 S4 key check), with
@@ -503,6 +504,68 @@ impl<L: Log + 'static> DurableWrites<L> {
     }
 
     /// Commit an `UNWATCH`.
+    /// Cut a branch of `namespace`'s memory at the current log position (B1): one
+    /// control record, nothing copied.
+    pub async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> AdbResult<crate::branches::Branch> {
+        use crate::branches::{check_name, Branch, MAIN};
+        check_name(name).map_err(AdbError::QueryError)?;
+        let parent = parent.filter(|p| !p.is_empty()).unwrap_or(MAIN);
+        if parent != MAIN && self.branches.get(namespace, parent).is_none() {
+            return Err(AdbError::QueryError(format!("no branch {parent:?} in namespace {namespace:?} to branch from")));
+        }
+        if self.branches.get(namespace, name).is_some() {
+            return Err(AdbError::QueryError(format!("namespace {namespace:?} already has a branch {name:?}")));
+        }
+        let mut seq = self.seq.lock().await;
+        let point_offset = seq.log().last_offset().0;
+        let point_ts = match point_offset {
+            0 => CommitTs::from_datetime(time::now()),
+            n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+        };
+        let id = RecordId(Branch::id_of(namespace, name));
+        let b = Branch {
+            id: id.0.clone(),
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            parent: parent.to_string(),
+            point_offset,
+            point_ts: point_ts.0,
+            created_by: created_by.map(String::from),
+        };
+        let ts = seq.begin();
+        let mut data = row(MemoryType::Working, Kind::Branch, serde_json::to_value(&b).unwrap_or_default());
+        data.key = None;
+        data.text = None;
+        data.namespace = Some(namespace.to_string());
+        data.subject_id = Some(id.0.clone());
+        let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.branches.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok(b)
+    }
+
+    /// Drop a branch (its own writes stay in the log until compaction; B4 erases them).
+    pub async fn branch_drop(&self, namespace: &str, name: &str) -> AdbResult<bool> {
+        if self.branches.get(namespace, name).is_none() {
+            return Ok(false);
+        }
+        if self.branches.has_children(namespace, name) {
+            return Err(AdbError::QueryError(format!("branch {name:?} has branches of its own: drop them first")));
+        }
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let effect = Effect::Unregister { id: RecordId(crate::branches::Branch::id_of(namespace, name)) };
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.branches.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok(true)
+    }
+
+    pub fn branches(&self) -> &Arc<crate::branches::Branches> {
+        &self.branches
+    }
+
     pub async fn unregister_watch(&self, id: &str) -> AdbResult<()> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
@@ -654,6 +717,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         // Caught up with the log: the applier starts from its end.
         let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
         let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
+        let branches = crate::branches::Branches::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
         let timers = store
             .with_ttl()
             .await
@@ -679,7 +743,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

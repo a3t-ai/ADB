@@ -505,6 +505,9 @@ pub struct Modifiers {
     /// Agent namespace
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// `BRANCH "name"` (AQL v0.11, B1): the memory branch; `None` = main.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Time-to-live for stored records
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(with = "option_duration_millis")]

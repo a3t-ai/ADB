@@ -47,6 +47,17 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// Memory branches (B1): cut, drop and list. Need a durable engine.
+    async fn branch_create(&self, _namespace: &str, _name: &str, _parent: Option<&str>, _created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn branch_drop(&self, _namespace: &str, _name: &str) -> Result<bool, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn branch_list(&self, _namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
+        Ok(Vec::new())
+    }
+
     /// A platform-table write (`Table*` effect), committed through the log and
     /// applied before it returns. Returns its log offset.
     async fn platform_write(&self, _effect: adb_core::log::Effect) -> Result<u64, String> {
@@ -709,6 +720,20 @@ impl Engine for LocalEngine {
             b.wait_for_committed().await;
         }
         crate::sql::run(Some(Arc::clone(store)), self.platform(), sql, limit).await
+    }
+
+    async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        d.branch_create(namespace, name, parent, created_by).await.map_err(|e| e.to_string())
+    }
+
+    async fn branch_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        d.branch_drop(namespace, name).await.map_err(|e| e.to_string())
+    }
+
+    async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
+        Ok(self.durable.as_ref().map(|d| d.branches().list(namespace)).unwrap_or_default())
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {

@@ -353,6 +353,25 @@ impl AdbFlight {
                 let offset = self.write(Effect::TableDelete { table, filter }).await?;
                 Ok(json!({ "deleted": true, "offset": offset }))
             }
+            // Memory branches (B1, agents as repos): cut one at the current log
+            // position (nothing copied), list, drop.
+            "branch_create" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                let parent = b.get("parent").and_then(|p| p.as_str());
+                let by = b.get("created_by").and_then(|p| p.as_str());
+                let br = self.engine.branch_create(ns, name, parent, by).await.map_err(Status::invalid_argument)?;
+                Ok(serde_json::to_value(br).unwrap_or_default())
+            }
+            "branch_list" => {
+                let ns = b.get("namespace").and_then(|n| n.as_str());
+                Ok(json!({ "branches": self.engine.branch_list(ns).await.map_err(Status::internal)? }))
+            }
+            "branch_drop" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                Ok(json!({ "dropped": self.engine.branch_drop(ns, name).await.map_err(Status::invalid_argument)? }))
+            }
             // CA-8 / CA-24: one write for an insert-or-replace by key (FlowR's state
             // and registry writes). `{table, key: [cols], rows: [{…}]}`; values are
             // kept as text, as the platform tables store them.
