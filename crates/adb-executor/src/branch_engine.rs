@@ -183,6 +183,11 @@ impl BranchHost {
                     Some(e) => Arc::clone(e),
                     None => {
                         let (e, _) = crate::LocalEngine::durable_branch(self.dir_of(b), view.clone()).await?;
+                        // Compaction keeps what this branch's own branches read (B4).
+                        if let Some(d) = e.durable_writes() {
+                            let (registry, ns, name) = (Arc::clone(&self.registry), b.namespace.clone(), b.name.clone());
+                            d.set_pins(Arc::new(move || registry.pins(Some((&ns, &name)))));
+                        }
                         let e = Arc::new(e);
                         engines.insert(b.id.clone(), Arc::clone(&e));
                         e
@@ -193,6 +198,21 @@ impl BranchHost {
             last = Some(engine);
         }
         last.ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))
+    }
+
+    /// FORGET on main reaches every branch (B4): each branch engine erases its own
+    /// rows of `lineages` (the parent's are already gone, so its view hides them).
+    /// Branches of every namespace are visited: a lineage key names its record
+    /// wherever it was copied.
+    pub async fn forget(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
+        let mut n = 0;
+        for b in self.registry.list(None) {
+            let e = self.engine(&b.namespace, &b.name).await?;
+            if let Some(d) = e.durable_writes() {
+                n += d.forget_lineages(memory, lineages).await.map_err(|e| format!("branch {}: {e}", b.id))?;
+            }
+        }
+        Ok(n)
     }
 
     /// Forget an engine (the branch was dropped): close it and delete its data.

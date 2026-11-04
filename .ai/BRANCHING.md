@@ -54,13 +54,36 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
 | Slice | Scope | Done when |
 |---|---|---|
 | B1 | Branch control records on the org log (`branch` rows), create / list / drop, AQL `BRANCH` | done (d734525) |
-| B2 | Branch engines: `ParentSource` (rows of a namespace `AS OF` t: the org engine, or a branch engine recursively); `BranchHost` opening branch engines under `<data dir>/branches/`; a statement with `BRANCH "b"` runs on b's engine | A branch engine reads its parent `AS OF` the point plus its own rows; the org table and log get no branch rows |
-| B3 | Branch-engine writes: STORE, UPDATE (override rows), FORGET (markers), key checks against the overlay | The developer test of the post: main and branch views stay apart through restarts, a branch of a branch |
-| B4 | Retention pins at the org (compaction keeps what open branches read); FORGET on main logged for branches and applied by a branch engine before it serves; dropping a branch deletes its engine | Compaction keeps a branch's view; a forgotten record is gone from every branch |
+| B2 | Branch engines: `ParentSource` (rows of a namespace `AS OF` t: the org engine, or a branch engine recursively); `BranchHost` opening branch engines under `<data dir>/branches/`; a statement with `BRANCH "b"` runs on b's engine | done (669e80d) |
+| B3 | Branch-engine writes: STORE, UPDATE (override rows), FORGET (markers), key checks against the overlay | done (669e80d) |
+| B4 | Retention pins (compaction keeps what open branches read); FORGET on main reaches every branch engine; dropping a branch deletes its engine | done (see below) |
 | B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | A promoted agent's memory equals the branch view; the original agent unchanged |
 | B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | The developer loop on vc-dev with the branch in its own pod |
 | B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |
 | later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches | — |
+
+### B4 as built
+
+- **Pins.** `PartitionStore::compact_pinned(history, now, pins)`: per namespace, the
+  horizon for superseded versions is never later than the pin, so a version current at
+  a branch point stays. The org's pins are the oldest point of each namespace's
+  branches cut from `main`; a branch engine's pins are its own child branches' points
+  (`Branches::pins`). Forgotten and expired rows still go: a pin keeps history, not
+  forgotten data.
+- **FORGET on main** tombstones every version of the lineage in the org table (so every
+  branch's view of the parent hides it at once), erases it from the org's disk, then
+  `BranchHost::forget` has each branch engine erase its own rows of those lineages —
+  overrides and edges — from its table, log and history (`forget_lineages`). FORGET
+  returns after all of them. Hosted placement only: synchronous and in-process. In
+  B6 (own pod) the org must deliver the FORGET to a remote branch, and a branch pod
+  that is hibernating applies it before it serves.
+- **Drop** deletes the branch engine's directory; a later branch of the same name is new
+  and empty.
+- Limits: FORGET opens every branch engine of the org (cost grows with the number of
+  branches); if one branch fails to erase, FORGET reports an error after main has
+  already erased, and that branch keeps its copy (a retried FORGET finds nothing on main
+  to target). Drop the branch to erase it; a durable pending-FORGET list per branch
+  comes with B6, where a remote branch needs one anyway.
 
 The first B2/B3 build (branch rows in the org table, schema v5 `branch` column) is kept
 at tag `b2-in-org-rows` and not used: it left branch traffic on the org.

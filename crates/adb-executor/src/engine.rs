@@ -443,6 +443,11 @@ impl LocalEngine {
         })
     }
 
+    /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
+    pub(crate) fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
+        self.durable.as_ref()
+    }
+
     async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, warm: Option<Warm>, parent: Option<crate::branch_engine::ParentView>) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
@@ -493,6 +498,11 @@ impl LocalEngine {
             ))),
             Some(_) => None,
         };
+        if let Some(host) = &branch_host {
+            writes.set_branch_host(Arc::clone(host));
+            let registry = Arc::clone(writes.branches());
+            writes.set_pins(Arc::new(move || registry.pins(None)));
+        }
         let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder.clone()).with_parent(parent.clone()));
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
@@ -792,7 +802,13 @@ impl Engine for LocalEngine {
 
     async fn branch_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
         let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
-        d.branch_drop(namespace, name).await.map_err(|e| e.to_string())
+        let b = d.branches().get(namespace, name);
+        let dropped = d.branch_drop(namespace, name).await.map_err(|e| e.to_string())?;
+        // B4: its engine goes with it — WAL, table, history.
+        if let (true, Some(b), Some(host)) = (dropped, b, &self.branch_host) {
+            host.remove(&b).await?;
+        }
+        Ok(dropped)
     }
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {

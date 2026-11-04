@@ -125,6 +125,24 @@ impl Branches {
     pub fn oldest_point(&self, namespace: &str) -> Option<CommitTs> {
         self.by_id.read().unwrap().values().filter(|b| b.namespace == namespace).map(Branch::point).min()
     }
+
+    /// Compaction pins (B4) of the engine that is `of` — `None` for the org (whose
+    /// readers are the branches cut from `main`), or a branch `(namespace, name)`
+    /// (read by its own child branches): per namespace, the oldest point read.
+    pub fn pins(&self, of: Option<(&str, &str)>) -> std::collections::HashMap<String, CommitTs> {
+        let mut out = std::collections::HashMap::<String, CommitTs>::new();
+        for b in self.by_id.read().unwrap().values() {
+            let reads_it = match of {
+                None => b.parent == MAIN,
+                Some((ns, name)) => b.namespace == ns && b.parent == name,
+            };
+            if reads_it {
+                let e = out.entry(b.namespace.clone()).or_insert(b.point());
+                *e = (*e).min(b.point());
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +181,8 @@ mod tests {
         assert!(b.chain("crm", "nope").is_err());
         assert!(b.has_children("crm", "a"));
         assert_eq!(b.oldest_point("crm"), Some(CommitTs(10)));
+        assert_eq!(b.pins(None).get("crm"), Some(&CommitTs(10)));
+        assert_eq!(b.pins(Some(("crm", "a"))).get("crm"), Some(&CommitTs(20)));
+        assert!(b.pins(Some(("crm", "b"))).is_empty());
     }
 }

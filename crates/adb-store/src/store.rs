@@ -217,7 +217,14 @@ impl PartitionStore {
     /// is applied first. The old table, its versions and MemWAL files, and any
     /// rewrite backups (`memory.dim*.bak`) are deleted: forgotten data is gone.
     pub async fn compact(&self, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
-        let keep = compaction_row(history, now);
+        self.compact_pinned(history, now, &Default::default()).await
+    }
+
+    /// [`Self::compact`] keeping, per namespace in `pins`, every version that was
+    /// current at or after the pinned commit time: the branch points of open memory
+    /// branches (`.ai/BRANCHING.md` B4), whose reads go `AS OF` them.
+    pub async fn compact_pinned(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>) -> StoreResult<CompactStats> {
+        let keep = compaction_row_pinned(history, now, pins.clone());
         let stats = self.rewrite_online(&keep, false).await?;
         self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
         self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
@@ -1073,8 +1080,18 @@ impl PartitionStore {
 /// sealed fields) — so its id still resolves to its memory, kind and scope:
 /// subscribers get the `forget` / `unlink` event, and replay finds the tombstone.
 fn compaction_row(history: Duration, now: CommitTs) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
-    let horizon = CommitTs(now.0 - history.as_micros() as i64);
+    compaction_row_pinned(history, now, Default::default())
+}
+
+/// [`compaction_row`] with per-namespace pins: a namespace's horizon is never later
+/// than its pin, so a superseded version that a branch reads at its point stays.
+fn compaction_row_pinned(history: Duration, now: CommitTs, pins: std::collections::HashMap<String, CommitTs>) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
+    let base = CommitTs(now.0 - history.as_micros() as i64);
     move |mut r: StoredRow| {
+        let horizon = match r.data.namespace.as_ref().and_then(|ns| pins.get(ns)) {
+            Some(p) if p.0 < base.0 => *p,
+            _ => base,
+        };
         if r.id == META_ID {
             return Some(r);
         }

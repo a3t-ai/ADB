@@ -125,3 +125,34 @@ async fn compaction_10k() {
 async fn compaction_100k() {
     spike(100_000).await;
 }
+
+/// B4 (`.ai/BRANCHING.md`): a branch point pins its namespace's history — a version
+/// superseded past the horizon but current at the pin stays; other namespaces don't.
+#[tokio::test]
+async fn a_branch_pin_keeps_the_versions_current_at_its_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 2_000, wal_flush: Duration::from_millis(50), embedding_model: None };
+    let now = CommitTs(T0 + 200 * DAY);
+    let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
+    let mut off = 0u64;
+    for ns in ["crm", "billing"] {
+        let k = format!("{ns}-a");
+        let mut d = row(&k, "v1");
+        d.namespace = Some(ns.into());
+        off += 1;
+        store.apply(&rec(off, T0 + off as i64, vec![Effect::PutEntity(NewRow { id: RecordId(k.clone()), lineage_id: RecordId(k.clone()), version: 1, data: d.clone() })])).await.unwrap();
+        // Superseded 150 days ago: past a 90-day horizon.
+        d.value = json!({ "key": k, "content": "v2" });
+        off += 1;
+        let new = NewRow { id: RecordId(format!("{k}-v2")), lineage_id: RecordId(k.clone()), version: 2, data: d };
+        store.apply(&rec(off, T0 + 50 * DAY, vec![Effect::Supersede { old: RecordId(k), new }])).await.unwrap();
+    }
+    let pins = std::collections::HashMap::from([("crm".to_string(), CommitTs(T0 + DAY))]);
+    store.compact_pinned(Duration::from_secs(90 * 86_400), now, &pins).await.unwrap();
+    let versions = store.versions(Memory::Semantic, None).await.unwrap();
+    let kept = |k: &str| versions.iter().filter(|r| r.lineage_id.ends_with(k)).count();
+    assert_eq!(kept("crm-a"), 2, "crm's v1 was current at the pin: kept");
+    assert_eq!(kept("billing-a"), 1, "billing has no branch: its old version goes");
+    let at_pin: Vec<_> = versions.iter().filter(|r| r.is_current_at(CommitTs(T0 + DAY), now)).map(|r| r.data.value["content"].clone()).collect();
+    assert_eq!(at_pin, [json!("v1")]);
+}

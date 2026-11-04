@@ -333,6 +333,10 @@ pub struct DurableWrites<L: Log> {
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
+    /// B4: the commit times compaction must keep readable (branch points), per namespace.
+    pins: std::sync::OnceLock<Pins>,
+    /// B4, on the org's engine: its branch engines, which a FORGET on main reaches too.
+    branch_host: std::sync::OnceLock<Arc<crate::branch_engine::BranchHost>>,
     /// Entity aliases (GR-12): a merged entity's key → the entity it merged into,
     /// from the survivors' `aliases` fields at open, kept by MERGE and FORGET.
     aliases: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -345,6 +349,9 @@ pub struct DurableWrites<L: Log> {
 /// Records written since the last compaction that make one due (W7, user 28 Oct:
 /// thousands of small puts slow every scan; at least a quarter of the table).
 pub const COMPACT_AFTER_WRITES: u64 = 2_000;
+
+/// Compaction pins (B4): per namespace, the oldest branch point read from this engine.
+pub type Pins = Arc<dyn Fn() -> std::collections::HashMap<String, CommitTs> + Send + Sync>;
 
 /// How long superseded versions (UPDATE history) are kept (W5, user 27 Oct).
 pub const HISTORY: Duration = Duration::from_secs(90 * 86_400);
@@ -426,7 +433,8 @@ impl<L: Log + 'static> DurableWrites<L> {
                 }
             }
         }
-        let stats = store.compact(HISTORY, CommitTs::from_datetime(time::now())).await.map_err(store_err)?;
+        let pins = self.pins.get().map(|f| f()).unwrap_or_default();
+        let stats = store.compact_pinned(HISTORY, CommitTs::from_datetime(time::now()), &pins).await.map_err(store_err)?;
         let mut redacted = 0;
         if !rows.is_empty() {
             // Close the segment holding the newest records, then rewrite the closed
@@ -593,6 +601,57 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     /// Make this a branch engine's writes (B3): reads for targets and key checks go
     /// through the overlay; a parent record changed or deleted gets a row in this table.
+    /// What compaction keeps for open branches (B4); set once when the engine opens.
+    pub fn set_pins(&self, pins: Pins) {
+        let _ = self.pins.set(pins);
+    }
+
+    /// The org's branch engines (B4): a FORGET on main erases their copies too.
+    pub fn set_branch_host(&self, host: Arc<crate::branch_engine::BranchHost>) {
+        let _ = self.branch_host.set(host);
+    }
+
+    /// B4: erase `lineages` (keys of `memory`) from this engine's own table, log and
+    /// history — a branch engine's copies of records FORGET removed on main. Only the
+    /// lineages it holds rows of (or edges to) are written. Returns how many.
+    pub async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> AdbResult<u64> {
+        let Some(store) = &self.store else { return Ok(0) };
+        if lineages.is_empty() {
+            return Ok(0);
+        }
+        let m = Memory::from(memory);
+        let by_row: std::collections::HashMap<String, &String> = lineages.iter().map(|k| (adb_store::row_id(m, k), k)).collect();
+        let mut seq = self.seq.lock().await;
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let mut held = std::collections::BTreeSet::new();
+        let quoted: Vec<String> = by_row.keys().map(|r| adb_store::sql_str(r)).collect();
+        for chunk in quoted.chunks(500) {
+            let set = chunk.join(", ");
+            let filter = format!("lineage_id IN ({set}) OR subject_id IN ({set}) OR object_id IN ({set})");
+            for r in store.scan(Some(&filter)).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? {
+                for id in [Some(&r.lineage_id), r.data.subject_id.as_ref(), r.data.object_id.as_ref()].into_iter().flatten() {
+                    if let Some(k) = by_row.get(id) {
+                        held.insert((*k).clone());
+                    }
+                }
+            }
+        }
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let ts = seq.begin();
+        let effects: Vec<Effect> = held.iter().map(|k| Effect::Forget { memory: m, lineage_id: RecordId(k.clone()) }).collect();
+        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        self.keys_gone(&effects);
+        self.forgotten.lock().unwrap().extend(held.iter().map(|k| (m, k.clone())));
+        self.to_store(&record, seq.log()).await;
+        drop(seq);
+        self.erase().await?;
+        Ok(held.len() as u64)
+    }
+
     pub fn set_parent(&mut self, parent: Option<crate::branch_engine::ParentView>) {
         self.parent = parent;
     }
@@ -823,7 +882,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1547,6 +1606,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if self.store.is_some() {
             self.erase().await.map_err(|e| {
                 AdbError::Internal(format!("forgotten (hidden from every read), but not yet erased from disk: {e}; the next compaction erases it"))
+            })?;
+        }
+        // And from every branch's own engine (B4): forgotten means gone everywhere.
+        if let Some(host) = self.branch_host.get() {
+            host.forget(memory_type, &ids).await.map_err(|e| {
+                AdbError::Internal(format!("forgotten on main, but a branch still holds a copy: {e}"))
             })?;
         }
         Ok(removed)

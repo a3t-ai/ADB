@@ -126,3 +126,53 @@ async fn a_branch_is_its_own_engine_and_the_org_never_sees_its_writes() {
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
     assert_eq!((main(&e).await, on(&e, "try").await, on(&e, "deeper").await), (m, t, d));
 }
+
+/// Every file under `dir` that contains `needle`.
+fn files_with(dir: &std::path::Path, needle: &[u8]) -> Vec<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { walk(&p, out) } else { out.push(p) }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    files.into_iter().filter(|f| std::fs::read(f).map(|b| b.windows(needle.len()).any(|w| w == needle)).unwrap_or(false)).map(|f| f.display().to_string()).collect()
+}
+
+/// B4: FORGET on main reaches every branch (its view and its own copies, on disk too);
+/// dropping a branch deletes its engine, and a new branch of the same name starts clean.
+#[tokio::test]
+async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    for (k, v) in [("a", "a1"), ("p", "PII-on-main")] {
+        e.query(&format!(r#"STORE INTO SEMANTIC (key = "{k}", fact = "{v}") NAMESPACE "crm""#), None).await.unwrap();
+    }
+    e.branch_create("crm", "try", None, None).await.unwrap();
+    e.branch_create("crm", "deeper", Some("try"), None).await.unwrap();
+    e.query(r#"UPDATE INTO SEMANTIC WHERE key = "p" (fact = "PII-copied-on-try") NAMESPACE "crm" BRANCH "try""#, None).await.unwrap();
+    e.query(r#"UPDATE INTO SEMANTIC WHERE key = "p" (fact = "PII-copied-on-deeper") NAMESPACE "crm" BRANCH "deeper""#, None).await.unwrap();
+    assert_eq!(on(&e, "try").await, ["PII-copied-on-try", "a1"]);
+    let branches = dir.path().join("branches");
+    assert!(!files_with(&branches, b"PII-copied-on-try").is_empty(), "on disk before (else this test proves nothing)");
+
+    e.query(r#"FORGET FROM SEMANTIC WHERE key = "p" NAMESPACE "crm""#, None).await.unwrap();
+    assert_eq!(main(&e).await, ["a1"]);
+    assert_eq!(on(&e, "try").await, ["a1"], "gone from the branch's view and its own copy");
+    assert_eq!(on(&e, "deeper").await, ["a1"]);
+    for needle in [&b"PII-on-main"[..], b"PII-copied-on-try", b"PII-copied-on-deeper"] {
+        assert!(files_with(dir.path(), needle).is_empty(), "{} still on disk: {:?}", String::from_utf8_lossy(needle), files_with(dir.path(), needle));
+    }
+
+    // Drop: the engine's directory goes; the same name later is a new, empty branch.
+    e.query(r#"STORE INTO SEMANTIC (key = "t", fact = "only-on-deeper") NAMESPACE "crm" BRANCH "deeper""#, None).await.unwrap();
+    assert!(e.branch_drop("crm", "deeper").await.unwrap());
+    assert!(!branches.join("crm__deeper").exists(), "its engine's data is deleted");
+    assert!(e.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "deeper""#, None).await.is_err());
+    e.branch_create("crm", "deeper", Some("try"), None).await.unwrap();
+    assert_eq!(on(&e, "deeper").await, ["a1"], "no only-on-deeper: a new branch");
+    drop(e);
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    assert_eq!(on(&e, "deeper").await, ["a1"]);
+}
