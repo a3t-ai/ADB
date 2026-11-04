@@ -171,7 +171,11 @@ fn caller_keyed(memory: MemoryType, payload: &serde_json::Value) -> bool {
 /// The record id of caller key `key` in the statement's scope (E-L12): keys are
 /// unique per (scope, memory type), so a named scope's keys are `<scope>~<key>`. A
 /// key already in that form is taken as it is; any other `~` is refused.
-fn scoped_key(in_scope: Option<&str>, key: &str) -> AdbResult<String> {
+/// The record id of `key` in `in_scope` and `namespace` (E-L12; NS, schema v5).
+fn scoped_key(namespace: Option<&str>, in_scope: Option<&str>, key: &str) -> AdbResult<String> {
+    if let Some(ns) = namespace.filter(|ns| !adb_store::valid_namespace(ns)) {
+        return Err(AdbError::QueryError(format!("NAMESPACE {ns:?}: a namespace can't be empty or contain '|' or '~'")));
+    }
     let scope = in_scope.unwrap_or(adb_store::DEFAULT_SCOPE);
     let id = adb_store::scoped_id(scope, key);
     let bare = if scope == adb_store::DEFAULT_SCOPE { id.as_str() } else { &id[scope.len() + 1..] };
@@ -180,7 +184,7 @@ fn scoped_key(in_scope: Option<&str>, key: &str) -> AdbResult<String> {
             "key {key:?}: a key can't contain '~' (a record in a named scope has the id <scope>~<key>)"
         )));
     }
-    Ok(id)
+    Ok(adb_store::namespaced(namespace, &id))
 }
 
 fn key_exists(memory: MemoryType, key: &str) -> AdbError {
@@ -834,6 +838,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             let n = store.scope_row_ids().await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
             tracing::info!(rows = n, "schema v4: record ids in named scopes carry the scope");
         }
+        // Schema v5 (NS): record ids carry their namespace.
+        if store.schema_version() < 5 {
+            let n = store.namespace_row_ids().await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            tracing::info!(rows = n, "schema v5: record ids in a namespace carry the namespace");
+        }
         let caught_up_in = t.elapsed();
         let (hydrated_rows, live) = hydrate(&store).await?;
         tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
@@ -1344,7 +1353,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
-        let id = RecordId(scoped_key(in_scope, &store_id(memory_type, key, &payload))?);
+        let id = RecordId(scoped_key(namespace, in_scope, &store_id(memory_type, key, &payload))?);
         if self.parent.is_some() && caller_keyed(memory_type, &payload) {
             let seen = self.branch_targets(memory_type, &Predicate::Where { conditions: Vec::new() }, None, ts).await?;
             if seen.iter().any(|(r, _)| adb_store::key_of(&r.lineage_id) == id.0) {
@@ -1403,9 +1412,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         // The ends' record ids in the fact's scope (E-L12); a merged entity's key
         // names the entity it merged into (GR-12).
-        let subject_id = scoped_key(in_scope, &subject)?;
+        let subject_id = scoped_key(namespace, in_scope, &subject)?;
         let subject_id = self.alias_of(&subject_id).unwrap_or(subject_id);
-        let object_id = field("object").map(|o| scoped_key(in_scope, &o)).transpose()?;
+        let object_id = field("object").map(|o| scoped_key(namespace, in_scope, &o)).transpose()?;
         let object_id = object_id.map(|o| self.alias_of(&o).unwrap_or(o));
         let subject = adb_store::unscoped(&subject_id).to_string();
         let object = object_id.as_deref().map(|o| adb_store::unscoped(o).to_string());
@@ -1422,7 +1431,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             (None, None) => return Err(AdbError::InvalidSyntax("FACT needs object or value".into())),
         };
         let bare_key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
-        let key = adb_store::scoped_id(in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
+        let key = adb_store::space_id(namespace, in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
         if let Some(obj) = payload.as_object_mut() {
             normalize_validity(obj, None)?;
             // On STORE a null bound is no bound.

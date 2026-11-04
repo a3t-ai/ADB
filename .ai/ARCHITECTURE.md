@@ -822,6 +822,13 @@ and sequencer constraints, which need plaintext. So:
 - Every committed record carries tenant, scope, agent and `txn_id`; hash-chaining
   log records gives a tamper-evident trail.
 
+## 14.4b Record ids and namespaces (schema v5, 4 Nov 2026)
+
+Keys are unique per (namespace, scope, memory type): a record in a namespace has the id
+`<namespace>|<scope part>~<key>`; without one, the id is as before. AQL is unchanged
+(`NAMESPACE` scopes keys too); a v4 table is rewritten once at open. Details:
+`.ai/NS_IDS.md`.
+
 ## 14.5 Memory branches (agents as repos, 4 Nov 2026)
 
 A branch of an agent's memory space is **its own engine** — WAL, sequencer, delta table —

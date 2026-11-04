@@ -147,12 +147,14 @@ impl Executor {
         let start = Instant::now();
         // Record ids in a named scope carry it (E-L12).
         let scoped;
-        let step = match step.modifiers.in_scope.as_deref() {
-            Some(s) if s != adb_store::DEFAULT_SCOPE => {
-                scoped = StepPlan { predicate: crate::reads::scope_ids(&step.predicate, s), ..step.clone() };
+        // And a record in a namespace, the namespace (NS, schema v5).
+        let (ns, sc) = (step.modifiers.namespace.as_deref(), step.modifiers.in_scope.as_deref().unwrap_or(adb_store::DEFAULT_SCOPE));
+        let step = match ns.is_some() || sc != adb_store::DEFAULT_SCOPE {
+            true => {
+                scoped = StepPlan { predicate: crate::reads::scope_ids(&step.predicate, ns, sc), ..step.clone() };
                 &scoped
             }
-            _ => step,
+            false => step,
         };
 
         let result = match step.operation {
@@ -170,6 +172,9 @@ impl Executor {
                 let start = Instant::now();
                 let data = step.data.as_ref().ok_or_else(|| ExecutorError::MissingData("merge data".to_string()))?;
                 let key = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if let Some(ns) = &step.modifiers.namespace {
+                    return Err(ExecutorError::InvalidOperation(format!("MERGE in NAMESPACE {ns:?} isn't supported yet (NS-L1): MERGE works on records without a namespace")));
+                }
                 let n = self.writes.merge(&key("from"), &key("into")).await?;
                 QueryResult::count(n, start.elapsed().as_millis() as u64)
             }
@@ -364,12 +369,14 @@ impl Executor {
     async fn execute_fanout(&self, fanout: &FanOutPlan) -> ExecutorResult<QueryResult> {
         // Record ids in a named scope carry it (E-L12).
         let scoped;
-        let fanout = match fanout.modifiers.in_scope.as_deref() {
-            Some(s) if s != adb_store::DEFAULT_SCOPE => {
-                scoped = FanOutPlan { predicate: crate::reads::scope_ids(&fanout.predicate, s), ..fanout.clone() };
+        // And a record in a namespace, the namespace (NS, schema v5).
+        let (ns, sc) = (fanout.modifiers.namespace.as_deref(), fanout.modifiers.in_scope.as_deref().unwrap_or(adb_store::DEFAULT_SCOPE));
+        let fanout = match ns.is_some() || sc != adb_store::DEFAULT_SCOPE {
+            true => {
+                scoped = FanOutPlan { predicate: crate::reads::scope_ids(&fanout.predicate, ns, sc), ..fanout.clone() };
                 &scoped
             }
-            _ => fanout,
+            false => fanout,
         };
         let start = Instant::now();
 

@@ -57,6 +57,7 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
 | B2 | Branch engines: `ParentSource` (rows of a namespace `AS OF` t: the org engine, or a branch engine recursively); `BranchHost` opening branch engines under `<data dir>/branches/`; a statement with `BRANCH "b"` runs on b's engine | done (669e80d) |
 | B3 | Branch-engine writes: STORE, UPDATE (override rows), FORGET (markers), key checks against the overlay | done (669e80d) |
 | B4 | Retention pins (compaction keeps what open branches read); FORGET on main reaches every branch engine; dropping a branch deletes its engine | done (see below) |
+| NS | Record ids carry the namespace (schema v5, `.ai/NS_IDS.md`): needed by B5 | done (ns-ids) |
 | B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | A promoted agent's memory equals the branch view; the original agent unchanged |
 | B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | The developer loop on vc-dev with the branch in its own pod |
 | B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |

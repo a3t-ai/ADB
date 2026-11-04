@@ -922,14 +922,14 @@ async fn procedures_keep_their_payload_and_namespace() {
     let r = adb.execute(r#"RECALL FROM PROCEDURAL WHERE owner = "ops""#).await.unwrap();
     let recs = r.get_records().unwrap();
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].id, "deploy");
+    assert_eq!(recs[0].id, "team-a|~deploy", "a record's id carries its namespace (NS, schema v5)");
     assert_eq!(recs[0].data["owner"], "ops");
     assert_eq!(recs[0].data["priority"], 2);
     assert_eq!(recs[0].data["steps"], json!(["build", "push"]), "node fields stay shaped");
 
-    assert_eq!(ids(adb.execute(r#"LOOKUP FROM PROCEDURAL KEY owner = "sre""#).await.unwrap()), vec!["rollback"]);
-    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "team-b""#).await.unwrap()), vec!["rollback"]);
-    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL WHERE priority > 1 NAMESPACE "team-a""#).await.unwrap()), vec!["deploy"]);
+    assert_eq!(ids(adb.execute(r#"LOOKUP FROM PROCEDURAL KEY owner = "sre""#).await.unwrap()), vec!["team-b|~rollback"]);
+    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "team-b""#).await.unwrap()), vec!["team-b|~rollback"]);
+    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL WHERE priority > 1 NAMESPACE "team-a""#).await.unwrap()), vec!["team-a|~deploy"]);
 }
 
 /// W9 (spec §12): with the budget enforced, a pipeline that runs out of TIMEOUT
