@@ -653,6 +653,38 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     Ok(records)
 }
 
+/// `RECALL` / `LOOKUP` on a branch engine (B2): the branch's view (its rows, then its
+/// parent's as of the point), then the predicate and modifiers as on main.
+pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
+    if is_history(modifiers) {
+        return Err(AdbError::UnsupportedOperation("AS OF, VALID AT and WITH HISTORY are not read on a branch yet".into()));
+    }
+    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN are not read on a branch yet".into()));
+    }
+    let in_scope = modifiers.in_scope.as_deref();
+    let mut records: Vec<MemoryRecord> = rows
+        .iter()
+        .filter(|r| in_scope.is_none_or(|s| r.data.scope == s))
+        .map(record)
+        .filter(|r| matches(memory, r, predicate))
+        .collect();
+    if let Some(v) = &modifiers.scope {
+        records.retain(|r| &r.metadata.scope == v);
+    }
+    default_order(memory, &mut records);
+    if let Some(o) = &modifiers.order_by {
+        order_by(&mut records, o);
+    }
+    if let Some(n) = modifiers.limit {
+        records.truncate(n);
+    }
+    if let Some(f) = &modifiers.return_fields {
+        project(&mut records, f);
+    }
+    Ok(records)
+}
+
 /// `SCAN FROM WORKING [WINDOW …]`: oldest first, then the window, `LIMIT`, `RETURN`.
 pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
     served(store, "scan", |source| scan_from(store, modifiers, now, source), same_records, show_records).await

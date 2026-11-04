@@ -110,6 +110,8 @@ pub struct LanceReads {
     barrier: Option<Arc<ApplyBarrier>>,
     /// Embeds the text of `LIKE $q` (MVP W4); `None`: only vectors can be passed.
     embedder: Option<Arc<adb_embed::Embedder>>,
+    /// On a branch engine (B2): reads overlay the branch's rows on its parent's.
+    parent: Option<crate::branch_engine::ParentView>,
 }
 
 /// `IN SCOPE` (named scopes, AQL v0.6) is served on the long-term memory types.
@@ -184,7 +186,12 @@ pub fn lance_owned(memory: MemoryType) -> bool {
 
 impl LanceReads {
     pub fn new(store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { store, barrier, embedder: None }
+        Self { store, barrier, embedder: None, parent: None }
+    }
+
+    pub fn with_parent(mut self, parent: Option<crate::branch_engine::ParentView>) -> Self {
+        self.parent = parent;
+        self
     }
 
     pub fn with_embedder(mut self, embedder: Option<Arc<adb_embed::Embedder>>) -> Self {
@@ -235,6 +242,10 @@ impl LanceReads {
     /// A non-`LIKE` RECALL / LOOKUP.
     async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         let now = self.committed().await;
+        if let Some(p) = &self.parent {
+            let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
+            return crate::query::branch_read(rows.into_iter().map(|(r, _)| r).collect(), memory, predicate, modifiers);
+        }
         if crate::query::is_history(modifiers) {
             return crate::query::history(&self.store, memory, predicate, modifiers, now).await;
         }
@@ -288,6 +299,9 @@ impl Reads for LanceReads {
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         if matches!(predicate, Predicate::Like { .. }) {
+            if self.parent.is_some() {
+                return Err(AdbError::UnsupportedOperation("LIKE is not read on a branch yet".into()));
+            }
             if crate::query::is_history(modifiers) {
                 return Err(AdbError::UnsupportedOperation("LIKE doesn't read history (AS OF, VALID AT, WITH HISTORY)".into()));
             }

@@ -297,6 +297,8 @@ pub struct DurableWrites<L: Log> {
     /// Live subscriptions (stage E), following registrations as they commit.
     subs: Arc<Registry>,
     branches: Arc<crate::branches::Branches>,
+    /// On a branch engine (B2 / B3): the parent its writes are read against.
+    parent: Option<crate::branch_engine::ParentView>,
     /// Platform tables (stage G), applied synchronously.
     platform: Option<Arc<adb_platform::PlatformStore>>,
     /// The live keys of SEMANTIC / EPISODIC / PROCEDURAL (D3 S4 key check), with
@@ -506,7 +508,24 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Commit an `UNWATCH`.
     /// Cut a branch of `namespace`'s memory at the current log position (B1): one
     /// control record, nothing copied.
+    /// The last record in this engine's log: its offset and commit time.
+    pub async fn last_commit(&self) -> AdbResult<(u64, CommitTs)> {
+        let seq = self.seq.lock().await;
+        let off = seq.log().last_offset().0;
+        let ts = match off {
+            0 => CommitTs::from_datetime(time::now()),
+            n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+        };
+        Ok((off, ts))
+    }
+
     pub async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> AdbResult<crate::branches::Branch> {
+        self.branch_create_at(namespace, name, parent, created_by, None).await
+    }
+
+    /// As [`Self::branch_create`], with the branch point given (a branch of a branch:
+    /// its point is on the parent branch's own log, not the org's).
+    pub async fn branch_create_at(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>, point: Option<(u64, CommitTs)>) -> AdbResult<crate::branches::Branch> {
         use crate::branches::{check_name, Branch, MAIN};
         check_name(name).map_err(AdbError::QueryError)?;
         let parent = parent.filter(|p| !p.is_empty()).unwrap_or(MAIN);
@@ -517,10 +536,16 @@ impl<L: Log + 'static> DurableWrites<L> {
             return Err(AdbError::QueryError(format!("namespace {namespace:?} already has a branch {name:?}")));
         }
         let mut seq = self.seq.lock().await;
-        let point_offset = seq.log().last_offset().0;
-        let point_ts = match point_offset {
-            0 => CommitTs::from_datetime(time::now()),
-            n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+        let (point_offset, point_ts) = match point {
+            Some(p) => p,
+            None => {
+                let off = seq.log().last_offset().0;
+                let ts = match off {
+                    0 => CommitTs::from_datetime(time::now()),
+                    n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+                };
+                (off, ts)
+            }
         };
         let id = RecordId(Branch::id_of(namespace, name));
         let b = Branch {
@@ -564,6 +589,61 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     pub fn branches(&self) -> &Arc<crate::branches::Branches> {
         &self.branches
+    }
+
+    /// Make this a branch engine's writes (B3): reads for targets and key checks go
+    /// through the overlay; a parent record changed or deleted gets a row in this table.
+    pub fn set_parent(&mut self, parent: Option<crate::branch_engine::ParentView>) {
+        self.parent = parent;
+    }
+
+    /// On a branch engine: the branch's view of `memory` matching `predicate`, each row
+    /// with `true` when it is in this (the branch's) table.
+    async fn branch_targets(&self, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<(adb_store::StoredRow, bool)>> {
+        let (Some(store), Some(parent)) = (&self.store, &self.parent) else { return Ok(Vec::new()) };
+        let rows = crate::branch_engine::view(store, &self.barrier(), parent, memory, now).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(r, _)| in_scope.is_none_or(|s| r.data.scope == s))
+            .filter(|(r, _)| crate::query::matches(memory, &crate::query::record(r), predicate))
+            .collect())
+    }
+
+    /// UPDATE / FORGET on a branch engine (B3), under the sequencer lock: the branch's
+    /// own row gets a new version; a parent's record gets an override row here in its
+    /// lineage (the parent untouched). FORGET writes `_branch_deleted` the same way.
+    #[allow(clippy::too_many_arguments)]
+    async fn branch_write(
+        &self,
+        seq: &mut Sequencer<L>,
+        ts: CommitTs,
+        memory: MemoryType,
+        predicate: &Predicate,
+        in_scope: Option<&str>,
+        fields: &serde_json::Map<String, serde_json::Value>,
+        vector: Option<Vec<half::f16>>,
+    ) -> AdbResult<u64> {
+        let rows = self.branch_targets(memory, predicate, in_scope, ts).await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut effects = Vec::with_capacity(rows.len());
+        for (cur, mine) in &rows {
+            let mut new = next_version(cur, fields, seq.new_id(ts));
+            if vector.is_some() {
+                new.data.embedding = vector.clone();
+            }
+            effects.push(match (mine, memory) {
+                (true, _) => Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new },
+                (false, MemoryType::Episodic) => Effect::PutEpisode(new),
+                (false, MemoryType::Tools) => Effect::PutTool(new),
+                (false, _) => Effect::PutEntity(new),
+            });
+        }
+        let n = effects.len() as u64;
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(n)
     }
 
     pub async fn unregister_watch(&self, id: &str) -> AdbResult<()> {
@@ -743,7 +823,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1195,9 +1275,23 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             true => self.vector_of(crate::reads::embed_text(memory_type, &payload)).await,
             false => None,
         };
+        // A branch engine's records belong to its namespace (B3).
+        let namespace = match &self.parent {
+            Some(p) => match namespace {
+                Some(ns) if ns != p.namespace => return Err(AdbError::QueryError(format!("branch {:?} belongs to namespace {:?}, not {ns:?}", p.branch, p.namespace))),
+                _ => Some(p.namespace.as_str()),
+            },
+            None => namespace,
+        };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let id = RecordId(scoped_key(in_scope, &store_id(memory_type, key, &payload))?);
+        if self.parent.is_some() && caller_keyed(memory_type, &payload) {
+            let seen = self.branch_targets(memory_type, &Predicate::Where { conditions: Vec::new() }, None, ts).await?;
+            if seen.iter().any(|(r, _)| adb_store::key_of(&r.lineage_id) == id.0) {
+                return Err(AdbError::QueryError(format!("{} exists on this branch (from it or its parent): UPDATE it to change it on the branch", id.0)));
+            }
+        }
         if memory_type == MemoryType::Semantic {
             if let Some(to) = self.alias_of(&id.0) {
                 return Err(AdbError::QueryError(format!("{} was merged into {to}: store into {to}", id.0)));
@@ -1357,6 +1451,20 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         };
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
+        if self.parent.is_some() {
+            let mut fields = match &data {
+                serde_json::Value::Object(map) => map.clone(),
+                other => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("value".into(), other.clone());
+                    m
+                }
+            };
+            if memory_type == MemoryType::Semantic {
+                normalize_validity(&mut fields, None)?;
+            }
+            return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, vector).await;
+        }
         let ids = self.targets(memory_type, predicate, ts, false, in_scope).await?;
         if ids.is_empty() {
             return Ok(0);
@@ -1413,6 +1521,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>) -> AdbResult<u64> {
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
+        // On a branch engine (B3): a delete marker hides the record on the branch; the
+        // parent keeps it (erasing data for good is FORGET on main).
+        if self.parent.is_some() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("_branch_deleted".into(), serde_json::Value::Bool(true));
+            return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, None).await;
+        }
         let mut ids = self.targets(memory_type, predicate, ts, true, in_scope).await?;
         if ids.is_empty() {
             return Ok(0);

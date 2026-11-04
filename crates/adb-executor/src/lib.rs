@@ -18,6 +18,7 @@ pub mod sql;
 pub mod writes;
 pub mod replica;
 pub mod branches;
+pub mod branch_engine;
 
 pub use error::{ExecutorError, ExecutorResult};
 pub use executor::{Executor, MAX_DEPTH, MAX_REACHED};
