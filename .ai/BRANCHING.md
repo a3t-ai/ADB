@@ -21,14 +21,46 @@ Why a row-level overlay and not Lance-level forks: ADB's history is per row
 (`valid_from` / `valid_to` / `superseded_by`, `AS OF`), the table is shared by every
 tenant of the partition, and compaction deletes old Lance versions (W5).
 
-## Build slices (4 Nov 2026; merging parked by the user)
+## Design (revised 4 Nov 2026, user)
+
+**A branch is isolated from the production agent.** Each branch is its own ADB engine:
+its own WAL, its own sequencer, its own small Lance table (the *delta*). The org's
+engine only logs the branch's control records (created at point X, dropped) and answers
+reads of the parent's rows `AS OF` the point. Test and dev traffic never reaches the
+org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
+
+- **Placement**, same code: *hosted* — branch engines live in the org's ADB process,
+  under `<data dir>/branches/<namespace>__<name>`, parent reads in-process; *own pod* —
+  a separate ADB process (a hibernating Sandbox with its own volume), parent reads over
+  Flight.
+- **Reads on a branch** = the overlay: the branch's own rows (current now), then the
+  parent's rows `AS OF` the branch point (the parent being the org, or another branch
+  that answers the same way recursively); the nearest level wins per lineage; a
+  `_branch_deleted` row hides a lineage.
+- **Writes on a branch** go to the branch engine only: a new record in its table; a
+  change to a parent record = an override row in the branch table with the parent's
+  lineage; a delete = a marker row; a keyed STORE of a key the overlay already has is
+  refused (UPDATE it).
+- **Merge = promote as a new agent**: materialise the branch's view (SEMANTIC,
+  PROCEDURAL, TOOLS) into a new namespace in production through the org's sequencer.
+  The original agent is untouched. No merge into the parent.
+- **Fork / clone** = the same materialisation without a branch.
+- **Durability**: a hosted branch's engine is on the org leader's disk, not
+  Raft-replicated: after an ADB failover a hosted branch is unavailable until moved or
+  restored (dev and test data). Branches that must survive failovers run in their own pod.
+
+## Build slices (revised 4 Nov 2026)
 
 | Slice | Scope | Done when |
 |---|---|---|
-| B1 | Schema v5 `branch` column (rows default `main`); `branches` control table (logged); AQL `BRANCH "<name>"` modifier + `branch` on HTTP / Flight requests; `CREATE BRANCH` / `LIST BRANCHES` / `DROP BRANCH` admin actions | A branch can be created at the current offset and listed; existing data reads unchanged |
-| B2 | Overlay reads for RECALL / LOOKUP on SEMANTIC, PROCEDURAL, TOOLS, EPISODIC: parent rows current at the branch point (`is_current_at`), branch rows current now, minus overridden lineages; chains walk parents | Conformance reads on a fresh branch equal the parent's at the point, after 1,000 parent writes |
-| B3 | Writes on a branch: STORE (new lineage, `branch` set), UPDATE of a parent lineage → override row (`overrides`), FORGET → branch tombstone; parent rows never touched | Branch writes invisible on `main`; `main` writes after the point invisible on the branch |
-| B4 | Retention pins: compaction keeps versions an open branch or tag needs; FORGET on `main` erases the lineage on every branch | Compaction after 10k writes keeps the branch's view; a forgotten record is gone from every branch |
-| B5 | Layers: an agent space lists `{space, mode: mount | pin(tag), memories, sealed}`; reads union the layers' SEMANTIC / PROCEDURAL / TOOLS (episodic, working never); writes that touch or shadow a sealed lineage are refused; precedence = layer order | The trading / compliance example of the post as a test |
-| B6 | FlowR: `agent_configs.memory_branch` + `layers`; agent memory passes `BRANCH` and layers; branch runs: the gateway refuses outbound calls from a non-`main` branch unless the branch policy allows them; MCP tools `memory_branch_create | list | diff | rebase | tag` | The developer loop (branch, run, diff, rebase) end to end against a real A3T agent |
-| later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches, branch index, flattening, merge (parked) | — |
+| B1 | Branch control records on the org log (`branch` rows), create / list / drop, AQL `BRANCH` | done (d734525) |
+| B2 | Branch engines: `ParentSource` (rows of a namespace `AS OF` t: the org engine, or a branch engine recursively); `BranchHost` opening branch engines under `<data dir>/branches/`; a statement with `BRANCH "b"` runs on b's engine | A branch engine reads its parent `AS OF` the point plus its own rows; the org table and log get no branch rows |
+| B3 | Branch-engine writes: STORE, UPDATE (override rows), FORGET (markers), key checks against the overlay | The developer test of the post: main and branch views stay apart through restarts, a branch of a branch |
+| B4 | Retention pins at the org (compaction keeps what open branches read); FORGET on main logged for branches and applied by a branch engine before it serves; dropping a branch deletes its engine | Compaction keeps a branch's view; a forgotten record is gone from every branch |
+| B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | A promoted agent's memory equals the branch view; the original agent unchanged |
+| B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | The developer loop on vc-dev with the branch in its own pod |
+| B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |
+| later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches | — |
+
+The first B2/B3 build (branch rows in the org table, schema v5 `branch` column) is kept
+at tag `b2-in-org-rows` and not used: it left branch traffic on the org.
