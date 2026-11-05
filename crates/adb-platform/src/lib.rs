@@ -44,6 +44,30 @@ pub enum PlatformError {
     Lance(String),
     #[error("io: {0}")]
     Io(String),
+    /// DB-13: an update, delete, upsert or replace of an append-only table.
+    #[error("table {0} is append-only: rows can't be changed or deleted (purge by age only)")]
+    AppendOnly(String),
+}
+
+/// The platform table an effect writes, if it is a platform-table effect.
+pub fn table_of(e: &Effect) -> Option<&str> {
+    match e {
+        Effect::TableCreate { table, .. }
+        | Effect::TableInsert { table, .. }
+        | Effect::TableUpdate { table, .. }
+        | Effect::TableDelete { table, .. }
+        | Effect::TableUpsert { table, .. }
+        | Effect::TableReplace { table, .. }
+        | Effect::TableAddColumns { table, .. }
+        | Effect::TableAppendOnly { table }
+        | Effect::TablePurge { table, .. } => Some(table),
+        _ => None,
+    }
+}
+
+fn valid_column(c: &str) -> bool {
+    let mut it = c.chars();
+    matches!(it.next(), Some(f) if f.is_ascii_alphabetic() || f == '_') && it.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') && c.len() <= 64
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;
@@ -63,6 +87,9 @@ struct Applied {
     /// The table being compacted: its new versions hold no effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compacting: Option<String>,
+    /// Tables made append-only (DB-13, `TableAppendOnly`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    append_only: std::collections::BTreeSet<String>,
 }
 
 /// What a platform compaction did (W5-L4).
@@ -260,7 +287,37 @@ impl PlatformStore {
     /// unknown columns and filters that don't parse are refused here.
     pub async fn validate(&self, effect: &Effect) -> PlatformResult<()> {
         let bad = |m: String| Err(PlatformError::Lance(m));
+        // DB-13: an append-only table takes inserts and retention purges only.
+        if let Effect::TableUpdate { table, .. } | Effect::TableDelete { table, .. } | Effect::TableUpsert { table, .. } | Effect::TableReplace { table, .. } = effect {
+            if self.applied.lock().await.append_only.contains(table) {
+                return Err(PlatformError::AppendOnly(table.clone()));
+            }
+        }
         match effect {
+            Effect::TableAddColumns { table, columns } => {
+                check_name(table)?;
+                self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
+                match columns.iter().find(|c| !valid_column(c)) {
+                    Some(c) => bad(format!("column name {c:?}: letters, digits and _, starting with a letter or _")),
+                    None if columns.is_empty() => bad(format!("add columns to {table}: name at least one")),
+                    None => Ok(()),
+                }
+            }
+            Effect::TableAppendOnly { table } => {
+                check_name(table)?;
+                self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone())).map(|_| ())
+            }
+            Effect::TablePurge { table, column, before } => {
+                check_name(table)?;
+                let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
+                if Schema::from(ds.schema()).field_with_name(column).is_err() {
+                    return bad(format!("table {table} has no column {column}"));
+                }
+                if before.is_empty() {
+                    return bad(format!("purge {table}: name the time to purge before"));
+                }
+                Ok(())
+            }
             Effect::TableCreate { table, .. } => check_name(table),
             Effect::TableInsert { table, rows } => {
                 check_name(table)?;
@@ -315,6 +372,48 @@ impl PlatformStore {
         }
     }
 
+    /// Check a transaction (DB-6): several effects logged as one record, applied in
+    /// order. A table created earlier in the transaction counts as existing. After a
+    /// schema change of a table (create, add columns, replace, append-only), a later
+    /// update, delete or purge of it in the same transaction is refused: its filter or
+    /// columns couldn't be checked, and a logged effect must apply.
+    pub async fn validate_all(&self, effects: &[Effect]) -> PlatformResult<()> {
+        let mut created: std::collections::HashSet<String> = Default::default();
+        let mut reshaped: std::collections::HashSet<String> = Default::default();
+        let mut append: std::collections::HashSet<String> = Default::default();
+        for e in effects {
+            let table = table_of(e).ok_or_else(|| PlatformError::Lance("a transaction holds platform-table effects only".into()))?;
+            if append.contains(table) && matches!(e, Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableUpsert { .. } | Effect::TableReplace { .. }) {
+                return Err(PlatformError::AppendOnly(table.to_string()));
+            }
+            if reshaped.contains(table) && matches!(e, Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TablePurge { .. }) {
+                return Err(PlatformError::Lance(format!("table {table} changed shape earlier in this transaction: update or delete its rows in a transaction of their own")));
+            }
+            match self.validate(e).await {
+                Err(PlatformError::NoTable(t)) if created.contains(&t) => {}
+                other => other?,
+            }
+            match e {
+                Effect::TableCreate { table, .. } | Effect::TableReplace { table, .. } => {
+                    created.insert(table.clone());
+                    reshaped.insert(table.clone());
+                }
+                Effect::TableInsert { table, .. } | Effect::TableUpsert { table, .. } => {
+                    created.insert(table.clone());
+                }
+                Effect::TableAddColumns { table, .. } => {
+                    reshaped.insert(table.clone());
+                }
+                Effect::TableAppendOnly { table } => {
+                    reshaped.insert(table.clone());
+                    append.insert(table.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a committed record's platform effects (in log order; a record at or
     /// below the applied offset is skipped). Returns whether it was new.
     pub async fn apply(&self, record: &LogRecord) -> PlatformResult<bool> {
@@ -324,6 +423,14 @@ impl PlatformStore {
         }
         for effect in &record.effects {
             self.apply_effect(&mut applied, effect).await?;
+        }
+        // Every effect of the record is in now: record each touched table's real
+        // version, so an effect that made no commit (a no-op add of columns, an
+        // append-only mark) can't shift the crash count of later records.
+        for table in record.effects.iter().filter_map(table_of) {
+            if let Some(ds) = self.dataset(table).await {
+                applied.versions.insert(table.to_string(), ds.version().version);
+            }
         }
         applied.offset = record.offset.0;
         self.save(&applied)?;
@@ -337,7 +444,30 @@ impl PlatformStore {
             | Effect::TableUpdate { table, .. }
             | Effect::TableDelete { table, .. }
             | Effect::TableUpsert { table, .. }
-            | Effect::TableReplace { table, .. } => table.clone(),
+            | Effect::TableReplace { table, .. }
+            | Effect::TablePurge { table, .. } => table.clone(),
+            // No Lance commit: a mark in `_applied.json`.
+            Effect::TableAppendOnly { table } => {
+                applied.append_only.insert(table.clone());
+                return Ok(());
+            }
+            // Metadata-only; a column the table has is skipped, so a re-run after a
+            // crash finds nothing to add and commits nothing.
+            Effect::TableAddColumns { table, columns } => {
+                let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
+                let have = Schema::from(ds.schema());
+                let mut new: Vec<&String> = columns.iter().filter(|c| have.field_with_name(c).is_err()).collect();
+                new.dedup();
+                if new.is_empty() {
+                    return Ok(());
+                }
+                let add = Arc::new(Schema::new(new.iter().map(|c| Field::new(c.as_str(), DataType::Utf8, true)).collect::<Vec<_>>()));
+                let mut ds = (*ds).clone();
+                ds.add_columns(lance::dataset::NewColumnTransform::AllNulls(add), None, None).await.map_err(lance)?;
+                applied.versions.insert(table.clone(), ds.version().version);
+                self.tables.write().await.insert(table.clone(), Arc::new(ds));
+                return Ok(());
+            }
             _ => return Ok(()),
         };
         let current = self.dataset(&table).await.map(|d| d.version().version);
@@ -438,6 +568,12 @@ impl PlatformStore {
                 let ds = self.dataset(&table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
                 let mut ds = (*ds).clone();
                 ds.delete(filter).await.map_err(lance)?;
+                ds
+            }
+            Effect::TablePurge { column, before, .. } => {
+                let ds = self.dataset(&table).await.ok_or_else(|| PlatformError::NoTable(table.clone()))?;
+                let mut ds = (*ds).clone();
+                ds.delete(&format!("{column} < '{}'", before.replace('\'', "''"))).await.map_err(lance)?;
                 ds
             }
             Effect::TableReplace { columns, rows, .. } => {

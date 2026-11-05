@@ -147,6 +147,12 @@ pub trait Writes: Send + Sync {
     async fn platform(&self, _effect: Effect) -> AdbResult<u64> {
         Err(AdbError::UnsupportedOperation("platform tables need a durable engine (start ADB with --data-dir)".into()))
     }
+
+    /// Several platform-table effects as one transaction (DB-6): one log record,
+    /// checked together, applied in order before it returns.
+    async fn platform_many(&self, _effects: Vec<Effect>) -> AdbResult<u64> {
+        Err(AdbError::UnsupportedOperation("platform tables need a durable engine (start ADB with --data-dir)".into()))
+    }
 }
 
 /// Subscriptions follow the committed log (E9).
@@ -2179,13 +2185,20 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     }
 
     async fn platform(&self, effect: Effect) -> AdbResult<u64> {
+        self.platform_many(vec![effect]).await
+    }
+
+    async fn platform_many(&self, effects: Vec<Effect>) -> AdbResult<u64> {
         let platform = self.platform.as_ref().ok_or_else(|| AdbError::UnsupportedOperation("this engine has no platform tables".into()))?;
         let perr = |e: adb_platform::PlatformError| AdbError::QueryError(e.to_string());
+        if effects.is_empty() {
+            return Err(AdbError::QueryError("a transaction needs at least one operation".into()));
+        }
         let mut seq = self.seq.lock().await;
-        // A logged effect must apply: check the table and its name first.
-        platform.validate(&effect).await.map_err(perr)?;
+        // A logged effect must apply: check the tables, names and columns first.
+        platform.validate_all(&effects).await.map_err(perr)?;
         let ts = seq.begin();
-        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
         platform.apply(&record).await.map_err(perr)?;
         self.to_store(&record, seq.log()).await;

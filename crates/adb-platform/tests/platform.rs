@@ -234,3 +234,80 @@ async fn upsert_replaces_by_key_in_one_version() {
     // Validation: rows need their key column.
     assert!(s.validate(&Effect::TableUpsert { table: "state".into(), key: vec!["key".into()], rows: rows(json!([{ "id": "9" }])) }).await.is_err());
 }
+
+/// DB-6: a transaction is one record of several effects across tables, checked
+/// together; a table created earlier in it counts as existing; after a schema change
+/// a later update of that table in the same transaction is refused. Adding columns
+/// keeps old rows (null) and survives a reopen.
+#[tokio::test]
+async fn transactions_and_added_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    let tx = vec![
+        Effect::TableCreate { table: "agents".into(), columns: vec!["id".into(), "name".into()] },
+        insert("agents", json!([{"id": "a1", "name": "Bot"}])),
+        insert("agent_versions", json!([{"id": "v1", "agent": "a1"}])),
+    ];
+    s.validate_all(&tx).await.unwrap();
+    s.apply(&rec(1, tx)).await.unwrap();
+    assert_eq!(ids(&select(&s, "agents", None).await), ["a1"]);
+    assert_eq!(ids(&select(&s, "agent_versions", None).await), ["v1"]);
+
+    let bad = vec![
+        Effect::TableAddColumns { table: "agents".into(), columns: vec!["status".into()] },
+        Effect::TableUpdate { table: "agents".into(), filter: "id = 'a1'".into(), values: vec![("status".into(), "'live'".into())] },
+    ];
+    let e = s.validate_all(&bad).await.unwrap_err().to_string();
+    assert!(e.contains("changed shape earlier in this transaction"), "{e}");
+    assert!(s.validate_all(&[Effect::TableAddColumns { table: "agents".into(), columns: vec!["1x".into()] }]).await.is_err());
+    assert!(s.validate_all(&[Effect::TableAddColumns { table: "nope".into(), columns: vec!["x".into()] }]).await.is_err());
+
+    let add = vec![Effect::TableAddColumns { table: "agents".into(), columns: vec!["status".into(), "name".into()] }];
+    s.validate_all(&add).await.unwrap();
+    s.apply(&rec(2, add.clone())).await.unwrap();
+    // Applying the same columns again (a replayed record past a crash) adds nothing.
+    s.apply(&rec(3, add)).await.unwrap();
+    let r = select(&s, "agents", None).await;
+    assert_eq!(r[0]["name"], json!("Bot"));
+    assert!(r[0].get("status").map_or(true, |v| v.is_null()), "old rows read null: {:?}", r[0]);
+    let up = Effect::TableUpdate { table: "agents".into(), filter: "id = 'a1'".into(), values: vec![("status".into(), "'live'".into())] };
+    s.validate(&up).await.unwrap();
+    s.apply(&rec(4, vec![up, insert("agents", json!([{"id": "a2", "name": "Two", "status": "draft"}]))])).await.unwrap();
+    drop(s);
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    let r = select(&s, "agents", None).await;
+    assert_eq!(r.iter().map(|r| r["status"].as_str().unwrap_or("")).collect::<Vec<_>>(), ["live", "draft"]);
+}
+
+/// DB-13: an append-only table takes inserts and purges by age; update, delete,
+/// upsert and replace are refused, also inside a transaction and after a reopen.
+#[tokio::test]
+async fn append_only_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    let tx = vec![
+        Effect::TableCreate { table: "a3t_errors".into(), columns: vec!["id".into(), "time".into(), "class".into()] },
+        Effect::TableAppendOnly { table: "a3t_errors".into() },
+        insert("a3t_errors", json!([{"id": "e1", "time": "2026-10-01T00:00:00Z", "class": "timeout"}])),
+    ];
+    s.validate_all(&tx).await.unwrap();
+    s.apply(&rec(1, tx)).await.unwrap();
+    s.apply(&rec(2, vec![insert("a3t_errors", json!([{"id": "e2", "time": "2026-11-05T00:00:00Z", "class": "denied"}]))])).await.unwrap();
+    for e in [
+        Effect::TableUpdate { table: "a3t_errors".into(), filter: "id = 'e1'".into(), values: vec![("class".into(), "'x'".into())] },
+        Effect::TableDelete { table: "a3t_errors".into(), filter: "id = 'e1'".into() },
+        Effect::TableUpsert { table: "a3t_errors".into(), key: vec!["id".into()], rows: rows(json!([{"id": "e1", "class": "x"}])) },
+        Effect::TableReplace { table: "a3t_errors".into(), columns: vec!["id".into()], rows: vec![] },
+    ] {
+        let err = s.validate(&e).await.unwrap_err().to_string();
+        assert!(err.contains("append-only"), "{err}");
+    }
+    let purge = Effect::TablePurge { table: "a3t_errors".into(), column: "time".into(), before: "2026-11-01T00:00:00Z".into() };
+    s.validate(&purge).await.unwrap();
+    s.apply(&rec(3, vec![purge])).await.unwrap();
+    assert_eq!(ids(&select(&s, "a3t_errors", None).await), ["e2"]);
+    drop(s);
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    assert!(s.validate(&Effect::TableDelete { table: "a3t_errors".into(), filter: "id = 'e2'".into() }).await.is_err(), "still append-only after a reopen");
+    assert!(s.validate(&Effect::TablePurge { table: "a3t_errors".into(), column: "nope".into(), before: "x".into() }).await.is_err());
+}

@@ -298,6 +298,17 @@ pub enum Effect {
     /// Replace the whole table — its columns and rows — in one step (copying a
     /// platform database across backends, FlowR's switch).
     TableReplace { table: String, columns: Vec<String>, rows: Vec<serde_json::Map<String, serde_json::Value>> },
+    /// Add UTF-8 columns to an existing table (DB-6): old rows read them as null. A
+    /// column the table already has is skipped.
+    TableAddColumns { table: String, columns: Vec<String> },
+    /// Make `table` append-only (DB-13): from then on only inserts and
+    /// [`TablePurge`](Effect::TablePurge) touch it; update, delete, upsert and replace are
+    /// refused. For error logs, audit and decision records. Can't be undone.
+    TableAppendOnly { table: String },
+    /// Retention for any table, the only removal an append-only table allows (DB-13):
+    /// delete the rows whose `column` (an ISO time, compared as text) is before
+    /// `before`.
+    TablePurge { table: String, column: String, before: String },
     /// Set the embedding of row `id` (its current version) in place, without a new
     /// version (MVP W4): the backfill of rows stored before there was a model, and
     /// an in-place `Patch` of EPISODIC `content`. The vector travels in the log (§9.1).

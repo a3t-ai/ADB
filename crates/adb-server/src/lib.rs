@@ -231,8 +231,15 @@ struct QueryResponse {
     data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// DB-18: the refusal's stable code (`adb_core::codes`), beside `error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     execution_time_ms: Option<u64>,
+}
+
+fn code(error: &Option<String>) -> Option<&'static str> {
+    error.as_deref().map(adb_core::codes::code_of)
 }
 
 /// `POST /query` — ClawDB's shape: `data` is the whole wire `QueryResult`.
@@ -244,11 +251,11 @@ async fn query(State(s): State<AppState>, Json(req): Json<QueryRequest>) -> (Sta
         Ok(wire) => {
             let success = wire.get("success").and_then(Value::as_bool).unwrap_or(true);
             let error = wire.get("error").and_then(Value::as_str).map(String::from);
-            (StatusCode::OK, Json(QueryResponse { success, data: Some(wire), error, execution_time_ms: ms }))
+            (StatusCode::OK, Json(QueryResponse { success, data: Some(wire), code: code(&error), error, execution_time_ms: ms }))
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(QueryResponse { success: false, data: None, error: Some(e), execution_time_ms: ms }),
+            Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: ms }),
         ),
     }
 }
@@ -278,8 +285,8 @@ async fn set_cache(State(s): State<AppState>, Json(body): Json<Value>) -> (Statu
 
 fn respond(r: Result<Value, String>, on_error: StatusCode) -> (StatusCode, Json<QueryResponse>) {
     match r {
-        Ok(data) => (StatusCode::OK, Json(QueryResponse { success: true, data: Some(data), error: None, execution_time_ms: None })),
-        Err(e) => (on_error, Json(QueryResponse { success: false, data: None, error: Some(e), execution_time_ms: None })),
+        Ok(data) => (StatusCode::OK, Json(QueryResponse { success: true, data: Some(data), error: None, code: None, execution_time_ms: None })),
+        Err(e) => (on_error, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None })),
     }
 }
 
@@ -287,11 +294,11 @@ async fn stats(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
     match s.engine.stats().await {
         Ok(data) => (
             StatusCode::OK,
-            Json(QueryResponse { success: true, data: Some(data), error: None, execution_time_ms: None }),
+            Json(QueryResponse { success: true, data: Some(data), error: None, code: None, execution_time_ms: None }),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(QueryResponse { success: false, data: None, error: Some(e), execution_time_ms: None }),
+            Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }),
         ),
     }
 }

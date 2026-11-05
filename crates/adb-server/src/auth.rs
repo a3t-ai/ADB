@@ -74,7 +74,7 @@ pub async fn require_token(token: Arc<str>, req: Request, next: Next) -> Respons
     if authorized(value, &token) {
         next.run(req).await
     } else {
-        (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "success": false, "error": "unauthorized: ADB needs Authorization: Bearer <token>" })))
+        (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "success": false, "code": "unauthorized", "error": "unauthorized: ADB needs Authorization: Bearer <token>" })))
             .into_response()
     }
 }

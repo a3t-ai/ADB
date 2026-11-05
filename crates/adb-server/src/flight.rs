@@ -298,6 +298,12 @@ impl AdbFlight {
             .ok_or_else(|| Status::failed_precondition("platform tables need a durable engine (start ADB with --data-dir)"))
     }
 
+    async fn write_many(&self, effects: Vec<Effect>) -> Result<u64, Status> {
+        self.engine.platform_write_many(effects).await.map_err(|e| {
+            if e.starts_with("no platform table") { Status::not_found(e) } else { Status::invalid_argument(e) }
+        })
+    }
+
     async fn write(&self, effect: Effect) -> Result<u64, Status> {
         self.engine.platform_write(effect).await.map_err(|e| {
             if e.starts_with("no platform table") { Status::not_found(e) } else { Status::invalid_argument(e) }
@@ -321,7 +327,12 @@ impl AdbFlight {
                     _ => Vec::new(),
                 };
                 columns.dedup();
-                let offset = self.write(Effect::TableCreate { table: table.clone(), columns }).await?;
+                let create = Effect::TableCreate { table: table.clone(), columns };
+                // DB-13: `append_only: true` marks it in the same record.
+                let offset = match b.get("append_only").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    true => self.write_many(vec![create, Effect::TableAppendOnly { table: table.clone() }]).await?,
+                    false => self.write(create).await?,
+                };
                 Ok(json!({ "created": true, "exists": false, "table": table, "offset": offset }))
             }
             "update" => {
@@ -352,6 +363,38 @@ impl AdbFlight {
                 let filter = str_field(&b, "filter")?.to_string();
                 let offset = self.write(Effect::TableDelete { table, filter }).await?;
                 Ok(json!({ "deleted": true, "offset": offset }))
+            }
+            // DB-5: platform-table changes after `from` (long poll up to `wait_ms`):
+            // `{from?, tables?, max?, wait_ms?}` → `{changes, reset, next, tip}`.
+            "table_changes" => {
+                let gateway = self.engine.gateway().ok_or_else(|| Status::failed_precondition("the table feed needs a durable engine (start ADB with --data-dir)"))?;
+                let q = adb_gateway::tables::TableQuery {
+                    from: b.get("from").and_then(|v| v.as_u64()),
+                    tables: string_list(b.get("tables")),
+                    max: b.get("max").and_then(|v| v.as_u64()).map(|m| m as usize).unwrap_or(1000),
+                    wait: std::time::Duration::from_millis(b.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(0).min(60_000)),
+                };
+                let t = gateway.table_changes(&q).await.map_err(|e| Status::internal(e.to_string()))?;
+                Ok(json!({ "changes": t.changes, "reset": t.reset, "next": t.next, "tip": t.tip }))
+            }
+            // DB-6: several operations as one transaction (one log record, applied in
+            // order): `{ops: [{op: "insert" | "upsert" | "update" | "delete" |
+            // "create_table" | "add_columns" | "append_only" | "purge", …that action's
+            // fields}]}`.
+            "transaction" => {
+                let ops = b.get("ops").and_then(|o| o.as_array()).ok_or_else(|| Status::invalid_argument("transaction needs ops: [{op, …}]"))?;
+                let effects = ops
+                    .iter()
+                    .map(|o| table_effect(o.get("op").and_then(|v| v.as_str()).unwrap_or_default(), o))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let n = effects.len();
+                let offset = self.write_many(effects).await?;
+                Ok(json!({ "committed": true, "ops": n, "offset": offset }))
+            }
+            // DB-6: new UTF-8 columns on an existing table (old rows read null).
+            "add_columns" | "append_only" | "purge" => {
+                let offset = self.write(table_effect(kind, &b)?).await?;
+                Ok(json!({ "done": true, "offset": offset }))
             }
             // Memory branches (B1, agents as repos): cut one at the current log
             // position (nothing copied), list, drop.
@@ -484,12 +527,119 @@ impl AdbFlight {
                 // Same answer shape as POST /query.
                 Ok(match self.engine.query(query, vars.as_ref()).await {
                     Ok(data) => json!({ "success": true, "data": data }),
-                    Err(e) => json!({ "success": false, "error": e }),
+                    Err(e) => json!({ "success": false, "code": adb_core::codes::code_of(&e), "error": e }),
                 })
             }
             other => Err(Status::unimplemented(format!("unknown action {other}"))),
         }
     }
+
+    /// `do_action`'s work; refusals get their stable code added by [`with_code`].
+    async fn do_action_inner(&self, req: Request<Action>) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let access = access(&req);
+        let pool = req.extensions().get::<crate::auth::EnginePool>().cloned();
+        let a = req.into_inner();
+        if a.r#type.starts_with("engine") {
+            if access == Access::Memory {
+                return Err(Status::permission_denied("FlowR's engine store needs the engine token (ADB_ENGINE_TOKEN)"));
+            }
+            let b = body(&a.body)?;
+            if let Some(crate::auth::EnginePool(p)) = &pool {
+                crate::auth::pool_allows(p, &a.r#type, &b).map_err(Status::permission_denied)?;
+            }
+            if a.r#type == "engine_subscribe" {
+                return Ok(Response::new(self.engine_subscribe(&b)?));
+            }
+            if a.r#type == "engine_restore" {
+                let space = str_field(&b, "space")?;
+                let changes = b.get("changes").and_then(|c| c.as_array()).cloned().ok_or_else(|| Status::invalid_argument("engine_restore needs changes"))?;
+                let first = b.get("first").and_then(|f| f.as_bool()).unwrap_or(false);
+                let n = self.engine.engine_restore(space, changes, first).await.map_err(Status::failed_precondition)?;
+                let r = arrow_flight::Result { body: json!({ "restored": n }).to_string().into() };
+                return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
+            }
+            if a.r#type != "engine" {
+                return Err(Status::invalid_argument(format!("unknown action {}", a.r#type)));
+            }
+            let r = arrow_flight::Result { body: self.engine_op(&b).await?.to_string().into() };
+            return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
+        }
+        if access == Access::Engine {
+            return Err(Status::permission_denied("the engine token opens only FlowR's engine store"));
+        }
+        let answer = self.action(&a.r#type, body(&a.body)?).await?;
+        let r = arrow_flight::Result { body: answer.to_string().into() };
+        Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
+    }
+}
+
+fn string_list(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|c| c.as_array()).map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
+/// Rows as the platform tables store them: every value text (null stays null).
+fn table_rows(b: &Value) -> Vec<serde_json::Map<String, Value>> {
+    b.get("rows")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.as_object())
+                .map(|r| r.iter().map(|(k, v)| (k.clone(), match v { Value::String(_) | Value::Null => v.clone(), other => Value::String(other.to_string()) })).collect())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One platform-table operation as its log effect (the single actions and the steps
+/// of a `transaction`).
+fn table_effect(op: &str, b: &Value) -> Result<Effect, Status> {
+    let table = str_field(b, "table")?.to_string();
+    Ok(match op {
+        "create_table" => {
+            let mut columns = string_list(b.get("columns"));
+            if columns.is_empty() {
+                columns = b.get("schema").and_then(|s| s.as_object()).map(|s| s.keys().cloned().collect()).unwrap_or_default();
+            }
+            Effect::TableCreate { table, columns }
+        }
+        "insert" => Effect::TableInsert { table, rows: table_rows(b) },
+        "upsert" => Effect::TableUpsert { table, key: string_list(b.get("key")), rows: table_rows(b) },
+        "update" => {
+            let filter = str_field(b, "filter")?.to_string();
+            let values = b
+                .get("values")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| Status::invalid_argument("update needs a \"values\" object"))?
+                .iter()
+                .map(|(k, v)| (k.clone(), sql_literal(v)))
+                .collect();
+            Effect::TableUpdate { table, filter, values }
+        }
+        "delete" => Effect::TableDelete { table, filter: str_field(b, "filter")?.to_string() },
+        "add_columns" => Effect::TableAddColumns { table, columns: string_list(b.get("columns")) },
+        "append_only" => Effect::TableAppendOnly { table },
+        "purge" => Effect::TablePurge { table, column: str_field(b, "column")?.to_string(), before: str_field(b, "before")?.to_string() },
+        other => return Err(Status::invalid_argument(format!("unknown table operation {other:?}"))),
+    })
+}
+
+/// A refusal with its stable code (DB-18) in the `adb-code` metadata: from the
+/// message, else from the gRPC status (permission denied, unauthenticated).
+fn with_code(mut s: Status) -> Status {
+    let code = match adb_core::codes::code_of(s.message()) {
+        "internal" => match s.code() {
+            tonic::Code::PermissionDenied => "forbidden",
+            tonic::Code::Unauthenticated => "unauthorized",
+            tonic::Code::NotFound => "not_found",
+            tonic::Code::Unimplemented => "unsupported",
+            _ => "internal",
+        },
+        c => c,
+    };
+    if let Ok(v) = code.parse() {
+        s.metadata_mut().insert("adb-code", v);
+    }
+    s
 }
 
 #[tonic::async_trait]
@@ -578,47 +728,21 @@ impl FlightService for AdbFlight {
     }
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        let access = access(&req);
-        let pool = req.extensions().get::<crate::auth::EnginePool>().cloned();
-        let a = req.into_inner();
-        if a.r#type.starts_with("engine") {
-            if access == Access::Memory {
-                return Err(Status::permission_denied("FlowR's engine store needs the engine token (ADB_ENGINE_TOKEN)"));
-            }
-            let b = body(&a.body)?;
-            if let Some(crate::auth::EnginePool(p)) = &pool {
-                crate::auth::pool_allows(p, &a.r#type, &b).map_err(Status::permission_denied)?;
-            }
-            if a.r#type == "engine_subscribe" {
-                return Ok(Response::new(self.engine_subscribe(&b)?));
-            }
-            if a.r#type == "engine_restore" {
-                let space = str_field(&b, "space")?;
-                let changes = b.get("changes").and_then(|c| c.as_array()).cloned().ok_or_else(|| Status::invalid_argument("engine_restore needs changes"))?;
-                let first = b.get("first").and_then(|f| f.as_bool()).unwrap_or(false);
-                let n = self.engine.engine_restore(space, changes, first).await.map_err(Status::failed_precondition)?;
-                let r = arrow_flight::Result { body: json!({ "restored": n }).to_string().into() };
-                return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
-            }
-            if a.r#type != "engine" {
-                return Err(Status::invalid_argument(format!("unknown action {}", a.r#type)));
-            }
-            let r = arrow_flight::Result { body: self.engine_op(&b).await?.to_string().into() };
-            return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
-        }
-        if access == Access::Engine {
-            return Err(Status::permission_denied("the engine token opens only FlowR's engine store"));
-        }
-        let answer = self.action(&a.r#type, body(&a.body)?).await?;
-        let r = arrow_flight::Result { body: answer.to_string().into() };
-        Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
+        self.do_action_inner(req).await.map_err(with_code)
     }
+
+
 
     async fn list_actions(&self, _: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
         let actions = [
             ("create_table", "Create a platform table: {table, columns? | schema?}"),
             ("update", "Set values on matching rows: {table, filter, values}"),
             ("delete", "Delete matching rows: {table, filter}"),
+            ("transaction", "Several table operations as one record (DB-6): {ops: [{op, table, …}]}; op = insert | upsert | update | delete | create_table | add_columns | append_only | purge"),
+            ("table_changes", "Platform-table change feed (DB-5): {from?, tables?, max?, wait_ms?} → {changes, reset, next, tip}; reset: reload, then follow from next"),
+            ("add_columns", "Add UTF-8 columns to a table (DB-6): {table, columns}"),
+            ("append_only", "Make a table append-only (DB-13): {table}; also create_table {append_only: true}"),
+            ("purge", "Retention (DB-13): delete rows whose {column} is before {before}: {table, column, before}"),
             ("compact", "Compact the memory table and platform tables now: drop forgotten / expired / deleted data and old history (W5)"),
             ("list_tables", "Platform table names"),
             ("replace_table", "Replace a table with an empty one: {table, columns}"),

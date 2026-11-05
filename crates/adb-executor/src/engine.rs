@@ -114,6 +114,11 @@ pub trait Engine: Send + Sync {
         Err("platform tables need a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// Several platform-table writes as one transaction (DB-6): one log record.
+    async fn platform_write_many(&self, _effects: Vec<adb_core::log::Effect>) -> Result<u64, String> {
+        Err("platform tables need a durable engine (start ADB with --data-dir)".into())
+    }
+
     /// Continuous queries (MVP W6), for engines with a log.
     fn watcher(&self) -> Option<Arc<adb_cq::Watcher>> {
         None
@@ -996,6 +1001,13 @@ impl Engine for LocalEngine {
         let source = self.as_parent_source().ok_or("cloning a memory space needs a durable engine (start ADB with --data-dir)")?;
         let n = self.materialise_from(source, namespace, into).await?;
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
+    }
+
+    async fn platform_write_many(&self, effects: Vec<adb_core::log::Effect>) -> Result<u64, String> {
+        match &self.platform {
+            Some((_, writes)) => writes.platform_many(effects).await.map_err(|e| e.to_string()),
+            None => Err("platform tables need a durable engine (start ADB with --data-dir)".into()),
+        }
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
