@@ -44,7 +44,7 @@ pub async fn open(dir: &std::path::Path, c: BranchConfig) -> Result<Arc<dyn Engi
     // The parent is main, or another branch hosted in the org's process.
     let parent_branch = (b.parent != adb_executor::branches::MAIN).then(|| b.parent.clone());
     let source = Arc::new(FlightParentSource { url: c.org.clone(), token: c.token.clone(), branch: parent_branch });
-    let view = ParentView { source, namespace: b.namespace.clone(), branch: b.name.clone(), point: b.point() };
+    let view = ParentView { source, namespace: b.namespace.clone(), branch: b.name.clone(), point: b.point().into() };
     let (engine, replayed) = LocalEngine::durable_branch(dir, view).await?;
     tracing::info!(branch = %b.id, org = %c.org, point_ts = b.point_ts, records = replayed.records, "ADB branch engine open (own pod)");
     // DB-20: a new pod's first record names where the branch came from.

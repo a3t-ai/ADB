@@ -1,7 +1,9 @@
 # Merges, conflicts and memory points (phase 2 ADB: DB-7, DB-10, DB-11, DB-19, DB-20)
 
-Status 5 Nov: DB-7, DB-20, DB-10, DB-19 built (`adb-executor/src/merge.rs`, `tests/merge.rs`,
-`adb-server/tests/merge_flight.rs`). DB-11 (rebase, promote gate, history layer) next.
+Status 5 Nov: DB-7, DB-20, DB-10, DB-19, DB-11 built (`adb-executor/src/merge.rs`,
+`tests/merge.rs`, `adb-server/tests/merge_flight.rs`). **The "As built" section at the end is
+the contract; where it differs from the design text, it wins.** D7 (kind 1 must rebase) is
+still open: the promote gate is on, and flipping it is one default.
 
 5 Nov 2026. Plan: claude.ai doc "A3T core features — ADB and platform plan" (§ Two merges
 and their conflicts). Decisions D1 (episodes), D3/D4 (one cluster, non-prod pod), D7–D9
@@ -86,3 +88,47 @@ never shadowed; reads merge them after the space's own episodes.
 ## Codes
 
 `merge_conflicts`, `merge_stale`, `merge_not_found`, `revert_conflicts`.
+
+## As built: the contract for callers
+
+Flight actions (FlowR's REST passes through to them). Refusals are gRPC errors: the message
+is a sentence, the code is in `adb-code` metadata (`.ai/ERROR_CODES.md`).
+
+| Action | Request | Answer |
+|---|---|---|
+| `branch_conflicts` | `{namespace, name, memories?}` (default SEMANTIC, PROCEDURAL, TOOLS) | `{base: {offset, ts}, main: {offset, ts}, clean: [Change], conflicts: [Conflict]}` |
+| `branch_merge` | `{namespace, name, memories?` (default PROCEDURAL)`, main_offset, resolutions?, merged_by?}` | `{merge_id, offset, changed, added, ended}` |
+| `branch_rebase` | `{namespace, name, main_offset, resolutions?}` | `{point: {offset, ts}, kept, dropped, edited}` |
+| `branch_promote` | `{namespace, name, into, allow_stale?}` | `{namespace, records, from: {namespace, branch}}` |
+| `merge_revert` | `{namespace, merge_id, reverted_by?, force_skip?}` | `{reverted, skipped: [lineage], offset}` |
+
+- `Change`: `{memory, lineage, key, change: "add" | "change" | "forget", branch}`.
+- `Conflict`: `{memory, lineage, key, type: "edit_edit" | "add_add" | "edit_forget", base, main,
+  branch}`.
+- `Resolution`: `{lineage, memory, take: "branch" | "main" | "edit", value?}`; `value` is
+  required for `edit`. `memory` is `"SEMANTIC"`, `"PROCEDURAL"` or `"TOOLS"`.
+
+What callers must know:
+
+- **`lineage` is opaque.** It carries the memory prefix (`procedural:ops|~refund`). Send it back
+  unchanged in a resolution; show `key` to people. `key` can be null.
+- **`base`, `main` and `branch` are stored payloads**, not RECALL's shaped records: PROCEDURAL
+  `steps` is as written (often a string), while RECALL returns it as a list. Render both.
+  `base` is null for `add_add`; `branch` is null for `edit_forget`. Ts values are µs.
+- **`merge_conflicts` and `merge_stale` answer with a sentence, not a list or a new diff.** On
+  either, call `branch_conflicts` again; pass its `main.offset` as `main_offset`.
+- `branch_promote` is refused with `merge_conflicts` while main and the branch both changed a
+  record, and with `merge_stale` while main changed anything since the point (rebase first,
+  or `allow_stale: true`). Branches of another branch skip this check.
+- Only branches of `main` can be diffed, merged or rebased (`unsupported`). A branch in its own
+  pod can't be rebased (`branch_pod_unsupported`).
+- A merge makes changes only to main; the branch stays until dropped. A kind 2 merge's
+  `Expire` is a soft end: a merged forget doesn't erase, and FORGET stays the only erasure.
+- `merge_revert` of a merge already reverted answers `merge_not_found`.
+- Promote is several steps, not one record (copy, tag on the old space, layers, origin record).
+  A crash between them leaves the new space without its history layer; retrying is refused
+  (`target_not_empty`). Known limit.
+- History layers (`mode: "history"`) read the old space's EPISODIC as of tag
+  `promoted-<into>`. FORGET in the old space reaches them, since they aren't copies. They come
+  back in `layers_get`, so a UI should list them as history, not as inherited knowledge.
+- Layers of the old space are copied to the new agent as they are at promote.

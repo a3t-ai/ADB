@@ -69,7 +69,7 @@ pub fn code_of(message: &str) -> &'static str {
         "tag_exists"
     } else if has(" has no tag ") || has("needs a tag") {
         if has("pinning") { "layer_invalid" } else { "tag_not_found" }
-    } else if has("layers are one level deep") || has("can't be a layer of itself") || has("a layer carries") || has("layer space ") {
+    } else if has("layers are one level deep") || has("can't be a layer of itself") || has("a layer carries") || has("layer space ") || has("a history layer of") {
         "layer_invalid"
     } else if has("already has a branch") {
         "branch_exists"
@@ -230,6 +230,8 @@ mod tests {
         ("Query execution error: merge_stale: main changed 1 since the conflicts were read: a", "merge_stale"),
         ("merge_not_found: no merge \"m1\" in namespace \"crm\"", "merge_not_found"),
         ("revert_conflicts: 1 records changed since the merge: a (force_skip reverts the rest)", "revert_conflicts"),
+        ("Query execution error: a history layer of \"bot\" carries EPISODIC only and isn't sealed", "layer_invalid"),
+        ("branch \"try\" runs in its own pod: rebasing one isn't supported yet (B6)", "branch_pod_unsupported"),
         ("Internal error: store: disk full", "internal"),
     ];
 

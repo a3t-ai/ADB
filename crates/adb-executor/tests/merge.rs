@@ -111,3 +111,70 @@ async fn memory_points_origin_conflicts_merge_and_revert() {
     assert_eq!(r["skipped"].as_array().unwrap().len(), 1, "{r}");
     assert!(procs(&e).await.contains(&"a-later".to_string()), "the record changed since is left as it is");
 }
+
+/// DB-11, kind 1: promote is refused while the branch has conflicts or is behind main;
+/// a rebase settles the conflicts (edit, keep main) and carries main's newer memory; the
+/// new agent starts its own episodes, reads the old agent's as of the promote, read-only,
+/// and its first record names its origin.
+#[tokio::test]
+async fn rebase_then_promote_as_a_new_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let steps = |ns: &'static str, b: Option<&'static str>| {
+        let e = &e;
+        async move {
+            let on = b.map(|b| format!(r#" BRANCH "{b}""#)).unwrap_or_default();
+            values(&e.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{ns}"{on} LIMIT 100"#), None).await.unwrap(), "steps")
+        }
+    };
+    for k in ["p1", "p2", "p3"] {
+        q(&e, &format!(r#"STORE INTO PROCEDURAL (key = "{k}", steps = "{k}-v1") NAMESPACE "bot""#)).await;
+    }
+    q(&e, r#"STORE INTO EPISODIC (event = "said hello") NAMESPACE "bot""#).await;
+    e.branch_create("bot", "try", None, None).await.unwrap();
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p1" (steps = "p1-branch") NAMESPACE "bot" BRANCH "try""#).await;
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p3" (steps = "p3-branch") NAMESPACE "bot" BRANCH "try""#).await;
+    // Main moves: two conflicts (p1, p3) and one clean fix (p2).
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p1" (steps = "p1-main") NAMESPACE "bot""#).await;
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-main") NAMESPACE "bot""#).await;
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p3" (steps = "p3-main") NAMESPACE "bot""#).await;
+
+    let err = e.branch_promote("bot", "try", "bot-v2", false).await.unwrap_err();
+    assert!(err.starts_with("merge_conflicts:"), "{err}");
+    let d = e.branch_conflicts("bot", "try", &[MemoryType::Procedural]).await.unwrap();
+    let off = d["main"]["offset"].as_u64().unwrap();
+    let lineage = |key: &str| d["conflicts"].as_array().unwrap().iter().find(|c| c["key"] == key).unwrap()["lineage"].as_str().unwrap().to_string();
+    let err = e.branch_rebase("bot", "try", off, vec![]).await.unwrap_err();
+    assert!(err.starts_with("merge_conflicts:"), "{err}");
+
+    let r = e.branch_rebase("bot", "try", off, vec![
+        Resolution { lineage: lineage("p1"), memory: MemoryType::Procedural, take: "edit".into(), value: Some(json!({ "key": "p1", "steps": "p1-edited" })) },
+        Resolution { lineage: lineage("p3"), memory: MemoryType::Procedural, take: "main".into(), value: None },
+    ]).await.unwrap();
+    assert_eq!((r["edited"].clone(), r["dropped"].clone()), (json!(1), json!(1)), "{r}");
+    assert_eq!(steps("bot", Some("try")).await, ["p1-edited", "p2-main", "p3-main"], "the branch carries main's fix and the settled conflicts");
+    let d = e.branch_conflicts("bot", "try", &[MemoryType::Procedural]).await.unwrap();
+    assert_eq!(d["conflicts"].as_array().unwrap().len(), 0, "{d}");
+
+    // Promote: the new agent has the rebased view, its own origin record, the old episodes.
+    let p = e.branch_promote("bot", "try", "bot-v2", false).await.unwrap();
+    assert_eq!(p["records"], json!(3), "{p}");
+    assert_eq!(steps("bot-v2", None).await, ["p1-edited", "p2-main", "p3-main"]);
+    assert_eq!(steps("bot", None).await, ["p1-main", "p2-main", "p3-main"], "the old agent is untouched");
+    q(&e, r#"STORE INTO EPISODIC (event = "old agent later") NAMESPACE "bot""#).await;
+    q(&e, r#"STORE INTO EPISODIC (event = "new agent said hi") NAMESPACE "bot-v2""#).await;
+    let eps = values(&q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "bot-v2" LIMIT 100"#).await, "event");
+    assert_eq!(eps, ["new agent said hi", "promoted_from", "said hello"], "own episodes, the origin, and the old agent's as of the promote");
+    let old = values(&q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "bot" LIMIT 100"#).await, "event");
+    assert_eq!(old, ["old agent later", "said hello"], "a new agent's episodes don't reach the old one");
+
+    // Behind main with no conflict: refused unless allow_stale.
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-newer") NAMESPACE "bot""#).await;
+    e.branch_create("bot", "behind", None, None).await.unwrap();
+    q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-main-again") NAMESPACE "bot""#).await;
+    let err = e.branch_promote("bot", "behind", "bot-v3", false).await.unwrap_err();
+    assert!(err.starts_with("merge_stale:"), "behind main, no conflict: {err}");
+    let p = e.branch_promote("bot", "behind", "bot-v3", true).await.unwrap();
+    assert_eq!(p["records"], json!(3), "allow_stale promotes the branch as it is: {p}");
+    assert_eq!(steps("bot-v3", None).await, ["p1-main", "p2-newer", "p3-main"]);
+}

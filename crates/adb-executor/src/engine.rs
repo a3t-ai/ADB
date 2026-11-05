@@ -61,7 +61,7 @@ pub trait Engine: Send + Sync {
     /// B5: promote branch `name` of `namespace` as a new agent in namespace `into`
     /// (its view of SEMANTIC, PROCEDURAL and TOOLS, materialised in production); the
     /// original agent and the branch are unchanged. `{namespace, records, from}`.
-    async fn branch_promote(&self, _namespace: &str, _name: &str, _into: &str) -> Result<Value, String> {
+    async fn branch_promote(&self, _namespace: &str, _name: &str, _into: &str, _allow_stale: bool) -> Result<Value, String> {
         Err("memory branches need a durable engine (start ADB with --data-dir)".into())
     }
     /// B5: clone `namespace` (main, now) as a new agent in namespace `into`.
@@ -78,6 +78,11 @@ pub trait Engine: Send + Sync {
     /// main, with `resolutions` for every conflict; refused when main moved past
     /// `main_offset`. `{merge_id, offset, changed, added, ended}`.
     async fn branch_merge(&self, _namespace: &str, _name: &str, _memories: &[MemoryType], _main_offset: u64, _resolutions: Vec<crate::merge::Resolution>, _by: Option<&str>) -> Result<Value, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    /// DB-11: move the branch point to main now, settling each conflict in the branch:
+    /// `main` drops the branch's change, `edit` writes the value, `branch` keeps it.
+    async fn branch_rebase(&self, _namespace: &str, _name: &str, _main_offset: u64, _resolutions: Vec<crate::merge::Resolution>) -> Result<Value, String> {
         Err("memory branches need a durable engine (start ADB with --data-dir)".into())
     }
     /// DB-19: undo merge `merge_id`; records changed since are conflicts (refused
@@ -531,11 +536,13 @@ impl LocalEngine {
         let view_src = host.source(namespace, name).await?;
         let main_point = d.point().await;
         let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let mut w = ThreeWay { branch: branch.clone(), main_point, clean: Vec::new(), conflicts: Vec::new(), main: Default::default(), view: Default::default() };
+        let mut w = ThreeWay { behind: 0, branch: branch.clone(), main_point, clean: Vec::new(), conflicts: Vec::new(), main: Default::default(), view: Default::default() };
         for m in memories {
             let base = parent.rows_as_of(*m, namespace, branch.point()).await.map_err(|e| e.to_string())?;
             let main = parent.rows_as_of(*m, namespace, now).await.map_err(|e| e.to_string())?;
             let view = view_src.rows_as_of(*m, namespace, now).await.map_err(|e| e.to_string())?;
+            let base_ids: std::collections::HashMap<&str, &str> = base.iter().map(|r| (r.lineage_id.as_str(), r.id.as_str())).collect();
+            w.behind += main.iter().filter(|r| base_ids.get(r.lineage_id.as_str()) != Some(&r.id.as_str())).count();
             let (c, k) = crate::merge::diff(*m, &base, &main, &view);
             w.clean.extend(c);
             w.conflicts.extend(k);
@@ -1045,11 +1052,91 @@ impl Engine for LocalEngine {
         d.forget_lineages(memory, lineages).await.map_err(|e| e.to_string())
     }
 
-    async fn branch_promote(&self, namespace: &str, name: &str, into: &str) -> Result<Value, String> {
+    async fn branch_promote(&self, namespace: &str, name: &str, into: &str, allow_stale: bool) -> Result<Value, String> {
         let host = self.branch_host.as_ref().ok_or("branches are promoted on the org's engine")?;
+        let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
+        let branch = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
+        // DB-11: a copy of a branch that is behind main would drop main's newer memory.
+        if !allow_stale && branch.parent == crate::branches::MAIN {
+            let w = self.three_way(namespace, name, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools]).await?;
+            if !w.conflicts.is_empty() {
+                return Err(format!("merge_conflicts: {} records changed on both main and the branch: {}: rebase first", w.conflicts.len(), w.conflicts.iter().map(|c| c.lineage.as_str()).collect::<Vec<_>>().join(", ")));
+            }
+            if w.behind > 0 {
+                return Err(format!("merge_stale: main changed {} records since the branch point: rebase first (allow_stale promotes without them)", w.behind));
+            }
+        }
         let source = host.source(namespace, name).await?;
         let n = self.materialise_from(source, namespace, into).await?;
+        // D1: the new agent carries the old one's layers, reads its episodes as of now,
+        // read-only, and its first record says where it came from.
+        let old_layers = d.branches().layers_of(namespace);
+        let safe: String = into.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).take(55).collect();
+        let tag = format!("promoted-{safe}");
+        d.tag_create(namespace, &tag, None).await.map_err(|e| e.to_string())?;
+        let mut layers = vec![crate::branches::Layer { space: namespace.to_string(), mode: crate::branches::LayerMode::History, tag: Some(tag), memories: vec![MemoryType::Episodic], sealed: false }];
+        layers.extend(old_layers);
+        d.layers_set(into, layers).await.map_err(|e| e.to_string())?;
+        let s = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
+        let aql = format!(
+            "STORE INTO EPISODIC (event = \"promoted_from\", from_namespace = {}, from_branch = {}, point_offset = \"{}\", point_ts = \"{}\") NAMESPACE {}",
+            s(namespace), s(name), branch.point_offset, branch.point_ts, s(into)
+        );
+        self.query(&aql, None).await?;
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
+    }
+
+    async fn branch_rebase(&self, namespace: &str, name: &str, main_offset: u64, resolutions: Vec<crate::merge::Resolution>) -> Result<Value, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        let host = self.branch_host.as_ref().ok_or("branches are rebased on the org's engine")?;
+        if host.placement(namespace, name).is_some() {
+            return Err(format!("branch {name:?} runs in its own pod: rebasing one isn't supported yet (B6)"));
+        }
+        let w = self.three_way(namespace, name, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools]).await?;
+        let res: std::collections::HashMap<&str, &crate::merge::Resolution> = resolutions.iter().map(|r| (r.lineage.as_str(), r)).collect();
+        let open: Vec<&str> = w.conflicts.iter().filter(|c| !res.contains_key(c.lineage.as_str())).map(|c| c.lineage.as_str()).collect();
+        if !open.is_empty() {
+            return Err(format!("merge_conflicts: {} conflicts have no resolution: {}", open.len(), open.join(", ")));
+        }
+        let engine = host.engine(namespace, name).await?;
+        let bd = engine.durable_writes().ok_or("a branch engine is durable")?;
+        let (mut kept, mut dropped, mut edited) = (0, 0, 0);
+        for c in &w.conflicts {
+            if let Some(m) = w.main.get(&c.lineage) {
+                if m.log_offset > main_offset {
+                    return Err(format!("merge_stale: main changed {} at offset {} after {main_offset}: read the conflicts again", c.lineage, m.log_offset));
+                }
+            }
+        }
+        for c in &w.conflicts {
+            let r = res[c.lineage.as_str()];
+            match r.take.as_str() {
+                "branch" => kept += 1,
+                "main" => {
+                    bd.forget_lineages(c.memory, &[adb_store::key_of(&c.lineage).to_string()]).await.map_err(|e| e.to_string())?;
+                    dropped += 1;
+                }
+                "edit" => {
+                    let value = r.value.clone().ok_or_else(|| format!("resolution for {}: an edit needs a value", c.lineage))?;
+                    let template = w.main.get(&c.lineage).or_else(|| w.view.get(&c.lineage)).ok_or_else(|| format!("resolution for {}: no row to edit", c.lineage))?;
+                    bd.branch_set_row(c.memory, &c.lineage, value, template).await.map_err(|e| e.to_string())?;
+                    edited += 1;
+                }
+                other => return Err(format!("resolution for {}: take is branch, main or edit, not {other:?}", c.lineage)),
+            }
+        }
+        // The new point: what the diff read as main. The live engine moves with it.
+        let (off, ts) = w.main_point;
+        d.branch_change(namespace, name, |b| {
+            b.point_offset = off;
+            b.point_ts = ts.0;
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some(p) = engine.parent.as_ref() {
+            p.point.set(ts);
+        }
+        Ok(json!({ "point": { "offset": off, "ts": ts.0 }, "kept": kept, "dropped": dropped, "edited": edited }))
     }
 
     async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {
@@ -1232,6 +1319,8 @@ fn is_write(aql: &str) -> bool {
 
 /// DB-10's inputs and diff (see `LocalEngine::three_way`).
 struct ThreeWay {
+    /// Main's records added or changed since the branch point.
+    behind: usize,
     branch: crate::branches::Branch,
     main_point: (u64, adb_core::log::CommitTs),
     clean: Vec<crate::merge::Change>,

@@ -700,21 +700,29 @@ impl<L: Log + 'static> DurableWrites<L> {
             if !adb_store::valid_namespace(&l.space) {
                 return Err(AdbError::QueryError(format!("layer space {:?}: not a valid namespace", l.space)));
             }
-            if !self.branches.layers_of(&l.space).is_empty() {
+            // D1: a promoted agent's history reaches back through its predecessors, so a
+            // history layer may name a space that has layers.
+            let history = l.mode == LayerMode::History;
+            if !history && !self.branches.layers_of(&l.space).is_empty() {
                 return Err(AdbError::QueryError(format!("{:?} has layers of its own: layers are one level deep (B7)", l.space)));
             }
-            if let Some(m) = l.memories.iter().find(|m| !matches!(m, MemoryType::Semantic | MemoryType::Procedural | MemoryType::Tools)) {
+            if history && (l.sealed || l.memories != [MemoryType::Episodic]) {
+                return Err(AdbError::QueryError(format!("a history layer of {:?} carries EPISODIC only and isn't sealed", l.space)));
+            }
+            if let Some(m) = l.memories.iter().find(|m| !history && !matches!(m, MemoryType::Semantic | MemoryType::Procedural | MemoryType::Tools)) {
                 return Err(AdbError::QueryError(format!("a layer carries SEMANTIC, PROCEDURAL or TOOLS, not {m:?}")));
             }
             match (l.mode, &l.tag) {
-                (LayerMode::Pin, None) => return Err(AdbError::QueryError(format!("pinning {:?} needs a tag", l.space))),
-                (LayerMode::Pin, Some(t)) if self.branches.tag(&l.space, t).is_none() => {
+                (LayerMode::Pin, None) | (LayerMode::History, None) => return Err(AdbError::QueryError(format!("pinning {:?} needs a tag", l.space))),
+                (LayerMode::Pin, Some(t)) | (LayerMode::History, Some(t)) if self.branches.tag(&l.space, t).is_none() => {
                     return Err(AdbError::QueryError(format!("{:?} has no tag {t:?}", l.space)));
                 }
                 _ => {}
             }
         }
-        if !self.branches.layered_by(namespace).is_empty() && !layers.is_empty() {
+        // A layer space stays flat, history layers aside (they name predecessors).
+        let layered = self.branches.layered_by(namespace).iter().any(|by| self.branches.layers_of(by).iter().any(|l| l.space == namespace && l.mode != LayerMode::History));
+        if layered && layers.iter().any(|l| l.mode != LayerMode::History) {
             return Err(AdbError::QueryError(format!("{namespace:?} is a layer of another space: layers are one level deep (B7)")));
         }
         let mut seq = self.seq.lock().await;
@@ -751,7 +759,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub fn layer_point(&self, l: &crate::branches::Layer) -> Option<CommitTs> {
         match l.mode {
             crate::branches::LayerMode::Mount => None,
-            crate::branches::LayerMode::Pin => l.tag.as_ref().and_then(|t| self.branches.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
+            crate::branches::LayerMode::Pin | crate::branches::LayerMode::History => l.tag.as_ref().and_then(|t| self.branches.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
         }
     }
 
@@ -950,6 +958,38 @@ impl<L: Log + 'static> DurableWrites<L> {
         self.live.lock().unwrap().extend(keys);
         self.to_store(&record, seq.log()).await;
         Ok((record.offset.0, after))
+    }
+
+    /// DB-11: on a branch engine, make `value` the branch's own row of `lineage` (a
+    /// rebase's edited resolution): a new version of its own row, or its first own row
+    /// over the parent's (`template`).
+    pub async fn branch_set_row(&self, memory: MemoryType, lineage: &str, value: serde_json::Value, template: &adb_store::StoredRow) -> AdbResult<u64> {
+        let Some(store) = &self.store else { return Err(needs_table("rebase")) };
+        let key = adb_store::key_of(lineage).to_string();
+        let mut seq = self.seq.lock().await;
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let ts = seq.begin();
+        let own = store.current_version(memory.into(), &key, ts).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        let mut data = own.as_ref().unwrap_or(template).data.clone();
+        data.text = value.get("content").and_then(|c| c.as_str()).map(String::from);
+        data.value = value;
+        data.embedding = None;
+        let version = own.as_ref().unwrap_or(template).version + 1;
+        let new = NewRow { id: seq.new_id(ts), lineage_id: RecordId(key), version, data };
+        let effect = match &own {
+            Some(o) => Effect::Supersede { old: RecordId(adb_store::key_of(&o.id).to_string()), new },
+            None => match new.data.kind {
+                Kind::Fact => Effect::PutFact(new),
+                Kind::Tool => Effect::PutTool(new),
+                Kind::Episode => Effect::PutEpisode(new),
+                _ => Effect::PutEntity(new),
+            },
+        };
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.to_store(&record, seq.log()).await;
+        Ok(record.offset.0)
     }
 
     /// The org's branch engines (B4): a FORGET on main erases their copies too.

@@ -82,6 +82,9 @@ impl Tag {
 pub enum LayerMode {
     Mount,
     Pin,
+    /// D1 (DB-11): the episodes of the agent this one was promoted from, read-only, as
+    /// of a tag. EPISODIC only, never sealed, never written.
+    History,
 }
 
 /// One inherited layer of a memory space.

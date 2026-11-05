@@ -202,7 +202,7 @@ async fn promote_a_branch_as_a_new_agent_and_clone_main() {
     // Main moves on after the point: not in the promoted agent.
     q(r#"STORE INTO SEMANTIC (key = "d", fact = "d1") NAMESPACE "crm""#.into()).await;
 
-    let p = e.branch_promote("crm", "try", "crm-v2").await.unwrap();
+    let p = e.branch_promote("crm", "try", "crm-v2", true).await.unwrap();
     assert_eq!(p["namespace"], "crm-v2");
     let in_ns = |ns: &'static str| {
         let e = &e;
@@ -211,17 +211,21 @@ async fn promote_a_branch_as_a_new_agent_and_clone_main() {
     assert_eq!(in_ns("crm-v2").await, ["a1", "b-try", "e1"], "the branch's view");
     assert_eq!(main(&e).await, ["a1", "b1", "c1", "d1"], "the original agent unchanged");
     assert_eq!(on(&e, "try").await, ["a1", "b-try", "e1"], "the branch unchanged");
-    // The new agent is a normal space: keyed lookups, its own fact and entity, its procedure, no episodes.
+    // The new agent is a normal space: keyed lookups, its own fact and entity, its procedure.
     assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "b" NAMESPACE "crm-v2""#.into()).await, "fact"), ["b-try"]);
     assert_eq!(values(&q(r#"RECALL FROM SEMANTIC WHERE subject = "user:alice" NAMESPACE "crm-v2""#.into()).await, "value"), ["pro"]);
     assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "user:alice" NAMESPACE "crm-v2""#.into()).await, "key"), ["user:alice"]);
     assert_eq!(q(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm-v2""#.into()).await.pointer("/data/count").and_then(|c| c.as_u64()), Some(1));
-    assert_eq!(q(r#"RECALL FROM EPISODIC ALL NAMESPACE "crm-v2""#.into()).await.pointer("/data/count").and_then(|c| c.as_u64()), Some(0), "episodes stay with the original agent");
+    // D1: episodes stay with the original agent; the new one reads them through a history
+    // layer (not a copy), beside its own origin record.
+    let eps = q(r#"RECALL FROM EPISODIC ALL NAMESPACE "crm-v2""#.into()).await;
+    assert_eq!(eps.pointer("/data/count").and_then(|c| c.as_u64()), Some(2), "{eps}");
+    assert_eq!(values(&eps, "event").iter().filter(|e| *e == "promoted_from").count(), 1, "{eps}");
     // Writes to the new agent leave the original alone.
     q(r#"UPDATE INTO SEMANTIC WHERE key = "a" (fact = "a-v2") NAMESPACE "crm-v2""#.into()).await;
     assert_eq!(main(&e).await, ["a1", "b1", "c1", "d1"]);
-    assert!(e.branch_promote("crm", "try", "crm-v2").await.is_err(), "into a new namespace only");
-    assert!(e.branch_promote("crm", "try", "crm").await.is_err());
+    assert!(e.branch_promote("crm", "try", "crm-v2", true).await.is_err(), "into a new namespace only");
+    assert!(e.branch_promote("crm", "try", "crm", true).await.is_err());
 
     let c = e.space_clone("crm", "crm-copy").await.unwrap();
     assert!(c["records"].as_u64().unwrap() >= 6, "{c}");

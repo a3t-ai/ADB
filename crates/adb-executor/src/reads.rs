@@ -226,7 +226,7 @@ impl LanceReads {
         };
         let point = |l: &crate::branches::Layer| match l.mode {
             crate::branches::LayerMode::Mount => Some(now),
-            crate::branches::LayerMode::Pin => l.tag.as_ref().and_then(|t| reg.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
+            crate::branches::LayerMode::Pin | crate::branches::LayerMode::History => l.tag.as_ref().and_then(|t| reg.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
         };
         let mut sources = Vec::new();
         for l in layers.iter().filter(|l| l.sealed) {

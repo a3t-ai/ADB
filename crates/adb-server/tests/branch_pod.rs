@@ -39,7 +39,7 @@ async fn start_pod(dir: &std::path::Path, org: &str, port: u16) -> (Arc<dyn Engi
     let b: Vec<adb_executor::branches::Branch> = serde_json::from_value(list["branches"].clone()).unwrap();
     let b = b.into_iter().find(|b| b.name == "pod-try").unwrap();
     let source = Arc::new(FlightParentSource { url: org.into(), token: None, branch: None });
-    let view = ParentView { source, namespace: "crm".into(), branch: "pod-try".into(), point: b.point() };
+    let view = ParentView { source, namespace: "crm".into(), branch: "pod-try".into(), point: b.point().into() };
     let (engine, _) = LocalEngine::durable_branch(dir, view).await.unwrap();
     let pending = flight_action(org, None, "branch_pending", json!({ "namespace": "crm", "name": "pod-try" })).await.unwrap();
     let forgets: Vec<adb_executor::branches::PendingForget> = serde_json::from_value(pending["forgets"].clone()).unwrap();
@@ -118,7 +118,7 @@ async fn a_branch_in_its_own_pod() {
     assert_eq!(pending["forgets"].as_array().map(|a| a.len()), Some(0));
 
     // Promote the pod branch as a new agent.
-    let p = org.branch_promote("crm", "pod-try", "crm-v2").await.unwrap();
+    let p = org.branch_promote("crm", "pod-try", "crm-v2", true).await.unwrap();
     assert_eq!(p["records"], 2, "{p}");
     assert_eq!(facts(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm-v2" LIMIT 100"#).await.unwrap()), ["a1", "e1"]);
     assert!(org.branch_create("crm", "child", Some("pod-try"), None).await.is_err(), "no hosted branch on a pod branch (yet)");

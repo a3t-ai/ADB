@@ -37,8 +37,28 @@ pub struct ParentView {
     pub source: Arc<dyn ParentSource>,
     pub namespace: String,
     pub branch: String,
-    /// The branch point: the parent is read as it was at this commit time.
-    pub point: CommitTs,
+    /// The branch point: the parent is read as it was at this commit time. A rebase
+    /// (DB-11) moves it in the live engine.
+    pub point: SharedPoint,
+}
+
+/// A branch point every holder of a [`ParentView`] sees move.
+#[derive(Clone, Debug)]
+pub struct SharedPoint(Arc<std::sync::atomic::AtomicI64>);
+
+impl SharedPoint {
+    pub fn get(&self) -> CommitTs {
+        CommitTs(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    pub fn set(&self, ts: CommitTs) {
+        self.0.store(ts.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl From<CommitTs> for SharedPoint {
+    fn from(ts: CommitTs) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicI64::new(ts.0)))
+    }
 }
 
 fn ns_filter(namespace: &str) -> String {
@@ -86,7 +106,7 @@ impl ParentSource for BranchSource {
         let now = CommitTs::from_datetime(time::now());
         let own = rows_at(&self.store, memory, namespace, at, now).await?;
         // The grandparent as it was at this branch's own point (never later than `at`).
-        let up = self.parent.source.rows_as_of(memory, namespace, self.parent.point).await?;
+        let up = self.parent.source.rows_as_of(memory, namespace, self.parent.point.get()).await?;
         Ok(overlay(own, up).into_iter().map(|(r, _)| r).collect())
     }
 }
@@ -116,7 +136,7 @@ pub fn overlay(own: Vec<StoredRow>, parent: Vec<StoredRow>) -> Vec<(StoredRow, b
 pub async fn view(store: &PartitionStore, barrier: &Option<Arc<ApplyBarrier>>, parent: &ParentView, memory: MemoryType, now: CommitTs) -> AdbResult<Vec<(StoredRow, bool)>> {
     wait(barrier).await;
     let own = rows_at(store, memory, &parent.namespace, now, now).await?;
-    let up = parent.source.rows_as_of(memory, &parent.namespace, parent.point).await?;
+    let up = parent.source.rows_as_of(memory, &parent.namespace, parent.point.get()).await?;
     Ok(overlay(own, up))
 }
 
@@ -242,7 +262,7 @@ impl BranchHost {
         let mut source: Arc<dyn ParentSource> = Arc::clone(&self.org);
         let mut last = None;
         for b in chain.iter().rev() {
-            let view = ParentView { source: Arc::clone(&source), namespace: b.namespace.clone(), branch: b.name.clone(), point: b.point() };
+            let view = ParentView { source: Arc::clone(&source), namespace: b.namespace.clone(), branch: b.name.clone(), point: b.point().into() };
             let engine = {
                 let mut engines = self.engines.lock().await;
                 match engines.get(&b.id) {
