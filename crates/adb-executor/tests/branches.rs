@@ -20,7 +20,8 @@ async fn a_branch_is_one_record_at_the_log_position_and_survives_a_restart() {
         assert!(b.point_offset >= 5, "the point is the log position at creation: {b:?}");
         // No memory row was added or changed by the branch.
         assert_eq!(engine.stats().await.unwrap(), before);
-        assert_eq!(engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap(), recall);
+        // (The records; the answer's memory point moves with the log, DB-7.)
+        assert_eq!(engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap()["data"], recall["data"]);
         // A child of the branch; checks.
         let c = engine.branch_create("crm", "child", Some("try-new-recall"), None).await.unwrap();
         assert_eq!(c.parent, "try-new-recall");
@@ -38,7 +39,7 @@ async fn a_branch_is_one_record_at_the_log_position_and_survives_a_restart() {
     assert_eq!(crm.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["child", "try-new-recall"]);
     assert_eq!(crm.iter().find(|b| b.name == "try-new-recall").unwrap().point_offset, offset_before);
     assert_eq!(engine.branch_list(None).await.unwrap().len(), 3);
-    assert_eq!(engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap(), recall_before);
+    assert_eq!(engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap()["data"], recall_before["data"]);
     assert!(engine.branch_drop("crm", "child").await.unwrap());
     assert!(engine.branch_drop("crm", "try-new-recall").await.unwrap());
     assert!(!engine.branch_drop("crm", "try-new-recall").await.unwrap(), "already gone");

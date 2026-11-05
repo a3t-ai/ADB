@@ -120,6 +120,28 @@ pub async fn view(store: &PartitionStore, barrier: &Option<Arc<ApplyBarrier>>, p
     Ok(overlay(own, up))
 }
 
+/// DB-20: a new branch engine's first record (when its log is empty) is an EPISODIC
+/// row naming where it came from: `{event: "branch_created", from_namespace, parent,
+/// point_offset, point_ts, created_by}` (D1). Hosted and pod branches alike.
+pub async fn write_origin(engine: &crate::LocalEngine, b: &Branch) -> Result<(), String> {
+    use crate::Engine;
+    let Some(d) = engine.durable_writes() else { return Ok(()) };
+    if d.last_commit().await.map_err(|e| e.to_string())?.0 > 0 {
+        return Ok(());
+    }
+    let s = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
+    let aql = format!(
+        "STORE INTO EPISODIC (event = \"branch_created\", from_namespace = {}, parent = {}, point_offset = \"{}\", point_ts = \"{}\", created_by = {}) NAMESPACE {}",
+        s(&b.namespace),
+        s(&b.parent),
+        b.point_offset,
+        b.point_ts,
+        s(b.created_by.as_deref().unwrap_or("")),
+        s(&b.namespace)
+    );
+    engine.query(&aql, None).await.map(|_| ())
+}
+
 /// The branch a statement names (`BRANCH "b"`, not main) and its NAMESPACE. A
 /// pipeline must name one branch in every stage, or none.
 pub fn statement_branch(aql: &str) -> Result<Option<(String, Option<String>)>, String> {
@@ -232,6 +254,7 @@ impl BranchHost {
                             let (registry, ns, name) = (Arc::clone(&self.registry), b.namespace.clone(), b.name.clone());
                             d.set_pins(Arc::new(move || registry.pins(Some((&ns, &name)))));
                         }
+                        write_origin(&e, b).await?;
                         let e = Arc::new(e);
                         engines.insert(b.id.clone(), Arc::clone(&e));
                         e

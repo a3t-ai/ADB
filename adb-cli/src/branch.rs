@@ -47,6 +47,8 @@ pub async fn open(dir: &std::path::Path, c: BranchConfig) -> Result<Arc<dyn Engi
     let view = ParentView { source, namespace: b.namespace.clone(), branch: b.name.clone(), point: b.point() };
     let (engine, replayed) = LocalEngine::durable_branch(dir, view).await?;
     tracing::info!(branch = %b.id, org = %c.org, point_ts = b.point_ts, records = replayed.records, "ADB branch engine open (own pod)");
+    // DB-20: a new pod's first record names where the branch came from.
+    adb_executor::branch_engine::write_origin(&engine, &b).await?;
     // FORGETs on main while this pod was down: erased before it serves.
     let pending = flight_action(&c.org, c.token.as_deref(), "branch_pending", json!({ "namespace": c.namespace, "name": c.name })).await?;
     let forgets: Vec<adb_executor::branches::PendingForget> = serde_json::from_value(pending.get("forgets").cloned().unwrap_or_default())?;

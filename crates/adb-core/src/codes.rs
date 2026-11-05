@@ -36,6 +36,10 @@ pub const CODES: &[&str] = &[
     "tag_pinned",
     "layer_invalid",
     "sealed_key",
+    "merge_conflicts",
+    "merge_stale",
+    "merge_not_found",
+    "revert_conflicts",
     "append_only",
     "transaction_invalid",
     "table_not_found",
@@ -97,6 +101,14 @@ pub fn code_of(message: &str) -> &'static str {
         "merge_invalid"
     } else if has("LINK: the ") && has("doesn't exist") {
         "link_target_missing"
+    } else if has("merge_conflicts:") {
+        "merge_conflicts"
+    } else if has("merge_stale:") {
+        "merge_stale"
+    } else if has("merge_not_found:") {
+        "merge_not_found"
+    } else if has("revert_conflicts:") {
+        "revert_conflicts"
     } else if has("is append-only: rows can't be changed") {
         "append_only"
     } else if has("changed shape earlier in this transaction") || has("a transaction needs at least one operation") || has("a transaction holds platform-table effects only") || has("unknown table operation") {
@@ -214,6 +226,10 @@ mod tests {
         ("Query execution error: no platform table agents", "table_not_found"),
         ("Query execution error: lance: table agents has no column colour", "column_not_found"),
         ("Query execution error: lance: column name \"1x\": letters, digits and _, starting with a letter or _", "invalid_value"),
+        ("merge_conflicts: 2 conflicts have no resolution: a, b", "merge_conflicts"),
+        ("Query execution error: merge_stale: main changed 1 since the conflicts were read: a", "merge_stale"),
+        ("merge_not_found: no merge \"m1\" in namespace \"crm\"", "merge_not_found"),
+        ("revert_conflicts: 1 records changed since the merge: a (force_skip reverts the rest)", "revert_conflicts"),
         ("Internal error: store: disk full", "internal"),
     ];
 

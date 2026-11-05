@@ -377,6 +377,32 @@ impl AdbFlight {
                 let t = gateway.table_changes(&q).await.map_err(|e| Status::internal(e.to_string()))?;
                 Ok(json!({ "changes": t.changes, "reset": t.reset, "next": t.next, "tip": t.tip }))
             }
+            // DB-10 / DB-19 (`.ai/MERGE.md`): three-way diff, merge back, revert.
+            "branch_conflicts" | "branch_merge" | "merge_revert" => {
+                let ns = str_field(&b, "namespace")?;
+                let memories: Vec<adb_core::MemoryType> = serde_json::from_value(b.get("memories").cloned().unwrap_or(json!([])))
+                    .map_err(|e| Status::invalid_argument(format!("memories: {e}")))?;
+                let r = match kind {
+                    "branch_conflicts" => self.engine.branch_conflicts(ns, str_field(&b, "name")?, &memories).await,
+                    "branch_merge" => {
+                        let main_offset = b.get("main_offset").and_then(|v| v.as_u64()).ok_or_else(|| Status::invalid_argument("branch_merge needs main_offset (main.offset from branch_conflicts)"))?;
+                        let resolutions: Vec<adb_executor::merge::Resolution> = serde_json::from_value(b.get("resolutions").cloned().unwrap_or(json!([])))
+                            .map_err(|e| Status::invalid_argument(format!("resolutions: {e}")))?;
+                        let by = b.get("merged_by").and_then(|v| v.as_str());
+                        self.engine.branch_merge(ns, str_field(&b, "name")?, &memories, main_offset, resolutions, by).await
+                    }
+                    _ => {
+                        let by = b.get("reverted_by").and_then(|v| v.as_str());
+                        let force = b.get("force_skip").and_then(|v| v.as_bool()).unwrap_or(false);
+                        self.engine.merge_revert(ns, str_field(&b, "merge_id")?, by, force).await
+                    }
+                };
+                r.map_err(|e| match e.split(':').next().unwrap_or("") {
+                    "merge_conflicts" | "merge_stale" | "revert_conflicts" => Status::failed_precondition(e),
+                    "merge_not_found" => Status::not_found(e),
+                    _ => Status::invalid_argument(e),
+                })
+            }
             // DB-6: several operations as one transaction (one log record, applied in
             // order): `{ops: [{op: "insert" | "upsert" | "update" | "delete" |
             // "create_table" | "add_columns" | "append_only" | "purge", …that action's
@@ -739,6 +765,9 @@ impl FlightService for AdbFlight {
             ("update", "Set values on matching rows: {table, filter, values}"),
             ("delete", "Delete matching rows: {table, filter}"),
             ("transaction", "Several table operations as one record (DB-6): {ops: [{op, table, …}]}; op = insert | upsert | update | delete | create_table | add_columns | append_only | purge"),
+            ("branch_conflicts", "Three-way diff of a branch against main (DB-10): {namespace, name, memories?} → {base, main, clean, conflicts}"),
+            ("branch_merge", "Merge a branch back into main (DB-19, kind 2): {namespace, name, memories? (PROCEDURAL), main_offset, resolutions, merged_by?} → {merge_id, offset, changed, added, ended}"),
+            ("merge_revert", "Undo a merge (DB-19): {namespace, merge_id, reverted_by?, force_skip?} → {reverted, skipped, offset}"),
             ("table_changes", "Platform-table change feed (DB-5): {from?, tables?, max?, wait_ms?} → {changes, reset, next, tip}; reset: reload, then follow from next"),
             ("add_columns", "Add UTF-8 columns to a table (DB-6): {table, columns}"),
             ("append_only", "Make a table append-only (DB-13): {table}; also create_table {append_only: true}"),

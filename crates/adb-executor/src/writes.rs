@@ -275,6 +275,24 @@ fn kind_of(memory: MemoryType) -> Kind {
     }
 }
 
+/// DB-19: the platform table that records every merge and revert (append-only).
+pub const MERGES: &str = "adb_merges";
+pub const MERGE_COLUMNS: [&str; 9] = ["id", "kind", "namespace", "branch", "by", "at", "offset", "entries", "of"];
+
+/// One record change of a merge (or a revert): replace `main` (the main row it expects
+/// to be current) with `value`, add `value` as a new lineage (`main` none, `template`
+/// gives the row's shape), or end the lineage (`value` none).
+#[derive(Debug, Clone)]
+pub struct MergeOp {
+    pub memory: MemoryType,
+    pub lineage: String,
+    pub main: Option<adb_store::StoredRow>,
+    pub value: Option<serde_json::Value>,
+    pub template: Option<adb_store::StoredRow>,
+    /// For an add that re-creates an ended lineage: its last version.
+    pub prev_version: Option<u32>,
+}
+
 fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
     RowData {
         tenant_id: TENANT.into(),
@@ -328,6 +346,9 @@ pub struct DurableWrites<L: Log> {
     /// Offset of the last record with platform-table effects (stage G). The log
     /// must keep it until the platform tables have applied it.
     platform_last: std::sync::atomic::AtomicU64,
+    /// DB-7: the last committed record (offset, commit time µs), for answers' memory point.
+    last_off: std::sync::atomic::AtomicU64,
+    last_ts: std::sync::atomic::AtomicI64,
     /// The most records the log keeps behind its tip for subscribers (E3):
     /// `ADB_LOG_RETAIN`, default [`RETAIN_MAX`].
     retain_max: u64,
@@ -528,6 +549,15 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Commit an `UNWATCH`.
     /// Cut a branch of `namespace`'s memory at the current log position (B1): one
     /// control record, nothing copied.
+    /// DB-7: the last commit this engine made (offset, commit time), without the
+    /// sequencer lock; from the log when nothing was written since opening.
+    pub async fn point(&self) -> (u64, CommitTs) {
+        match self.last_off.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => self.last_commit().await.unwrap_or((0, CommitTs(0))),
+            off => (off, CommitTs(self.last_ts.load(std::sync::atomic::Ordering::SeqCst))),
+        }
+    }
+
     /// The last record in this engine's log: its offset and commit time.
     pub async fn last_commit(&self) -> AdbResult<(u64, CommitTs)> {
         let seq = self.seq.lock().await;
@@ -825,6 +855,103 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(n)
     }
 
+    /// DB-19: apply merge `ops` to `namespace`'s main records in one log record, with
+    /// `merge_row` appended to the append-only platform table [`MERGES`] in the same
+    /// record. Each op names the main row it expects to replace (or none): if main moved
+    /// since, nothing is written and the lineages that moved are returned as
+    /// `merge_stale`. Returns the record's offset and, per op, the row it wrote (`after`).
+    pub async fn merge_rows(&self, ops: Vec<MergeOp>, mut merge_row: serde_json::Map<String, serde_json::Value>) -> AdbResult<(u64, Vec<Option<String>>)> {
+        if self.parent.is_some() {
+            return Err(AdbError::QueryError("merges are written on the org's engine, not a branch's".into()));
+        }
+        let Some(store) = &self.store else { return Err(needs_table("merge")) };
+        let platform = self.platform.as_ref().ok_or_else(|| needs_table("merge"))?;
+        let mut seq = self.seq.lock().await;
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let ts = seq.begin();
+        // Main as it is now, under the sequencer lock: nothing can move it until we log.
+        let mut stale = Vec::new();
+        for op in &ops {
+            let now = store
+                .current_version(op.memory.into(), adb_store::key_of(&op.lineage), ts)
+                .await
+                .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            if now.as_ref().map(|r| &r.id) != op.main.as_ref().map(|r| &r.id) {
+                stale.push(op.lineage.clone());
+            }
+        }
+        if !stale.is_empty() {
+            return Err(AdbError::QueryError(format!("merge_stale: main changed {} since the conflicts were read: {}", stale.len(), stale.join(", "))));
+        }
+        let mut effects = Vec::new();
+        let mut after = Vec::new();
+        let mut keys = Vec::new();
+        for op in &ops {
+            match (&op.main, &op.value) {
+                (Some(m), Some(v)) => {
+                    let mut data = m.data.clone();
+                    data.value = v.clone();
+                    data.text = v.get("content").and_then(|c| c.as_str()).map(String::from);
+                    data.embedding = None;
+                    // The bare key, as UPDATE writes it (the store adds the memory prefix).
+                    let new = NewRow { id: seq.new_id(ts), lineage_id: RecordId(adb_store::key_of(&m.lineage_id).to_string()), version: m.version + 1, data };
+                    after.push(Some(new.id.0.clone()));
+                    effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&m.id).to_string()), new });
+                }
+                (None, Some(v)) => {
+                    let template = op.template.as_ref().ok_or_else(|| AdbError::Internal(format!("merge: no row to add for {}", op.lineage)))?;
+                    let mut data = template.data.clone();
+                    data.value = v.clone();
+                    data.text = v.get("content").and_then(|c| c.as_str()).map(String::from);
+                    data.embedding = None;
+                    // A lineage that had versions (re-added by a revert) continues them.
+                    let (id, version) = match op.prev_version {
+                        Some(p) => (seq.new_id(ts), p + 1),
+                        None => (RecordId(adb_store::key_of(&op.lineage).to_string()), 1),
+                    };
+                    let new = NewRow { id, lineage_id: RecordId(adb_store::key_of(&op.lineage).to_string()), version, data };
+                    if unique_keys(op.memory) {
+                        keys.push(((new.data.memory, new.lineage_id.0.clone()), new.data.ttl_at));
+                    }
+                    after.push(Some(new.id.0.clone()));
+                    effects.push(match new.data.kind {
+                        Kind::Fact => Effect::PutFact(new),
+                        Kind::Tool => Effect::PutTool(new),
+                        Kind::Episode => Effect::PutEpisode(new),
+                        _ => Effect::PutEntity(new),
+                    });
+                }
+                (Some(m), None) => {
+                    after.push(None);
+                    effects.push(Effect::Expire { memory: m.data.memory, lineage_id: RecordId(adb_store::key_of(&m.lineage_id).to_string()) });
+                }
+                (None, None) => after.push(None),
+            }
+        }
+        let entries: Vec<serde_json::Value> = ops
+            .iter()
+            .zip(&after)
+            .map(|(op, a)| serde_json::json!({ "memory": op.memory, "lineage": op.lineage, "before": op.main, "after": a, "template": op.main.is_none().then_some(op.template.clone()).flatten() }))
+            .collect();
+        merge_row.insert("entries".into(), serde_json::Value::String(serde_json::Value::Array(entries).to_string()));
+        merge_row.insert("at".into(), serde_json::json!(time::now().to_rfc3339()));
+        let table = vec![
+            Effect::TableCreate { table: MERGES.into(), columns: MERGE_COLUMNS.iter().map(|c| c.to_string()).collect() },
+            Effect::TableAppendOnly { table: MERGES.into() },
+            Effect::TableInsert { table: MERGES.into(), rows: vec![merge_row] },
+        ];
+        platform.validate_all(&table).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
+        effects.extend(table);
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
+        platform.apply(&record).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
+        self.live.lock().unwrap().extend(keys);
+        self.to_store(&record, seq.log()).await;
+        Ok((record.offset.0, after))
+    }
+
     /// The org's branch engines (B4): a FORGET on main erases their copies too.
     pub fn set_branch_host(&self, host: Arc<crate::branch_engine::BranchHost>) {
         let _ = self.branch_host.set(host);
@@ -1106,7 +1233,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1464,6 +1591,8 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// needs the records above what Lance has made durable, so segments below
     /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
     async fn to_store(&self, record: &LogRecord, log: &L) {
+        self.last_off.fetch_max(record.offset.0, std::sync::atomic::Ordering::SeqCst);
+        self.last_ts.fetch_max(record.commit_ts.0, std::sync::atomic::Ordering::SeqCst);
         let (Some(s), Some(applier)) = (&self.store, &self.applier) else { return };
         // TTL timers (W9.12) for records written with one; validity timers for facts
         // with a bound ahead (AQL v0.10).

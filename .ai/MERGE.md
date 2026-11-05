@@ -1,5 +1,8 @@
 # Merges, conflicts and memory points (phase 2 ADB: DB-7, DB-10, DB-11, DB-19, DB-20)
 
+Status 5 Nov: DB-7, DB-20, DB-10, DB-19 built (`adb-executor/src/merge.rs`, `tests/merge.rs`,
+`adb-server/tests/merge_flight.rs`). DB-11 (rebase, promote gate, history layer) next.
+
 5 Nov 2026. Plan: claude.ai doc "A3T core features — ADB and platform plan" (§ Two merges
 and their conflicts). Decisions D1 (episodes), D3/D4 (one cluster, non-prod pod), D7–D9
 open (proposed below as defaults).

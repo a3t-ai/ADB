@@ -50,4 +50,15 @@ Where the code appears:
 | `unsupported` | Not supported (yet), or an unknown action | — |
 | `internal` | Anything else: a fault, not the caller's mistake | Report it |
 
-The merge features (DB-10, DB-19) add their conflict codes here when they land.
+Merges and tables:
+
+| Code | Meaning | Usual fix |
+|---|---|---|
+| `merge_conflicts` | A merge has conflicts without a resolution | Resolve each (`branch_conflicts` lists them) |
+| `merge_stale` | Main changed an affected record after `main_offset` | Read the conflicts again |
+| `merge_not_found` | No such merge in the namespace, or it was already reverted | — |
+| `revert_conflicts` | Records changed since the merge | `force_skip` reverts the rest |
+| `append_only` | Update, delete, upsert or replace of an append-only table | Insert; purge by age |
+| `transaction_invalid` | A transaction that can't be checked (empty, unknown op, change after a schema change) | Split it |
+| `table_not_found` | No such platform table | Create it |
+| `column_not_found` | No such column | `add_columns` |

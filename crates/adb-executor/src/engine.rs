@@ -69,6 +69,23 @@ pub trait Engine: Send + Sync {
         Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// DB-10: the three-way diff of branch `name` against main (`.ai/MERGE.md`):
+    /// `{base, main, clean, conflicts}` for `memories` (default all three).
+    async fn branch_conflicts(&self, _namespace: &str, _name: &str, _memories: &[MemoryType]) -> Result<Value, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    /// DB-19: merge the branch's changes of `memories` (default PROCEDURAL) back into
+    /// main, with `resolutions` for every conflict; refused when main moved past
+    /// `main_offset`. `{merge_id, offset, changed, added, ended}`.
+    async fn branch_merge(&self, _namespace: &str, _name: &str, _memories: &[MemoryType], _main_offset: u64, _resolutions: Vec<crate::merge::Resolution>, _by: Option<&str>) -> Result<Value, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    /// DB-19: undo merge `merge_id`; records changed since are conflicts (refused
+    /// unless `force_skip`, which reverts the rest).
+    async fn merge_revert(&self, _namespace: &str, _merge_id: &str, _by: Option<&str>, _force_skip: bool) -> Result<Value, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+
     /// B6: rows of `namespace` in `memory` as this engine (or its hosted branch
     /// `branch`) saw them at `at` — what a branch in its own pod reads its parent
     /// through, and what an org reads a pod's view through.
@@ -501,6 +518,33 @@ impl LocalEngine {
     /// B5: what `source` sees of `namespace` now, in the memories a new agent takes
     /// (SEMANTIC, PROCEDURAL, TOOLS — EPISODIC stays with the original agent, WORKING
     /// is session state), written into `into`.
+    /// DB-10: base (main at the branch point), main now and the branch's view, per
+    /// memory type, and their diff. Branches of main only.
+    async fn three_way(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<ThreeWay, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        let host = self.branch_host.as_ref().ok_or("branches are merged on the org's engine")?;
+        let branch = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
+        if branch.parent != crate::branches::MAIN {
+            return Err(format!("branch {name:?} is a branch of {:?}: merging into a parent branch isn't supported yet", branch.parent));
+        }
+        let parent = self.as_parent_source().ok_or("a branch engine has no table")?;
+        let view_src = host.source(namespace, name).await?;
+        let main_point = d.point().await;
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let mut w = ThreeWay { branch: branch.clone(), main_point, clean: Vec::new(), conflicts: Vec::new(), main: Default::default(), view: Default::default() };
+        for m in memories {
+            let base = parent.rows_as_of(*m, namespace, branch.point()).await.map_err(|e| e.to_string())?;
+            let main = parent.rows_as_of(*m, namespace, now).await.map_err(|e| e.to_string())?;
+            let view = view_src.rows_as_of(*m, namespace, now).await.map_err(|e| e.to_string())?;
+            let (c, k) = crate::merge::diff(*m, &base, &main, &view);
+            w.clean.extend(c);
+            w.conflicts.extend(k);
+            w.main.extend(main.into_iter().map(|r| (r.lineage_id.clone(), r)));
+            w.view.extend(view.into_iter().map(|r| (r.lineage_id.clone(), r)));
+        }
+        Ok(w)
+    }
+
     async fn materialise_from(&self, source: Arc<dyn crate::branch_engine::ParentSource>, namespace: &str, into: &str) -> Result<u64, String> {
         let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
         if namespace == into {
@@ -760,12 +804,26 @@ impl Engine for LocalEngine {
             return self.watch(stmt, variables).await;
         }
         let started = std::time::Instant::now();
+        let before = match &self.durable {
+            Some(d) => Some(d.point().await),
+            None => None,
+        };
         let result = match variables {
             Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
             _ => self.executor.execute(aql).await,
         };
         let executed = started.elapsed();
-        let wire = result.map(|r| to_wire(&r)).map_err(|e| e.to_string());
+        let mut wire = result.map(|r| to_wire(&r)).map_err(|e| e.to_string());
+        // DB-7: the memory point: a write's own record, else the last commit before
+        // the statement ran (the answer includes at least that).
+        if let (Ok(w), Some(d), Some(before)) = (&mut wire, &self.durable, before) {
+            let after = d.point().await;
+            let (off, ts) = if after.0 > before.0 && is_write(aql) { after } else { before };
+            if let Some(m) = w.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                let at = ts.to_datetime().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+                m.insert("point".into(), json!({ "offset": off, "ts": ts.0, "at": at }));
+            }
+        }
         tracing::debug!(?executed, total = ?started.elapsed(), "query");
         wire
     }
@@ -1003,6 +1061,130 @@ impl Engine for LocalEngine {
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
     }
 
+    async fn branch_conflicts(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<Value, String> {
+        let all = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
+        let w = self.three_way(namespace, name, if memories.is_empty() { &all } else { memories }).await?;
+        Ok(json!({
+            "base": { "offset": w.branch.point_offset, "ts": w.branch.point_ts },
+            "main": { "offset": w.main_point.0, "ts": w.main_point.1 .0 },
+            "clean": w.clean,
+            "conflicts": w.conflicts,
+        }))
+    }
+
+    async fn branch_merge(&self, namespace: &str, name: &str, memories: &[MemoryType], main_offset: u64, resolutions: Vec<crate::merge::Resolution>, by: Option<&str>) -> Result<Value, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        let w = self.three_way(namespace, name, if memories.is_empty() { &[MemoryType::Procedural] } else { memories }).await?;
+        let res: std::collections::HashMap<&str, &crate::merge::Resolution> = resolutions.iter().map(|r| (r.lineage.as_str(), r)).collect();
+        let open: Vec<&str> = w.conflicts.iter().filter(|c| !res.contains_key(c.lineage.as_str())).map(|c| c.lineage.as_str()).collect();
+        if !open.is_empty() {
+            return Err(format!("merge_conflicts: {} conflicts have no resolution: {}", open.len(), open.join(", ")));
+        }
+        // Each settled change: (memory, lineage, the branch's value or None for a forget).
+        let mut settled: Vec<(MemoryType, String, Option<Value>)> = Vec::new();
+        for c in &w.clean {
+            let v = if c.change == "forget" { None } else { Some(c.branch.clone()) };
+            settled.push((c.memory, c.lineage.clone(), v));
+        }
+        for c in &w.conflicts {
+            let v = if c.branch.is_null() { None } else { Some(c.branch.clone()) };
+            settled.push((c.memory, c.lineage.clone(), v));
+        }
+        let mut ops = Vec::new();
+        for (memory, lineage, branch_value) in settled {
+            let value = match res.get(lineage.as_str()) {
+                Some(r) if r.take == "main" => continue,
+                Some(r) if r.take == "edit" => Some(r.value.clone().ok_or_else(|| format!("resolution for {lineage}: an edit needs a value"))?),
+                Some(r) if r.take != "branch" => return Err(format!("resolution for {lineage}: take is branch, main or edit, not {:?}", r.take)),
+                _ => branch_value,
+            };
+            let main = w.main.get(&lineage).cloned();
+            if let Some(m) = &main {
+                if m.log_offset > main_offset {
+                    return Err(format!("merge_stale: main changed {lineage} at offset {} after {main_offset}: read the conflicts again", m.log_offset));
+                }
+            }
+            if main.is_none() && value.is_none() {
+                continue;
+            }
+            let template = w.view.get(&lineage).cloned();
+            ops.push(crate::writes::MergeOp { memory, lineage, main, value, template, prev_version: None });
+        }
+        let (changed, added, ended) = ops.iter().fold((0, 0, 0), |(c, a, e), op| match (&op.main, &op.value) {
+            (Some(_), Some(_)) => (c + 1, a, e),
+            (None, Some(_)) => (c, a + 1, e),
+            _ => (c, a, e + 1),
+        });
+        let merge_id = format!("{name}-{}", adb_core::time::now().timestamp_micros());
+        let mut row = serde_json::Map::new();
+        for (k, v) in [("id", merge_id.as_str()), ("kind", "merge"), ("namespace", namespace), ("branch", name), ("by", by.unwrap_or(""))] {
+            row.insert(k.into(), json!(v));
+        }
+        let (offset, _) = d.merge_rows(ops, row).await.map_err(|e| e.to_string())?;
+        Ok(json!({ "merge_id": merge_id, "offset": offset, "changed": changed, "added": added, "ended": ended }))
+    }
+
+    async fn merge_revert(&self, namespace: &str, merge_id: &str, by: Option<&str>, force_skip: bool) -> Result<Value, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        let platform = self.platform.as_ref().map(|(p, _)| Arc::clone(p)).ok_or("platform tables need a durable engine (start ADB with --data-dir)")?;
+        let q = |s: &str| s.replace('\'', "''");
+        let rows = match platform.query(crate::writes::MERGES, Some(&format!("namespace = '{}' AND (id = '{}' OR of = '{}')", q(namespace), q(merge_id), q(merge_id))), 100).await {
+            Ok(b) => adb_platform::batches_to_json(&b),
+            Err(_) => Vec::new(),
+        };
+        let merge = rows.iter().find(|r| r["kind"] == "merge" && r["id"] == merge_id).ok_or_else(|| format!("merge_not_found: no merge {merge_id:?} in namespace {namespace:?}"))?;
+        if rows.iter().any(|r| r["kind"] == "revert" && r["of"] == merge_id) {
+            return Err(format!("merge_not_found: merge {merge_id:?} was already reverted"));
+        }
+        let entries: Vec<Value> = serde_json::from_str(merge["entries"].as_str().unwrap_or("[]")).map_err(|e| format!("merge {merge_id}: entries: {e}"))?;
+        let source = self.as_parent_source().ok_or("a branch engine has no table")?;
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let mut current: std::collections::HashMap<(MemoryType, String), adb_store::StoredRow> = Default::default();
+        let mut ops = Vec::new();
+        let mut moved = Vec::new();
+        for e in &entries {
+            let memory: MemoryType = serde_json::from_value(e["memory"].clone()).map_err(|x| x.to_string())?;
+            let lineage = e["lineage"].as_str().unwrap_or_default().to_string();
+            if !current.keys().any(|(m, _)| *m == memory) {
+                for r in source.rows_as_of(memory, namespace, now).await.map_err(|x| x.to_string())? {
+                    current.insert((memory, r.lineage_id.clone()), r);
+                }
+            }
+            let cur = current.get(&(memory, lineage.clone())).cloned();
+            let after = e["after"].as_str();
+            // Stored ids carry the memory prefix; the merge recorded the bare id.
+            if cur.as_ref().map(|r| adb_store::key_of(&r.id)) != after.map(adb_store::key_of) {
+                tracing::debug!(lineage, now = ?cur.as_ref().map(|r| &r.id), merged = ?after, "revert: changed since the merge");
+                moved.push(lineage);
+                continue;
+            }
+            let before: Option<adb_store::StoredRow> = serde_json::from_value(e["before"].clone()).ok();
+            let template: Option<adb_store::StoredRow> = serde_json::from_value(e["template"].clone()).ok();
+            ops.push(match before {
+                // Was an add: end it.
+                None => crate::writes::MergeOp { memory, lineage, main: cur, value: None, template: None, prev_version: None },
+                // Was a change: write the old value back as a new version.
+                Some(b) if cur.is_some() => crate::writes::MergeOp { memory, lineage, main: cur, value: Some(b.data.value.clone()), template: None, prev_version: None },
+                // Was an end: bring the lineage back.
+                Some(b) => {
+                    let v = b.version;
+                    crate::writes::MergeOp { memory, lineage, main: None, value: Some(b.data.value.clone()), template: Some(b).or(template), prev_version: Some(v) }
+                }
+            });
+        }
+        if !moved.is_empty() && !force_skip {
+            return Err(format!("revert_conflicts: {} records changed since the merge: {} (force_skip reverts the rest)", moved.len(), moved.join(", ")));
+        }
+        let mut row = serde_json::Map::new();
+        let id = format!("{merge_id}-revert");
+        for (k, v) in [("id", id.as_str()), ("kind", "revert"), ("namespace", namespace), ("branch", merge["branch"].as_str().unwrap_or("")), ("by", by.unwrap_or("")), ("of", merge_id)] {
+            row.insert(k.into(), json!(v));
+        }
+        let n = ops.len();
+        let (offset, _) = d.merge_rows(ops, row).await.map_err(|e| e.to_string())?;
+        Ok(json!({ "reverted": n, "skipped": moved, "offset": offset }))
+    }
+
     async fn platform_write_many(&self, effects: Vec<adb_core::log::Effect>) -> Result<u64, String> {
         match &self.platform {
             Some((_, writes)) => writes.platform_many(effects).await.map_err(|e| e.to_string()),
@@ -1040,6 +1222,22 @@ impl Engine for LocalEngine {
         }
         Ok(Value::Object(counts))
     }
+}
+
+/// Whether a statement writes (its verb), for the memory point.
+fn is_write(aql: &str) -> bool {
+    let verb = aql.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    matches!(verb.as_str(), "STORE" | "UPDATE" | "FORGET" | "LINK" | "UNLINK" | "MERGE" | "PIPELINE")
+}
+
+/// DB-10's inputs and diff (see `LocalEngine::three_way`).
+struct ThreeWay {
+    branch: crate::branches::Branch,
+    main_point: (u64, adb_core::log::CommitTs),
+    clean: Vec<crate::merge::Change>,
+    conflicts: Vec<crate::merge::Conflict>,
+    main: std::collections::HashMap<String, adb_store::StoredRow>,
+    view: std::collections::HashMap<String, adb_store::StoredRow>,
 }
 
 /// ADB result → ClawDB wire `QueryResult`.
