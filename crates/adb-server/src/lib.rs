@@ -17,6 +17,7 @@
 //! `Authorization: Bearer <token>` ([`auth`]).
 
 pub mod auth;
+pub mod branch_remote;
 pub mod flight;
 pub use flight::{serve_flight, serve_flight_with_token, serve_flight_with_tokens};
 

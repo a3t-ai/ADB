@@ -238,6 +238,7 @@ dependencies = [
  "adb-gateway",
  "adb-mcp",
  "adb-platform",
+ "adb-store",
  "arrow-array",
  "arrow-cast",
  "arrow-flight",

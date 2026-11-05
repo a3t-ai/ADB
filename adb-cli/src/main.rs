@@ -18,6 +18,7 @@ use adb_executor::{Engine, LocalEngine};
 use adb_mcp::McpServer;
 use clap::{Parser, Subcommand};
 
+mod branch;
 mod cluster;
 mod import;
 mod import_engine;
@@ -132,8 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let engine: Arc<dyn Engine> = match &cli.data_dir {
+        // B6: a memory branch in its own pod (ADB_BRANCH_OF, ADB_BRANCH).
+        Some(dir) if branch::config()?.is_some() => branch::open(dir, branch::config()?.expect("checked")).await?,
         Some(dir) => {
             let (engine, replayed) = LocalEngine::durable(dir).await?;
+            engine.set_branch_remote(branch::remote());
             tracing::info!(
                 dir = %dir.display(),
                 records = replayed.records,

@@ -125,8 +125,9 @@ pub fn qualified(n: &NewRow) -> NewRow {
     n
 }
 
-/// One row version: the writer's fields plus the engine's (D3 §1, D2 §1).
-#[derive(Debug, Clone, PartialEq)]
+/// One row version: the writer's fields plus the engine's (D3 §1, D2 §1). Serialised
+/// when a branch in its own pod reads its parent over Flight (B6).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredRow {
     pub id: String,
     pub lineage_id: String,

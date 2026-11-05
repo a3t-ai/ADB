@@ -570,18 +570,38 @@ impl<L: Log + 'static> DurableWrites<L> {
             point_offset,
             point_ts: point_ts.0,
             created_by: created_by.map(String::from),
+            placement: None,
+            pending_forgets: Vec::new(),
         };
+        self.register_branch(&mut seq, &b).await?;
+        Ok(b)
+    }
+
+    /// Log `b` as the branch's control row (a new one, or its new state: the row of
+    /// that id is replaced).
+    async fn register_branch(&self, seq: &mut Sequencer<L>, b: &crate::branches::Branch) -> AdbResult<()> {
+        let id = RecordId(b.id.clone());
         let ts = seq.begin();
-        let mut data = row(MemoryType::Working, Kind::Branch, serde_json::to_value(&b).unwrap_or_default());
+        let mut data = row(MemoryType::Working, Kind::Branch, serde_json::to_value(b).unwrap_or_default());
         data.key = None;
         data.text = None;
-        data.namespace = Some(namespace.to_string());
+        data.namespace = Some(b.namespace.clone());
         data.subject_id = Some(id.0.clone());
         let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.branches.apply(&record);
         self.to_store(&record, seq.log()).await;
-        Ok(b)
+        Ok(())
+    }
+
+    /// Change a branch's control row (B6: placement, pending FORGETs) under the
+    /// sequencer lock. `None` when there is no such branch.
+    pub async fn branch_change(&self, namespace: &str, name: &str, change: impl FnOnce(&mut crate::branches::Branch)) -> AdbResult<Option<crate::branches::Branch>> {
+        let mut seq = self.seq.lock().await;
+        let Some(mut b) = self.branches.get(namespace, name) else { return Ok(None) };
+        change(&mut b);
+        self.register_branch(&mut seq, &b).await?;
+        Ok(Some(b))
     }
 
     /// Drop a branch (its own writes stay in the log until compaction; B4 erases them).
@@ -1686,9 +1706,14 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         // And from every branch's own engine (B4): forgotten means gone everywhere.
         if let Some(host) = self.branch_host.get() {
-            host.forget(memory_type, &ids).await.map_err(|e| {
+            let unreachable = host.forget(memory_type, &ids).await.map_err(|e| {
                 AdbError::Internal(format!("forgotten on main, but a branch still holds a copy: {e}"))
             })?;
+            // A branch in a pod that can't be reached now erases them when it starts (B6).
+            for b in unreachable {
+                let pending = crate::branches::PendingForget { memory: memory_type, lineages: ids.clone() };
+                self.branch_change(&b.namespace, &b.name, |b| b.pending_forgets.push(pending)).await?;
+            }
         }
         Ok(removed)
     }

@@ -150,17 +150,58 @@ pub fn statement_branch(aql: &str) -> Result<Option<(String, Option<String>)>, S
     Ok(Some(first))
 }
 
-/// The branch engines of an org engine (hosted placement).
+/// B6: a branch engine in its own ADB process, reached over the network (the
+/// server crate implements it over Arrow Flight).
+#[async_trait]
+pub trait BranchRemote: Send + Sync {
+    /// Run a statement on the branch's engine (its `aql` action).
+    async fn query(&self, url: &str, aql: &str, variables: Option<serde_json::Value>) -> Result<serde_json::Value, String>;
+    /// Have it erase its own rows of `lineages` (FORGET on main reaching it).
+    async fn forget(&self, url: &str, memory: MemoryType, lineages: &[String]) -> Result<u64, String>;
+    /// Its view (its rows over its parent's at its point), as a parent source.
+    fn source(&self, url: &str) -> Arc<dyn ParentSource>;
+}
+
+/// The branch engines of an org engine: hosted ones opened here; ones in their own
+/// pod (B6) reached through the [`BranchRemote`].
 pub struct BranchHost {
     root: PathBuf,
     org: Arc<dyn ParentSource>,
     registry: Arc<Branches>,
     engines: tokio::sync::Mutex<HashMap<String, Arc<crate::LocalEngine>>>,
+    remote: std::sync::OnceLock<Arc<dyn BranchRemote>>,
 }
 
 impl BranchHost {
     pub fn new(root: PathBuf, org: Arc<dyn ParentSource>, registry: Arc<Branches>) -> Self {
-        Self { root, org, registry, engines: Default::default() }
+        Self { root, org, registry, engines: Default::default(), remote: Default::default() }
+    }
+
+    /// How this org reaches branches in their own pods (B6); set once at start.
+    pub fn set_remote(&self, remote: Arc<dyn BranchRemote>) {
+        let _ = self.remote.set(remote);
+    }
+
+    fn remote(&self) -> Result<&Arc<dyn BranchRemote>, String> {
+        self.remote.get().ok_or_else(|| "this ADB can't reach branches in their own pods (no Flight client)".into())
+    }
+
+    /// The branch's pod URL, when it has one.
+    pub fn placement(&self, namespace: &str, name: &str) -> Option<String> {
+        self.registry.get(namespace, name).and_then(|b| b.placement)
+    }
+
+    /// Run `aql` on a branch in its own pod (B6).
+    pub async fn query_remote(&self, url: &str, aql: &str, variables: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+        self.remote()?.query(url, aql, variables).await
+    }
+
+    /// The branch's view as a parent source: its pod's (B6), or its hosted engine's.
+    pub async fn source(&self, namespace: &str, name: &str) -> Result<Arc<dyn ParentSource>, String> {
+        match self.placement(namespace, name) {
+            Some(url) => Ok(self.remote()?.source(&url)),
+            None => self.engine(namespace, name).await?.as_parent_source().ok_or_else(|| "a branch engine has no table".into()),
+        }
     }
 
     fn dir_of(&self, b: &Branch) -> PathBuf {
@@ -172,6 +213,9 @@ impl BranchHost {
     /// first, for a branch of a branch).
     pub async fn engine(&self, namespace: &str, name: &str) -> Result<Arc<crate::LocalEngine>, String> {
         let chain = self.registry.chain(namespace, name)?;
+        if let Some(b) = chain.iter().find(|b| b.placement.is_some()) {
+            return Err(format!("branch {:?} runs in its own pod: a hosted branch can't be on it (B6)", b.name));
+        }
         // Open from the one nearest main outwards, each reading through the previous.
         let mut source: Arc<dyn ParentSource> = Arc::clone(&self.org);
         let mut last = None;
@@ -203,19 +247,33 @@ impl BranchHost {
     /// FORGET on main reaches every branch (B4): each branch engine erases its own
     /// rows of `lineages` (the parent's are already gone, so its view hides them).
     /// Branches of every namespace are visited: a lineage key names its record
-    /// wherever it was copied.
-    pub async fn forget(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
-        let mut n = 0;
+    /// wherever it was copied. A branch in its own pod is asked over the network
+    /// (B6); the ones that can't be reached now are returned, for the caller to keep
+    /// the FORGET pending on them.
+    pub async fn forget(&self, memory: MemoryType, lineages: &[String]) -> Result<Vec<Branch>, String> {
+        let mut unreachable = Vec::new();
         for b in self.registry.list(None) {
+            if let Some(url) = &b.placement {
+                if let Err(e) = self.remote()?.forget(url, memory, lineages).await {
+                    tracing::warn!(branch = %b.id, %url, error = %e, "branch pod unreachable: the FORGET stays pending until it starts");
+                    unreachable.push(b);
+                }
+                continue;
+            }
             let e = self.engine(&b.namespace, &b.name).await?;
             if let Some(d) = e.durable_writes() {
-                n += d.forget_lineages(memory, lineages).await.map_err(|e| format!("branch {}: {e}", b.id))?;
+                d.forget_lineages(memory, lineages).await.map_err(|e| format!("branch {}: {e}", b.id))?;
             }
         }
-        Ok(n)
+        Ok(unreachable)
     }
 
-    /// Forget an engine (the branch was dropped): close it and delete its data.
+    /// Whether a hosted engine exists for `b` (it was opened and wrote its WAL).
+    pub fn hosted_exists(&self, b: &Branch) -> bool {
+        self.dir_of(b).exists()
+    }
+
+    //// Forget an engine (the branch was dropped): close it and delete its data.
     pub async fn remove(&self, b: &Branch) -> Result<(), String> {
         let e = self.engines.lock().await.remove(&b.id);
         drop(e);

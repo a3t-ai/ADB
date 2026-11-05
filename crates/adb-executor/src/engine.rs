@@ -69,6 +69,28 @@ pub trait Engine: Send + Sync {
         Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// B6: rows of `namespace` in `memory` as this engine (or its hosted branch
+    /// `branch`) saw them at `at` — what a branch in its own pod reads its parent
+    /// through, and what an org reads a pod's view through.
+    async fn parent_rows(&self, _memory: MemoryType, _namespace: &str, _branch: Option<&str>, _at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    /// B6: the branch runs in its own pod at `url` (Flight) from now on.
+    async fn branch_place(&self, _namespace: &str, _name: &str, _url: &str) -> Result<crate::branches::Branch, String> {
+        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
+    }
+    /// B6: FORGETs a branch's pod hasn't applied; `ack` drops the first `n` of them.
+    async fn branch_pending(&self, _namespace: &str, _name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
+        Ok(Vec::new())
+    }
+    async fn branch_pending_ack(&self, _namespace: &str, _name: &str, _n: usize) -> Result<(), String> {
+        Ok(())
+    }
+    /// B6, on a branch engine: erase this engine's own rows of `lineages`.
+    async fn forget_lineages(&self, _memory: MemoryType, _lineages: &[String]) -> Result<u64, String> {
+        Err("not a branch engine".into())
+    }
+
     /// A platform-table write (`Table*` effect), committed through the log and
     /// applied before it returns. Returns its log offset.
     async fn platform_write(&self, _effect: adb_core::log::Effect) -> Result<u64, String> {
@@ -470,6 +492,13 @@ impl LocalEngine {
         d.materialise(into, rows).await.map_err(|e| e.to_string())
     }
 
+    /// B6: how this org reaches branches in their own pods (the server's Flight client).
+    pub fn set_branch_remote(&self, remote: Arc<dyn crate::branch_engine::BranchRemote>) {
+        if let Some(host) = &self.branch_host {
+            host.set_remote(remote);
+        }
+    }
+
     /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
     pub(crate) fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
@@ -689,6 +718,11 @@ impl Engine for LocalEngine {
             Some((b, ns)) => match (&self.branch_host, &self.parent) {
                 (Some(host), _) => {
                     let ns = ns.ok_or_else(|| format!("BRANCH \"{b}\" needs NAMESPACE: a branch belongs to one memory space"))?;
+                    // B6: a branch in its own pod runs the statement there.
+                    if let Some(url) = host.placement(&ns, &b) {
+                        let vars = variables.map(|v| serde_json::to_value(v).unwrap_or_default());
+                        return host.query_remote(&url, aql, vars).await;
+                    }
                     return host.engine(&ns, &b).await?.query(aql, variables).await;
                 }
                 (None, Some(p)) => {
@@ -820,6 +854,11 @@ impl Engine for LocalEngine {
         }
         let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
         // A branch of a branch is cut at the parent branch's own log position.
+        if let (Some(p), Some(host)) = (parent.filter(|p| !p.is_empty() && *p != crate::branches::MAIN), &self.branch_host) {
+            if host.placement(namespace, p).is_some() {
+                return Err(format!("branch {p:?} runs in its own pod: branching from it isn't supported yet (B6)"));
+            }
+        }
         let point = match (parent.filter(|p| !p.is_empty() && *p != crate::branches::MAIN), &self.branch_host) {
             (Some(p), Some(host)) if d.branches().get(namespace, p).is_some() => Some(host.engine(namespace, p).await?.last_commit().await?),
             _ => None,
@@ -842,10 +881,70 @@ impl Engine for LocalEngine {
         Ok(self.durable.as_ref().map(|d| d.branches().list(namespace)).unwrap_or_default())
     }
 
+    async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
+        let source = match (branch.filter(|b| *b != crate::branches::MAIN), &self.branch_host) {
+            (Some(b), Some(host)) => host.source(namespace, b).await?,
+            (Some(b), None) => return Err(format!("no branch {b:?} here: this engine is a branch itself")),
+            (None, _) => {
+                if let Some(p) = self.parent.as_ref().filter(|p| p.namespace != namespace) {
+                    return Err(format!("this is a branch of {:?}, not {namespace:?}", p.namespace));
+                }
+                self.as_parent_source().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?
+            }
+        };
+        source.rows_as_of(memory, namespace, adb_core::log::CommitTs(at)).await.map_err(|e| e.to_string())
+    }
+
+    async fn branch_place(&self, namespace: &str, name: &str, url: &str) -> Result<crate::branches::Branch, String> {
+        let (d, host) = match (&self.durable, &self.branch_host) {
+            (Some(d), Some(h)) => (d, h),
+            _ => return Err("branches are placed on the org's engine".into()),
+        };
+        if url.is_empty() {
+            return Err("branch_place needs the pod's Flight URL".into());
+        }
+        let b = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
+        if b.placement.is_none() && host.hosted_exists(&b) {
+            return Err(format!("branch {name:?} already has a hosted engine with its own writes: moving one to a pod isn't supported yet (B6)"));
+        }
+        if d.branches().has_children(namespace, name) {
+            return Err(format!("branch {name:?} has branches of its own: a pod branch can't be a parent yet (B6)"));
+        }
+        let url = url.to_string();
+        let b = d.branch_change(namespace, name, |b| b.placement = Some(url)).await.map_err(|e| e.to_string())?;
+        b.ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))
+    }
+
+    async fn branch_pending(&self, namespace: &str, name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        Ok(d.branches().get(namespace, name).map(|b| b.pending_forgets).unwrap_or_default())
+    }
+
+    async fn branch_pending_ack(&self, namespace: &str, name: &str, n: usize) -> Result<(), String> {
+        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+        if n == 0 {
+            return Ok(());
+        }
+        d.branch_change(namespace, name, |b| {
+            let k = n.min(b.pending_forgets.len());
+            b.pending_forgets.drain(..k);
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
+        if self.parent.is_none() {
+            return Err("forget_lineages runs on a branch engine (FORGET on main reaching it)".into());
+        }
+        let d = self.durable.as_ref().ok_or("a branch engine is durable")?;
+        d.forget_lineages(memory, lineages).await.map_err(|e| e.to_string())
+    }
+
     async fn branch_promote(&self, namespace: &str, name: &str, into: &str) -> Result<Value, String> {
         let host = self.branch_host.as_ref().ok_or("branches are promoted on the org's engine")?;
-        let branch = host.engine(namespace, name).await?;
-        let source = branch.as_parent_source().ok_or("a branch engine has no table")?;
+        let source = host.source(namespace, name).await?;
         let n = self.materialise_from(source, namespace, into).await?;
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
     }

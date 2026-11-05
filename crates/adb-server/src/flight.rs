@@ -384,6 +384,44 @@ impl AdbFlight {
                 let into = str_field(&b, "into")?;
                 self.engine.space_clone(ns, into).await.map_err(Status::invalid_argument)
             }
+            // B6: branches in their own pod. The org: a parent's rows AS OF a time,
+            // placing a branch in a pod, its pending FORGETs. The pod: erase lineages.
+            "branch_parent_rows" => {
+                let memory: adb_core::MemoryType = serde_json::from_value(b.get("memory").cloned().unwrap_or_default())
+                    .map_err(|e| Status::invalid_argument(format!("memory: {e}")))?;
+                let ns = str_field(&b, "namespace")?;
+                let branch = b.get("branch").and_then(|v| v.as_str());
+                let at = b.get("at").and_then(|v| v.as_i64()).ok_or_else(|| Status::invalid_argument("missing \"at\" (commit time, µs)"))?;
+                let rows = self.engine.parent_rows(memory, ns, branch, at).await.map_err(Status::failed_precondition)?;
+                Ok(json!({ "rows": rows }))
+            }
+            "branch_place" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                let url = str_field(&b, "url")?;
+                let br = self.engine.branch_place(ns, name, url).await.map_err(Status::invalid_argument)?;
+                Ok(serde_json::to_value(br).unwrap_or_default())
+            }
+            "branch_pending" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                Ok(json!({ "forgets": self.engine.branch_pending(ns, name).await.map_err(Status::internal)? }))
+            }
+            "branch_pending_ack" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                let n = b.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                self.engine.branch_pending_ack(ns, name, n).await.map_err(Status::internal)?;
+                Ok(json!({ "acked": n }))
+            }
+            "branch_forget" => {
+                let memory: adb_core::MemoryType = serde_json::from_value(b.get("memory").cloned().unwrap_or_default())
+                    .map_err(|e| Status::invalid_argument(format!("memory: {e}")))?;
+                let lineages: Vec<String> = serde_json::from_value(b.get("lineages").cloned().unwrap_or_default())
+                    .map_err(|e| Status::invalid_argument(format!("lineages: {e}")))?;
+                let n = self.engine.forget_lineages(memory, &lineages).await.map_err(Status::failed_precondition)?;
+                Ok(json!({ "erased": n }))
+            }
             // CA-8 / CA-24: one write for an insert-or-replace by key (FlowR's state
             // and registry writes). `{table, key: [cols], rows: [{…}]}`; values are
             // kept as text, as the platform tables store them.

@@ -77,6 +77,7 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
                 }
             };
             tracing::info!(records = stats.records, last_offset = stats.last_offset.0, took_ms = t0.elapsed().as_millis() as u64, "ADB engine open (leader)");
+            engine.set_branch_remote(crate::branch::remote());
             let engine: Arc<dyn Engine> = Arc::new(engine);
             let app = Router::new().route("/ready", get(|| async { "leader" })).merge(adb_server::router(Arc::clone(&engine)));
             let http = axum::serve(bind(SocketAddr::new(host, port)).await?, app);

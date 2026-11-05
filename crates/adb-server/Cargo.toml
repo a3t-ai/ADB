@@ -7,6 +7,8 @@ description = "ADB HTTP server: ClawDB-compatible REST API and MCP (streamable H
 
 [dependencies]
 adb-executor = { path = "../adb-executor" }
+adb-store = { path = "../adb-store" }
+async-trait.workspace = true
 adb-mcp = { path = "../adb-mcp" }
 tokio.workspace = true
 futures.workspace = true

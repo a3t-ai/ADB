@@ -30,6 +30,21 @@ pub struct Branch {
     pub point_ts: i64,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// B6: the branch engine runs in its own ADB process at this Flight URL (`None`:
+    /// hosted in the org's process, `<data dir>/branches/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    /// B6: FORGETs on main the branch's pod hasn't applied yet (it was unreachable,
+    /// e.g. hibernating): it pulls them when it starts, before it serves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_forgets: Vec<PendingForget>,
+}
+
+/// Lineages FORGET removed on main, for a branch to erase from its own engine (B6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingForget {
+    pub memory: adb_core::MemoryType,
+    pub lineages: Vec<String>,
 }
 
 impl Branch {
@@ -169,6 +184,8 @@ mod tests {
             point_offset: off,
             point_ts: off as i64,
             created_by: None,
+            placement: None,
+            pending_forgets: Vec::new(),
         };
         {
             let mut m = b.by_id.write().unwrap();

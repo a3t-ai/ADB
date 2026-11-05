@@ -1,0 +1,64 @@
+# A memory branch in its own pod (.ai/BRANCHING.md B6): one ADB process that is one
+# branch's engine — own WAL, sequencer and table on its own volume — reading the org's
+# ADB over Flight AS OF the branch point. Test and dev traffic on the branch never
+# reaches the org's sequencer, WAL or table.
+#
+# Steps (the A3T controller does these; by hand for now):
+#   1. branch_create {namespace, name}            on the org ADB (Flight)
+#   2. apply this manifest with NS / NAME filled in (one StatefulSet per branch)
+#   3. branch_place {namespace, name, url: http://adb-br-<name>.a3t.svc.cluster.local:3001}
+#   Hibernate: scale to 0 — FORGETs on main while it sleeps wait on the org
+#   (branch_pending) and are applied when it starts, before it serves.
+#   Drop: branch_drop on the org, then delete this StatefulSet and its volume.
+apiVersion: v1
+kind: Service
+metadata:
+  name: adb-br-NAME
+  namespace: a3t
+spec:
+  selector: { app: adb-br-NAME }
+  ports:
+    - { name: http, port: 3000 }
+    - { name: flight, port: 3001 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: adb-br-NAME
+  namespace: a3t
+  labels: { app: adb-br-NAME, a3t.io/memory-branch: NAME }
+spec:
+  replicas: 1
+  serviceName: adb-br-NAME
+  selector: { matchLabels: { app: adb-br-NAME } }
+  template:
+    metadata:
+      labels: { app: adb-br-NAME, a3t.io/memory-branch: NAME }
+    spec:
+      containers:
+        - name: adb
+          image: ghcr.io/srirammails/adb:2026-11-05-b6
+          args: ["adb", "serve-http", "--host", "0.0.0.0", "--port", "3000"]
+          env:
+            - { name: ADB_DATA_DIR, value: /data/adb }
+            - { name: ADB_BRANCH_OF, value: "http://adb.a3t.svc.cluster.local:3001" }
+            - { name: ADB_BRANCH, value: "NAMESPACE/NAME" }
+            # The org's token (calls to the org) and this pod's (the org's calls here).
+            - name: ADB_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: adb-auth, key: token, optional: true } }
+          ports:
+            - { name: http, containerPort: 3000 }
+            - { name: flight, containerPort: 3001 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data/adb }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }

@@ -59,7 +59,7 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
 | B4 | Retention pins (compaction keeps what open branches read); FORGET on main reaches every branch engine; dropping a branch deletes its engine | done (see below) |
 | NS | Record ids carry the namespace (schema v5, `.ai/NS_IDS.md`): needed by B5 | done (ns-ids) |
 | B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | done (see below) |
-| B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | The developer loop on vc-dev with the branch in its own pod |
+| B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | ADB side done (see below); the developer loop on vc-dev waits on the A3T controller (B7) |
 | B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |
 | later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches | — |
 
@@ -102,6 +102,33 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
   dropping the branch afterwards is the caller's choice.
 - Limits: links (`LINK`) are not copied; provenance stays as written (who wrote the
   original record); a large space is copied in one call (no progress, no resume).
+
+### B6 as built (ADB side)
+
+- **Pod mode**: `adb serve-http` with `ADB_BRANCH_OF=<org Flight URL>` and
+  `ADB_BRANCH=<namespace>/<name>` (`ADB_BRANCH_TOKEN`, default `ADB_AUTH_TOKEN`) is that
+  branch's engine (`adb-cli/src/branch.rs`). It reads its record from the org, opens,
+  applies pending FORGETs, then serves HTTP and Flight. Manifest template:
+  `deploy/k8s/adb-branch.yaml` (one StatefulSet + volume per branch; hibernate = scale 0).
+- **Parent reads over Flight**: `branch_parent_rows {memory, namespace, branch?, at}` on
+  the org (main, or a hosted branch) returns the rows current at `at`
+  (`FlightParentSource`, `adb-server/src/branch_remote.rs`); `StoredRow` is serde.
+- **Placement**: `branch_place {namespace, name, url}` records the pod's Flight URL on
+  the branch row. The org then forwards `BRANCH` statements to the pod (`aql` action) and
+  reads its view from it for promote. Only a branch with no hosted engine yet, and no
+  children, can be placed.
+- **FORGET on main** goes to each placed pod (`branch_forget`); a pod that can't be
+  reached gets the lineages added to its row's `pending_forgets` (logged on the org);
+  the pod pulls them on start (`branch_pending`), erases, and acks
+  (`branch_pending_ack`). FORGET returns once main is erased and every pod either
+  erased or has it pending.
+- Test: `adb-server/tests/branch_pod.rs` (org and pod in one process over Flight:
+  forwarding, isolation of the org table, FORGET live and pending across a restart, the
+  pod's disk erased, promote of a pod branch).
+- Limits: no branch of a pod branch, no moving a hosted branch into a pod; the pod's
+  data is deleted by deleting its volume (the org's `branch_drop` only drops the row);
+  creating, scaling and routing pods is the A3T controller's job (B7); the org↔pod
+  calls use one shared token (`ADB_AUTH_TOKEN`).
 
 The first B2/B3 build (branch rows in the org table, schema v5 `branch` column) is kept
 at tag `b2-in-org-rows` and not used: it left branch traffic on the org.
