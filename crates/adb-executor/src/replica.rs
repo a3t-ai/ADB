@@ -44,7 +44,23 @@ impl Replica {
         let mut r = Self { log, store, embedder, platform, engine, platform_next, engine_next, retain_max: retain_max() };
         let n = r.step().await?;
         tracing::info!(records = n, offset = r.log.last_offset().0, "replica caught up");
+        // The table's schema migrations, as the leader's engine runs them on open
+        // (`DurableWrites::open`): a follower applies the leader's new-format records,
+        // so its own rows must be in that format too (v4 scoped ids, v5 namespace ids).
+        if r.store.schema_version() < 4 {
+            let n = r.store.scope_row_ids().await.map_err(s("store"))?;
+            tracing::info!(rows = n, "schema v4: record ids in named scopes carry the scope");
+        }
+        if r.store.schema_version() < 5 {
+            let n = r.store.namespace_row_ids().await.map_err(s("store"))?;
+            tracing::info!(rows = n, "schema v5: record ids in a namespace carry the namespace");
+        }
         Ok(r)
+    }
+
+    /// The follower's own table (status, tests).
+    pub fn store(&self) -> &Arc<PartitionStore> {
+        &self.store
     }
 
     /// Hand what this replica keeps open to the leader's engine
