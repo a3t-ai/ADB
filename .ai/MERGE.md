@@ -56,9 +56,9 @@ a resolution for a clean change may override it (`main` drops it).
 `branch_merge {namespace, name, memories: ["PROCEDURAL"] (default), main_offset,
 resolutions, merged_by?}`:
 
-1. Recompute the diff. Any conflict without a resolution → refused (`merge_conflicts`,
-   with the list). Any affected lineage changed on main after `main_offset` → refused
-   (`merge_stale`, with the new diff).
+1. Recompute the diff. Any conflict without a resolution → refused (`merge_conflicts`). Any
+   affected lineage changed on main after `main_offset` → refused (`merge_stale`). Both answer
+   with a sentence; the caller reads `branch_conflicts` again.
 2. One log record on the org: for each change, a `Supersede` (new version of the lineage,
    value from the branch or the edit), a new row (`Put*`) for an add, an `Expire` for a
    branch forget (soft end; FORGET stays the only erasure); plus a control row
