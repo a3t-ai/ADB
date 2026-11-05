@@ -178,3 +178,31 @@ async fn rebase_then_promote_as_a_new_agent() {
     assert_eq!(p["records"], json!(3), "allow_stale promotes the branch as it is: {p}");
     assert_eq!(steps("bot-v3", None).await, ["p1-main", "p2-newer", "p3-main"]);
 }
+
+/// DB-1: dev and QA branch work never reaches the prod sequencer. Hundreds of writes and
+/// reads on two branches leave the org's log offset, stats and main's reads as they were.
+#[tokio::test]
+async fn branch_traffic_never_reaches_the_org() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    for k in 0..20 {
+        q(&e, &format!(r#"STORE INTO SEMANTIC (key = "k{k}", fact = "main") NAMESPACE "prod""#)).await;
+    }
+    e.branch_create("prod", "dev", None, None).await.unwrap();
+    e.branch_create("prod", "qa", None, None).await.unwrap();
+    let at = |a: &Value| a.pointer("/metadata/point/offset").and_then(|o| o.as_u64()).unwrap();
+    let read_main = r#"RECALL FROM SEMANTIC ALL NAMESPACE "prod" LIMIT 100"#;
+    let before = q(&e, read_main).await;
+    let stats = e.stats().await.unwrap();
+    for i in 0..150 {
+        for b in ["dev", "qa"] {
+            q(&e, &format!(r#"STORE INTO EPISODIC (event = "run {i}") NAMESPACE "prod" BRANCH "{b}""#)).await;
+            q(&e, &format!(r#"UPDATE INTO SEMANTIC WHERE key = "k{}" (fact = "{b}{i}") NAMESPACE "prod" BRANCH "{b}""#, i % 20)).await;
+            q(&e, &format!(r#"RECALL FROM SEMANTIC ALL NAMESPACE "prod" BRANCH "{b}" LIMIT 5"#)).await;
+        }
+    }
+    let after = q(&e, read_main).await;
+    assert_eq!(at(&after), at(&before), "the org's log didn't move");
+    assert_eq!(after["data"], before["data"], "main reads the same");
+    assert_eq!(e.stats().await.unwrap(), stats, "the org's table got no branch rows");
+}

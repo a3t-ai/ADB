@@ -21,6 +21,16 @@ fn facts(answer: &serde_json::Value) -> Vec<String> {
     v
 }
 
+fn events(answer: &serde_json::Value) -> Vec<String> {
+    let recs = answer.pointer("/data/records").or_else(|| answer.pointer("/data/data/records")).and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    recs.iter().filter_map(|r| r.pointer("/data/event").and_then(|x| x.as_str()).map(String::from)).collect()
+}
+
+/// The log offset an answer's memory point names (DB-7).
+fn offset(answer: &serde_json::Value) -> u64 {
+    answer.pointer("/metadata/point/offset").and_then(|o| o.as_u64()).unwrap_or_else(|| panic!("no point: {answer}"))
+}
+
 fn files_with(dir: &std::path::Path, needle: &[u8]) -> usize {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -41,6 +51,8 @@ async fn start_pod(dir: &std::path::Path, org: &str, port: u16) -> (Arc<dyn Engi
     let source = Arc::new(FlightParentSource { url: org.into(), token: None, branch: None });
     let view = ParentView { source, namespace: "crm".into(), branch: "pod-try".into(), point: b.point().into() };
     let (engine, _) = LocalEngine::durable_branch(dir, view).await.unwrap();
+    // As `adb-cli`'s pod mode does (DB-20): a new pod's first record names its origin.
+    adb_executor::branch_engine::write_origin(&engine, &b).await.unwrap();
     let pending = flight_action(org, None, "branch_pending", json!({ "namespace": "crm", "name": "pod-try" })).await.unwrap();
     let forgets: Vec<adb_executor::branches::PendingForget> = serde_json::from_value(pending["forgets"].clone()).unwrap();
     for f in &forgets {
@@ -89,9 +101,14 @@ async fn a_branch_in_its_own_pod() {
 
     // Statements on the branch run in the pod; the org's table doesn't move.
     let org_stats = org.stats().await.unwrap();
+    let org_at = offset(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" LIMIT 1"#).await.unwrap());
     q(r#"UPDATE INTO SEMANTIC WHERE key = "p" (fact = "PII-pod-copy") NAMESPACE "crm" BRANCH "pod-try""#).await.unwrap();
     q(r#"STORE INTO SEMANTIC (key = "e", fact = "e1") NAMESPACE "crm" BRANCH "pod-try""#).await.unwrap();
     assert_eq!(org.stats().await.unwrap(), org_stats, "branch writes stay in the pod");
+    assert_eq!(offset(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" LIMIT 1"#).await.unwrap()), org_at, "DB-1: nothing reached the org's log");
+    // DB-20: the pod's first record says where it came from.
+    let origin = q(r#"RECALL FROM EPISODIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 10"#).await.unwrap();
+    assert_eq!(events(&origin), ["branch_created"], "{origin}");
     let on = || async { facts(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#).await.unwrap()) };
     assert_eq!(on().await, ["PII-main-s", "PII-pod-copy", "a1", "e1"], "parent AS OF the point (no late1) + its own");
     assert_eq!(facts(&pod.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#, None).await.unwrap()), on().await);
