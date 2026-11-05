@@ -386,6 +386,32 @@ impl AdbFlight {
             }
             // B6: branches in their own pod. The org: a parent's rows AS OF a time,
             // placing a branch in a pod, its pending FORGETs. The pod: erase lineages.
+            // B7: tags (named points of a space) and layers (inherited spaces).
+            "tag_create" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                let by = b.get("created_by").and_then(|p| p.as_str());
+                Ok(serde_json::to_value(self.engine.tag_create(ns, name, by).await.map_err(Status::invalid_argument)?).unwrap_or_default())
+            }
+            "tag_list" => {
+                let ns = b.get("namespace").and_then(|n| n.as_str());
+                Ok(json!({ "tags": self.engine.tag_list(ns).await.map_err(Status::internal)? }))
+            }
+            "tag_drop" => {
+                let ns = str_field(&b, "namespace")?;
+                let name = str_field(&b, "name")?;
+                Ok(json!({ "dropped": self.engine.tag_drop(ns, name).await.map_err(Status::invalid_argument)? }))
+            }
+            "layers_set" => {
+                let ns = str_field(&b, "namespace")?;
+                let layers: Vec<adb_executor::branches::Layer> = serde_json::from_value(b.get("layers").cloned().unwrap_or(json!([])))
+                    .map_err(|e| Status::invalid_argument(format!("layers: {e}")))?;
+                Ok(serde_json::to_value(self.engine.layers_set(ns, layers).await.map_err(Status::invalid_argument)?).unwrap_or_default())
+            }
+            "layers_get" => {
+                let ns = str_field(&b, "namespace")?;
+                Ok(json!({ "layers": self.engine.layers_get(ns).await.map_err(Status::internal)? }))
+            }
             "branch_parent_rows" => {
                 let memory: adb_core::MemoryType = serde_json::from_value(b.get("memory").cloned().unwrap_or_default())
                     .map_err(|e| Status::invalid_argument(format!("memory: {e}")))?;

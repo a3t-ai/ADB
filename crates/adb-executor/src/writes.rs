@@ -580,18 +580,143 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Log `b` as the branch's control row (a new one, or its new state: the row of
     /// that id is replaced).
     async fn register_branch(&self, seq: &mut Sequencer<L>, b: &crate::branches::Branch) -> AdbResult<()> {
-        let id = RecordId(b.id.clone());
+        self.register_control(seq, &b.id, &b.namespace, serde_json::to_value(b).unwrap_or_default()).await
+    }
+
+    /// A `branch`-kind control row (a branch, tag or layer list, by its id's prefix).
+    async fn register_control(&self, seq: &mut Sequencer<L>, id: &str, namespace: &str, value: serde_json::Value) -> AdbResult<()> {
+        let id = RecordId(id.to_string());
         let ts = seq.begin();
-        let mut data = row(MemoryType::Working, Kind::Branch, serde_json::to_value(b).unwrap_or_default());
+        let mut data = row(MemoryType::Working, Kind::Branch, value);
         data.key = None;
         data.text = None;
-        data.namespace = Some(b.namespace.clone());
+        data.namespace = Some(namespace.to_string());
         data.subject_id = Some(id.0.clone());
         let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.branches.apply(&record);
         self.to_store(&record, seq.log()).await;
         Ok(())
+    }
+
+    /// The log's last offset and its commit time (now, for an empty log): a new
+    /// branch's or tag's point.
+    async fn last_point(&self, seq: &Sequencer<L>) -> AdbResult<(u64, CommitTs)> {
+        let off = seq.log().last_offset().0;
+        let ts = match off {
+            0 => CommitTs::from_datetime(time::now()),
+            n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+        };
+        Ok((off, ts))
+    }
+
+    /// B7: tag `namespace` at the current log position (`tag:<namespace>/<name>`).
+    pub async fn tag_create(&self, namespace: &str, name: &str, created_by: Option<&str>) -> AdbResult<crate::branches::Tag> {
+        crate::branches::check_name(name).map_err(AdbError::QueryError)?;
+        if self.branches.tag(namespace, name).is_some() {
+            return Err(AdbError::QueryError(format!("namespace {namespace:?} already has a tag {name:?}")));
+        }
+        let mut seq = self.seq.lock().await;
+        let (point_offset, ts) = self.last_point(&seq).await?;
+        let t = crate::branches::Tag {
+            id: crate::branches::Tag::id_of(namespace, name),
+            namespace: namespace.into(),
+            name: name.into(),
+            point_offset,
+            point_ts: ts.0,
+            created_by: created_by.map(String::from),
+        };
+        self.register_control(&mut seq, &t.id, namespace, serde_json::to_value(&t).unwrap_or_default()).await?;
+        Ok(t)
+    }
+
+    /// B7: drop a tag (refused while a pinned layer reads it).
+    pub async fn tag_drop(&self, namespace: &str, name: &str) -> AdbResult<bool> {
+        if self.branches.tag(namespace, name).is_none() {
+            return Ok(false);
+        }
+        for space in self.branches.layered_by(namespace) {
+            if self.branches.layers_of(&space).iter().any(|l| l.space == namespace && l.tag.as_deref() == Some(name)) {
+                return Err(AdbError::QueryError(format!("tag {name:?} of {namespace:?} is pinned by {space:?}: change its layers first")));
+            }
+        }
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let effect = Effect::Unregister { id: RecordId(crate::branches::Tag::id_of(namespace, name)) };
+        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+        self.branches.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok(true)
+    }
+
+    /// B7: set `namespace`'s layers (empty: none). One level: a layer's space has no
+    /// layers itself; a pin names an existing tag; layers carry SEMANTIC, PROCEDURAL or
+    /// TOOLS only.
+    pub async fn layers_set(&self, namespace: &str, layers: Vec<crate::branches::Layer>) -> AdbResult<crate::branches::Layers> {
+        use crate::branches::LayerMode;
+        if self.parent.is_some() {
+            return Err(AdbError::QueryError("layers are set on the org's engine".into()));
+        }
+        for l in &layers {
+            if l.space == namespace {
+                return Err(AdbError::QueryError(format!("{namespace:?} can't be a layer of itself")));
+            }
+            if !adb_store::valid_namespace(&l.space) {
+                return Err(AdbError::QueryError(format!("layer space {:?}: not a valid namespace", l.space)));
+            }
+            if !self.branches.layers_of(&l.space).is_empty() {
+                return Err(AdbError::QueryError(format!("{:?} has layers of its own: layers are one level deep (B7)", l.space)));
+            }
+            if let Some(m) = l.memories.iter().find(|m| !matches!(m, MemoryType::Semantic | MemoryType::Procedural | MemoryType::Tools)) {
+                return Err(AdbError::QueryError(format!("a layer carries SEMANTIC, PROCEDURAL or TOOLS, not {m:?}")));
+            }
+            match (l.mode, &l.tag) {
+                (LayerMode::Pin, None) => return Err(AdbError::QueryError(format!("pinning {:?} needs a tag", l.space))),
+                (LayerMode::Pin, Some(t)) if self.branches.tag(&l.space, t).is_none() => {
+                    return Err(AdbError::QueryError(format!("{:?} has no tag {t:?}", l.space)));
+                }
+                _ => {}
+            }
+        }
+        if !self.branches.layered_by(namespace).is_empty() && !layers.is_empty() {
+            return Err(AdbError::QueryError(format!("{namespace:?} is a layer of another space: layers are one level deep (B7)")));
+        }
+        let mut seq = self.seq.lock().await;
+        let ls = crate::branches::Layers { id: crate::branches::Layers::id_of(namespace), namespace: namespace.into(), layers };
+        self.register_control(&mut seq, &ls.id, namespace, serde_json::to_value(&ls).unwrap_or_default()).await?;
+        Ok(ls)
+    }
+
+    /// B7, sealed layers: refuse a write in `namespace` of `key` (a record id without
+    /// its namespace) when a sealed layer carrying `memory` has it — or, for a fact, has
+    /// a fact with the same subject and predicate.
+    async fn check_sealed(&self, memory: MemoryType, namespace: Option<&str>, key: &str, fact: Option<(&str, &str)>, now: CommitTs) -> AdbResult<()> {
+        let (Some(ns), Some(store)) = (namespace, &self.store) else { return Ok(()) };
+        for l in self.branches.layers_of(ns).iter().filter(|l| l.sealed && l.memories.contains(&memory)) {
+            let at = self.layer_point(l).unwrap_or(now);
+            let rows = store.versions(memory.into(), Some(&format!("namespace = {}", adb_store::sql_str(&l.space)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            let shadows = rows.iter().filter(|r| r.is_current_at(at, now)).any(|r| {
+                let bare = adb_store::without_namespace(adb_store::key_of(&r.lineage_id));
+                bare == key
+                    || fact.is_some_and(|(s, p)| {
+                        r.data.kind == Kind::Fact
+                            && r.data.predicate.as_deref() == Some(p)
+                            && r.data.subject_id.as_deref().map(|x| adb_store::unscoped(adb_store::key_of(x))) == Some(s)
+                    })
+            });
+            if shadows {
+                return Err(AdbError::QueryError(format!("{key} belongs to the sealed layer {:?} of {ns:?}: it can't be written or shadowed here", l.space)));
+            }
+        }
+        Ok(())
+    }
+
+    /// The commit time a layer is read at: its tag's point for a pin, `None` (now) for a mount.
+    pub fn layer_point(&self, l: &crate::branches::Layer) -> Option<CommitTs> {
+        match l.mode {
+            crate::branches::LayerMode::Mount => None,
+            crate::branches::LayerMode::Pin => l.tag.as_ref().and_then(|t| self.branches.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
+        }
     }
 
     /// Change a branch's control row (B6: placement, pending FORGETs) under the
@@ -1438,6 +1563,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             },
             None => namespace,
         };
+        if self.parent.is_none() {
+            let bare = scoped_key(None, in_scope, &store_id(memory_type, key, &payload))?;
+            self.check_sealed(memory_type, namespace, &bare, None, CommitTs::from_datetime(time::now())).await?;
+        }
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         let id = RecordId(scoped_key(namespace, in_scope, &store_id(memory_type, key, &payload))?);
@@ -1518,6 +1647,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             (None, None) => return Err(AdbError::InvalidSyntax("FACT needs object or value".into())),
         };
         let bare_key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
+        if self.parent.is_none() {
+            let fk = adb_store::scoped_id(in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
+            self.check_sealed(memory, namespace, &fk, Some((subject.as_str(), predicate.as_str())), CommitTs::from_datetime(time::now())).await?;
+        }
         let key = adb_store::space_id(namespace, in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
         if let Some(obj) = payload.as_object_mut() {
             normalize_validity(obj, None)?;

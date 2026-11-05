@@ -819,6 +819,14 @@ async fn similar_from(
     if let Some(ns) = &modifiers.namespace {
         rows.retain(|r| r.data.namespace.as_ref() == Some(ns));
     }
+    let out = rank_rows(rows, modifiers, text, vector, now);
+    Ok(if cached { Answer::Cache(out) } else { Answer::Lance(out) })
+}
+
+/// `LIKE`'s ranking of candidate `rows` (already filtered by scope and namespace):
+/// `WINDOW`, rank against the text / vector, `MIN_CONFIDENCE`, `LIMIT`, then
+/// `ORDER BY` and `RETURN`. B7: a space with layers ranks its merged rows here.
+pub fn rank_rows(mut rows: Vec<Arc<StoredRow>>, modifiers: &Modifiers, text: Option<&str>, vector: Option<&[f32]>, now: CommitTs) -> Vec<MemoryRecord> {
     // One order whatever the source (ranking breaks ties by position).
     rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
     if let Some(w) = &modifiers.window {
@@ -869,7 +877,7 @@ async fn similar_from(
             }
         }
     }
-    Ok(if cached { Answer::Cache(out) } else { Answer::Lance(out) })
+    out
 }
 
 // ------------------------------------------------------------------ aggregates

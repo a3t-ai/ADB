@@ -91,6 +91,23 @@ pub trait Engine: Send + Sync {
         Err("not a branch engine".into())
     }
 
+    /// B7: tags (named points of a space) and layers (inherited spaces).
+    async fn tag_create(&self, _namespace: &str, _name: &str, _created_by: Option<&str>) -> Result<crate::branches::Tag, String> {
+        Err("tags need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn tag_drop(&self, _namespace: &str, _name: &str) -> Result<bool, String> {
+        Err("tags need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn tag_list(&self, _namespace: Option<&str>) -> Result<Vec<crate::branches::Tag>, String> {
+        Ok(Vec::new())
+    }
+    async fn layers_set(&self, _namespace: &str, _layers: Vec<crate::branches::Layer>) -> Result<crate::branches::Layers, String> {
+        Err("layers need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn layers_get(&self, _namespace: &str) -> Result<Vec<crate::branches::Layer>, String> {
+        Ok(Vec::new())
+    }
+
     /// A platform-table write (`Table*` effect), committed through the log and
     /// applied before it returns. Returns its log offset.
     async fn platform_write(&self, _effect: adb_core::log::Effect) -> Result<u64, String> {
@@ -559,7 +576,7 @@ impl LocalEngine {
             let registry = Arc::clone(writes.branches());
             writes.set_pins(Arc::new(move || registry.pins(None)));
         }
-        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder.clone()).with_parent(parent.clone()));
+        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder.clone()).with_parent(parent.clone()).with_layers(parent.is_none().then(|| Arc::clone(writes.branches()))));
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
         let durable_handle = Arc::clone(&durable);
@@ -879,6 +896,29 @@ impl Engine for LocalEngine {
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
         Ok(self.durable.as_ref().map(|d| d.branches().list(namespace)).unwrap_or_default())
+    }
+
+    async fn tag_create(&self, namespace: &str, name: &str, created_by: Option<&str>) -> Result<crate::branches::Tag, String> {
+        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("tags are created on the org's engine")?;
+        d.tag_create(namespace, name, created_by).await.map_err(|e| e.to_string())
+    }
+
+    async fn tag_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
+        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("tags are dropped on the org's engine")?;
+        d.tag_drop(namespace, name).await.map_err(|e| e.to_string())
+    }
+
+    async fn tag_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Tag>, String> {
+        Ok(self.durable.as_ref().map(|d| d.branches().tags(namespace)).unwrap_or_default())
+    }
+
+    async fn layers_set(&self, namespace: &str, layers: Vec<crate::branches::Layer>) -> Result<crate::branches::Layers, String> {
+        let d = self.durable.as_ref().ok_or("layers need a durable engine (start ADB with --data-dir)")?;
+        d.layers_set(namespace, layers).await.map_err(|e| e.to_string())
+    }
+
+    async fn layers_get(&self, namespace: &str) -> Result<Vec<crate::branches::Layer>, String> {
+        Ok(self.durable.as_ref().map(|d| d.branches().layers_of(namespace)).unwrap_or_default())
     }
 
     async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {

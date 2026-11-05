@@ -60,7 +60,7 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
 | NS | Record ids carry the namespace (schema v5, `.ai/NS_IDS.md`): needed by B5 | done (ns-ids) |
 | B5 | Promote as a new agent / clone: materialise a view into a new namespace through the org sequencer (batched) | done (see below) |
 | B6 | Own-pod placement: branch engine in its own ADB process, parent reads over Flight, a hibernating Sandbox; routing of `BRANCH` statements | ADB side done (see below); the developer loop on vc-dev waits on the A3T controller (B7) |
-| B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | The trading / compliance example |
+| B7 | Layers (mount / pin, sealed), FlowR (agent config, branch runs, gateway side-effect guard) | ADB layers done (see below); FlowR part next |
 | later | FOLLOW LINKS / LIKE / WATCH / aggregates on branches | — |
 
 ### B4 as built
@@ -129,6 +129,29 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
   data is deleted by deleting its volume (the org's `branch_drop` only drops the row);
   creating, scaling and routing pods is the A3T controller's job (B7); the org↔pod
   calls use one shared token (`ADB_AUTH_TOKEN`).
+
+### B7 as built (ADB: tags and layers)
+
+- **Tags** (`tag_create {namespace, name}`, `tag_list`, `tag_drop`): `tag:<ns>/<name>` →
+  the log position and commit time when tagged. Compaction keeps what a tag points at
+  (org pins); a tag a pinned layer reads can't be dropped.
+- **Layers** (`layers_set {namespace, layers}`, `layers_get`): `{space, mode: mount | pin,
+  tag?, memories: [SEMANTIC | PROCEDURAL | TOOLS], sealed}`. One level deep (a layer has
+  no layers; a space used as a layer has none), never EPISODIC or WORKING.
+- **Reads** with `NAMESPACE` of a space with layers carrying the memory: sealed layers'
+  records first, then the space's own, then unsealed layers' — one record per key, the
+  first wins. Mount = the layer now; pin = `AS OF` its tag. A layer record answers under
+  the reading space's id; its `metadata.namespace` is the layer's. FORGET on the layer
+  reaches every mount and pin at once (it tombstones every version).
+- **Sealed**: STORE of a key a sealed layer has, or a FACT with the same subject and
+  predicate as one of its facts, is refused in the inheriting space. Its UPDATE / FORGET
+  only reach its own records, so a layer's can't be changed from there.
+- Test: `a_sealed_layer_pinned_then_mounted` (the compliance example of the spec).
+- `LIKE` (the agent's recall) ranks the merged records (`query::rank_rows`).
+- Limits: `FOLLOW LINKS`, `WITH LINKS`, `PATTERN` and history reads see the space's own
+  records only (no layers yet; FlowR's recall also follows links from its facts); no
+  cross-tenant layers (one tenant per ADB today); a
+  procedure / tool `KEY pattern_id` lookup through a layer doesn't match (ids differ).
 
 The first B2/B3 build (branch rows in the org table, schema v5 `branch` column) is kept
 at tag `b2-in-org-rows` and not used: it left branch traffic on the org.

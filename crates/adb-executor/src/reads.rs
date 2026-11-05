@@ -112,6 +112,8 @@ pub struct LanceReads {
     embedder: Option<Arc<adb_embed::Embedder>>,
     /// On a branch engine (B2): reads overlay the branch's rows on its parent's.
     parent: Option<crate::branch_engine::ParentView>,
+    /// B7: the org's tags and layers (a read in a namespace with layers sees them).
+    registry: Option<Arc<crate::branches::Branches>>,
 }
 
 /// `IN SCOPE` (named scopes, AQL v0.6) is served on the long-term memory types.
@@ -186,12 +188,93 @@ pub fn lance_owned(memory: MemoryType) -> bool {
 
 impl LanceReads {
     pub fn new(store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { store, barrier, embedder: None, parent: None }
+        Self { store, barrier, embedder: None, parent: None, registry: None }
     }
 
     pub fn with_parent(mut self, parent: Option<crate::branch_engine::ParentView>) -> Self {
         self.parent = parent;
         self
+    }
+
+    /// B7: reads in a namespace with layers see them.
+    pub fn with_layers(mut self, registry: Option<Arc<crate::branches::Branches>>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// B7 (spec §3.9): the layers of the statement's namespace carrying `memory`
+    /// (`None`: no NAMESPACE, or none apply).
+    fn layers_for(&self, memory: MemoryType, modifiers: &Modifiers) -> Option<(String, Vec<crate::branches::Layer>)> {
+        let (reg, ns) = (self.registry.as_ref()?, modifiers.namespace.as_deref()?);
+        let layers: Vec<crate::branches::Layer> = reg.layers_of(ns).into_iter().filter(|l| l.memories.contains(&memory)).collect();
+        (!layers.is_empty()).then(|| (ns.to_string(), layers))
+    }
+
+    /// The rows a space with layers reads: the sealed layers' records first, then the
+    /// space's own, then unsealed layers' — one per key, the first source wins. A
+    /// mount reads its space now; a pin at its tag. A layer's record is given this
+    /// namespace's id (its `namespace` column says where it is from).
+    async fn layer_rows(&self, memory: MemoryType, ns: &str, layers: &[crate::branches::Layer], in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<StoredRow>> {
+        let reg = self.registry.as_ref().expect("layers come from the registry");
+        let m: adb_core::log::Memory = memory.into();
+        let rows_at = |space: String, at: CommitTs| {
+            let store = Arc::clone(&self.store);
+            async move {
+                let rows = store.versions(m, Some(&format!("namespace = {}", adb_store::sql_str(&space)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+                AdbResult::Ok(rows.into_iter().filter(|r| r.is_current_at(at, now) && in_scope.is_none_or(|s| r.data.scope == s)).collect::<Vec<_>>())
+            }
+        };
+        let point = |l: &crate::branches::Layer| match l.mode {
+            crate::branches::LayerMode::Mount => Some(now),
+            crate::branches::LayerMode::Pin => l.tag.as_ref().and_then(|t| reg.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
+        };
+        let mut sources = Vec::new();
+        for l in layers.iter().filter(|l| l.sealed) {
+            if let Some(at) = point(l) {
+                sources.push((rows_at(l.space.clone(), at).await?, false));
+            }
+        }
+        sources.push((rows_at(ns.to_string(), now).await?, true));
+        for l in layers.iter().filter(|l| !l.sealed) {
+            if let Some(at) = point(l) {
+                sources.push((rows_at(l.space.clone(), at).await?, false));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::new();
+        for (source, own) in sources {
+            for mut r in source {
+                let bare = adb_store::without_namespace(adb_store::key_of(&r.lineage_id)).to_string();
+                if !seen.insert(bare.clone()) {
+                    continue;
+                }
+                if !own {
+                    let here = adb_store::row_id(m, &adb_store::namespaced(Some(ns), &bare));
+                    if r.id == r.lineage_id {
+                        r.id = here.clone();
+                    }
+                    r.lineage_id = here;
+                }
+                rows.push(r);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// B7: a read in a namespace with layers. `None`: no layer applies, or the
+    /// statement reads what layers don't serve yet (history, links, PATTERN): the
+    /// space's own records.
+    async fn layered(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<Vec<MemoryRecord>>> {
+        let Some((ns, layers)) = self.layers_for(memory, modifiers) else { return Ok(None) };
+        if crate::query::is_history(modifiers)
+            || modifiers.follow_links.is_some()
+            || modifiers.with_links.is_some()
+            || matches!(predicate, Predicate::Pattern { .. } | Predicate::Like { .. })
+        {
+            return Ok(None);
+        }
+        let rows = self.layer_rows(memory, &ns, &layers, modifiers.in_scope.as_deref(), now).await?;
+        Ok(Some(crate::query::branch_read(rows, memory, predicate, modifiers)?))
     }
 
     pub fn with_embedder(mut self, embedder: Option<Arc<adb_embed::Embedder>>) -> Self {
@@ -224,6 +307,11 @@ impl LanceReads {
             b.wait_for_committed().await;
         }
         let now = CommitTs::from_datetime(time::now());
+        // B7: a space with layers ranks its merged rows.
+        if let Some((ns, layers)) = self.layers_for(memory, modifiers).filter(|_| self.parent.is_none()) {
+            let rows = self.layer_rows(memory, &ns, &layers, modifiers.in_scope.as_deref(), now).await?;
+            return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
+        }
         crate::query::similar(&self.store, memory, modifiers, query_text.as_deref(), query_vec.as_deref(), now).await
     }
 
@@ -245,6 +333,9 @@ impl LanceReads {
         if let Some(p) = &self.parent {
             let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
             return crate::query::branch_read(rows.into_iter().map(|(r, _)| r).collect(), memory, predicate, modifiers);
+        }
+        if let Some(records) = self.layered(memory, predicate, modifiers, now).await? {
+            return Ok(records);
         }
         if crate::query::is_history(modifiers) {
             return crate::query::history(&self.store, memory, predicate, modifiers, now).await;
