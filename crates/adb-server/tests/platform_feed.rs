@@ -22,6 +22,21 @@ async fn action(url: &str, kind: &str, body: Value) -> Result<Value, (String, St
     }
 }
 
+/// Follow the feed from `from` until `n` changes arrived (the feed trails the commit by
+/// the applier, so a reader long-polls, as FlowR does).
+async fn follow(url: &str, from: u64, tables: Value, n: usize) -> (Value, u64) {
+    let (mut all, mut next) = (Vec::new(), from);
+    for _ in 0..20 {
+        let r = action(url, "table_changes", json!({ "from": next, "tables": tables, "wait_ms": 2000 })).await.unwrap();
+        all.extend(r["changes"].as_array().unwrap().iter().cloned());
+        next = r["next"].as_u64().unwrap();
+        if all.len() >= n {
+            break;
+        }
+    }
+    (Value::Array(all), next)
+}
+
 fn ops(changes: &Value) -> Vec<String> {
     changes.as_array().unwrap().iter().map(|c| format!("{}:{}", c["table"].as_str().unwrap(), c["op"].as_str().unwrap())).collect()
 }
@@ -51,11 +66,10 @@ async fn transactions_append_only_and_the_table_feed() {
         { "op": "insert", "table": "agent_versions", "rows": [{ "id": "v1", "agent": "a1" }] },
     ]})).await.unwrap();
     assert_eq!(t["ops"], json!(3));
-    let r = action(&f, "table_changes", json!({ "from": from })).await.unwrap();
-    assert_eq!(ops(&r["changes"]), ["agents:create_table", "agents:insert", "agent_versions:insert"]);
-    let offsets: Vec<u64> = r["changes"].as_array().unwrap().iter().map(|c| c["offset"].as_u64().unwrap()).collect();
+    let (changes, from) = follow(&f, from, json!([]), 3).await;
+    assert_eq!(ops(&changes), ["agents:create_table", "agents:insert", "agent_versions:insert"]);
+    let offsets: Vec<u64> = changes.as_array().unwrap().iter().map(|c| c["offset"].as_u64().unwrap()).collect();
     assert!(offsets.windows(2).all(|w| w[0] == w[1]), "one record: {offsets:?}");
-    let from = r["next"].as_u64().unwrap();
 
     // A refused transaction writes nothing.
     let bad = action(&f, "transaction", json!({ "ops": [
@@ -81,12 +95,11 @@ async fn transactions_append_only_and_the_table_feed() {
     }
     action(&f, "purge", json!({ "table": "a3t_errors", "column": "time", "before": "2026-11-01T00:00:00Z" })).await.unwrap();
 
-    let r = action(&f, "table_changes", json!({ "from": from, "tables": ["agents", "a3t_errors"] })).await.unwrap();
+    let (changes, next) = follow(&f, from, json!(["agents", "a3t_errors"]), 6).await;
     assert_eq!(
-        ops(&r["changes"]),
+        ops(&changes),
         ["agents:add_columns", "agents:update", "a3t_errors:create_table", "a3t_errors:append_only", "a3t_errors:insert", "a3t_errors:purge"]
     );
-    let next = r["next"].as_u64().unwrap();
 
     // Long poll: a read with nothing new waits for the next write.
     let f2 = f.clone();
