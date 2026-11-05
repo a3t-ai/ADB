@@ -2,12 +2,11 @@
 
 Status 5 Nov: DB-7, DB-20, DB-10, DB-19, DB-11 built (`adb-executor/src/merge.rs`,
 `tests/merge.rs`, `adb-server/tests/merge_flight.rs`). **The "As built" section at the end is
-the contract; where it differs from the design text, it wins.** D7 (kind 1 must rebase) is
-still open: the promote gate is on, and flipping it is one default.
+the contract; where it differs from the design text, it wins.** Decided 5 Nov: D7 (kind 1
+rebases first), D8 (kind 2 procedures only), D9 (conflicts per key).
 
 5 Nov 2026. Plan: claude.ai doc "A3T core features — ADB and platform plan" (§ Two merges
-and their conflicts). Decisions D1 (episodes), D3/D4 (one cluster, non-prod pod), D7–D9
-open (proposed below as defaults).
+and their conflicts). Decisions D1 (episodes), D3/D4 (one cluster, non-prod pod), D7–D9.
 
 ## DB-7 Memory point
 
