@@ -13,7 +13,10 @@
  *   - promote the branch as agent bot2: its memory = the branch view, its row a copy;
  *   - fork bot as bot3: its memory = main; an existing agent id is refused;
  *   - tags and layers (a layer named by agent id → its namespace);
- *   - ADB refusals come back as 400 with ADB's sentence; drop.
+ *   - layers: a raw space must be an agent's, in this org; history layers stay;
+ *   - kind 2 merge: conflicts, refusals, resolve, merge back, revert (ADB MERGE.md);
+ *   - kind 1: promote refused until rebased, then a new agent with its history layer;
+ *   - ADB refusals come back as {error, code} with a fitting status; drop.
  *
  *   node tests/agent-branches.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)>
  */
@@ -107,6 +110,7 @@ do:
         table: agent_configs
         records:
           - { id: bot, org_id: org-default, name: Bot, template_id: tpl-1, template_version: '1.0.0', namespace: acme, mode: reactive, variables: '{}', resource_bindings: '{}', status: active, created_by: usr-1, created_at: '2026-11-05T00:00:00Z' }
+          - { id: rival, org_id: org-rival, name: Rival, template_id: tpl-1, template_version: '1.0.0', namespace: rivalco, mode: reactive, variables: '{}', resource_bindings: '{}', status: active, created_by: usr-2, created_at: '2026-11-05T00:00:00Z' }
 ` });
   await tool('execute_flow', { namespace: 't', name: 'seed-agent' });
 
@@ -130,7 +134,7 @@ do:
   r = await api('GET', '/agents/bot/branches');
   check('list branches', r.status === 200 && r.body.branches?.length === 1 && r.body.branches[0].name === 'try', JSON.stringify(r));
   r = await api('POST', '/agents/bot/branches', { name: 'try' });
-  check('a taken name → 400 with ADB\'s sentence', r.status === 400 && /already has a branch/.test(r.body.error), JSON.stringify(r));
+  check('a taken name → 409 with ADB\'s sentence and code', r.status === 409 && r.body.code === 'branch_exists' && /already has a branch/.test(r.body.error), JSON.stringify(r));
   r = await api('POST', '/agents/bot/branches', { name: 'bad name' });
   check('a bad name → 400', r.status === 400 && /branch name/.test(r.body.error), JSON.stringify(r));
 
@@ -156,17 +160,97 @@ do:
   r = await api('POST', '/agents/bot/tags', { name: 'v1' });
   check('create tag → 201', r.status === 201 && r.body.id === 'tag:acme--bot/v1', JSON.stringify(r));
   r = await api('GET', '/agents/bot/tags');
-  check('list tags', r.body.tags?.length === 1, JSON.stringify(r));
+  check('list tags: v1, and the tag promote keeps on the old space', r.body.tags?.length === 2 && r.body.tags.some(t => t.name === 'v1') && r.body.tags.some(t => t.name === 'promoted-acme--bot2'), JSON.stringify(r));
   r = await api('PUT', '/agents/bot3/layers', { layers: [{ agent: 'bot', mode: 'pin', tag: 'v1', memories: ['SEMANTIC'], sealed: true }] });
   check('a layer named by agent id → its namespace', r.status === 200 && r.body.layers?.[0]?.space === 'acme--bot', JSON.stringify(r));
   r = await api('GET', '/agents/bot3/layers');
   check('get layers', r.body.layers?.[0]?.tag === 'v1', JSON.stringify(r));
   r = await api('DELETE', '/agents/bot/tags/v1');
-  check('a pinned tag can\'t be dropped → 400', r.status === 400 && /pinned/.test(r.body.error), JSON.stringify(r));
+  check('a pinned tag can\'t be dropped → 409 tag_pinned', r.status === 409 && r.body.code === 'tag_pinned', JSON.stringify(r));
   r = await api('PUT', '/agents/bot3/layers', { layers: [{ agent: 'bot', mode: 'mount', memories: ['EPISODIC'] }] });
   check('a layer of EPISODIC → 400', r.status === 400, JSON.stringify(r));
 
+  // --- layers can't reach outside the org, and history layers stay
+  r = await api('PUT', '/agents/rival/memory', {});
+  check('a second org\'s agent has a space', r.status === 200 && r.body.namespace === 'rivalco--rival', JSON.stringify(r));
+  await aql('STORE INTO SEMANTIC (key = "secret", fact = "rival-only") NAMESPACE "rivalco--rival"');
+  r = await api('PUT', '/agents/bot3/layers', { layers: [{ space: 'rivalco--rival', mode: 'mount', memories: ['SEMANTIC'] }] });
+  check('a raw space in another org → 400', r.status === 400 && /another org/.test(r.body.error), JSON.stringify(r));
+  r = await api('PUT', '/agents/bot3/layers', { layers: [{ agent: 'rival', mode: 'mount', memories: ['SEMANTIC'] }] });
+  check('an agent in another org → 400', r.status === 400 && /another org/.test(r.body.error), JSON.stringify(r));
+  r = await api('PUT', '/agents/bot3/layers', { layers: [{ space: 'nobody--owns-this', mode: 'mount', memories: ['SEMANTIC'] }] });
+  check('a space no agent owns → 400', r.status === 400 && /no agent has/.test(r.body.error), JSON.stringify(r));
+  r = await api('PUT', '/agents/bot3/layers', { layers: [{ space: 'acme--bot', mode: 'pin', tag: 'v1', memories: ['SEMANTIC'], sealed: true }] });
+  check('a raw space of an agent in this org is accepted (GET → PUT round trip)', r.status === 200 && r.body.layers?.[0]?.space === 'acme--bot', JSON.stringify(r));
+
+  r = await api('GET', '/agents/bot2/layers');
+  const hist = l => (l.body.layers?.layers ?? l.body.layers ?? []).filter(x => x.mode === 'history');
+  check('a promoted agent has a history layer on the old space', hist(r).length === 1 && hist(r)[0].space === 'acme--bot', JSON.stringify(r));
+  r = await api('PUT', '/agents/bot2/layers', { layers: [] });
+  check('PUT without it keeps the history layer', r.status === 200 && hist(r).length === 1, JSON.stringify(r));
+  r = await api('PUT', '/agents/bot2/layers', { layers: [{ space: 'rivalco--rival', mode: 'history', tag: 't', memories: ['EPISODIC'] }] });
+  check('a forged history layer is dropped', r.status === 200 && hist(r).length === 1 && hist(r)[0].space === 'acme--bot', JSON.stringify(r));
+
+  // --- kind 2: procedures back into the same agent (a conflict, resolved, then reverted)
+  const steps = async ns => {
+    const d = await aql(`RECALL FROM PROCEDURAL WHERE key = "refund" NAMESPACE "${ns}"`);
+    return JSON.stringify(((d.data ?? d).records ?? [])[0]?.data?.steps ?? null);
+  };
+  await aql('STORE INTO PROCEDURAL (key = "refund", steps = "v1") NAMESPACE "acme--bot"');
+  r = await api('POST', '/agents/bot/branches', { name: 'teach' });
+  check('branch for a kind 2 merge', r.status === 201, JSON.stringify(r));
+  await aql('UPDATE INTO PROCEDURAL WHERE key = "refund" (steps = "from-branch") NAMESPACE "acme--bot" BRANCH "teach"');
+  await aql('STORE INTO PROCEDURAL (key = "escalate", steps = "new") NAMESPACE "acme--bot" BRANCH "teach"');
+  await aql('UPDATE INTO PROCEDURAL WHERE key = "refund" (steps = "from-main") NAMESPACE "acme--bot"');
+
+  r = await api('GET', '/agents/bot/branches/teach/conflicts?memories=procedural');
+  const c = r.body;
+  check('conflicts: one edit_edit, one clean add', r.status === 200 && c.conflicts?.length === 1 && c.conflicts[0].type === 'edit_edit' && c.conflicts[0].key === 'refund' && c.clean?.length === 1 && c.clean[0].key === 'escalate', JSON.stringify(r));
+  r = await api('POST', '/agents/bot/branches/teach/merge', { main_offset: c.main.offset });
+  check('merge with an open conflict → 409 merge_conflicts', r.status === 409 && r.body.code === 'merge_conflicts', JSON.stringify(r));
+  const resolutions = [{ lineage: c.conflicts[0].lineage, memory: 'PROCEDURAL', take: 'branch' }];
+  r = await api('POST', '/agents/bot/branches/teach/merge', { main_offset: 1, resolutions });
+  check('merge at an old main_offset → 409 merge_stale', r.status === 409 && r.body.code === 'merge_stale', JSON.stringify(r));
+  check('nothing applied yet', (await steps('acme--bot')).includes('from-main'), await steps('acme--bot'));
+  r = await api('POST', '/agents/bot/branches/teach/merge', { main_offset: c.main.offset, resolutions, merged_by: 'someone-else', name: 'other' });
+  const merged = r.body;
+  check('merge → merge id, the same agent', r.status === 200 && merged.merge_id && merged.added === 1 && merged.changed === 1, JSON.stringify(r));
+  check('main has the resolved procedure', (await steps('acme--bot')).includes('from-branch'), await steps('acme--bot'));
+  r = await api('POST', '/agents/bot/merges/nope/revert');
+  check('revert of an unknown merge → 404', r.status === 404 && r.body.code === 'merge_not_found', JSON.stringify(r));
+  r = await api('POST', `/agents/bot/merges/${merged.merge_id}/revert`);
+  check('revert → previous versions back', r.status === 200 && r.body.reverted === 2 && (await steps('acme--bot')).includes('from-main'), JSON.stringify(r));
+
+  // A body can't aim a merge at another agent's memory.
+  await aql('STORE INTO PROCEDURAL (key = "refund", steps = "rival") NAMESPACE "rivalco--rival"');
+  r = await api('GET', '/agents/bot/branches/teach/conflicts');
+  r = await api('POST', '/agents/bot/branches/teach/merge', { namespace: 'rivalco--rival', main_offset: r.body.main?.offset, resolutions: [] });
+  check('a body\'s namespace is ignored: the other org is untouched', (await steps('rivalco--rival')).includes('rival'), await steps('rivalco--rival'));
+
+  // --- kind 1: refused until rebased, then a new agent
+  r = await api('POST', '/agents/bot/branches', { name: 'behave' });
+  check('branch for a kind 1 merge', r.status === 201, JSON.stringify(r));
+  await aql('STORE INTO SEMANTIC (key = "rule:c", fact = "branch-c") NAMESPACE "acme--bot" BRANCH "behave"');
+  await aql('STORE INTO SEMANTIC (key = "rule:d", fact = "prod-newer") NAMESPACE "acme--bot"');
+  r = await api('POST', '/agents/bot/branches/behave/promote', { new_agent: { id: 'bot4' } });
+  check('promote while main moved → 409 merge_stale, no agent', r.status === 409 && r.body.code === 'merge_stale', JSON.stringify(r));
+  check('no agent was created', (await api('GET', '/agents/bot4/memory')).status === 404);
+  r = await api('GET', '/agents/bot/branches/behave/conflicts');
+  r = await api('POST', '/agents/bot/branches/behave/rebase', { main_offset: r.body.main.offset });
+  check('rebase → the branch point moves', r.status === 200 && r.body.point?.offset != null, JSON.stringify(r));
+  r = await api('POST', '/agents/bot/branches/behave/promote', { new_agent: { id: 'bot4', name: 'Bot 4' } });
+  check('promote after the rebase → 201', r.status === 201 && r.body.agent?.id === 'bot4', JSON.stringify(r));
+  const f4 = await facts('acme--bot4');
+  check('the new agent keeps prod\'s newer memory and the branch\'s', f4.includes('prod-newer') && f4.includes('branch-c'), JSON.stringify(f4));
+  await api('POST', '/agents/bot/branches', { name: 'stale' });
+  await aql('STORE INTO SEMANTIC (key = "rule:e", fact = "later") NAMESPACE "acme--bot"');
+  r = await api('POST', '/agents/bot/branches/stale/promote', { new_agent: { id: 'bot5' }, allow_stale: true });
+  check('allow_stale passes the gate', r.status === 201, JSON.stringify(r));
+
   // --- drop
+  await api('DELETE', '/agents/bot/branches/teach');
+  await api('DELETE', '/agents/bot/branches/behave');
+  await api('DELETE', '/agents/bot/branches/stale');
   r = await api('DELETE', '/agents/bot/branches/try');
   check('drop branch', r.status === 200 && r.body.dropped === true, JSON.stringify(r));
   r = await api('GET', '/agents/bot/branches');
