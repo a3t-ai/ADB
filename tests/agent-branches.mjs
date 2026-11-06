@@ -354,7 +354,8 @@ do:
   r = await api('POST', '/agents/bot/versions', { flows: [{ namespace: 't', name: 'rule', version: '1.0.0' }] });
   check('a version holding flow rule@1.0.0', r.status === 201, JSON.stringify(r));
   await api('POST', '/agents/bot/branches', { name: 'mr1' });
-  r = await api('POST', '/agents/bot/branches/mr1/flows', { yaml: ruleFlow('2.0.0') });
+  const ruleWithHost = v => `document: { dsl: '1.0.3', namespace: t, name: rule, version: '${v}' }\ndo:\n  - a:\n      call: http\n      with:\n        method: get\n        endpoint: https://new-host.example.com/x\n`;
+  r = await api('POST', '/agents/bot/branches/mr1/flows', { yaml: ruleWithHost('2.0.0') });
   check('a draft on the branch keeps its base', r.status === 201 && r.body.base_version === '1.0.0' && r.body.branch_version === '2.0.0', JSON.stringify(r));
   const active = async () => (await tool('get_flow', { namespace: 't', name: 'rule' })).version ?? (await tool('get_flow', { namespace: 't', name: 'rule' }));
   check('a draft is not active', String(JSON.stringify(await active())).includes('1.0.0'), JSON.stringify(await active()));
@@ -367,7 +368,8 @@ do:
   check('a flow fixed in prod after the branch point is a conflict', r.status === 201 && flowRow?.state === 'conflict' && flowRow?.prod_version === '1.1.0', JSON.stringify(r));
   const mr1 = r.body.id;
   check('it blocks the merge', r.body.blocked_by?.some(b => b.includes('t/rule')), JSON.stringify(r.body.blocked_by));
-  await api('POST', '/agents/bot/branches/mr1/flows', { yaml: ruleFlow('2.1.0') });
+  check('the merge says it adds an outbound host', r.body.manifest_diff?.added?.hosts?.includes('new-host.example.com'), JSON.stringify(r.body.manifest_diff));
+  await api('POST', '/agents/bot/branches/mr1/flows', { yaml: ruleWithHost('2.1.0') });
   check('an edit must name a version that exists', (await api('PUT', `/agents/bot/merge-requests/${mr1}/resolutions`, { flow_resolutions: [{ namespace: 't', name: 'rule', take: 'edit', version: '9.9.9' }] })).status === 400);
   await api('PUT', `/agents/bot/merge-requests/${mr1}/resolutions`, { flow_resolutions: [{ namespace: 't', name: 'rule', take: 'branch' }] });
   await api('POST', `/agents/bot/merge-requests/${mr1}/approvals`);
@@ -377,6 +379,8 @@ do:
   check('kind 1 ships as a new agent', r.status === 200 && r.body.status === 'merged' && r.body.result?.promoted_agent === 'bot8', JSON.stringify(r));
   check('the chosen flow is the new agent\'s version', r.body.result?.agent?.version?.flows?.[0]?.version === '2.1.0', JSON.stringify(r.body.result?.agent?.version));
   check('with its lineage', r.body.result?.agent?.version?.lineage?.promoted_from?.branch === 'mr1');
+  const shipped = await api('GET', '/agents/bot8/versions/1/manifest');
+  check('its version\'s manifest names the host', shipped.body.manifest?.hosts?.includes('new-host.example.com') && shipped.body.manifest?.unreadable?.length === 0, JSON.stringify(shipped));
   check('the trigger moved', r.body.result?.moved_triggers?.includes(trigger), JSON.stringify(r.body.result?.moved_triggers));
   const aimedAt = async () => (await api('GET', `/triggers/${trigger}`)).body.targets?.map(t => t.agent_id);
   check('it now aims at the new agent', JSON.stringify(await aimedAt()) === '["bot8"]', JSON.stringify(await aimedAt()));
