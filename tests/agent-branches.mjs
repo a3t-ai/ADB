@@ -17,7 +17,8 @@
  *   - kind 2 merge: conflicts, refusals, resolve, merge back, revert (ADB MERGE.md);
  *   - kind 1: promote refused until rebased, then a new agent with its history layer;
  *   - ADB refusals come back as {error, code} with a fitting status; drop;
- *   - a run on a branch (AC-6): its writes reach the branch only; a run on main as before.
+ *   - a run on a branch (AC-6): its writes reach the branch only; a run on main as before;
+ *   - agent versions and deployment pins (AC-5), with lineage on promote and fork.
  *
  *   node tests/agent-branches.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)>
  */
@@ -270,6 +271,34 @@ do:
   await tool('execute_flow', { namespace: 't', name: 'branch-writer', input: { key: 'run-on-main' } });
   check('a run on main writes to main', await until(async () => (await facts('acme--bot')).includes('run-on-main')), JSON.stringify(await facts('acme--bot')));
   await api('DELETE', '/agents/bot/branches/run');
+
+  // --- AC-5: versions, pins, lineage
+  r = await api('GET', '/agents/bot/versions');
+  check('no versions yet', r.status === 200 && r.body.versions?.length === 0, JSON.stringify(r));
+  r = await api('POST', '/agents/bot/versions', { flows: [{ namespace: 't', name: 'branch-writer', version: '9.9.9' }] });
+  check('a flow version that does not exist is refused', r.status === 400, JSON.stringify(r));
+  r = await api('POST', '/agents/bot/versions', { flows: [{ namespace: 't', name: 'branch-writer', version: '1.0.0' }], note: 'first' });
+  check('version 1 holds its flows and memory point', r.status === 201 && r.body.version === '1' && r.body.flows?.[0]?.name === 'branch-writer' && r.body.memory?.namespace === 'acme--bot' && r.body.memory?.tag === 'agent-v1' && r.body.memory?.point?.offset > 0, JSON.stringify(r));
+  await aql('STORE INTO SEMANTIC (key = "after-v1", fact = "after-v1") NAMESPACE "acme--bot"');
+  r = await api('POST', '/agents/bot/versions', {});
+  check('the next one is version 2', r.status === 201 && r.body.version === '2' && r.body.flows?.length === 0, JSON.stringify(r));
+  r = await api('GET', '/agents/bot/versions/1');
+  check('version 1 reads back unchanged', r.status === 200 && r.body.note === 'first' && r.body.flows?.length === 1, JSON.stringify(r));
+  check('a missing version → 404', (await api('GET', '/agents/bot/versions/99')).status === 404);
+  r = await api('PUT', '/agents/bot/deployments/prod', { version: '1' });
+  check('pin prod to version 1', r.status === 200 && r.body.version === '1' && r.body.previous === '', JSON.stringify(r));
+  await api('PUT', '/agents/bot/deployments/dev', { version: '2' });
+  r = await api('PUT', '/agents/bot/deployments/prod', { version: '2' });
+  check('a new pin remembers the previous', r.status === 200 && r.body.version === '2' && r.body.previous === '1', JSON.stringify(r));
+  r = await api('GET', '/agents/bot/deployments');
+  check('one pin per environment', r.body.deployments?.length === 2, JSON.stringify(r));
+  check('pinning a missing version → 404', (await api('PUT', '/agents/bot/deployments/prod', { version: '99' })).status === 404);
+  await api('POST', '/agents/bot/branches', { name: 'ship' });
+  r = await api('POST', '/agents/bot/branches/ship/promote', { new_agent: { id: 'bot6' } });
+  check('a promoted agent starts at version 1 with its lineage', r.status === 201 && r.body.version?.version === '1' && r.body.version?.lineage?.promoted_from?.agent === 'bot' && r.body.version?.lineage?.promoted_from?.branch === 'ship', JSON.stringify(r));
+  r = await api('POST', '/agents/bot/fork', { new_agent: { id: 'bot7' } });
+  check('a forked agent too', r.status === 201 && r.body.version?.lineage?.forked_from?.agent === 'bot', JSON.stringify(r));
+  await api('DELETE', '/agents/bot/branches/ship');
 
   // --- drop
   await api('DELETE', '/agents/bot/branches/teach');
