@@ -53,7 +53,7 @@ enum Reach {
 
 fn reach_of(action: &str) -> Option<Reach> {
     Some(match action {
-        "branch_list" | "tag_list" | "layers_get" | "branch_conflicts" | "space_stats" | "space_records" | "space_changes" | "branch_parent_rows" | "branch_pending"
+        "branch_list" | "tag_list" | "layers_get" | "branch_conflicts" | "space_stats" | "space_records" | "space_changes" | "branch_parent_rows" | "branch_pending" | "space_usage"
         // A pod acks what it erased: it only trims that branch's own list, so a read-only
         // pod token (DB-2) can do it.
         | "branch_pending_ack" => Reach::Read("namespace"),

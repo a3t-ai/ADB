@@ -513,6 +513,14 @@ impl AdbFlight {
                 let t = gateway.space_changes(&q).await.map_err(|e| Status::internal(e.to_string()))?;
                 Ok(json!({ "changes": t.changes, "reset": t.reset, "next": t.next, "tip": t.tip }))
             }
+            // DB-4: storage quotas and usage.
+            "quota_set" => {
+                let q = self.engine.quota_set(str_field(&b, "pattern")?, b.get("max_bytes").and_then(|v| v.as_u64()), b.get("max_records").and_then(|v| v.as_u64())).await.map_err(Status::invalid_argument)?;
+                Ok(serde_json::to_value(q).unwrap_or_default())
+            }
+            "quota_drop" => Ok(json!({ "dropped": self.engine.quota_drop(str_field(&b, "pattern")?).await.map_err(Status::invalid_argument)? })),
+            "quota_list" => Ok(json!({ "quotas": self.engine.quota_list().await.map_err(Status::internal)? })),
+            "space_usage" => self.engine.space_usage(b.get("namespace").and_then(|v| v.as_str())).await.map_err(Status::internal),
             // DB-12: who reads a space as a layer.
             "layers_dependents" => {
                 let space = str_field(&b, "space")?;
@@ -870,6 +878,10 @@ impl FlightService for AdbFlight {
             ("space_stats", "Per memory type counts of a space (DB-14): {namespace, branch?, max_age_ms?} → {tiers: {type: {count, bytes, last_write_ts}}, age_ms}"),
             ("space_records", "A page of a space's current rows, newest first (DB-14): {namespace, memory, branch?, after?, limit?} → {records, next}"),
             ("space_changes", "A space's change feed (DB-14): {namespace, branch?, memories?, from?, max?, wait_ms?} → {changes, reset, next, tip}"),
+            ("quota_set", "Storage limit (DB-4): {pattern, max_bytes?, max_records?}; a pattern is a namespace, or a prefix ending in *"),
+            ("quota_drop", "Remove a quota: {pattern}"),
+            ("quota_list", "The quotas: {quotas}"),
+            ("space_usage", "Records and payload bytes per namespace (DB-4): {namespace?} → {namespaces}"),
             ("layers_dependents", "Who reads a space as a layer (DB-12): {space} → {dependents: [{namespace, mode, tag?, sealed, memories}]}"),
             ("add_columns", "Add UTF-8 columns to a table (DB-6): {table, columns}"),
             ("append_only", "Make a table append-only (DB-13): {table}; also create_table {append_only: true}"),

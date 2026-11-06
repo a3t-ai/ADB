@@ -366,6 +366,9 @@ pub struct DurableWrites<L: Log> {
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
+    /// DB-4: per namespace, (records, payload bytes) of current rows. Built by one scan when
+    /// first needed, added to on each STORE, dropped by FORGET and compaction.
+    usage: Mutex<Option<std::collections::HashMap<String, (u64, u64)>>>,
     /// B4: the commit times compaction must keep readable (branch points), per namespace.
     pins: std::sync::OnceLock<Pins>,
     /// B4, on the org's engine: its branch engines, which a FORGET on main reaches too.
@@ -484,6 +487,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             disk_before = stats.bytes_before, disk_after = stats.bytes_after, log_records_redacted = redacted,
             "compacted"
         );
+        self.usage_stale().await;
         Ok(Some(stats))
     }
 
@@ -677,6 +681,91 @@ impl<L: Log + 'static> DurableWrites<L> {
             n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
         };
         Ok((off, ts))
+    }
+
+    /// DB-4: set or replace the quota on `pattern`.
+    pub async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>) -> AdbResult<crate::branches::Quota> {
+        if pattern.is_empty() || (max_bytes.is_none() && max_records.is_none()) {
+            return Err(AdbError::QueryError("quota_set needs a pattern and max_bytes or max_records".into()));
+        }
+        let q = crate::branches::Quota { id: crate::branches::Quota::id_of(pattern), pattern: pattern.to_string(), max_bytes, max_records };
+        let mut seq = self.seq.lock().await;
+        self.register_control(&mut seq, &q.id, pattern, serde_json::to_value(&q).unwrap_or_default()).await?;
+        Ok(q)
+    }
+
+    /// DB-4: remove the quota on `pattern`; whether it had one.
+    pub async fn quota_drop(&self, pattern: &str) -> AdbResult<bool> {
+        let id = crate::branches::Quota::id_of(pattern);
+        if !self.branches.quotas().iter().any(|q| q.id == id) {
+            return Ok(false);
+        }
+        let mut seq = self.seq.lock().await;
+        let ts = seq.begin();
+        let record = seq.append_record(ts, None, vec![Effect::Unregister { id: RecordId(id) }]).await.map_err(log_err)?;
+        self.branches.apply(&record);
+        self.to_store(&record, seq.log()).await;
+        Ok(true)
+    }
+
+    /// DB-4: (records, payload bytes) per namespace, from one scan if not known yet.
+    pub async fn usage(&self) -> AdbResult<std::collections::HashMap<String, (u64, u64)>> {
+        let mut known = self.usage.lock().await;
+        if let Some(u) = known.as_ref() {
+            return Ok(u.clone());
+        }
+        let mut u = std::collections::HashMap::<String, (u64, u64)>::new();
+        if let Some(store) = &self.store {
+            if let Some(b) = self.barrier() {
+                b.wait_for_committed().await;
+            }
+            let rows = store.current(Some(adb_store::RECORD_KINDS), CommitTs::from_datetime(time::now())).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            for r in rows {
+                if let Some(ns) = &r.data.namespace {
+                    let e = u.entry(ns.clone()).or_default();
+                    e.0 += 1;
+                    e.1 += r.data.value.to_string().len() as u64;
+                }
+            }
+        }
+        *known = Some(u.clone());
+        Ok(u)
+    }
+
+    /// DB-4: refuse a new record that would pass a quota covering `namespace`. Checked under
+    /// the sequencer lock, so a flood can't slip past between check and write. Branch engines
+    /// have none: their writes aren't the org's storage.
+    async fn check_quota(&self, namespace: Option<&str>, bytes: u64) -> AdbResult<()> {
+        let Some(ns) = namespace.filter(|_| self.parent.is_none()) else { return Ok(()) };
+        let quotas: Vec<_> = self.branches.quotas().into_iter().filter(|q| q.covers(ns)).collect();
+        if quotas.is_empty() {
+            return Ok(());
+        }
+        let usage = self.usage().await?;
+        for q in quotas {
+            let (records, used) = usage.iter().filter(|(n, _)| q.covers(n)).fold((0u64, 0u64), |a, (_, u)| (a.0 + u.0, a.1 + u.1));
+            if q.max_records.is_some_and(|m| records + 1 > m) {
+                return Err(AdbError::QueryError(format!("quota_exceeded: {:?} holds {records} records, its limit is {}", q.pattern, q.max_records.unwrap_or(0))));
+            }
+            if q.max_bytes.is_some_and(|m| used + bytes > m) {
+                return Err(AdbError::QueryError(format!("quota_exceeded: {:?} holds {used} bytes and this adds {bytes}; its limit is {}", q.pattern, q.max_bytes.unwrap_or(0))));
+            }
+        }
+        Ok(())
+    }
+
+    /// DB-4: count a stored record, if usage is being kept.
+    async fn note_stored(&self, namespace: Option<&str>, bytes: u64) {
+        if let (Some(ns), Some(u)) = (namespace, self.usage.lock().await.as_mut()) {
+            let e = u.entry(ns.to_string()).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+        }
+    }
+
+    /// DB-4: usage is recounted after something left the table.
+    async fn usage_stale(&self) {
+        *self.usage.lock().await = None;
     }
 
     /// B7: tag `namespace` at the current log position (`tag:<namespace>/<name>`).
@@ -1306,7 +1395,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), platform_last: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1775,7 +1864,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             let bare = scoped_key(None, in_scope, &store_id(memory_type, key, &payload))?;
             self.check_sealed(memory_type, namespace, &bare, None, CommitTs::from_datetime(time::now())).await?;
         }
+        let bytes = payload.to_string().len() as u64;
         let mut seq = self.seq.lock().await;
+        self.check_quota(namespace, bytes).await?;
         let ts = seq.begin();
         let id = RecordId(scoped_key(namespace, in_scope, &store_id(memory_type, key, &payload))?);
         if self.parent.is_some() && caller_keyed(memory_type, &payload) {
@@ -1816,6 +1907,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         // The table is the only copy: answer with the record as reads shape it.
         let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
         self.to_store(&record, seq.log()).await;
+        self.note_stored(namespace, bytes).await;
         Ok(stored)
     }
 
@@ -1874,7 +1966,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             true => self.vector_of(crate::reads::embed_text(memory, &payload)).await,
             false => None,
         };
+        let fact_bytes = payload.to_string().len() as u64;
         let mut seq = self.seq.lock().await;
+        self.check_quota(namespace, fact_bytes).await?;
         let ts = seq.begin();
         let shaped = |kind: Kind, value: serde_json::Value| {
             let mut d = row(memory, kind, value);
@@ -1936,6 +2030,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
         self.to_store(&record, seq.log()).await;
+        self.note_stored(namespace, fact_bytes).await;
         Ok(stored)
     }
 
@@ -2033,6 +2128,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         let effects: Vec<Effect> =
             ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
+        self.usage_stale().await;
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
         self.forgotten.lock().unwrap().extend(ids.iter().map(|id| (Memory::from(memory_type), id.clone())));

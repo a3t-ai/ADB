@@ -79,6 +79,21 @@ pub trait Engine: Send + Sync {
     async fn space_clone_at(&self, _namespace: &str, _into: &str, _at: &crate::branches::PointRef) -> Result<Value, String> {
         Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
+    /// DB-4: set or replace a storage quota on the namespaces matching `pattern`.
+    async fn quota_set(&self, _pattern: &str, _max_bytes: Option<u64>, _max_records: Option<u64>) -> Result<crate::branches::Quota, String> {
+        Err("quotas need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn quota_drop(&self, _pattern: &str) -> Result<bool, String> {
+        Err("quotas need a durable engine (start ADB with --data-dir)".into())
+    }
+    async fn quota_list(&self) -> Result<Vec<crate::branches::Quota>, String> {
+        Ok(Vec::new())
+    }
+    /// DB-4: `{namespaces: {ns: {records, bytes}}}`, one namespace's if named. A scan when the
+    /// count isn't known yet.
+    async fn space_usage(&self, _namespace: Option<&str>) -> Result<Value, String> {
+        Err("usage needs a durable engine (start ADB with --data-dir)".into())
+    }
     /// DB-12: the spaces that read `space` as a layer.
     async fn layers_dependents(&self, _space: &str) -> Result<Vec<crate::branches::Dependent>, String> {
         Ok(Vec::new())
@@ -1233,6 +1248,31 @@ impl Engine for LocalEngine {
         let n = self.materialise_at(source, namespace, into, ts).await?;
         let exact = self.past_is_exact(namespace, ts).await?;
         Ok(json!({ "namespace": into, "records": n, "exact": exact, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
+    }
+
+    async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>) -> Result<crate::branches::Quota, String> {
+        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("quotas are set on the org's engine")?;
+        d.quota_set(pattern, max_bytes, max_records).await.map_err(|e| e.to_string())
+    }
+
+    async fn quota_drop(&self, pattern: &str) -> Result<bool, String> {
+        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("quotas are set on the org's engine")?;
+        d.quota_drop(pattern).await.map_err(|e| e.to_string())
+    }
+
+    async fn quota_list(&self) -> Result<Vec<crate::branches::Quota>, String> {
+        Ok(self.durable.as_ref().map(|d| d.branches().quotas()).unwrap_or_default())
+    }
+
+    async fn space_usage(&self, namespace: Option<&str>) -> Result<Value, String> {
+        let d = self.durable.as_ref().ok_or("usage needs a durable engine (start ADB with --data-dir)")?;
+        let usage = d.usage().await.map_err(|e| e.to_string())?;
+        let namespaces: serde_json::Map<String, Value> = usage
+            .into_iter()
+            .filter(|(n, _)| namespace.is_none_or(|w| w == n))
+            .map(|(n, (records, bytes))| (n, json!({ "records": records, "bytes": bytes })))
+            .collect();
+        Ok(json!({ "namespaces": namespaces }))
     }
 
     async fn layers_dependents(&self, space: &str) -> Result<Vec<crate::branches::Dependent>, String> {

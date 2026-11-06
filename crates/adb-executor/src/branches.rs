@@ -129,6 +129,31 @@ pub struct Dependent {
     pub memories: Vec<adb_core::MemoryType>,
 }
 
+/// DB-4: a storage limit on the namespaces matching `pattern` together (an exact namespace,
+/// or a prefix ending in `*`, such as an org's `acme--*`): `quota:<pattern>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Quota {
+    pub id: String,
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u64>,
+}
+
+impl Quota {
+    pub fn id_of(pattern: &str) -> String {
+        format!("quota:{pattern}")
+    }
+
+    pub fn covers(&self, namespace: &str) -> bool {
+        match self.pattern.strip_suffix('*') {
+            Some(prefix) => namespace.starts_with(prefix),
+            None => self.pattern == namespace,
+        }
+    }
+}
+
 /// DB-9: a past point of a space: a tag, or an offset from a memory point (DB-7). `ts`
 /// goes with the offset once the log no longer holds that record.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -162,6 +187,8 @@ pub struct Branches {
     /// B7: tags and layers, the other control rows of kind `branch` (by id prefix).
     tags: RwLock<BTreeMap<String, Tag>>,
     layers: RwLock<BTreeMap<String, Layers>>,
+    /// DB-4: storage limits.
+    quotas: RwLock<BTreeMap<String, Quota>>,
 }
 
 /// What a `branch`-kind control row holds, by its id's prefix.
@@ -171,6 +198,8 @@ fn control(value: &serde_json::Value) -> Option<Control> {
         serde_json::from_value(value.clone()).ok().map(Control::Tag)
     } else if id.starts_with("layers:") {
         serde_json::from_value(value.clone()).ok().map(Control::Layers)
+    } else if id.starts_with("quota:") {
+        serde_json::from_value(value.clone()).ok().map(Control::Quota)
     } else {
         serde_json::from_value(value.clone()).ok().map(Control::Branch)
     }
@@ -180,6 +209,7 @@ enum Control {
     Branch(Branch),
     Tag(Tag),
     Layers(Layers),
+    Quota(Quota),
 }
 
 impl Branches {
@@ -203,6 +233,9 @@ impl Branches {
             Some(Control::Layers(l)) => {
                 self.layers.write().unwrap().insert(l.id.clone(), l);
             }
+            Some(Control::Quota(q)) => {
+                self.quotas.write().unwrap().insert(q.id.clone(), q);
+            }
             None => {}
         }
     }
@@ -216,10 +249,16 @@ impl Branches {
                     self.by_id.write().unwrap().remove(&id.0);
                     self.tags.write().unwrap().remove(&id.0);
                     self.layers.write().unwrap().remove(&id.0);
+                    self.quotas.write().unwrap().remove(&id.0);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// DB-4: every quota.
+    pub fn quotas(&self) -> Vec<Quota> {
+        self.quotas.read().unwrap().values().cloned().collect()
     }
 
     pub fn tag(&self, namespace: &str, name: &str) -> Option<Tag> {

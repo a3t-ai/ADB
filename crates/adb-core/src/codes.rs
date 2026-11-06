@@ -38,6 +38,7 @@ pub const CODES: &[&str] = &[
     "sealed_key",
     "merge_conflicts",
     "merge_stale",
+    "quota_exceeded",
     "point_too_old",
     "point_invalid",
     "merge_not_found",
@@ -63,6 +64,8 @@ pub fn code_of(message: &str) -> &'static str {
         "unauthorized"
     } else if has(" pool's token") || has(" is the console's (the engine token)") || has(" is not open to the ") {
         "forbidden"
+    } else if has("quota_exceeded:") {
+        "quota_exceeded"
     } else if has("point_too_old:") {
         "point_too_old"
     } else if has("point_invalid:") {
@@ -236,6 +239,7 @@ mod tests {
         ("Query execution error: merge_stale: main changed 1 since the conflicts were read: a", "merge_stale"),
         ("Query execution error: point_too_old: offset 3 is older than the 90 days kept", "point_too_old"),
         ("point_invalid: offset 99 is past the log's end (12)", "point_invalid"),
+        ("Query execution error: quota_exceeded: \"acme--*\" holds 3 records, its limit is 3", "quota_exceeded"),
         ("merge_not_found: no merge \"m1\" in namespace \"crm\"", "merge_not_found"),
         ("revert_conflicts: 1 records changed since the merge: a (force_skip reverts the rest)", "revert_conflicts"),
         ("Query execution error: a history layer of \"bot\" carries EPISODIC only and isn't sealed", "layer_invalid"),
