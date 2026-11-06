@@ -437,27 +437,39 @@ impl Log for LocalWal {
         let mut changed = 0;
         for (seg, from, entries) in closed {
             let path = segment_path(&self.dir, seg);
-            let mut records = Vec::with_capacity(entries.len());
-            {
-                let file = File::open(&path).map_err(io)?;
-                for e in &entries {
-                    let mut payload = vec![0u8; e.len as usize];
-                    file.read_exact_at(&mut payload, e.pos + HEADER as u64).map_err(io)?;
-                    records.push(decode(&payload)?);
+            // One record at a time: a whole segment decoded at once is many times its size
+            // on disk, and on a real log that is hundreds of MiB for each FORGET, which
+            // glibc then keeps in the calling thread's arena (leader memory, CA-53).
+            let source = File::open(&path).map_err(io)?;
+            let mut payload = Vec::new();
+            let mut read = |e: &Entry, payload: &mut Vec<u8>| -> LogResult<LogRecord> {
+                payload.resize(e.len as usize, 0);
+                source.read_exact_at(payload, e.pos + HEADER as u64).map_err(io)?;
+                decode(payload)
+            };
+            // Most segments hold nothing forgotten: stop at the first record that does.
+            let mut touched = false;
+            for e in &entries {
+                let mut r = read(e, &mut payload)?;
+                if redact(&mut r) {
+                    touched = true;
+                    break;
                 }
             }
-            let hits = records.iter_mut().map(|r| redact(r)).filter(|changed| *changed).count();
-            if hits == 0 {
+            if !touched {
                 continue;
             }
-            changed += hits;
             // The rewritten segment, complete and synced, then swapped in with its index.
             let tmp = path.with_extension("wal.rewrite");
             let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp).map_err(io)?;
-            let mut new_entries = Vec::with_capacity(records.len());
+            let mut new_entries = Vec::with_capacity(entries.len());
             let mut pos = 0u64;
-            for r in &records {
-                let frame = encode(r)?;
+            for e in &entries {
+                let mut r = read(e, &mut payload)?;
+                if redact(&mut r) {
+                    changed += 1;
+                }
+                let frame = encode(&r)?;
                 file.write_all(&frame).map_err(io)?;
                 new_entries.push(Entry { segment: seg, pos, len: (frame.len() - HEADER) as u32 });
                 pos += frame.len() as u64;
