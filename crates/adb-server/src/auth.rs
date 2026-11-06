@@ -56,6 +56,8 @@ pub enum Access {
     Memory,
     /// The engine token: FlowR's engine store only.
     Engine,
+    /// A scoped token (DB-3): its namespaces only; the request carries its [`Scope`].
+    Scoped,
 }
 
 /// Whether an `Authorization` value carries `token` (constant time in its length).
@@ -66,12 +68,20 @@ pub fn authorized(value: Option<&str>, token: &str) -> bool {
 }
 
 /// HTTP middleware: `/health` stays open (probes); everything else needs the token.
-pub async fn require_token(token: Arc<str>, req: Request, next: Next) -> Response {
+pub async fn require_token(token: Option<Arc<str>>, scopes: Arc<Vec<Arc<crate::scope::Scope>>>, mut req: Request, next: Next) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
     let value = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    if authorized(value, &token) {
+    if token.as_deref().is_some_and(|t| authorized(value, t)) {
+        next.run(req).await
+    } else if let Some(scope) = scopes.iter().find(|s| authorized(value, &s.token)) {
+        // DB-3: only `/query`, which checks each statement; nothing else stays in a namespace.
+        if req.uri().path() != "/query" {
+            let error = format!("{} is not open to the {} token", req.uri().path(), scope.name);
+            return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "success": false, "code": "forbidden", "error": error }))).into_response();
+        }
+        req.extensions_mut().insert(Arc::clone(scope));
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "success": false, "code": "unauthorized", "error": "unauthorized: ADB needs Authorization: Bearer <token>" })))
@@ -88,11 +98,13 @@ pub struct FlightAuth {
     pub engine: Option<Arc<str>>,
     /// Pool tokens: (pool, token).
     pub pools: Vec<(Arc<str>, Arc<str>)>,
+    /// Scoped tokens (DB-3).
+    pub scopes: Vec<Arc<crate::scope::Scope>>,
 }
 
 impl tonic::service::Interceptor for FlightAuth {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let access = if self.memory.is_none() && self.engine.is_none() && self.pools.is_empty() {
+        let access = if self.memory.is_none() && self.engine.is_none() && self.pools.is_empty() && self.scopes.is_empty() {
             Access::Open
         } else {
             let value = req.metadata().get("authorization").and_then(|v| v.to_str().ok());
@@ -103,6 +115,9 @@ impl tonic::service::Interceptor for FlightAuth {
             } else if let Some((pool, _)) = self.pools.iter().find(|(_, t)| authorized(value, t)) {
                 req.extensions_mut().insert(EnginePool(Arc::clone(pool)));
                 Access::Engine
+            } else if let Some(scope) = self.scopes.iter().find(|s| authorized(value, &s.token)) {
+                req.extensions_mut().insert(Arc::clone(scope));
+                Access::Scoped
             } else {
                 return Err(tonic::Status::unauthenticated("ADB needs authorization: Bearer <token>"));
             }

@@ -19,6 +19,7 @@
 pub mod auth;
 pub mod branch_remote;
 pub mod flight;
+pub mod scope;
 pub use flight::{serve_flight, serve_flight_with_token, serve_flight_with_tokens};
 
 use std::collections::HashMap;
@@ -64,8 +65,9 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
 /// The full router; with `token`, every endpoint but `/health` requires it.
 pub fn router_with_token(engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> Router {
     let mut r = routes(engine);
-    if let Some(t) = token {
-        r = r.layer(axum::middleware::from_fn(move |req, next| auth::require_token(Arc::clone(&t), req, next)));
+    let scopes = Arc::new(scope::scopes_from_env());
+    if token.is_some() || !scopes.is_empty() {
+        r = r.layer(axum::middleware::from_fn(move |req, next| auth::require_token(token.clone(), Arc::clone(&scopes), req, next)));
     }
     r.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
 }
@@ -243,7 +245,12 @@ fn code(error: &Option<String>) -> Option<&'static str> {
 }
 
 /// `POST /query` — ClawDB's shape: `data` is the whole wire `QueryResult`.
-async fn query(State(s): State<AppState>, Json(req): Json<QueryRequest>) -> (StatusCode, Json<QueryResponse>) {
+async fn query(State(s): State<AppState>, scope: Option<axum::Extension<Arc<scope::Scope>>>, Json(req): Json<QueryRequest>) -> (StatusCode, Json<QueryResponse>) {
+    if let Some(axum::Extension(scope)) = scope {
+        if let Err(e) = scope.check_aql(&req.query) {
+            return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }));
+        }
+    }
     let start = Instant::now();
     let result = s.engine.query(&req.query, req.variables.as_ref()).await;
     let ms = Some(start.elapsed().as_millis() as u64);

@@ -192,6 +192,30 @@ pub fn statement_branch(aql: &str) -> Result<Option<(String, Option<String>)>, S
     Ok(Some(first))
 }
 
+/// DB-3: what a statement touches: per stage, its `NAMESPACE` and whether it writes. A kind
+/// that doesn't say (LINK, SUBSCRIBE, …), or a statement that doesn't parse, is an error.
+pub fn statement_namespaces(aql: &str) -> Result<Vec<(Option<String>, bool)>, String> {
+    use aql_parser::Statement as S;
+    let stmt = aql_parser::parse(aql).map_err(|_| "a statement that doesn't parse".to_string())?;
+    fn of(s: &S) -> Option<(Option<String>, bool)> {
+        Some(match s {
+            S::Recall(x) => (x.modifiers.namespace.clone(), false),
+            S::Lookup(x) => (x.modifiers.namespace.clone(), false),
+            S::Load(x) => (x.modifiers.namespace.clone(), false),
+            S::Scan(x) => (x.modifiers.namespace.clone(), false),
+            S::Store(x) => (x.modifiers.namespace.clone(), true),
+            S::Update(x) => (x.modifiers.namespace.clone(), true),
+            S::Forget(x) => (x.modifiers.namespace.clone(), true),
+            _ => return None,
+        })
+    }
+    let stages: Vec<&S> = match &stmt {
+        S::Pipeline(p) => p.stages.iter().collect(),
+        other => vec![other],
+    };
+    stages.iter().map(|s| of(s).ok_or_else(|| "this kind of statement".to_string())).collect()
+}
+
 /// B6: a branch engine in its own ADB process, reached over the network (the
 /// server crate implements it over Arrow Flight).
 #[async_trait]

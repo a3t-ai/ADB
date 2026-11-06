@@ -71,7 +71,7 @@ pub async fn serve_flight_with_tokens(addr: SocketAddr, engine: Arc<dyn Engine>,
     if !pools.is_empty() {
         tracing::info!(pools = ?pools.iter().map(|(p, _)| p.to_string()).collect::<Vec<_>>(), "engine pool tokens");
     }
-    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth { memory: token, engine: engine_token, pools });
+    let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth { memory: token, engine: engine_token, pools, scopes: crate::scope::scopes_from_env() });
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve(addr)
@@ -96,6 +96,14 @@ fn not_engine_only<T>(req: &Request<T>) -> Result<(), Status> {
     match access(req) {
         Access::Engine => Err(Status::permission_denied("the engine token opens only FlowR's engine store")),
         _ => Ok(()),
+    }
+}
+
+/// Tables are not open to a scoped token (DB-3).
+fn not_scoped<T>(req: &Request<T>) -> Result<(), Status> {
+    match req.extensions().get::<Arc<crate::scope::Scope>>() {
+        Some(s) => Err(Status::permission_denied(format!("platform tables are not open to the {} token", s.name))),
+        None => Ok(()),
     }
 }
 
@@ -621,9 +629,10 @@ impl AdbFlight {
     async fn do_action_inner(&self, req: Request<Action>) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
         let access = access(&req);
         let pool = req.extensions().get::<crate::auth::EnginePool>().cloned();
+        let scope = req.extensions().get::<Arc<crate::scope::Scope>>().cloned();
         let a = req.into_inner();
         if a.r#type.starts_with("engine") {
-            if access == Access::Memory {
+            if access == Access::Memory || access == Access::Scoped {
                 return Err(Status::permission_denied("FlowR's engine store needs the engine token (ADB_ENGINE_TOKEN)"));
             }
             let b = body(&a.body)?;
@@ -650,7 +659,11 @@ impl AdbFlight {
         if access == Access::Engine {
             return Err(Status::permission_denied("the engine token opens only FlowR's engine store"));
         }
-        let answer = self.action(&a.r#type, body(&a.body)?).await?;
+        let b = body(&a.body)?;
+        if let Some(scope) = &scope {
+            scope.check_action(&a.r#type, &b).map_err(Status::permission_denied)?;
+        }
+        let answer = self.action(&a.r#type, b).await?;
         let r = arrow_flight::Result { body: answer.to_string().into() };
         Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
     }
@@ -754,7 +767,16 @@ impl FlightService for AdbFlight {
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         not_engine_only(&req)?;
+        let scope = req.extensions().get::<Arc<crate::scope::Scope>>().cloned();
         let q = body(&req.into_inner().ticket)?;
+        // DB-3: a scoped token follows its own namespace's fact feed, and reads no table.
+        if let Some(scope) = &scope {
+            let feed = q.get("feed").and_then(|f| f.as_str()) == Some("facts");
+            let ns = q.get("namespace").and_then(|n| n.as_str()).unwrap_or_default();
+            if !feed || !scope.may(ns, false) {
+                return Err(Status::permission_denied(format!("this read is not open to the {} token", scope.name)));
+            }
+        }
         match q.get("feed").and_then(|f| f.as_str()) {
             Some("facts") => return Ok(Response::new(self.fact_feed(&q).await?)),
             Some(other) => return Err(Status::invalid_argument(format!("unknown feed {other} (the feed is \"facts\")"))),
@@ -786,6 +808,7 @@ impl FlightService for AdbFlight {
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
         not_engine_only(&req)?;
+        not_scoped(&req)?;
         let mut stream = req.into_inner().peekable();
         // The table comes in the first message's descriptor; `[table, "replace"]`
         // replaces the table with these rows instead of appending them;
@@ -876,6 +899,7 @@ impl FlightService for AdbFlight {
         Err(Status::unimplemented("not supported"))
     }
     async fn get_schema(&self, req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
+        not_scoped(&req)?;
         let table = req.into_inner().path.first().cloned().ok_or_else(|| Status::invalid_argument("descriptor path [table]"))?;
         let schema = self.platform()?.schema(&table).await.map_err(platform_err)?;
         let opts = arrow_ipc::writer::IpcWriteOptions::default();
