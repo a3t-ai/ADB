@@ -69,6 +69,11 @@ pub trait Engine: Send + Sync {
         Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// DB-17: copy a space's procedures (and tools, with `tools`) into `into`. No episodes,
+    /// facts or working memory.
+    async fn space_copy_procedures(&self, _namespace: &str, _into: &str, _tools: bool) -> Result<Value, String> {
+        Err("copying a memory space needs a durable engine (start ADB with --data-dir)".into())
+    }
     /// DB-9: a branch of main at a past point: the branch, plus `exact: false` when the
     /// space holds EPISODIC or TOOLS rows, which change in place (L9-a) and so read
     /// as they are now.
@@ -601,6 +606,22 @@ impl LocalEngine {
     async fn materialise_from(&self, source: Arc<dyn crate::branch_engine::ParentSource>, namespace: &str, into: &str) -> Result<u64, String> {
         let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
         self.materialise_at(source, namespace, into, now).await
+    }
+
+    /// DB-17: copy only PROCEDURAL (and TOOLS' schemas, with `tools`) of `namespace` into `into`:
+    /// nothing a client said or was learned about them travels.
+    async fn materialise_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<u64, String> {
+        let d = self.durable.as_ref().ok_or("copying needs a durable engine (start ADB with --data-dir)")?;
+        if namespace == into {
+            return Err(format!("promote into a new namespace, not {into:?} itself"));
+        }
+        let source = self.as_parent_source().ok_or("copying needs a durable engine (start ADB with --data-dir)")?;
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let mut rows = source.rows_as_of(MemoryType::Procedural, namespace, now).await.map_err(|e| e.to_string())?;
+        if tools {
+            rows.extend(source.rows_as_of(MemoryType::Tools, namespace, now).await.map_err(|e| e.to_string())?);
+        }
+        d.materialise(into, rows).await.map_err(|e| e.to_string())
     }
 
     /// DB-9: whether a read of `namespace` at a past point is exact: EPISODIC and TOOLS
@@ -1236,6 +1257,14 @@ impl Engine for LocalEngine {
         let mut v = serde_json::to_value(&b).unwrap_or_default();
         v["exact"] = json!(exact);
         Ok(v)
+    }
+
+    async fn space_copy_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<Value, String> {
+        if self.parent.is_some() {
+            return Err("spaces are copied on the org's engine".into());
+        }
+        let n = self.materialise_procedures(namespace, into, tools).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN }, "procedures_only": true }))
     }
 
     async fn space_clone_at(&self, namespace: &str, into: &str, at: &crate::branches::PointRef) -> Result<Value, String> {

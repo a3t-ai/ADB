@@ -401,10 +401,11 @@ do:
       if (JSON.parse(body || '{}').stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 } })}\n\n`);
         res.end('data: [DONE]\n\n');
       } else {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] }));
+        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }], usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 } }));
       }
     });
   });
@@ -454,8 +455,32 @@ do:
   const run = r.body.runs?.find(x => x.memory_branch === 'chat');
   check('the turn names its version, environment and branch', run?.agent_version === '2' && run?.environment === 'prod' && run?.memory_namespace === 'acme--bot', JSON.stringify(r));
   check('and the memory point it read', JSON.parse(run?.memory_point || '{}').offset > 0, JSON.stringify(run));
+  r = await api('GET', '/agents/bot/usage');
+  const prodUse = r.body.by_environment?.prod;
+  check('the turn\'s tokens match what the provider said', prodUse?.turns === 1 && prodUse?.prompt_tokens === 11 && prodUse?.completion_tokens === 7, JSON.stringify(r));
+  r = await api('GET', '/projects/acme/usage');
+  check('and roll up per agent', r.body.by_agent?.bot?.prod?.prompt_tokens === 11, JSON.stringify(r));
   llm.close();
   await api('DELETE', '/agents/bot/branches/chat');
+
+  // --- DB-17: to another org, procedures only
+  await tool('create_flow', { yaml: `document: { dsl: '1.0.3', namespace: t, name: seed-project, version: '1.0.0' }
+do:
+  - insert:
+      call: lancedb
+      with:
+        operation: insert
+        table: projects
+        records:
+          - { namespace: globex-crm, owner_kind: org, owner: globex, owner_id: org-globex, name: crm }
+` });
+  await tool('execute_flow', { namespace: 't', name: 'seed-project' });
+  check('a transfer needs a project', (await api('POST', '/agents/bot/transfer', {})).status === 400);
+  check('that exists', (await api('POST', '/agents/bot/transfer', { project: 'nowhere' })).status === 404);
+  r = await api('POST', '/agents/bot/transfer', { project: 'globex-crm', new_agent: { id: 'bot9' } });
+  check('a transfer lands in the other org', r.status === 201 && r.body.agent?.org_id === 'org-globex' && r.body.version?.lineage?.transferred_from?.agent === 'bot', JSON.stringify(r));
+  const carried = JSON.stringify([await aql('RECALL FROM SEMANTIC ALL NAMESPACE "globex-crm--bot9"'), await aql('RECALL FROM EPISODIC ALL NAMESPACE "globex-crm--bot9"')]);
+  check('it carries procedures, no facts or episodes', r.body.memory?.records > 0 && !carried.includes('"key"'), carried);
 
   // --- drop
   await api('DELETE', '/agents/bot/branches/teach');

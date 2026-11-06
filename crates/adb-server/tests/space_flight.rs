@@ -249,3 +249,26 @@ async fn branch_and_clone_at_a_tag_or_offset_read_what_that_point_held() {
     assert_eq!(refused(json!({ "namespace": "crm", "name": "x3", "at": { "offset": 99999999 } })).await, "point_invalid");
     assert_eq!(refused(json!({ "namespace": "crm", "name": "x4", "parent": "at-tag", "at": { "tag": "v1" } })).await, "point_invalid");
 }
+
+/// DB-17: a procedures-only copy carries no episodes or facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_procedures_only_copy_carries_nothing_about_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = serve(dir.path()).await;
+    aql(&f, r#"STORE INTO PROCEDURAL (key = "refund", steps = "check, then pay") NAMESPACE "acme--bot""#).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "client", content = "client secret fact") NAMESPACE "acme--bot""#).await;
+    aql(&f, r#"STORE INTO EPISODIC (key = "talk", content = "client said something") NAMESPACE "acme--bot""#).await;
+    aql(&f, r#"STORE INTO WORKING (key = "w", content = "client working note") NAMESPACE "acme--bot""#).await;
+    aql(&f, r#"STORE INTO TOOLS (key = "t", name = "lookup", description = "a tool", schema = "{}") NAMESPACE "acme--bot""#).await;
+
+    let c = action(&f, "space_clone", json!({ "namespace": "acme--bot", "into": "globex--bot", "procedures_only": true })).await.unwrap();
+    assert_eq!(c["records"], json!(1), "{c}");
+    assert!(holds(&aql(&f, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "globex--bot""#).await, "check, then pay"));
+    let stats = action(&f, "space_stats", json!({ "namespace": "globex--bot", "max_age_ms": 0 })).await.unwrap();
+    for (tier, count) in [("PROCEDURAL", 1), ("SEMANTIC", 0), ("EPISODIC", 0), ("WORKING", 0), ("TOOLS", 0)] {
+        assert_eq!(stats["tiers"][tier]["count"], json!(count), "{tier}: {stats}");
+    }
+    let with = action(&f, "space_clone", json!({ "namespace": "acme--bot", "into": "initech--bot", "procedures_only": true, "tools": true })).await.unwrap();
+    assert_eq!(with["records"], json!(2), "{with}");
+    assert_eq!(action(&f, "space_clone", json!({ "namespace": "acme--bot", "into": "x", "procedures_only": true, "at": { "tag": "v" } })).await.unwrap_err().0, "point_invalid");
+}

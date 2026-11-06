@@ -481,6 +481,13 @@ impl AdbFlight {
             "space_clone" => {
                 let ns = str_field(&b, "namespace")?;
                 let into = str_field(&b, "into")?;
+                // DB-17: `{procedures_only: true, tools?}`, for a copy to another org.
+                if b.get("procedures_only").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if b.get("at").is_some() {
+                        return Err(Status::invalid_argument("point_invalid: a procedures-only copy is of main now"));
+                    }
+                    return self.engine.space_copy_procedures(ns, into, b.get("tools").and_then(|v| v.as_bool()).unwrap_or(false)).await.map_err(Status::invalid_argument);
+                }
                 if let Some(at) = b.get("at") {
                     return self.engine.space_clone_at(ns, into, &point_ref(at)?).await.map_err(Status::invalid_argument);
                 }
