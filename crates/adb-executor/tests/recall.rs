@@ -24,7 +24,10 @@ async fn like(engine: &LocalEngine, aql: &str, text: &str) -> Value {
 }
 
 fn keys(v: &Value) -> Vec<String> {
-    v["data"]["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
+    v["data"]["records"].as_array().unwrap().iter().map(|r| {
+        let id = r["id"].as_str().unwrap();
+        id.split_once("|~").map(|(_, k)| k).unwrap_or(id).to_string()
+    }).collect()
 }
 
 const FACTS: &[(&str, &str)] = &[

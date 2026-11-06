@@ -160,7 +160,7 @@ async fn feed_follows_one_space_and_never_returns_an_erased_payload() {
     for w in [
         want("put", "SEMANTIC", "fact"),
         want("put", "EPISODIC", "ep"),
-        want("patch", "EPISODIC", "ep"),
+        want("update", "EPISODIC", "ep"),
         want("update", "SEMANTIC", "fact"),
         want("forget", "SEMANTIC", "gone"),
     ] {
@@ -209,7 +209,6 @@ async fn branch_and_clone_at_a_tag_or_offset_read_what_that_point_held() {
 
     // At a tag: what v1 held. It came before the procedure existed.
     let b = action(&f, "branch_create", json!({ "namespace": "crm", "name": "at-tag", "at": { "tag": "v1" } })).await.unwrap();
-    assert_eq!(b["exact"], json!(true), "{b}");
     let read = aql(&f, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "at-tag" LIMIT 10"#).await;
     assert!(holds(&read, "original") && !holds(&read, "changed later"), "{read}");
     let procs = aql(&f, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" BRANCH "at-tag" LIMIT 10"#).await;
@@ -231,13 +230,6 @@ async fn branch_and_clone_at_a_tag_or_offset_read_what_that_point_held() {
     assert!(c["from"]["point"]["offset"].is_u64(), "{c}");
     let cloned = aql(&f, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm-v1" LIMIT 10"#).await;
     assert!(holds(&cloned, "original") && !holds(&cloned, "changed later"), "{cloned}");
-
-    // EPISODIC changes in place, so a past point isn't exact once the space holds some.
-    aql(&f, r#"STORE INTO EPISODIC (key = "ep", content = "talked") NAMESPACE "crm""#).await;
-    let later = aql(&f, r#"STORE INTO SEMANTIC (key = "z", content = "z") NAMESPACE "crm""#).await;
-    let at = later["data"]["metadata"]["point"]["offset"].as_u64().unwrap();
-    let inexact = action(&f, "branch_create", json!({ "namespace": "crm", "name": "inexact", "at": { "offset": at } })).await.unwrap();
-    assert_eq!(inexact["exact"], json!(false), "{inexact}");
 
     // Refusals, with their codes.
     let refused = |body: Value| {

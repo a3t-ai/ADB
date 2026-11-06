@@ -470,7 +470,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
         }
         let pins = self.pins.get().map(|f| f()).unwrap_or_default();
-        let stats = store.compact_pinned(HISTORY, CommitTs::from_datetime(time::now()), &pins).await.map_err(store_err)?;
+        // DB-8: a namespace's own history window, where a quota row sets one.
+        let windows: Vec<(String, Duration)> = self.branches.quotas().into_iter()
+            .filter_map(|q| q.history_days.map(|d| (q.pattern, Duration::from_secs(d * 86_400))))
+            .collect();
+        let stats = store.compact_with_windows(HISTORY, CommitTs::from_datetime(time::now()), &pins, windows).await.map_err(store_err)?;
         let mut redacted = 0;
         if !rows.is_empty() {
             // Close the segment holding the newest records, then rewrite the closed
@@ -684,11 +688,11 @@ impl<L: Log + 'static> DurableWrites<L> {
     }
 
     /// DB-4: set or replace the quota on `pattern`.
-    pub async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>) -> AdbResult<crate::branches::Quota> {
-        if pattern.is_empty() || (max_bytes.is_none() && max_records.is_none()) {
-            return Err(AdbError::QueryError("quota_set needs a pattern and max_bytes or max_records".into()));
+    pub async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>, history_days: Option<u64>) -> AdbResult<crate::branches::Quota> {
+        if pattern.is_empty() || (max_bytes.is_none() && max_records.is_none() && history_days.is_none()) {
+            return Err(AdbError::QueryError("quota_set needs a pattern and max_bytes, max_records or history_days".into()));
         }
-        let q = crate::branches::Quota { id: crate::branches::Quota::id_of(pattern), pattern: pattern.to_string(), max_bytes, max_records };
+        let q = crate::branches::Quota { id: crate::branches::Quota::id_of(pattern), pattern: pattern.to_string(), max_bytes, max_records, history_days };
         let mut seq = self.seq.lock().await;
         self.register_control(&mut seq, &q.id, pattern, serde_json::to_value(&q).unwrap_or_default()).await?;
         Ok(q)
@@ -2547,9 +2551,10 @@ pub fn store_id(memory: MemoryType, key: &str, payload: &serde_json::Value) -> S
     field.and_then(|f| payload.get(f)).and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| key.to_string())
 }
 
-/// Memory types whose `UPDATE` writes a new version (D2 §2).
+/// Memory types whose `UPDATE` writes a new version (D2 §2; DB-8 adds EPISODIC and TOOLS, so
+/// "what the agent knew at 14:32" covers them). WORKING is session state and changes in place.
 fn supersedes(memory: MemoryType) -> bool {
-    matches!(memory, MemoryType::Semantic | MemoryType::Procedural)
+    !matches!(memory, MemoryType::Working)
 }
 
 /// A fact's `valid_from` / `valid_to`, the bounds it has (AQL v0.10).

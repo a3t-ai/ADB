@@ -522,7 +522,7 @@ impl AdbFlight {
             }
             // DB-4: storage quotas and usage.
             "quota_set" => {
-                let q = self.engine.quota_set(str_field(&b, "pattern")?, b.get("max_bytes").and_then(|v| v.as_u64()), b.get("max_records").and_then(|v| v.as_u64())).await.map_err(Status::invalid_argument)?;
+                let q = self.engine.quota_set(str_field(&b, "pattern")?, b.get("max_bytes").and_then(|v| v.as_u64()), b.get("max_records").and_then(|v| v.as_u64()), b.get("history_days").and_then(|v| v.as_u64())).await.map_err(Status::invalid_argument)?;
                 Ok(serde_json::to_value(q).unwrap_or_default())
             }
             "quota_drop" => Ok(json!({ "dropped": self.engine.quota_drop(str_field(&b, "pattern")?).await.map_err(Status::invalid_argument)? })),
@@ -885,7 +885,7 @@ impl FlightService for AdbFlight {
             ("space_stats", "Per memory type counts of a space (DB-14): {namespace, branch?, max_age_ms?} → {tiers: {type: {count, bytes, last_write_ts}}, age_ms}"),
             ("space_records", "A page of a space's current rows, newest first (DB-14): {namespace, memory, branch?, after?, limit?} → {records, next}"),
             ("space_changes", "A space's change feed (DB-14): {namespace, branch?, memories?, from?, max?, wait_ms?} → {changes, reset, next, tip}"),
-            ("quota_set", "Storage limit (DB-4): {pattern, max_bytes?, max_records?}; a pattern is a namespace, or a prefix ending in *"),
+            ("quota_set", "Storage limit (DB-4) and history window (DB-8): {pattern, max_bytes?, max_records?, history_days?}; a pattern is a namespace, or a prefix ending in *"),
             ("quota_drop", "Remove a quota: {pattern}"),
             ("quota_list", "The quotas: {quotas}"),
             ("space_usage", "Records and payload bytes per namespace (DB-4): {namespace?} → {namespaces}"),

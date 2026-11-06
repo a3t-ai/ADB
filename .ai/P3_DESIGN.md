@@ -76,8 +76,8 @@ Tests: `crates/adb-server/tests/space_flight.rs`, `crates/adb-executor/tests/poi
   `point_too_old`.
 - **`point_invalid`** is a second new code: `at` with neither tag nor offset, an offset past
   the log's end, or `at` with a parent branch. A past point is cut from main only.
-- **`exact`:** answered on `branch_create` and `space_clone` with `at`. False when the space has
-  EPISODIC or TOOLS rows at that point. It says whether such rows exist, not whether they changed.
+- **`exact`:** removed by DB-8: EPISODIC and TOOLS are versioned now, so a past point reads them as
+  they were. A change made before DB-8 changed them in place, so it has no earlier version to read.
 - **Stats cache:** 10 s by default, `max_age_ms` overrides, `age_ms` in the answer. Scans rows on
   a miss, as designed.
 - **Paging:** an updated record moves to the top, so a reader paging through can miss it on later

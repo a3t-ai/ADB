@@ -125,7 +125,7 @@ async fn as_of_reads_past_versions() {
         r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF 1h AGO FOLLOW LINKS ALL"#,
         r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF "yesterday""#,
         r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF $unbound"#,
-        r#"RECALL FROM EPISODIC WHERE a = 1 AS OF 1h AGO"#,
+        r#"RECALL FROM WORKING WHERE a = 1 AS OF 1h AGO"#,
     ] {
         assert!(engine.query(bad, None).await.is_err(), "{bad} should be refused");
     }

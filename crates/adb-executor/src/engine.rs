@@ -74,9 +74,7 @@ pub trait Engine: Send + Sync {
     async fn space_copy_procedures(&self, _namespace: &str, _into: &str, _tools: bool) -> Result<Value, String> {
         Err("copying a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
-    /// DB-9: a branch of main at a past point: the branch, plus `exact: false` when the
-    /// space holds EPISODIC or TOOLS rows, which change in place (L9-a) and so read
-    /// as they are now.
+    /// DB-9: a branch of main at a past point.
     async fn branch_create_past(&self, _namespace: &str, _name: &str, _created_by: Option<&str>, _at: &crate::branches::PointRef) -> Result<Value, String> {
         Err("memory branches need a durable engine (start ADB with --data-dir)".into())
     }
@@ -85,7 +83,7 @@ pub trait Engine: Send + Sync {
         Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
     /// DB-4: set or replace a storage quota on the namespaces matching `pattern`.
-    async fn quota_set(&self, _pattern: &str, _max_bytes: Option<u64>, _max_records: Option<u64>) -> Result<crate::branches::Quota, String> {
+    async fn quota_set(&self, _pattern: &str, _max_bytes: Option<u64>, _max_records: Option<u64>, _history_days: Option<u64>) -> Result<crate::branches::Quota, String> {
         Err("quotas need a durable engine (start ADB with --data-dir)".into())
     }
     async fn quota_drop(&self, _pattern: &str) -> Result<bool, String> {
@@ -622,18 +620,6 @@ impl LocalEngine {
             rows.extend(source.rows_as_of(MemoryType::Tools, namespace, now).await.map_err(|e| e.to_string())?);
         }
         d.materialise(into, rows).await.map_err(|e| e.to_string())
-    }
-
-    /// DB-9: whether a read of `namespace` at a past point is exact: EPISODIC and TOOLS
-    /// change in place (L9-a), so any such rows read as they are now.
-    async fn past_is_exact(&self, namespace: &str, at: adb_core::log::CommitTs) -> Result<bool, String> {
-        let source = self.as_parent_source().ok_or("past points need a durable engine (start ADB with --data-dir)")?;
-        for m in [MemoryType::Episodic, MemoryType::Tools] {
-            if !source.rows_as_of(m, namespace, at).await.map_err(|e| e.to_string())?.is_empty() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// DB-14: a space's rows as main or as a hosted or placed branch sees them.
@@ -1253,10 +1239,7 @@ impl Engine for LocalEngine {
         }
         let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
         let b = d.branch_create_past(namespace, name, created_by, at).await.map_err(|e| e.to_string())?;
-        let exact = self.past_is_exact(namespace, b.point()).await?;
-        let mut v = serde_json::to_value(&b).unwrap_or_default();
-        v["exact"] = json!(exact);
-        Ok(v)
+        Ok(serde_json::to_value(&b).unwrap_or_default())
     }
 
     async fn space_copy_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<Value, String> {
@@ -1275,13 +1258,12 @@ impl Engine for LocalEngine {
         let (offset, ts) = d.resolve_point(namespace, at).await.map_err(|e| e.to_string())?;
         let source = self.as_parent_source().ok_or("cloning a memory space needs a durable engine (start ADB with --data-dir)")?;
         let n = self.materialise_at(source, namespace, into, ts).await?;
-        let exact = self.past_is_exact(namespace, ts).await?;
-        Ok(json!({ "namespace": into, "records": n, "exact": exact, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
     }
 
-    async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>) -> Result<crate::branches::Quota, String> {
+    async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>, history_days: Option<u64>) -> Result<crate::branches::Quota, String> {
         let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("quotas are set on the org's engine")?;
-        d.quota_set(pattern, max_bytes, max_records).await.map_err(|e| e.to_string())
+        d.quota_set(pattern, max_bytes, max_records, history_days).await.map_err(|e| e.to_string())
     }
 
     async fn quota_drop(&self, pattern: &str) -> Result<bool, String> {

@@ -223,6 +223,17 @@ impl PartitionStore {
     /// [`Self::compact`] keeping, per namespace in `pins`, every version that was
     /// current at or after the pinned commit time: the branch points of open memory
     /// branches (`.ai/BRANCHING.md` B4), whose reads go `AS OF` them.
+    /// As [`Self::compact_pinned`], with `(pattern, window)` overrides of `history` per
+    /// namespace (a namespace, or a prefix ending in `*`; DB-8). A pin older than the window
+    /// still wins: a tag or a branch keeps what it reads.
+    pub async fn compact_with_windows(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>, windows: Vec<(String, Duration)>) -> StoreResult<CompactStats> {
+        let keep = compaction_row_windows(history, now, pins.clone(), windows);
+        let stats = self.rewrite_online(&keep, false).await?;
+        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(stats)
+    }
+
     pub async fn compact_pinned(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>) -> StoreResult<CompactStats> {
         let keep = compaction_row_pinned(history, now, pins.clone());
         let stats = self.rewrite_online(&keep, false).await?;
@@ -1088,8 +1099,9 @@ impl PartitionStore {
                 }
                 Effect::Embed { memory, id, embedding } => {
                     if let Some(mut cur) = Self::row(inner, &out, &row_id(*memory, &id.0)).await? {
+                        // Not a change to the record: `log_offset` stays its version's, or a
+                        // merge would see main as moved when only its vector arrived (DB-19).
                         cur.data.embedding = Some(embedding.clone());
-                        cur.log_offset = off;
                         out.insert(cur.id.clone(), cur);
                     }
                 }
@@ -1216,8 +1228,19 @@ fn compaction_row(history: Duration, now: CommitTs) -> impl Fn(StoredRow) -> Opt
 /// [`compaction_row`] with per-namespace pins: a namespace's horizon is never later
 /// than its pin, so a superseded version that a branch reads at its point stays.
 fn compaction_row_pinned(history: Duration, now: CommitTs, pins: std::collections::HashMap<String, CommitTs>) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
+    compaction_row_windows(history, now, pins, Vec::new())
+}
+
+fn compaction_row_windows(history: Duration, now: CommitTs, pins: std::collections::HashMap<String, CommitTs>, windows: Vec<(String, Duration)>) -> impl Fn(StoredRow) -> Option<StoredRow> + Sync {
     let base = CommitTs(now.0 - history.as_micros() as i64);
     move |mut r: StoredRow| {
+        let own = r.data.namespace.as_ref().and_then(|ns| {
+            windows.iter().find(|(pattern, _)| match pattern.strip_suffix('*') {
+                Some(prefix) => ns.starts_with(prefix),
+                None => pattern == ns,
+            })
+        });
+        let base = own.map(|(_, w)| CommitTs(now.0 - w.as_micros() as i64)).unwrap_or(base);
         let horizon = match r.data.namespace.as_ref().and_then(|ns| pins.get(ns)) {
             Some(p) if p.0 < base.0 => *p,
             _ => base,

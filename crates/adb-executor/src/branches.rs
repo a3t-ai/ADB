@@ -139,6 +139,9 @@ pub struct Quota {
     pub max_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_records: Option<u64>,
+    /// DB-8: how many days of replaced versions these namespaces keep (default 90).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_days: Option<u64>,
 }
 
 impl Quota {

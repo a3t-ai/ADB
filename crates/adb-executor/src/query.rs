@@ -609,8 +609,8 @@ fn instant(t: &adb_core::TimePoint, what: &str, now: CommitTs) -> AdbResult<Comm
 /// replaced it, by `AS OF`; else null). Versions superseded more than
 /// `writes::HISTORY` ago are compacted away; forgotten and expired records have none.
 pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
-    if !matches!(memory, MemoryType::Semantic | MemoryType::Procedural) {
-        return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY are only valid on SEMANTIC and PROCEDURAL".into()));
+    if matches!(memory, MemoryType::Working) {
+        return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY aren't valid on WORKING: it's session state, without versions".into()));
     }
     if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
         return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, VALID AT, WITH HISTORY)".into()));
