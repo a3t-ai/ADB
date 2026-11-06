@@ -18,7 +18,9 @@
  *   - kind 1: promote refused until rebased, then a new agent with its history layer;
  *   - ADB refusals come back as {error, code} with a fitting status; drop;
  *   - a run on a branch (AC-6): its writes reach the branch only; a run on main as before;
- *   - agent versions and deployment pins (AC-5), with lineage on promote and fork.
+ *   - agent versions and deployment pins (AC-5), with lineage on promote and fork;
+ *   - merge requests, both kinds: conflicts, gate, apply, rollback (AC-22, 23, 10, 11a);
+ *   - an agent turn on a branch, recorded with its version and memory point (AC-6, AC-20).
  *
  *   node tests/agent-branches.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)>
  */
@@ -27,6 +29,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer as netServer } from 'node:net';
+import { createServer as httpServer } from 'node:http';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]]] : a), []));
 if (!args.adb || !args.flowr) {
@@ -299,6 +302,124 @@ do:
   r = await api('POST', '/agents/bot/fork', { new_agent: { id: 'bot7' } });
   check('a forked agent too', r.status === 201 && r.body.version?.lineage?.forked_from?.agent === 'bot', JSON.stringify(r));
   await api('DELETE', '/agents/bot/branches/ship');
+
+  // --- merge request, kind 2: procedures back into this agent
+  const procs = async () => JSON.stringify(await aql('RECALL FROM PROCEDURAL ALL NAMESPACE "acme--bot"'));
+  await aql('STORE INTO PROCEDURAL (key = "mr-proc", steps = "v1") NAMESPACE "acme--bot"');
+  await api('POST', '/agents/bot/branches', { name: 'mr2' });
+  await aql('UPDATE INTO PROCEDURAL WHERE key = "mr-proc" (steps = "from-branch") NAMESPACE "acme--bot" BRANCH "mr2"');
+  await aql('STORE INTO PROCEDURAL (key = "mr-new", steps = "added-on-branch") NAMESPACE "acme--bot" BRANCH "mr2"');
+  await aql('UPDATE INTO PROCEDURAL WHERE key = "mr-proc" (steps = "from-main") NAMESPACE "acme--bot"');
+  r = await api('POST', '/agents/bot/merge-requests', { branch: 'nope', kind: 2 });
+  check('a merge request for no such branch is refused', r.status >= 400, JSON.stringify(r));
+  check('a kind must be 1 or 2', (await api('POST', '/agents/bot/merge-requests', { branch: 'mr2', kind: 3 })).status === 400);
+  r = await api('POST', '/agents/bot/merge-requests', { branch: 'mr2', kind: 2 });
+  check('kind 2 opens with its conflict and what blocks it', r.status === 201 && r.body.status === 'open' && r.body.conflicts?.length === 1 && r.body.blocked_by?.length === 3, JSON.stringify(r));
+  const mr2 = r.body.id;
+  const conflict = r.body.conflicts[0];
+  r = await api('POST', `/agents/bot/merge-requests/${mr2}/apply`);
+  check('apply waits for the gate', r.status === 409 && r.body.code === 'merge_blocked' && r.body.blocked_by?.length === 3, JSON.stringify(r));
+  check('nothing landed', (await procs()).includes('from-main') && !(await procs()).includes('added-on-branch'));
+  r = await api('PUT', `/agents/bot/merge-requests/${mr2}/resolutions`, { resolutions: [{ lineage: conflict.lineage, memory: conflict.memory, take: 'edit', value: { key: 'mr-proc', steps: 'resolved' } }] });
+  check('a resolution clears the conflict', r.status === 200 && r.body.blocked_by?.length === 2, JSON.stringify(r));
+  r = await api('POST', `/agents/bot/merge-requests/${mr2}/approvals`, { note: 'looks right' });
+  check('an approval counts', r.status === 200 && r.body.approvals?.length === 1 && r.body.blocked_by?.length === 1, JSON.stringify(r));
+  check('evidence needs a ref', (await api('POST', `/agents/bot/merge-requests/${mr2}/evidence`, { kind: 'run' })).status === 400);
+  r = await api('POST', `/agents/bot/merge-requests/${mr2}/evidence`, { kind: 'run', ref: 'run-1' });
+  check('evidence opens the gate', r.status === 200 && r.body.blocked_by?.length === 0, JSON.stringify(r));
+  r = await api('POST', `/agents/bot/merge-requests/${mr2}/apply`);
+  check('kind 2 applies and names its merge', r.status === 200 && r.body.status === 'merged' && !!r.body.result?.merge_id, JSON.stringify(r));
+  check('main has the resolution and the addition', (await procs()).includes('resolved') && (await procs()).includes('added-on-branch'), await procs());
+  check('applying twice is refused', (await api('POST', `/agents/bot/merge-requests/${mr2}/apply`)).body.code === 'merge_not_open');
+  r = await api('GET', `/agents/bot/merge-requests/${mr2}`);
+  check('the record keeps it all', r.body.kind === '2' && r.body.resolutions?.length === 1 && r.body.approvals?.length === 1 && r.body.evidence?.length === 1 && !!r.body.result?.merge_id, JSON.stringify(r));
+  r = await api('POST', `/agents/bot/merge-requests/${mr2}/rollback`);
+  check('kind 2 rolls back by its merge id', r.status === 200 && r.body.status === 'rolled_back', JSON.stringify(r));
+  check('main is back', (await procs()).includes('from-main') && !(await procs()).includes('added-on-branch'), await procs());
+  await api('DELETE', '/agents/bot/branches/mr2');
+
+  // --- merge request, kind 1: behaviour, as a new agent
+  const ruleFlow = v => `document: { dsl: '1.0.3', namespace: t, name: rule, version: '${v}' }\ndo:\n  - a:\n      set:\n        v: '${v}'\n`;
+  await tool('create_flow', { yaml: ruleFlow('1.0.0') });
+  r = await api('POST', '/agents/bot/versions', { flows: [{ namespace: 't', name: 'rule', version: '1.0.0' }] });
+  check('a version holding flow rule@1.0.0', r.status === 201, JSON.stringify(r));
+  await api('POST', '/agents/bot/branches', { name: 'mr1' });
+  r = await api('POST', '/agents/bot/branches/mr1/flows', { yaml: ruleFlow('2.0.0') });
+  check('a draft on the branch keeps its base', r.status === 201 && r.body.base_version === '1.0.0' && r.body.branch_version === '2.0.0', JSON.stringify(r));
+  const active = async () => (await tool('get_flow', { namespace: 't', name: 'rule' })).version ?? (await tool('get_flow', { namespace: 't', name: 'rule' }));
+  check('a draft is not active', String(JSON.stringify(await active())).includes('1.0.0'), JSON.stringify(await active()));
+  await tool('create_flow', { yaml: ruleFlow('1.1.0') });
+  r = await api('POST', '/triggers', { name: 'mr-hook', namespace: 'acme', config: { type: 'webhook', path: '/mr-hook' }, targets: [{ type: 'agent', agent_id: 'bot' }] });
+  check('a trigger aimed at the agent', r.status === 201, JSON.stringify(r));
+  const trigger = r.body.id;
+  r = await api('POST', '/agents/bot/merge-requests', { branch: 'mr1', kind: 1 });
+  const flowRow = r.body.flows?.find(f => f.name === 'rule');
+  check('a flow fixed in prod after the branch point is a conflict', r.status === 201 && flowRow?.state === 'conflict' && flowRow?.prod_version === '1.1.0', JSON.stringify(r));
+  const mr1 = r.body.id;
+  check('it blocks the merge', r.body.blocked_by?.some(b => b.includes('t/rule')), JSON.stringify(r.body.blocked_by));
+  await api('POST', '/agents/bot/branches/mr1/flows', { yaml: ruleFlow('2.1.0') });
+  check('an edit must name a version that exists', (await api('PUT', `/agents/bot/merge-requests/${mr1}/resolutions`, { flow_resolutions: [{ namespace: 't', name: 'rule', take: 'edit', version: '9.9.9' }] })).status === 400);
+  await api('PUT', `/agents/bot/merge-requests/${mr1}/resolutions`, { flow_resolutions: [{ namespace: 't', name: 'rule', take: 'branch' }] });
+  await api('POST', `/agents/bot/merge-requests/${mr1}/approvals`);
+  r = await api('POST', `/agents/bot/merge-requests/${mr1}/evidence`, { kind: 'run', ref: 'run-2' });
+  check('kind 1 is ready', r.body.blocked_by?.length === 0, JSON.stringify(r.body.blocked_by));
+  r = await api('POST', `/agents/bot/merge-requests/${mr1}/apply`, { new_agent: { id: 'bot8' } });
+  check('kind 1 ships as a new agent', r.status === 200 && r.body.status === 'merged' && r.body.result?.promoted_agent === 'bot8', JSON.stringify(r));
+  check('the chosen flow is the new agent\'s version', r.body.result?.agent?.version?.flows?.[0]?.version === '2.1.0', JSON.stringify(r.body.result?.agent?.version));
+  check('with its lineage', r.body.result?.agent?.version?.lineage?.promoted_from?.branch === 'mr1');
+  check('the trigger moved', r.body.result?.moved_triggers?.includes(trigger), JSON.stringify(r.body.result?.moved_triggers));
+  const aimedAt = async () => (await api('GET', `/triggers/${trigger}`)).body.targets?.map(t => t.agent_id);
+  check('it now aims at the new agent', JSON.stringify(await aimedAt()) === '["bot8"]', JSON.stringify(await aimedAt()));
+  const t0 = Date.now();
+  r = await api('POST', `/agents/bot/merge-requests/${mr1}/rollback`);
+  check('kind 1 rolls back the triggers', r.status === 200 && r.body.status === 'rolled_back' && JSON.stringify(await aimedAt()) === '["bot"]', JSON.stringify(r));
+  check('in under 5 minutes', Date.now() - t0 < 300000);
+  r = await api('GET', '/agents/bot/merge-requests');
+  check('both records are listed', r.body.merge_requests?.length === 2, JSON.stringify(r.body.merge_requests?.length));
+  await api('DELETE', '/agents/bot/branches/mr1');
+
+  // --- an agent turn: on a branch, and recorded (AC-6, AC-20). A stub model answers.
+  const llm = httpServer((req, res) => {
+    let body = '';
+    req.on('data', d => { body += d; });
+    req.on('end', () => {
+      const content = 'stub answer';
+      if (JSON.parse(body || '{}').stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`);
+        res.end('data: [DONE]\n\n');
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] }));
+      }
+    });
+  });
+  const llmPort = await freePort();
+  await new Promise(res => llm.listen(llmPort, '127.0.0.1', res));
+  await tool('create_resource', { namespace: 'a3t', name: 'stub-llm', type_ref: 'llm', config: { provider: 'openai', api_url: `http://127.0.0.1:${llmPort}`, api_key: 'stub', model: 'stub' } });
+  await tool('create_flow', { yaml: `document: { dsl: '1.0.3', namespace: t, name: agent-turn, version: '1.0.0' }
+do:
+  - run_agent:
+      call: a3t:agent
+      with:
+        config: \${ .config }
+        session_id: \${ .session_id }
+        message: \${ .message }
+` });
+  await api('POST', '/agents/bot/branches', { name: 'chat' });
+  await api('PUT', '/agents/bot/deployments/prod', { version: '2' });
+  const session = 'bot:session-chat';
+  const config = { llm_resource: 'a3t/stub-llm', memory_resource: 'a3t/agent-memory', memory_namespace: 'unused', system_prompt: 'Test agent.', mcp_servers: [] };
+  await tool('execute_flow', { namespace: 't', name: 'agent-turn', memory_branch: 'chat', input: { session_id: session, message: 'hello on the branch', config } });
+  const turns = async b => JSON.stringify(await aql(`RECALL FROM WORKING WHERE session_id = "${session}" NAMESPACE "acme--bot"${b ? ` BRANCH "${b}"` : ''}`));
+  check('an agent turn on a branch stores on the branch', await until(async () => (await turns('chat')).includes('hello on the branch')), await turns('chat'));
+  check('main has none of it', !(await turns()).includes('hello on the branch'), await turns());
+  r = await api('GET', '/agents/bot/runs');
+  const run = r.body.runs?.find(x => x.memory_branch === 'chat');
+  check('the turn names its version, environment and branch', run?.agent_version === '2' && run?.environment === 'prod' && run?.memory_namespace === 'acme--bot', JSON.stringify(r));
+  check('and the memory point it read', JSON.parse(run?.memory_point || '{}').offset > 0, JSON.stringify(run));
+  llm.close();
+  await api('DELETE', '/agents/bot/branches/chat');
 
   // --- drop
   await api('DELETE', '/agents/bot/branches/teach');
