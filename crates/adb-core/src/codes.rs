@@ -38,6 +38,8 @@ pub const CODES: &[&str] = &[
     "sealed_key",
     "merge_conflicts",
     "merge_stale",
+    "point_too_old",
+    "point_invalid",
     "merge_not_found",
     "revert_conflicts",
     "append_only",
@@ -61,6 +63,10 @@ pub fn code_of(message: &str) -> &'static str {
         "unauthorized"
     } else if has(" pool's token") || has(" is the console's (the engine token)") || has(" is not open to the ") {
         "forbidden"
+    } else if has("point_too_old:") {
+        "point_too_old"
+    } else if has("point_invalid:") {
+        "point_invalid"
     } else if has("belongs to the sealed layer") {
         "sealed_key"
     } else if has("is pinned by") {
@@ -228,6 +234,8 @@ mod tests {
         ("Query execution error: lance: column name \"1x\": letters, digits and _, starting with a letter or _", "invalid_value"),
         ("merge_conflicts: 2 conflicts have no resolution: a, b", "merge_conflicts"),
         ("Query execution error: merge_stale: main changed 1 since the conflicts were read: a", "merge_stale"),
+        ("Query execution error: point_too_old: offset 3 is older than the 90 days kept", "point_too_old"),
+        ("point_invalid: offset 99 is past the log's end (12)", "point_invalid"),
         ("merge_not_found: no merge \"m1\" in namespace \"crm\"", "merge_not_found"),
         ("revert_conflicts: 1 records changed since the merge: a (force_skip reverts the rest)", "revert_conflicts"),
         ("Query execution error: a history layer of \"bot\" carries EPISODIC only and isn't sealed", "layer_invalid"),

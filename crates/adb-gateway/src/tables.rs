@@ -37,7 +37,50 @@ pub struct TableBatch {
     pub tip: u64,
 }
 
+/// A read of one memory space's feed (DB-14).
+#[derive(Debug, Clone, Default)]
+pub struct SpaceQuery {
+    pub namespace: String,
+    pub from: Option<u64>,
+    /// Only these memory types, any case (empty: all).
+    pub memories: Vec<String>,
+    pub max: usize,
+    pub wait: Duration,
+}
+
 const READ_BATCH: usize = 256;
+
+/// The change an effect makes to `namespace`'s memory: `{offset, ts, op, memory, key?,
+/// lineage, value?}`, with `op` one of `put`, `update`, `patch`, `forget`, `expire`.
+/// Links, topics and control rows aren't memory records. FORGET rewrites the log, so an
+/// erased payload is never read here; a `forget` names the key only (W5-L2).
+pub fn space_change(r: &LogRecord, e: &Effect, namespace: &str) -> Option<Value> {
+    let row = |op: &str, n: &adb_core::log::NewRow| {
+        (n.data.namespace.as_deref() == Some(namespace)).then(|| {
+            json!({ "op": op, "memory": n.data.memory.tag(), "key": n.data.key, "lineage": n.lineage_id.0, "value": n.data.value })
+        })
+    };
+    let by_id = |op: &str, memory: &adb_core::log::Memory, id: &str, value: Option<Value>| {
+        (adb_store::rows::namespace_of(id) == Some(namespace)).then(|| {
+            let mut c = json!({ "op": op, "memory": memory.tag(), "key": adb_store::rows::without_namespace(id), "lineage": id });
+            if let Some(v) = value {
+                c["value"] = v;
+            }
+            c
+        })
+    };
+    let mut c = match e {
+        Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) => row("put", n),
+        Effect::Supersede { new, .. } => row("update", new),
+        Effect::Patch { memory, id, fields, .. } => by_id("patch", memory, &id.0, Some(Value::Object(fields.clone()))),
+        Effect::Forget { memory, lineage_id } => by_id("forget", memory, &lineage_id.0, None),
+        Effect::Expire { memory, lineage_id } => by_id("expire", memory, &lineage_id.0, None),
+        _ => None,
+    }?;
+    c["offset"] = json!(r.offset.0);
+    c["ts"] = json!(r.commit_ts.0);
+    Some(c)
+}
 
 /// The change an effect makes, if it is a platform-table effect.
 pub fn table_change(r: &LogRecord, e: &Effect) -> Option<(String, Value)> {
@@ -68,14 +111,43 @@ pub fn table_change(r: &LogRecord, e: &Effect) -> Option<(String, Value)> {
 impl Gateway {
     /// One read of the platform-table feed (DB-5).
     pub async fn table_changes(&self, q: &TableQuery) -> Result<TableBatch, GatewayError> {
+        self.follow(q.from, q.max, q.wait, |r, out| {
+            for e in &r.effects {
+                if let Some((table, change)) = table_change(r, e) {
+                    if q.tables.is_empty() || q.tables.contains(&table) {
+                        out.push(change);
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// One read of a memory space's feed (DB-14).
+    pub async fn space_changes(&self, q: &SpaceQuery) -> Result<TableBatch, GatewayError> {
+        self.follow(q.from, q.max, q.wait, |r, out| {
+            for e in &r.effects {
+                if let Some(change) = space_change(r, e, &q.namespace) {
+                    if q.memories.is_empty() || change["memory"].as_str().is_some_and(|m| q.memories.iter().any(|w| w.eq_ignore_ascii_case(m))) {
+                        out.push(change);
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Log records after `from` through `take`, long-polling up to `wait` for a first
+    /// change. Without an offset, or past the log's retention: `reset`.
+    async fn follow(&self, from: Option<u64>, max: usize, wait: Duration, take: impl Fn(&LogRecord, &mut Vec<Value>)) -> Result<TableBatch, GatewayError> {
         let mut applied = self.applied.clone();
-        let Some(from) = q.from.filter(|f| *f > 0) else {
+        let Some(from) = from.filter(|f| *f > 0) else {
             let tip = *applied.borrow_and_update();
             return Ok(TableBatch { changes: Vec::new(), reset: true, next: tip + 1, tip });
         };
-        let max = q.max.max(1);
+        let max = max.max(1);
         let mut next = from;
-        let deadline = tokio::time::Instant::now() + q.wait;
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             let tip = *applied.borrow_and_update();
             let mut out = Vec::new();
@@ -91,13 +163,7 @@ impl Gateway {
                 }
                 for r in &records {
                     next = r.offset.0 + 1;
-                    for e in &r.effects {
-                        if let Some((table, change)) = table_change(r, e) {
-                            if q.tables.is_empty() || q.tables.contains(&table) {
-                                out.push(change);
-                            }
-                        }
-                    }
+                    take(r, &mut out);
                     if out.len() >= max {
                         break;
                     }

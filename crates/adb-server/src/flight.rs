@@ -431,12 +431,29 @@ impl AdbFlight {
                 let name = str_field(&b, "name")?;
                 let parent = b.get("parent").and_then(|p| p.as_str());
                 let by = b.get("created_by").and_then(|p| p.as_str());
+                if let Some(at) = b.get("at") {
+                    if parent.is_some_and(|p| !p.is_empty() && p != adb_executor::branches::MAIN) {
+                        return Err(Status::invalid_argument("point_invalid: a branch at a past point is cut from main"));
+                    }
+                    return self.engine.branch_create_past(ns, name, by, &point_ref(at)?).await.map_err(Status::invalid_argument);
+                }
                 let br = self.engine.branch_create(ns, name, parent, by).await.map_err(Status::invalid_argument)?;
                 Ok(serde_json::to_value(br).unwrap_or_default())
             }
             "branch_list" => {
                 let ns = b.get("namespace").and_then(|n| n.as_str());
-                Ok(json!({ "branches": self.engine.branch_list(ns).await.map_err(Status::internal)? }))
+                let branches = self.engine.branch_list(ns).await.map_err(Status::internal)?;
+                // DB-14: opt-in, as N branches mean N scans.
+                if b.get("stats").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let mut out = Vec::with_capacity(branches.len());
+                    for br in &branches {
+                        let mut v = serde_json::to_value(br).unwrap_or_default();
+                        v["stats"] = self.engine.space_stats(&br.namespace, Some(&br.name), STATS_MAX_AGE).await.map_err(Status::internal)?;
+                        out.push(v);
+                    }
+                    return Ok(json!({ "branches": out }));
+                }
+                Ok(json!({ "branches": branches }))
             }
             "branch_drop" => {
                 let ns = str_field(&b, "namespace")?;
@@ -456,7 +473,42 @@ impl AdbFlight {
             "space_clone" => {
                 let ns = str_field(&b, "namespace")?;
                 let into = str_field(&b, "into")?;
+                if let Some(at) = b.get("at") {
+                    return self.engine.space_clone_at(ns, into, &point_ref(at)?).await.map_err(Status::invalid_argument);
+                }
                 self.engine.space_clone(ns, into).await.map_err(Status::invalid_argument)
+            }
+            // DB-14: stats, paging and the feed of one memory space.
+            "space_stats" => {
+                let max_age = b.get("max_age_ms").and_then(|v| v.as_u64()).map(std::time::Duration::from_millis).unwrap_or(STATS_MAX_AGE);
+                self.engine.space_stats(str_field(&b, "namespace")?, b.get("branch").and_then(|v| v.as_str()), max_age).await.map_err(Status::invalid_argument)
+            }
+            "space_records" => {
+                let memory: adb_core::MemoryType = serde_json::from_value(b.get("memory").cloned().unwrap_or_default())
+                    .map_err(|e| Status::invalid_argument(format!("memory: {e}")))?;
+                let limit = b.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                self.engine
+                    .space_records(str_field(&b, "namespace")?, memory, b.get("branch").and_then(|v| v.as_str()), b.get("after").and_then(|v| v.as_str()), limit)
+                    .await
+                    .map_err(Status::invalid_argument)
+            }
+            "space_changes" => {
+                let ns = str_field(&b, "namespace")?;
+                let gateway = self.engine.space_gateway(ns, b.get("branch").and_then(|v| v.as_str())).await.map_err(Status::invalid_argument)?;
+                let q = adb_gateway::tables::SpaceQuery {
+                    namespace: ns.to_string(),
+                    from: b.get("from").and_then(|v| v.as_u64()),
+                    memories: string_list(b.get("memories")),
+                    max: b.get("max").and_then(|v| v.as_u64()).map(|m| m as usize).unwrap_or(1000),
+                    wait: std::time::Duration::from_millis(b.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(0).min(60_000)),
+                };
+                let t = gateway.space_changes(&q).await.map_err(|e| Status::internal(e.to_string()))?;
+                Ok(json!({ "changes": t.changes, "reset": t.reset, "next": t.next, "tip": t.tip }))
+            }
+            // DB-12: who reads a space as a layer.
+            "layers_dependents" => {
+                let space = str_field(&b, "space")?;
+                Ok(json!({ "dependents": self.engine.layers_dependents(space).await.map_err(Status::internal)? }))
             }
             // B6: branches in their own pod. The org: a parent's rows AS OF a time,
             // placing a branch in a pod, its pending FORGETs. The pod: erase lineages.
@@ -611,6 +663,14 @@ fn merge_status(e: String) -> Status {
         "merge_not_found" => Status::not_found(e),
         _ => Status::invalid_argument(e),
     }
+}
+
+/// How long a space's stats are kept unless the caller says otherwise (DB-14).
+const STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// DB-9: `at = {tag} | {offset, ts?}`.
+fn point_ref(at: &Value) -> Result<adb_executor::branches::PointRef, Status> {
+    serde_json::from_value(at.clone()).map_err(|e| Status::invalid_argument(format!("point_invalid: at: {e}")))
 }
 
 fn string_list(v: Option<&Value>) -> Vec<String> {
@@ -784,6 +844,10 @@ impl FlightService for AdbFlight {
             ("branch_rebase", "Move a branch to main now (DB-11, kind 1): {namespace, name, main_offset, resolutions} → {point, kept, dropped, edited}"),
             ("merge_revert", "Undo a merge (DB-19): {namespace, merge_id, reverted_by?, force_skip?} → {reverted, skipped, offset}"),
             ("table_changes", "Platform-table change feed (DB-5): {from?, tables?, max?, wait_ms?} → {changes, reset, next, tip}; reset: reload, then follow from next"),
+            ("space_stats", "Per memory type counts of a space (DB-14): {namespace, branch?, max_age_ms?} → {tiers: {type: {count, bytes, last_write_ts}}, age_ms}"),
+            ("space_records", "A page of a space's current rows, newest first (DB-14): {namespace, memory, branch?, after?, limit?} → {records, next}"),
+            ("space_changes", "A space's change feed (DB-14): {namespace, branch?, memories?, from?, max?, wait_ms?} → {changes, reset, next, tip}"),
+            ("layers_dependents", "Who reads a space as a layer (DB-12): {space} → {dependents: [{namespace, mode, tag?, sealed, memories}]}"),
             ("add_columns", "Add UTF-8 columns to a table (DB-6): {table, columns}"),
             ("append_only", "Make a table append-only (DB-13): {table}; also create_table {append_only: true}"),
             ("purge", "Retention (DB-13): delete rows whose {column} is before {before}: {table, column, before}"),

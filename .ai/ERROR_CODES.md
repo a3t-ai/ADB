@@ -56,6 +56,8 @@ Merges and tables:
 |---|---|---|
 | `merge_conflicts` | A merge has conflicts without a resolution | Resolve each (`branch_conflicts` lists them) |
 | `merge_stale` | Main changed an affected record after `main_offset` | Read the conflicts again |
+| `point_too_old` | The asked point is past the 90 days of versions kept, or its offset left the log with no `ts` given | Use a tag, or a newer point |
+| `point_invalid` | `at` names neither a tag nor an offset, or an offset past the log's end, or asks for a point on a branch of a branch | Fix the request |
 | `merge_not_found` | No such merge in the namespace, or it was already reverted | — |
 | `revert_conflicts` | Records changed since the merge | `force_skip` reverts the rest |
 | `append_only` | Update, delete, upsert or replace of an append-only table | Insert; purge by age |

@@ -576,6 +576,45 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// As [`Self::branch_create`], with the branch point given (a branch of a branch:
     /// its point is on the parent branch's own log, not the org's).
     pub async fn branch_create_at(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>, point: Option<(u64, CommitTs)>) -> AdbResult<crate::branches::Branch> {
+        self.branch_create_in(namespace, name, parent, created_by, point, None).await
+    }
+
+    /// DB-9: cut a branch of main at a past point (a tag or an offset). The point is
+    /// checked and the branch's pin registered under the sequencer's lock.
+    pub async fn branch_create_past(&self, namespace: &str, name: &str, created_by: Option<&str>, at: &crate::branches::PointRef) -> AdbResult<crate::branches::Branch> {
+        self.branch_create_in(namespace, name, None, created_by, None, Some(at)).await
+    }
+
+    /// DB-9: the (offset, time) a past point names.
+    pub async fn resolve_point(&self, namespace: &str, at: &crate::branches::PointRef) -> AdbResult<(u64, CommitTs)> {
+        let seq = self.seq.lock().await;
+        self.point_of(&seq, namespace, at).await
+    }
+
+    async fn point_of(&self, seq: &Sequencer<L>, namespace: &str, at: &crate::branches::PointRef) -> AdbResult<(u64, CommitTs)> {
+        if let Some(tag) = &at.tag {
+            let t = self.branches.tag(namespace, tag).ok_or_else(|| AdbError::QueryError(format!("{namespace:?} has no tag {tag:?}")))?;
+            return Ok((t.point_offset, CommitTs(t.point_ts)));
+        }
+        let off = at.offset.ok_or_else(|| AdbError::QueryError("point_invalid: at needs a tag or an offset".into()))?;
+        let tip = seq.log().last_offset().0;
+        if off > tip {
+            return Err(AdbError::QueryError(format!("point_invalid: offset {off} is past the log's end ({tip})")));
+        }
+        let held = match seq.log().read(LogOffset(off), 1).await {
+            Ok(r) => r.first().filter(|r| r.offset.0 == off).map(|r| r.commit_ts),
+            Err(LogError::Purged { .. }) => None,
+            Err(e) => return Err(log_err(e)),
+        };
+        let ts = held.or(at.ts.map(CommitTs)).ok_or_else(|| AdbError::QueryError(format!("point_too_old: offset {off} is no longer in the log: give its ts (from the memory point) or use a tag")))?;
+        let kept_from = CommitTs::from_datetime(time::now()).0 - HISTORY.as_micros() as i64;
+        if ts.0 < kept_from {
+            return Err(AdbError::QueryError(format!("point_too_old: offset {off} is older than the {} days of versions kept: use a tag", HISTORY.as_secs() / 86_400)));
+        }
+        Ok((off, ts))
+    }
+
+    async fn branch_create_in(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>, point: Option<(u64, CommitTs)>, at: Option<&crate::branches::PointRef>) -> AdbResult<crate::branches::Branch> {
         use crate::branches::{check_name, Branch, MAIN};
         check_name(name).map_err(AdbError::QueryError)?;
         let parent = parent.filter(|p| !p.is_empty()).unwrap_or(MAIN);
@@ -586,16 +625,10 @@ impl<L: Log + 'static> DurableWrites<L> {
             return Err(AdbError::QueryError(format!("namespace {namespace:?} already has a branch {name:?}")));
         }
         let mut seq = self.seq.lock().await;
-        let (point_offset, point_ts) = match point {
-            Some(p) => p,
-            None => {
-                let off = seq.log().last_offset().0;
-                let ts = match off {
-                    0 => CommitTs::from_datetime(time::now()),
-                    n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
-                };
-                (off, ts)
-            }
+        let (point_offset, point_ts) = match (point, at) {
+            (Some(p), _) => p,
+            (None, Some(a)) => self.point_of(&seq, namespace, a).await?,
+            (None, None) => self.last_point(&seq).await?,
         };
         let id = RecordId(Branch::id_of(namespace, name));
         let b = Branch {

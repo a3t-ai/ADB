@@ -118,6 +118,30 @@ impl Layers {
     }
 }
 
+/// DB-12: one reader of a memory space: who inherits it, how, and at which tag.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Dependent {
+    pub namespace: String,
+    pub mode: LayerMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    pub sealed: bool,
+    pub memories: Vec<adb_core::MemoryType>,
+}
+
+/// DB-9: a past point of a space: a tag, or an offset from a memory point (DB-7). `ts`
+/// goes with the offset once the log no longer holds that record.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PointRef {
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub ts: Option<i64>,
+}
+
 /// Branch names: letters, digits, `-`, `_`, `.`, 1–64 characters; `main` is taken.
 pub fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
@@ -214,6 +238,18 @@ impl Branches {
     /// Whether any space lists `namespace` as a layer.
     pub fn layered_by(&self, namespace: &str) -> Vec<String> {
         self.layers.read().unwrap().values().filter(|l| l.layers.iter().any(|x| x.space == namespace)).map(|l| l.namespace.clone()).collect()
+    }
+
+    /// DB-12: every space reading `space` as a layer, one row per layer.
+    pub fn dependents(&self, space: &str) -> Vec<Dependent> {
+        let layers = self.layers.read().unwrap();
+        let mut out = Vec::new();
+        for l in layers.values() {
+            for x in l.layers.iter().filter(|x| x.space == space) {
+                out.push(Dependent { namespace: l.namespace.clone(), mode: x.mode, tag: x.tag.clone(), sealed: x.sealed, memories: x.memories.clone() });
+            }
+        }
+        out
     }
 
     pub fn get(&self, namespace: &str, name: &str) -> Option<Branch> {

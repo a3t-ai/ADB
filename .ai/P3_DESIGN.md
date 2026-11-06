@@ -1,4 +1,4 @@
-# Phase 3 ADB design: DB-14, DB-12, DB-9 (for review; nothing built)
+# Phase 3 ADB: DB-14, DB-12, DB-9 (built 6 Nov; see "As built" at the end)
 
 6 Nov 2026. Same pattern as phases 1 and 2: Flight actions, stable codes, FlowR passes through.
 
@@ -64,3 +64,24 @@ schedule's order stands. DB-9 last: AC-9 needs it, and its exactness depends on 
 ## New codes
 
 `point_too_old`.
+
+## As built (6 Nov)
+
+Tests: `crates/adb-server/tests/space_flight.rs`, `crates/adb-executor/tests/point_retention.rs`.
+
+- **`at = {tag} | {offset, ts?}`.** The design said a purged offset is refused. The log only
+  drops whole 64 MB segments, but a real point can still leave it, and a memory point carries
+  its time anyway, so `ts` is accepted once the log no longer holds the offset. An offset the
+  log still holds uses the log's time and ignores `ts`. Without `ts`, or past 90 days:
+  `point_too_old`.
+- **`point_invalid`** is a second new code: `at` with neither tag nor offset, an offset past
+  the log's end, or `at` with a parent branch. A past point is cut from main only.
+- **`exact`:** answered on `branch_create` and `space_clone` with `at`. False when the space has
+  EPISODIC or TOOLS rows at that point. It says whether such rows exist, not whether they changed.
+- **Stats cache:** 10 s by default, `max_age_ms` overrides, `age_ms` in the answer. Scans rows on
+  a miss, as designed.
+- **Paging:** an updated record moves to the top, so a reader paging through can miss it on later
+  pages. New records never shift pages.
+- **Feed:** a branch in its own pod is refused here (follow its feed on the pod). Links and topics
+  aren't in the feed.
+- **Not tested:** on a Raft cluster, or `space_stats` / `space_records` on a pod branch.
