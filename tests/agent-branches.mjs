@@ -16,7 +16,8 @@
  *   - layers: a raw space must be an agent's, in this org; history layers stay;
  *   - kind 2 merge: conflicts, refusals, resolve, merge back, revert (ADB MERGE.md);
  *   - kind 1: promote refused until rebased, then a new agent with its history layer;
- *   - ADB refusals come back as {error, code} with a fitting status; drop.
+ *   - ADB refusals come back as {error, code} with a fitting status; drop;
+ *   - a run on a branch (AC-6): its writes reach the branch only; a run on main as before.
  *
  *   node tests/agent-branches.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)>
  */
@@ -246,6 +247,29 @@ do:
   await aql('STORE INTO SEMANTIC (key = "rule:e", fact = "later") NAMESPACE "acme--bot"');
   r = await api('POST', '/agents/bot/branches/stale/promote', { new_agent: { id: 'bot5' }, allow_stale: true });
   check('allow_stale passes the gate', r.status === 201, JSON.stringify(r));
+
+  // --- AC-6: a run on a memory branch
+  r = await api('POST', '/agents/bot/branches', { name: 'run' });
+  check('a branch to run on', r.status === 201, JSON.stringify(r));
+  await tool('create_flow', { yaml: `document: { dsl: '1.0.3', namespace: t, name: branch-writer, version: '1.0.0' }
+do:
+  - store:
+      call: adb
+      with:
+        _resource: a3t/agent-memory
+        query: 'STORE INTO SEMANTIC (key = "\${ .key }", fact = "\${ .key }") NAMESPACE "acme--bot"'
+` });
+  const branchFacts = async () => {
+    const d = await aql('RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot" BRANCH "run"');
+    return ((d.data ?? d).records ?? []).map(x => x.data?.fact);
+  };
+  const until = async f => { for (let i = 0; i < 100; i++) { if (await f()) return true; await sleep(100); } return false; };
+  await tool('execute_flow', { namespace: 't', name: 'branch-writer', memory_branch: 'run', input: { key: 'run-on-branch' } });
+  check('a run on a branch writes to the branch', await until(async () => (await branchFacts()).includes('run-on-branch')), JSON.stringify(await branchFacts()));
+  check('main is unchanged by it', !(await facts('acme--bot')).includes('run-on-branch'), JSON.stringify(await facts('acme--bot')));
+  await tool('execute_flow', { namespace: 't', name: 'branch-writer', input: { key: 'run-on-main' } });
+  check('a run on main writes to main', await until(async () => (await facts('acme--bot')).includes('run-on-main')), JSON.stringify(await facts('acme--bot')));
+  await api('DELETE', '/agents/bot/branches/run');
 
   // --- drop
   await api('DELETE', '/agents/bot/branches/teach');
