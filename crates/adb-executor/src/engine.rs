@@ -1053,6 +1053,10 @@ impl Engine for LocalEngine {
     async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
         let source = match (branch.filter(|b| *b != crate::branches::MAIN), &self.branch_host) {
             (Some(b), Some(host)) => host.source(namespace, b).await?,
+            // A pod that is one branch, asked for that branch by name.
+            (Some(b), None) if self.parent.as_ref().is_some_and(|p| p.branch == b && p.namespace == namespace) => {
+                self.as_parent_source().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?
+            }
             (Some(b), None) => return Err(format!("no branch {b:?} here: this engine is a branch itself")),
             (None, _) => {
                 if let Some(p) = self.parent.as_ref().filter(|p| p.namespace != namespace) {

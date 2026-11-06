@@ -225,7 +225,7 @@ pub trait BranchRemote: Send + Sync {
     /// Have it erase its own rows of `lineages` (FORGET on main reaching it).
     async fn forget(&self, url: &str, memory: MemoryType, lineages: &[String]) -> Result<u64, String>;
     /// Its view (its rows over its parent's at its point), as a parent source.
-    fn source(&self, url: &str) -> Arc<dyn ParentSource>;
+    fn source(&self, url: &str, branch: &str) -> Arc<dyn ParentSource>;
 }
 
 /// The branch engines of an org engine: hosted ones opened here; ones in their own
@@ -265,7 +265,7 @@ impl BranchHost {
     /// The branch's view as a parent source: its pod's (B6), or its hosted engine's.
     pub async fn source(&self, namespace: &str, name: &str) -> Result<Arc<dyn ParentSource>, String> {
         match self.placement(namespace, name) {
-            Some(url) => Ok(self.remote()?.source(&url)),
+            Some(url) => Ok(self.remote()?.source(&url, name)),
             None => self.engine(namespace, name).await?.as_parent_source().ok_or_else(|| "a branch engine has no table".into()),
         }
     }

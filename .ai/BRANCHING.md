@@ -130,6 +130,24 @@ org's sequencer, WAL, table or compaction. No Iggy: the branch log is ADB's WAL.
   creating, scaling and routing pods is the A3T controller's job (B7); the org↔pod
   calls use one shared token (`ADB_AUTH_TOKEN`).
 
+### DB-2 as built: one non-prod pod
+
+`adb serve-http` with `ADB_NON_PROD_OF=<prod Flight URL>`, `ADB_NON_PROD_URL=<its own Flight URL>`
+and `ADB_NON_PROD_TOKEN` (`crates/adb-server/src/non_prod.rs`) hosts every dev and QA branch. Each
+keeps its own WAL, sequencer and table in `<data dir>/branches/`.
+
+- **No main:** a statement must name a `BRANCH`, and the branch must be placed on this pod
+  (`branch_place {url}` on prod). Anything else is refused, so its writes can't split.
+- **Token on prod:** a scoped token that reads `*` and writes nothing (DB-3). It may list every
+  branch and ack pending FORGETs.
+- **Start:** opens every branch placed here and applies its pending FORGETs before serving.
+- **FORGET on main:** prod calls `branch_forget` once per placed branch; each call erases in every
+  branch here. Harmless, but N calls where one would do.
+- **Prod's token on the pod:** prod forwards with its own `ADB_AUTH_TOKEN`, so the pod must accept it.
+- **Limits:** no branch of a branch, no rebase on a placed branch, no space feed through prod. One
+  pod is one process: a branch's load affects the others. Not tested on a Raft prod. Nothing places
+  branches on it yet (AC-12), and no manifest applied on vc-dev.
+
 ### B7 as built (ADB: tags and layers)
 
 - **Tags** (`tag_create {namespace, name}`, `tag_list`, `tag_drop`): `tag:<ns>/<name>` →

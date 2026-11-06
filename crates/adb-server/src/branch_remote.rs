@@ -77,7 +77,7 @@ impl BranchRemote for FlightRemote {
         Ok(v.get("erased").and_then(|n| n.as_u64()).unwrap_or(0))
     }
 
-    fn source(&self, url: &str) -> Arc<dyn ParentSource> {
-        Arc::new(FlightParentSource { url: url.to_string(), token: self.token.clone(), branch: None })
+    fn source(&self, url: &str, branch: &str) -> Arc<dyn ParentSource> {
+        Arc::new(FlightParentSource { url: url.to_string(), token: self.token.clone(), branch: Some(branch.to_string()) })
     }
 }

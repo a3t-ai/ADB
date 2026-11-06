@@ -53,9 +53,12 @@ enum Reach {
 
 fn reach_of(action: &str) -> Option<Reach> {
     Some(match action {
-        "branch_list" | "tag_list" | "layers_get" | "branch_conflicts" | "space_stats" | "space_records" | "space_changes" | "branch_parent_rows" | "branch_pending" => Reach::Read("namespace"),
+        "branch_list" | "tag_list" | "layers_get" | "branch_conflicts" | "space_stats" | "space_records" | "space_changes" | "branch_parent_rows" | "branch_pending"
+        // A pod acks what it erased: it only trims that branch's own list, so a read-only
+        // pod token (DB-2) can do it.
+        | "branch_pending_ack" => Reach::Read("namespace"),
         "layers_dependents" => Reach::Read("space"),
-        "branch_create" | "branch_drop" | "branch_merge" | "branch_rebase" | "merge_revert" | "tag_create" | "tag_drop" | "branch_place" | "branch_pending_ack" => Reach::Write("namespace"),
+        "branch_create" | "branch_drop" | "branch_merge" | "branch_rebase" | "merge_revert" | "tag_create" | "tag_drop" | "branch_place" => Reach::Write("namespace"),
         "branch_promote" | "space_clone" => Reach::Copy,
         "layers_set" => Reach::Layers,
         _ => return None,
@@ -91,6 +94,10 @@ impl Scope {
     pub fn check_action(&self, action: &str, body: &Value) -> Result<(), String> {
         if action == "aql" {
             return self.check_aql(body.get("query").and_then(|q| q.as_str()).unwrap_or_default());
+        }
+        // Every namespace's branches: for a token that reads them all (the non-prod pod).
+        if action == "branch_list" && body.get("namespace").is_none() && self.read.iter().chain(&self.write).any(|p| p == "*") {
+            return Ok(());
         }
         let field = |f: &str| body.get(f).and_then(|v| v.as_str()).map(String::from).ok_or_else(|| format!("{action} without {f} is not open to the {} token", self.name));
         match reach_of(action) {

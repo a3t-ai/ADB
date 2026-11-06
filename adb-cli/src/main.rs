@@ -135,6 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine: Arc<dyn Engine> = match &cli.data_dir {
         // B6: a memory branch in its own pod (ADB_BRANCH_OF, ADB_BRANCH).
         Some(dir) if branch::config()?.is_some() => branch::open(dir, branch::config()?.expect("checked")).await?,
+        // DB-2: one pod hosting every dev and QA branch (ADB_NON_PROD_OF, ADB_NON_PROD_URL).
+        Some(dir) if adb_server::non_prod::NonProdConfig::from_env()?.is_some() => {
+            let config = adb_server::non_prod::NonProdConfig::from_env()?.expect("checked");
+            Arc::new(adb_server::non_prod::NonProdPod::open(dir, config).await?)
+        }
         Some(dir) => {
             let (engine, replayed) = LocalEngine::durable(dir).await?;
             engine.set_branch_remote(branch::remote());
