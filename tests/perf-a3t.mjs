@@ -95,4 +95,4 @@ do:
   { const xs = []; const end = performance.now() + SECS * 1000; let k = 0; await Promise.all(Array.from({ length: C }, async (_, w) => { while (performance.now() < end) { const t = performance.now(); await tool('set_state', { key: `bench:w${w}:${k++}`, value: { k } }); xs.push(performance.now() - t); } })); const s = stat(xs); results.write = { ...s, per_s: xs.length / SECS }; fmt(`write: set_state x${C} writers`, s); console.log(`  ${''.padEnd(30)} → ${results.write.per_s.toFixed(0)} writes/s`); }
   console.log('RESULTS ' + JSON.stringify(results));
 } catch (e) { console.error(e, F.log()); process.exitCode = 1; }
-finally { for (const k of kids) k.kill('SIGKILL'); await sleep(300); rmSync(tmp, { recursive: true, force: true }); }
+finally { for (const k of kids) k.kill('SIGKILL'); await sleep(300); rmSync(tmp, { recursive: true, force: true }); process.exit(); }

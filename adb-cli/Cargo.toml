@@ -10,6 +10,8 @@ name = "adb"
 path = "src/main.rs"
 
 [dependencies]
+# The allocator (see `alloc.rs`). Also takes over malloc for C and C++ code in this binary.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "profiling"] }
 adb-server = { path = "../crates/adb-server" }
 adb-executor = { path = "../crates/adb-executor" }
 adb-mcp = { path = "../crates/adb-mcp" }
