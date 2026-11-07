@@ -50,8 +50,10 @@ struct Loc {
 #[derive(Default)]
 struct Inner {
     index: BTreeMap<u64, Loc>,
-    /// Recent entries and any not yet on disk, with their encoded size.
-    tail: BTreeMap<u64, (EntryOf<TC>, u32)>,
+    /// Recent entries and any not yet on disk, encoded: what they cost here is their
+    /// size on disk, which is what `ADB_RAFT_LOG_TAIL_MB` limits. Parsed, an entry's
+    /// JSON takes several times that.
+    tail: BTreeMap<u64, Arc<[u8]>>,
     tail_bytes: usize,
     /// Entries below this number are on disk, so may leave `tail`.
     written: u64,
@@ -77,15 +79,15 @@ impl Inner {
             if k >= self.written {
                 break;
             }
-            if let Some((_, len)) = self.tail.remove(&k) {
-                self.tail_bytes -= len as usize;
+            if let Some(b) = self.tail.remove(&k) {
+                self.tail_bytes -= b.len();
             }
         }
     }
 
     /// Replace the tail, for a purge or a truncation.
-    fn set_tail(&mut self, tail: BTreeMap<u64, (EntryOf<TC>, u32)>) {
-        self.tail_bytes = tail.values().map(|(_, len)| *len as usize).sum();
+    fn set_tail(&mut self, tail: BTreeMap<u64, Arc<[u8]>>) {
+        self.tail_bytes = tail.values().map(|b| b.len()).sum();
         self.tail = tail;
     }
 }
@@ -329,14 +331,14 @@ impl LogStore {
 
 impl RaftLogReader<TC> for LogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(&mut self, range: RB) -> Result<Vec<EntryOf<TC>>, io::Error> {
-        // Recent entries come from the tail. The rest are decoded after the lock is
-        // released: appends must not wait for a slow follower's catch-up read.
+        // Recent entries come from the tail, the rest from the mapping. Either way they
+        // are decoded after the lock is released: appends must not wait for a read.
         let (items, map, base) = {
             let mut i = self.inner.lock().unwrap();
-            let items: Vec<Result<EntryOf<TC>, Loc>> = i
+            let items: Vec<Result<Arc<[u8]>, Loc>> = i
                 .index
                 .range(range)
-                .map(|(k, loc)| i.tail.get(k).map(|(e, _)| e.clone()).ok_or(*loc))
+                .map(|(k, loc)| i.tail.get(k).cloned().ok_or(*loc))
                 .collect();
             let end = items.iter().filter_map(|r| r.as_ref().err()).map(|l| l.at + 4 + u64::from(l.len)).max();
             let base = i.base;
@@ -349,7 +351,7 @@ impl RaftLogReader<TC> for LogStore {
         items
             .into_iter()
             .map(|item| match item {
-                Ok(e) => Ok(e),
+                Ok(b) => rmp_serde::from_slice(&b).map_err(invalid),
                 Err(loc) => {
                     let map = map.as_ref().ok_or_else(|| invalid("raft log: no mapping"))?;
                     let start = (loc.at - base + 4) as usize;
@@ -411,7 +413,7 @@ impl RaftLogStorage<TC> for LogStore {
                 i.index.insert(n, Loc { at, len });
                 i.next = at + 4 + u64::from(len);
                 i.last = Some(e.log_id());
-                i.tail.insert(n, (e, len));
+                i.tail.insert(n, Arc::from(b));
                 i.tail_bytes += len as usize;
                 upto = n + 1;
             }
