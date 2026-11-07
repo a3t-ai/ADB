@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 # The allocator (see `alloc.rs`). Also takes over malloc for C and C++ code in this binary.
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "profiling"] }
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "profiling", "stats"] }
+# Reads jemalloc's own counters for the periodic `adb::alloc` log line.
+tikv-jemalloc-sys = "0.6"
 adb-server = { path = "../crates/adb-server" }
 adb-executor = { path = "../crates/adb-executor" }
 adb-mcp = { path = "../crates/adb-mcp" }

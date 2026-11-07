@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(log_filter(std::env::var("RUST_LOG").ok()))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .init();
-
+    alloc::report_every(alloc::report_interval());
 
     // A replica set member (M3): the engine opens only while this node leads.
     if let (Some(dir), Commands::Serve { http: true, host, port, flight_port } | Commands::ServeHttp { host, port, flight_port }) = (&cli.data_dir, &command) {
