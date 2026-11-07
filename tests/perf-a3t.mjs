@@ -13,7 +13,9 @@
  *   flow xC   the same flow, C callers at once      (throughput)
  *   write     set_state, C writers for --secs       (Raft commits/s, latency)
  *
- * Flags: --adb <bin> --flowr <bin> [--n 40] [--c 8] [--secs 8] [--transient]
+ * Flags: --adb <bin> --flowr <bin> [--n 40] [--c 8] [--secs 8] [--transient] [--ee]
+ *   --ee: the FlowR binary is EE (flowr-server), which needs a bearer token: the
+ *         console gets a throwaway signing secret for this run and the driver signs its own.
  * (--transient marks bench/read3 `metadata.a3t.durability: transient`).
  */
 import { spawn } from 'node:child_process';
@@ -21,6 +23,7 @@ import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
+import { createHmac, randomBytes } from 'node:crypto';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]?.startsWith('--') || all[i + 1] === undefined ? 'true' : all[i + 1]]] : a), []));
 if (!args.adb || !args.flowr) { console.error('usage: perf-a3t.mjs --adb <bin> --flowr <bin> [--n 40] [--c 8] [--secs 8] [--transient]'); process.exit(2); }
@@ -50,16 +53,22 @@ const proxy = kind => new Promise(r => { const s = net.createServer({ noDelay: t
 const httpP = await proxy('http'), flightP = await proxy('flight');
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
+const EE = 'ee' in args;
+const JWT_SECRET = randomBytes(32).toString('hex');
+const b64u = b => Buffer.from(b).toString('base64url');
+const jwt = claims => { const h = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' })), p = b64u(JSON.stringify(claims)); return `${h}.${p}.${createHmac('sha256', JWT_SECRET).update(`${h}.${p}`).digest('base64url')}`; };
 const F = start(args.flowr, ['--mode', 'http', '--port', String(port)], {
   HOSTNAME: 'flowr-console', CLAWDFLOW_DATA_DIR: join(tmp, 'flowr'),
   FLOWR_ENGINE_ADB_URL: `http://127.0.0.1:${flightP}`, FLOWR_ENGINE_ADB_TOKEN: TOKEN,
   FLOWR_REGISTRY_ADB: `http://127.0.0.1:${httpP}`, FLOWR_REGISTRY_ADB_FLIGHT: `http://127.0.0.1:${flightP}`,
   ADB_AUTH_TOKEN: AUTH, ADB_AUTH_URLS: `http://127.0.0.1:${httpP},http://127.0.0.1:${flightP}`,
+  ...(EE ? { FLOWR_JWT_SECRET: JWT_SECRET, MCP_RESOURCE_URI: url } : {}),
 });
+const BEARER = EE ? jwt({ sub: 'perf', org: 'org-default', role: 'superadmin', email: 'perf@localhost', name: 'perf', aud: url, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 86400 }) : null;
 for (let i = 0; i < 400; i++) { try { if ((await fetch(`${url}/health`)).ok) break; } catch {} await sleep(100); }
 let id = 1;
 async function tool(name, a) {
-  const r = await (await fetch(`${url}/message`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name, arguments: a } }) })).json();
+  const r = await (await fetch(`${url}/message`, { method: 'POST', headers: { 'content-type': 'application/json', ...(BEARER ? { authorization: `Bearer ${BEARER}` } : {}) }, body: JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name, arguments: a } }) })).json();
   if (r.error || r.result?.isError) throw new Error(`${name}: ${r.result?.content?.[0]?.text ?? JSON.stringify(r.error)}`);
   return r.result?.content?.[0]?.text ?? '';
 }
