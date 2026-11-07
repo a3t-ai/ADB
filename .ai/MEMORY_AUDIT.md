@@ -276,3 +276,23 @@ RssAnon over 1,470 s now: leader 107 to 305 (max 344), followers 101 to 259 (max
 ## Open: erasure on followers' logs
 
 After a FORGET the leader rewrites its own WAL without the forgotten payload (`rewrite_closed`). Followers don't, and the Raft `entries` file keeps up to `ADB_RAFT_LOG_KEEP` (20,000) entries holding it. Follower compaction now erases it from their tables, not from their logs. Not a memory issue: an erasure correctness one.
+
+## 7 Nov: jemalloc's own counters, no profiler (step 4)
+
+Same run (`perf-a3t --n 1500 --c 8 --secs 120`, debug), `ADB_ALLOC_STATS_SECS=30`, no `MALLOC_CONF`.
+At the end (about 1,410 s), MiB:
+
+| | RssAnon | resident | active | allocated (live) | retained (address space only) |
+|---|---|---|---|---|---|
+| Leader | 272 | 240 | 222 | 170 | 509 |
+| Follower | 224 | 193 | 182 | 161 | 535 |
+| Follower | 222 | 186 | 178 | 158 | 521 |
+
+- Live data (`allocated`) is flat after the first ~600 s: followers 115-130 MiB, leader 130-150 MiB,
+  with short peaks (up to 187 / 234) during compactions and the write phase. No steady growth.
+- The profiler cost about 50 MiB per node (RssAnon 305/255/259 with it, 272/224/222 without).
+- Gap between RssAnon and live data, leader: about 50 MiB of page fragmentation (`active - allocated`,
+  higher on the leader than on followers at about 20), about 18 MiB of freed pages waiting for decay
+  (`resident - active`), and about 30 MiB outside jemalloc (thread stacks, binary data).
+- `retained` (~500 MiB) is virtual only: returned to the system, costs no RAM.
+- Throughput unchanged: 7.8 flows/s, 5.6 writes/s (p50 1.25 s, debug).
