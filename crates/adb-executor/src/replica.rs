@@ -26,7 +26,17 @@ pub struct Replica {
     platform_next: LogOffset,
     engine_next: LogOffset,
     retain_max: u64,
+    /// When [`Self::maintain`] last ran.
+    maintained: std::time::Instant,
 }
+
+/// How often a follower checks whether its tables need compacting.
+const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A follower keeps every version it holds: history windows and branch pins are the
+/// leader's to apply, and a follower that applied its own could drop a version the
+/// leader still serves. The next leader's compaction trims history as usual.
+const FOLLOWER_HISTORY: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 86_400);
 
 fn s<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
     move |e| format!("{what}: {e}")
@@ -41,7 +51,7 @@ impl Replica {
         let platform_next = LogOffset(platform.applied_offset().await + 1);
         let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;
         let engine_next = engine.replay_from().await.map_err(s("engine"))?;
-        let mut r = Self { log, store, embedder, platform, engine, platform_next, engine_next, retain_max: retain_max() };
+        let mut r = Self { log, store, embedder, platform, engine, platform_next, engine_next, retain_max: retain_max(), maintained: std::time::Instant::now() };
         let n = r.step().await?;
         tracing::info!(records = n, offset = r.log.last_offset().0, "replica caught up");
         // The table's schema migrations, as the leader's engine runs them on open
@@ -108,7 +118,36 @@ impl Replica {
         }
         self.engine.snapshot_due(false).await.map_err(s("engine"))?;
         self.purge().await?;
+        if self.maintained.elapsed() >= MAINTAIN_EVERY {
+            self.maintained = std::time::Instant::now();
+            self.maintain().await;
+        }
         Ok(applied)
+    }
+
+    /// Compaction on the leader's thresholds. Without it a follower's sealed memtables,
+    /// journal generations and table versions pile up until it leads: each flush then
+    /// rewrites a longer manifest, and forgotten rows stay on its disk. Failures are
+    /// logged and retried at the next check.
+    pub async fn maintain(&self) {
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let due = self.store.writes_due(crate::writes::COMPACT_AFTER_WRITES) || self.store.generation_count().await.is_ok_and(|n| n > 16);
+        if due {
+            match self.store.compact(FOLLOWER_HISTORY, now).await {
+                Ok(st) => tracing::info!(kept = st.kept, of = st.total, took = ?st.took, "follower table compacted"),
+                Err(e) => tracing::warn!(error = %e, "follower compaction failed; retrying later"),
+            }
+        }
+        for j in self.engine.journals_to_compact().await {
+            if let Err(e) = j.run().await {
+                tracing::warn!(space = %j.space, error = %e, "follower journal compaction failed");
+            }
+        }
+        if self.platform.compaction_due().await {
+            if let Err(e) = self.platform.compact().await {
+                tracing::warn!(error = %e, "follower platform compaction failed");
+            }
+        }
     }
 
     /// Trim the WAL below what the table (on disk), the platform tables and the

@@ -65,6 +65,14 @@ impl StoreConfig {
     }
 }
 
+/// Rows per chunk when a compaction rewrites a table.
+const REWRITE_CHUNK: usize = 10_000;
+
+/// What a batch costs in memory beyond the contents Lance counts: one array per
+/// column (34) with its own small allocations. Measured: 24 KiB per batch of one or two
+/// rows (heap profile against Lance's count, 7 Nov).
+const BATCH_OVERHEAD: usize = 24 << 10;
+
 /// Bytes at which ADB seals the active memtable, whatever its row count, and of unsealed
 /// plus unflushed memtables at which writes wait: `ADB_MEMTABLE_MB` (default 64) and
 /// `ADB_MEMTABLE_BACKLOG_MB` (default 1024).
@@ -481,6 +489,50 @@ impl PartitionStore {
         self.rewrite_online_with(keep, &[], vectors_cleared).await
     }
 
+    /// Stream the rows `keep` accepts from `inner` into a new table at `staged`, as its
+    /// base data, `REWRITE_CHUNK` rows at a time: memory follows the chunk, not the
+    /// table, and the new table has no MemWAL generations. The LSM scan yields the
+    /// newest version of each id once (`_meta` included), so the base holds no
+    /// duplicates. Returns (rows read, rows kept).
+    async fn write_kept(&self, inner: &Inner, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), staged: &std::path::Path) -> StoreResult<(usize, usize)> {
+        use futures::StreamExt;
+        let uri = staged.to_string_lossy().to_string();
+        let mut stream = Self::scanner(inner).await?.try_into_stream().await.map_err(lance)?;
+        let (mut total, mut kept) = (0, 0);
+        let mut buf: Vec<StoredRow> = Vec::new();
+        let mut ds: Option<Dataset> = None;
+        loop {
+            let next = stream.next().await;
+            if let Some(b) = &next {
+                let rows = decode(b.as_ref().map_err(lance)?)?;
+                total += rows.len();
+                buf.extend(rows.into_iter().filter_map(keep));
+            }
+            let done = next.is_none();
+            if buf.len() >= REWRITE_CHUNK || (done && !buf.is_empty()) {
+                kept += buf.len();
+                let batch = encode(&buf, &self.schema, self.dim)?;
+                buf.clear();
+                let mode = if ds.is_some() { lance::dataset::WriteMode::Append } else { lance::dataset::WriteMode::Create };
+                let params = WriteParams { mode, ..Default::default() };
+                ds = Some(Dataset::write(RecordBatchIterator::new([Ok(batch)], self.schema.clone()), &uri, Some(params)).await.map_err(lance)?);
+            }
+            if done {
+                break;
+            }
+        }
+        let Some(mut ds) = ds else {
+            // Nothing at all, not even `_meta` (not expected): an empty table.
+            Self::create(&uri, &self.schema, self.dim).await?;
+            return Ok((total, kept));
+        };
+        ds.create_index(&["id"], IndexType::BTree, Some("id_idx".into()), &ScalarIndexParams::default(), true)
+            .await
+            .map_err(lance)?;
+        ds.initialize_mem_wal().unsharded().maintained_indexes(["id_idx"]).execute().await.map_err(lance)?;
+        Ok((total, kept))
+    }
+
     /// [`Self::rewrite_online`] adding `extra` rows to the new table (a migration's
     /// new rows: in the same swap, so all or nothing).
     async fn rewrite_online_with(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), extra: &[StoredRow], vectors_cleared: bool) -> StoreResult<CompactStats> {
@@ -491,20 +543,27 @@ impl PartitionStore {
         let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
         let mut g = self.state.write().await;
         let bytes_before = dir_size(&dir);
-        let all = Self::scan_in(open_state(&g), None).await?;
-        let total = all.len();
-        let mut rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
-        rows.extend(extra.iter().cloned());
         // The new table, complete and closed, beside the old one.
         if staged.exists() {
             std::fs::remove_dir_all(&staged).map_err(err)?;
         }
-        Self::create(&staged.to_string_lossy(), &self.schema, self.dim).await?;
-        let new = Self::open_inner(&self.cfg, self.partition, &staged).await?;
-        for chunk in rows.chunks(10_000) {
-            new.writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
-        }
-        new.writer.close().await.map_err(lance)?;
+        let (total, kept) = if extra.is_empty() {
+            self.write_kept(open_state(&g), keep, &staged).await?
+        } else {
+            // A migration's rows replace rows of the same id, which only a put through
+            // the MemWAL (newest wins) gets right: in memory, as before. Rare and one-off.
+            let all = Self::scan_in(open_state(&g), None).await?;
+            let total = all.len();
+            let mut rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
+            rows.extend(extra.iter().cloned());
+            Self::create(&staged.to_string_lossy(), &self.schema, self.dim).await?;
+            let new = Self::open_inner(&self.cfg, self.partition, &staged).await?;
+            for chunk in rows.chunks(REWRITE_CHUNK) {
+                new.writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
+            }
+            new.writer.close().await.map_err(lance)?;
+            (total, rows.len())
+        };
         // On disk before anything old goes (L11, W9): Lance doesn't fsync locally.
         adb_core::disk::sync_fs_async(&staged).await.map_err(err)?;
         // Close the current writer before the directories move: its WAL path is the
@@ -540,7 +599,7 @@ impl PartitionStore {
                 std::fs::remove_dir_all(e.path()).map_err(err)?;
             }
         }
-        Ok(CompactStats { total, kept: rows.len(), bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
+        Ok(CompactStats { total, kept, bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
     }
 
     /// What `_meta` records about the table besides offsets: its embedding size and
@@ -1058,9 +1117,20 @@ impl PartitionStore {
         self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
         inner.puts.lock().unwrap().offsets.push_back(off);
         self.puts_since_compaction.fetch_add(records.len() as u64, std::sync::atomic::Ordering::SeqCst);
-        if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows
-            || inner.writer.memory().active_bytes() >= memtable_limits().0
-        {
+        let st = inner.writer.memtable_stats().await.map_err(lance)?;
+        let mem = inner.writer.memory();
+        // Lance counts the buffers' contents; each batch also costs its arrays and
+        // small allocations, which dominate when a put is a record or two.
+        let held = mem.active_bytes() + st.batch_count * BATCH_OVERHEAD;
+        let seal = st.row_count >= self.memtable_rows || held >= memtable_limits().0;
+        if seal || (self.apply_seq.load(std::sync::atomic::Ordering::Relaxed) / 2) % 1000 == 0 {
+            tracing::debug!(
+                target: "adb_store::memtable",
+                partition = self.partition.0, rows = st.row_count, batches = st.batch_count, seal, held,
+                active = mem.active_bytes(), frozen = mem.frozen_bytes(), "memtable"
+            );
+        }
+        if seal {
             // Queued for flush; nothing here waits on it (the fence is dropped).
             inner.writer.force_freeze_active().await.map_err(lance)?;
         }

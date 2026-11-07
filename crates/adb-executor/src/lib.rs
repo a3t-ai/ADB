@@ -27,6 +27,6 @@ pub use engine::{request_restart, restart_requested, Engine, LocalEngine};
 pub use result::{QueryResult, ResultSet};
 pub use apply::ApplyBarrier;
 pub use reads::{LanceReads, Reads};
-pub use writes::{DurableWrites, ReplayStats, Writes};
+pub use writes::{DurableWrites, ReplayStats, Writes, COMPACT_AFTER_WRITES};
 pub use replica::Replica;
 pub use engine::{EngineLog, Warm};

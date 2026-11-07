@@ -246,3 +246,33 @@ Not proven: that the leader's larger data memtable comes from `encode` builders 
 9. **Regression guard:** a test that runs N flows and fails if live heap per run exceeds a budget. Without this, new growth stays invisible until the next OOM.
 
 After these, `ADB_MALLOC_TRIM_SECS` should be unnecessary. Remove it and confirm heap stays flat.
+
+## Heap profile after the fixes (7 Nov, local)
+
+Same workload (`tests/perf-a3t.mjs --n 1500 --c 8 --secs 120`), debug build, jemalloc with its own profiler (`MALLOC_CONF=prof:true,...`). Every phase completed. Live MiB by owner:
+
+| Owner | Leader | Followers | Shape |
+|---|---|---|---|
+| Data table memtable | 7 to 71 | 15 to **110, 123** | Saw-tooth on the leader; rises the whole run on followers |
+| Raft log (incl. 26 to 29 MiB of static histogram tables) | 39 | 96 | Flat |
+| Leader's Raft tail (entries as JSON) | 58 | n/a | Flat |
+| Engine journal memtable | 16 to 83 | 17 to 105 | Saw-tooth |
+| Lance manifest building (`Transaction::build_manifest`) | 2 to 55 | 1 to 61 | Spikes at commits, higher later |
+| EngineCore | 34 (peak 43) | 37 (peak 45) | Now falls as journals are evicted |
+
+RssAnon at the end: 432, 467, 466 MiB, against about 285 and 355 MiB live: jemalloc and profiler overhead not yet broken down.
+
+What that profile led to (7 Nov, all measured on the same workload):
+
+| Finding | Cause | Fix | Result |
+|---|---|---|---|
+| Followers' data memtable rose all run | One or two rows per put; each batch costs about 24 KiB of arrays and small allocations that Lance doesn't count, so the 64 MiB seal never fired | Seal counts `batch_count * 24 KiB` on top of Lance's figure | 22 to 28 MiB, saw-tooth, instead of 110 to 123 |
+| Raft tail 58 MiB on the leader, most of 96 on followers | The 8 MiB tail held parsed JSON | Tail kept encoded, decoded on read | Raft log 39 to 46 MiB on every node (26 to 29 of it openraft's histogram tables) |
+| Lance manifest spikes growing on followers | Followers never compacted anything | `Replica::maintain`: the leader's thresholds, once a minute; the data table keeps all history (windows and pins are the leader's) | Generations no longer pile up; forgotten payloads leave a follower's table |
+| Follower spikes to 671 to 681 MiB | Compaction (C2) read the whole table, decoded and re-encoded it in memory; the engine journal holds 30 days | Compaction streams the LSM scan into the new table's base, 10,000 rows at a time | Follower peak 255 MiB live; RssAnon max 267 |
+
+RssAnon over 1,470 s now: leader 107 to 305 (max 344), followers 101 to 259 (max 267). Start of this work, glibc: 816, 787, 785 at 630 s.
+
+## Open: erasure on followers' logs
+
+After a FORGET the leader rewrites its own WAL without the forgotten payload (`rewrite_closed`). Followers don't, and the Raft `entries` file keeps up to `ADB_RAFT_LOG_KEEP` (20,000) entries holding it. Follower compaction now erases it from their tables, not from their logs. Not a memory issue: an erasure correctness one.

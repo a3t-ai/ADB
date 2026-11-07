@@ -24,6 +24,8 @@ thiserror.workspace = true
 # syncfs before the log is purged (risk K8).
 tokio.workspace = true
 uuid.workspace = true
+# Compaction streams the LSM scan (`write_kept`).
+futures.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
