@@ -271,12 +271,16 @@ pub fn encode(rows: &[StoredRow], schema: &SchemaRef, dim: i32) -> StoreResult<R
         Arc::new(b.finish())
     };
     let mut weight = Float32Builder::with_capacity(n);
-    let mut sealed = LargeBinaryBuilder::new();
+    // Sized for these rows: a default builder holds room for 1024 values, and a batch
+    // keeps its buffers' whole capacity for as long as it stays in a memtable. Most
+    // batches here are a row or two.
+    let sealed_bytes: usize = rows.iter().filter_map(|r| r.data.sealed.as_deref()).map(<[u8]>::len).sum();
+    let mut sealed = LargeBinaryBuilder::with_capacity(n, sealed_bytes);
     let mut version = UInt32Builder::with_capacity(n);
     let mut tombstone = BooleanBuilder::with_capacity(n);
     let mut log_offset = UInt64Builder::with_capacity(n);
     let mut epoch = UInt64Builder::with_capacity(n);
-    let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), dim)
+    let mut embedding = FixedSizeListBuilder::with_capacity(Float32Builder::with_capacity(n * dim as usize), dim, n)
         .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
     for r in rows {
         weight.append_option(r.data.weight);
@@ -316,7 +320,7 @@ pub fn encode(rows: &[StoredRow], schema: &SchemaRef, dim: i32) -> StoreResult<R
         Arc::new(weight.finish()),
         {
             // JSONB, as Lance's json_* functions read it.
-            let mut b = LargeBinaryBuilder::new();
+            let mut b = LargeBinaryBuilder::with_capacity(n, 0);
             for r in rows {
                 if r.data.value.is_null() {
                     b.append_null();
@@ -455,6 +459,18 @@ pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {
 #[cfg(test)]
 mod ns_tests {
     use super::*;
+
+    /// A batch stays in a memtable with its buffers' whole capacity, so a one-row batch
+    /// must not hold room for a thousand.
+    #[test]
+    fn a_small_batch_keeps_small_buffers() {
+        let dim = 384;
+        let schema = crate::memory_schema(dim);
+        let meta = StoredRow::meta(1, adb_core::log::CommitTs(0), 1, serde_json::json!({}));
+        let batch = encode(std::slice::from_ref(&meta), &schema, dim).unwrap();
+        let held = batch.get_array_memory_size();
+        assert!(held < 8 * 1024, "one row holds {held} bytes");
+    }
 
     #[test]
     fn namespaced_ids() {

@@ -65,6 +65,17 @@ impl StoreConfig {
     }
 }
 
+/// Bytes at which ADB seals the active memtable, whatever its row count, and of unsealed
+/// plus unflushed memtables at which writes wait: `ADB_MEMTABLE_MB` (default 64) and
+/// `ADB_MEMTABLE_BACKLOG_MB` (default 1024).
+fn memtable_limits() -> (usize, usize) {
+    static LIMITS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let mb = |var: &str, d: usize| std::env::var(var).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d) << 20;
+        (mb("ADB_MEMTABLE_MB", 64), mb("ADB_MEMTABLE_BACKLOG_MB", 1024))
+    })
+}
+
 fn lance(e: impl std::fmt::Display) -> StoreError {
     StoreError::Lance(e.to_string())
 }
@@ -705,9 +716,14 @@ impl PartitionStore {
             // ADB seals (see the module docs): Lance's own limits out of reach, but finite —
             // Lance sizes buffers from them (usize::MAX overflows), values from spike R11.
             .with_max_memtable_rows(10_000_000)
-            .with_max_memtable_size(4 << 30)
-            .with_max_memtable_batches(1_000_000)
-            .with_max_unflushed_memtable_bytes(8 << 30);
+            // Half the backlog (Lance requires it to fit): ADB's own seal comes first, at
+            // `memtable_limits().0`.
+            .with_max_memtable_size(memtable_limits().1 / 2)
+            // Each memtable allocates a slot per batch up front, about 72 bytes each.
+            .with_max_memtable_batches(100_000)
+            // Writes wait here. Below the pod's limit: a flush that falls behind must slow
+            // writers down, not end in an OOM.
+            .with_max_unflushed_memtable_bytes(memtable_limits().1);
         let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
         let _ = schema;
         Ok(Inner { base, writer, cache: Arc::new(SsTableCache::new(64)), puts: std::sync::Mutex::new(PutLedger::default()) })
@@ -1042,7 +1058,9 @@ impl PartitionStore {
         self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
         inner.puts.lock().unwrap().offsets.push_back(off);
         self.puts_since_compaction.fetch_add(records.len() as u64, std::sync::atomic::Ordering::SeqCst);
-        if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows {
+        if inner.writer.memtable_stats().await.map_err(lance)?.row_count >= self.memtable_rows
+            || inner.writer.memory().active_bytes() >= memtable_limits().0
+        {
             // Queued for flush; nothing here waits on it (the fence is dropped).
             inner.writer.force_freeze_active().await.map_err(lance)?;
         }

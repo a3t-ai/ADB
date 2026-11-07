@@ -102,13 +102,33 @@ struct Space {
     snapshot_at: Instant,
 }
 
+/// The core as a snapshot writes it (the fields of [`Snapshot`], borrowed: no copy).
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    offset: u64,
+    core: &'a EngineCore,
+}
+
+/// How many subscriptions between sweeps of topics nobody listens to.
+const SUBS_SWEEP_EVERY: u64 = 1024;
+
 /// Subscribers per (space, topic).
 pub type Subs = std::sync::Mutex<HashMap<(String, String), Vec<UnboundedSender<Value>>>>;
 
 /// Notices on `topic` in `space`, from now on (no host lock needed).
 pub fn subscribe_on(subs: &Subs, space: &str, topic: &str) -> UnboundedReceiver<Value> {
+    static SUBSCRIBED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (tx, rx) = unbounded();
-    subs.lock().unwrap().entry((space.to_string(), topic.to_string())).or_default().push(tx);
+    let mut subs = subs.lock().unwrap();
+    subs.entry((space.to_string(), topic.to_string())).or_default().push(tx);
+    // A run's topic never fires after the run ends, so `notify` alone would keep it for
+    // good. Swept here, it costs at most this many dead topics.
+    if SUBSCRIBED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SUBS_SWEEP_EVERY == SUBS_SWEEP_EVERY - 1 {
+        subs.retain(|_, list| {
+            list.retain(|tx| !tx.is_closed());
+            !list.is_empty()
+        });
+    }
     rx
 }
 
@@ -415,21 +435,7 @@ impl EngineHost {
     pub async fn evictable(&mut self, space: &str, now: DateTime<Utc>) -> EngineResult<Vec<RunId>> {
         let cut = now - chrono::Duration::from_std(EVICT_AFTER).unwrap_or_default();
         let s = self.space(space).await?;
-        let page = s.core.list(&flowr_storage::engine::RunQuery {
-            phases: vec![
-                flowr_storage::engine::RunPhase::Completed,
-                flowr_storage::engine::RunPhase::Faulted,
-                flowr_storage::engine::RunPhase::Cancelled,
-            ],
-            limit: 10_000,
-            ..Default::default()
-        });
-        Ok(page
-            .items
-            .into_iter()
-            .filter(|r| r.completed_at.is_some_and(|c| c < cut) && s.core.read_from(r.run_id, u64::MAX).is_some())
-            .map(|r| r.run_id)
-            .collect())
+        Ok(s.core.evictable(cut, 10_000))
     }
 
     /// The journals whose compaction is due, to compact without the host lock.
@@ -463,15 +469,16 @@ impl EngineHost {
             if !due {
                 continue;
             }
-            let snap = Snapshot { offset: s.last_offset, core: s.core.clone() };
-            let bytes = serde_json::to_vec(&snap).map_err(|e| EngineError::Snapshot(e.to_string()))?;
             let dir = self.dir.join(&name);
             let tmp = dir.join("snapshot.json.tmp");
             {
                 use std::io::Write;
-                let mut f = std::fs::File::create(&tmp).map_err(|e| EngineError::Snapshot(e.to_string()))?;
-                f.write_all(&bytes).map_err(|e| EngineError::Snapshot(e.to_string()))?;
-                f.sync_all().map_err(|e| EngineError::Snapshot(e.to_string()))?;
+                // Straight to the file: no copy of the core and no buffer of its size.
+                let f = std::fs::File::create(&tmp).map_err(|e| EngineError::Snapshot(e.to_string()))?;
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+                serde_json::to_writer(&mut w, &SnapshotRef { offset: s.last_offset, core: &s.core }).map_err(|e| EngineError::Snapshot(e.to_string()))?;
+                w.flush().map_err(|e| EngineError::Snapshot(e.to_string()))?;
+                w.get_ref().sync_all().map_err(|e| EngineError::Snapshot(e.to_string()))?;
             }
             std::fs::rename(&tmp, dir.join("snapshot.json")).map_err(|e| EngineError::Snapshot(e.to_string()))?;
             if let Ok(d) = std::fs::File::open(&dir) {
@@ -516,8 +523,12 @@ impl EngineHost {
     pub fn notify(&self, space: &str, notices: Vec<(String, Value)>) {
         let mut subs = self.subs.lock().unwrap();
         for (topic, msg) in notices {
-            if let Some(list) = subs.get_mut(&(space.to_string(), topic)) {
+            let key = (space.to_string(), topic);
+            if let Some(list) = subs.get_mut(&key) {
                 list.retain(|tx| tx.unbounded_send(msg.clone()).is_ok());
+                if list.is_empty() {
+                    subs.remove(&key);
+                }
             }
         }
     }
@@ -560,5 +571,24 @@ impl JournalCompaction {
         // no marker for deleted rows (the writer skips anything at or below the
         // applied offset, so nothing comes back).
         self.journal.compact_append_only(CommitTs::from_datetime(Utc::now())).await.map_err(store_err)
+    }
+}
+
+#[cfg(test)]
+mod subs_tests {
+    use super::*;
+
+    #[test]
+    fn topics_nobody_listens_to_are_swept() {
+        let subs: Subs = Default::default();
+        let kept = subscribe_on(&subs, "s", "live");
+        for i in 0..(SUBS_SWEEP_EVERY * 3) {
+            drop(subscribe_on(&subs, "s", &format!("run:{i}")));
+        }
+        let guard = subs.lock().unwrap();
+        assert!(guard.len() as u64 <= SUBS_SWEEP_EVERY + 1, "{} topics", guard.len());
+        assert!(guard.contains_key(&("s".to_string(), "live".to_string())), "a live topic stays");
+        drop(guard);
+        drop(kept);
     }
 }
