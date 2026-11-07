@@ -37,6 +37,9 @@ enum Job {
     Append { bytes: Vec<u8>, upto: u64, cb: IOFlushed<TC> },
     /// Keep only this range of the file (positions as in [`Loc`]).
     Rewrite { keep: Range<u64>, done: mpsc::Sender<io::Result<()>> },
+    /// Write out earlier appends, report on `held`, then wait: the caller rewrites the
+    /// file and sends back the new one to append to (`None`: keep the current one).
+    Hold { held: mpsc::Sender<io::Result<()>>, resume: Mutex<mpsc::Receiver<Option<File>>> },
 }
 
 /// Where an entry's frame is. `at` counts bytes since the store opened and is not
@@ -217,6 +220,103 @@ fn rewrite_file(path: &Path, inner: &Mutex<Inner>, keep: Range<u64>) -> io::Resu
     Ok(f)
 }
 
+/// `bytes` (one encoded entry) with `redact` applied to its record, padded to the same
+/// length; `None` if `redact` leaves it as it is. The padding is [`crate::Cmd::pad`]:
+/// a MessagePack array of zero bytes (one byte each) after a 4-byte key, with a
+/// header of 1, 3 or 5 bytes by length.
+fn redact_entry(bytes: &[u8], redact: &(dyn Fn(&mut adb_core::log::LogRecord) -> bool + Sync)) -> io::Result<Option<Vec<u8>>> {
+    let mut e: EntryOf<TC> = rmp_serde::from_slice(bytes).map_err(invalid)?;
+    fn pad(e: &mut EntryOf<TC>) -> Option<&mut Vec<u8>> {
+        match &mut e.payload {
+            openraft::EntryPayload::Normal(cmd) => Some(&mut cmd.pad),
+            _ => None,
+        }
+    }
+    {
+        let openraft::EntryPayload::Normal(cmd) = &mut e.payload else { return Ok(None) };
+        if !redact(&mut cmd.record) {
+            return Ok(None);
+        }
+        cmd.pad.clear();
+    }
+    let bare = encode(&e)?.len();
+    let extra = bytes.len().checked_sub(bare).ok_or_else(|| invalid("raft log: a redacted entry grew"))?;
+    for (header, fits) in [(1usize, 1..16usize), (3, 16..65_536), (5, 65_536..usize::MAX)] {
+        let Some(n) = extra.checked_sub(4 + header) else { continue };
+        if !fits.contains(&n) {
+            continue;
+        }
+        if let Some(p) = pad(&mut e) {
+            *p = vec![0; n];
+        }
+        let out = encode(&e)?;
+        if out.len() == bytes.len() {
+            return Ok(Some(out));
+        }
+    }
+    Err(invalid(format!("raft log: cannot pad a redacted entry from {bare} to {} bytes", bytes.len())))
+}
+
+/// Copy the file with `redact` applied to every entry, each frame keeping its length,
+/// then swap it in. `None` for the file if nothing changed.
+fn redact_file(path: &Path, inner: &Mutex<Inner>, redact: &(dyn Fn(&mut adb_core::log::LogRecord) -> bool + Sync)) -> io::Result<(Option<File>, usize)> {
+    let src = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((None, 0)),
+        Err(e) => return Err(e),
+    };
+    let len = src.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok((None, 0));
+    }
+    // SAFETY: the writer is held (no appends), and only this store writes the file.
+    let buf = unsafe { Mmap::map(&src)? };
+    let mut changed = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= len {
+        let n = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+        if at + 4 + n > len {
+            break;
+        }
+        if let Some(out) = redact_entry(&buf[at + 4..at + 4 + n], redact)? {
+            changed.push((at + 4, out));
+        }
+        at += 4 + n;
+    }
+    if changed.is_empty() {
+        return Ok((None, 0));
+    }
+    let tmp = path.with_extension("redact");
+    {
+        let mut t = File::create(&tmp)?;
+        let mut from = 0usize;
+        for (pos, out) in &changed {
+            t.write_all(&buf[from..*pos])?;
+            t.write_all(out)?;
+            from = pos + out.len();
+        }
+        t.write_all(&buf[from..len])?;
+        t.sync_all()?;
+    }
+    drop(buf);
+    let f;
+    {
+        let mut i = inner.lock().unwrap();
+        std::fs::rename(&tmp, path)?;
+        f = OpenOptions::new().append(true).open(path)?;
+        i.map = None;
+        // The recent entries held in RAM too.
+        let keys: Vec<u64> = i.tail.keys().copied().collect();
+        for k in keys {
+            if let Some(out) = redact_entry(&i.tail[&k], redact)? {
+                i.tail.insert(k, out.into());
+            }
+        }
+    }
+    sync_dir(path);
+    Ok((Some(f), changed.len()))
+}
+
 fn spawn_writer(path: PathBuf, inner: Arc<Mutex<Inner>>, tail_limit: usize) -> io::Result<mpsc::Sender<Job>> {
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
     let (tx, rx) = mpsc::channel::<Job>();
@@ -249,6 +349,20 @@ fn spawn_writer(path: PathBuf, inner: Arc<Mutex<Inner>>, tail_limit: usize) -> i
                         }
                         let r = flushed.and_then(|_| rewrite_file(&path, &inner, keep)).map(|new| f = new);
                         let _ = done.send(r);
+                    }
+                    Job::Hold { held, resume } => {
+                        let flushed = result.as_ref().map_err(clone_err).and_then(|_| f.sync_data());
+                        if flushed.is_ok() {
+                            inner.lock().unwrap().mark_written(pending_upto, tail_limit);
+                        }
+                        for cb in pending.drain(..) {
+                            cb.io_completed(flushed.as_ref().map(|_| ()).map_err(clone_err));
+                        }
+                        if held.send(flushed).is_ok() {
+                            if let Ok(Some(new)) = resume.into_inner().unwrap().recv() {
+                                f = new;
+                            }
+                        }
                     }
                 }
             }
@@ -294,6 +408,29 @@ impl LogStore {
         let inner = Arc::new(Mutex::new(inner));
         let writer = spawn_writer(path, Arc::clone(&inner), tail_limit)?;
         Ok(Self { dir, inner, writer })
+    }
+
+    /// Rewrite every entry whose record `redact` changes (W5 erasure: a forgotten
+    /// payload leaves the Raft log too, not only the WAL). Each entry keeps its length
+    /// on disk, so every position, and any append queued meanwhile, stays right; the
+    /// new file is complete and synced before it replaces the old one, so a crash
+    /// leaves one or the other. Appends wait while it runs. Returns how many changed.
+    pub fn redact(&self, redact: &(dyn Fn(&mut adb_core::log::LogRecord) -> bool + Sync)) -> io::Result<usize> {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let stopped = || io::Error::other("raft log writer stopped");
+        self.writer.send(Job::Hold { held: held_tx, resume: Mutex::new(resume_rx) }).map_err(|_| stopped())?;
+        held_rx.recv().map_err(|_| stopped())??;
+        let r = redact_file(&self.dir.join("entries"), &self.inner, redact);
+        let (file, n) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = resume_tx.send(None);
+                return Err(e);
+            }
+        };
+        let _ = resume_tx.send(file);
+        Ok(n)
     }
 
     /// No entry and no vote: a node that never took part.
@@ -483,6 +620,95 @@ mod tests {
 
     async fn numbers(s: &mut LogStore, r: Range<u64>) -> Vec<u64> {
         s.try_get_log_entries(r).await.unwrap().iter().map(|e| e.index()).collect()
+    }
+
+    fn put(key: &str, text_len: usize) -> adb_core::log::Effect {
+        use adb_core::log::*;
+        Effect::PutEntity(NewRow {
+            id: RecordId(key.into()),
+            lineage_id: RecordId(key.into()),
+            version: 1,
+            data: RowData {
+                tenant_id: "default".into(),
+                scope: "tenant:default".into(),
+                visibility: Visibility::Private,
+                namespace: None,
+                memory: Memory::Semantic,
+                kind: Kind::Entity,
+                key: Some(key.into()),
+                subject_id: None,
+                predicate: None,
+                object_id: None,
+                link_type: None,
+                weight: None,
+                text: Some("x".repeat(text_len)),
+                value: serde_json::json!({ "key": key }),
+                sealed: None,
+                embedding: None,
+                ttl_at: None,
+                provenance: Provenance::default(),
+            },
+        })
+    }
+
+    /// Entry `n` committing a record with these effects.
+    fn cmd(n: u64, effects: Vec<adb_core::log::Effect>) -> EntryOf<TC> {
+        use adb_core::log::*;
+        let mut e = entry(n);
+        let record = LogRecord { partition: PartitionId(0), offset: LogOffset(n), epoch: Epoch(1), commit_ts: CommitTs(1), txn_id: None, effects };
+        e.payload = openraft::EntryPayload::Normal(crate::Cmd { record, new_segment: false, pad: Vec::new() });
+        e
+    }
+
+    fn keys(e: &EntryOf<TC>) -> Vec<String> {
+        match &e.payload {
+            openraft::EntryPayload::Normal(c) => c.record.effects.iter().filter_map(|x| match x {
+                adb_core::log::Effect::PutEntity(r) => Some(r.id.0.clone()),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn redaction_takes_payloads_out_and_keeps_every_position() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = LogStore::open(d.path()).unwrap();
+        // Small and large dropped effects: each padding header size (1, 3 and 5 bytes).
+        let entries = vec![
+            cmd(0, vec![put("keep0", 10)]),
+            cmd(1, vec![put("gone", 3), put("keep1", 10)]),
+            cmd(2, vec![put("gone", 300), put("keep2", 10)]),
+            cmd(3, vec![put("gone", 200_000)]),
+            cmd(4, vec![put("keep4", 10)]),
+        ];
+        s.append(entries.into_iter(), IOFlushed::noop()).await.unwrap();
+        // A redaction that changes nothing still waits for the appends to reach the file.
+        assert_eq!(s.redact(&|_| false).unwrap(), 0);
+        let size = std::fs::metadata(d.path().join("entries")).unwrap().len();
+        let redact = |r: &mut adb_core::log::LogRecord| {
+            let n = r.effects.len();
+            r.effects.retain(|e| !matches!(e, adb_core::log::Effect::PutEntity(x) if x.id.0 == "gone"));
+            r.effects.len() != n
+        };
+        assert_eq!(s.redact(&redact).unwrap(), 3);
+        assert_eq!(std::fs::metadata(d.path().join("entries")).unwrap().len(), size, "same length on disk");
+        let raw = std::fs::read(d.path().join("entries")).unwrap();
+        assert!(!raw.windows(4).any(|w| w == b"gone"), "no trace left on disk");
+        // An append after it lands where the index says.
+        s.append([cmd(5, vec![put("keep5", 10)])], IOFlushed::noop()).await.unwrap();
+        let want = vec![vec!["keep0"], vec!["keep1"], vec!["keep2"], vec![], vec!["keep4"], vec!["keep5"]];
+        let read = |es: Vec<EntryOf<TC>>| es.iter().map(keys).collect::<Vec<_>>();
+        // From RAM (the tail), from disk, and after a reopen.
+        assert_eq!(read(s.try_get_log_entries(0..6).await.unwrap()), want);
+        assert_eq!(s.redact(&|_| false).unwrap(), 0);
+        s.inner.lock().unwrap().mark_written(6, 0);
+        assert!(s.inner.lock().unwrap().tail.is_empty(), "the next reads come from the file");
+        assert_eq!(read(s.try_get_log_entries(0..6).await.unwrap()), want);
+        drop(s);
+        let mut s = LogStore::open(d.path()).unwrap();
+        assert_eq!(read(s.try_get_log_entries(0..6).await.unwrap()), want);
+        assert_eq!(s.redact(&redact).unwrap(), 0, "nothing left to take out");
     }
 
     #[tokio::test]

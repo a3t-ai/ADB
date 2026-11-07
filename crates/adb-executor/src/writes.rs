@@ -202,7 +202,24 @@ fn key_exists(memory: MemoryType, key: &str) -> AdbError {
 /// Drop from `r` the effects that carry a forgotten row's content (W5): its puts,
 /// versions, patches and vectors, and the edges touching it. `Forget` effects and
 /// everything else stay. Returns whether anything was dropped.
-fn redact_record(r: &mut LogRecord, rows: &std::collections::HashSet<(Memory, String)>) -> bool {
+/// Every row id (all versions) of the `forgotten` lineages, themselves included:
+/// what [`redact_record`] takes out of the log. Read before the table is compacted.
+pub(crate) async fn forgotten_rows(
+    store: &adb_store::PartitionStore,
+    forgotten: std::collections::HashSet<(Memory, String)>,
+) -> Result<std::collections::HashSet<(Memory, String)>, adb_store::StoreError> {
+    let lineages: Vec<String> = forgotten.iter().map(|(m, k)| adb_store::sql_str(&adb_store::row_id(*m, k))).collect();
+    let mut rows = forgotten;
+    for chunk in lineages.chunks(500) {
+        let filter = format!("lineage_id IN ({})", chunk.join(", "));
+        for r in store.scan(Some(&filter)).await? {
+            rows.insert((r.data.memory, adb_store::key_of(&r.id).to_string()));
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) fn redact_record(r: &mut LogRecord, rows: &std::collections::HashSet<(Memory, String)>) -> bool {
     let hit = |m: Memory, k: &str| rows.contains(&(m, k.to_string()));
     let before = r.effects.len();
     r.effects.retain(|e| match e {
@@ -459,16 +476,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         // Every row id (all versions) of the lineages forgotten since the last
         // compaction: their effects are redacted from the log below.
         let forgotten: std::collections::HashSet<(Memory, String)> = std::mem::take(&mut *self.forgotten.lock().unwrap());
-        let mut rows: std::collections::HashSet<(Memory, String)> = forgotten.clone();
-        if !forgotten.is_empty() {
-            let lineages: Vec<String> = forgotten.iter().map(|(m, k)| adb_store::sql_str(&adb_store::row_id(*m, k))).collect();
-            for chunk in lineages.chunks(500) {
-                let filter = format!("lineage_id IN ({})", chunk.join(", "));
-                for r in store.scan(Some(&filter)).await.map_err(store_err)? {
-                    rows.insert((r.data.memory, adb_store::key_of(&r.id).to_string()));
-                }
-            }
-        }
+        let rows = forgotten_rows(store, forgotten).await.map_err(store_err)?;
         let pins = self.pins.get().map(|f| f()).unwrap_or_default();
         // DB-8: a namespace's own history window, where a quota row sets one.
         let windows: Vec<(String, Duration)> = self.branches.quotas().into_iter()

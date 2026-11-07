@@ -111,7 +111,8 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
         }
 
         // A follower (or a candidate, or a leader not yet ready).
-        let mut replica = Replica::open(dir, Arc::clone(&wal) as EngineLog).await?;
+        // The Raft log, not only the WAL: erasure must reach openraft's own log too.
+        let mut replica = Replica::open(dir, node.log() as EngineLog).await?;
         let leader_node = Arc::clone(&node);
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))

@@ -51,7 +51,7 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: adb
-          image: ghcr.io/srirammails/adb:2026-11-03-k
+          image: ghcr.io/srirammails/adb:2026-11-07-m1
           args: [adb, serve-http, --host, 0.0.0.0, --port, "3000"]
           env:
             - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }

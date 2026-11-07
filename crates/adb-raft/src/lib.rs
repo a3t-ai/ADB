@@ -31,6 +31,10 @@ pub struct Cmd {
     pub record: LogRecord,
     #[serde(default)]
     pub new_segment: bool,
+    /// Filler that keeps a redacted entry the length it had on disk (see
+    /// [`store::LogStore::redact`]). Empty, and then not written, on every new entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pad: Vec<u8>,
 }
 
 impl fmt::Display for Cmd {
@@ -127,6 +131,8 @@ pub struct Node {
     pub raft: AdbRaft,
     pub wal: Arc<LocalWal>,
     pub config: ClusterConfig,
+    /// openraft's log, shared with Raft: erasure rewrites it (see [`RaftLog`]).
+    store: store::LogStore,
 }
 
 impl Node {
@@ -139,6 +145,7 @@ impl Node {
         let empty = log.is_empty();
         let sm = Arc::new(sm::StateMachine::open(dir.join("raft"), Arc::clone(&wal)).map_err(|e| format!("raft state: {e}"))?);
         let cfg = Arc::new(raft_config().validate().map_err(|e| e.to_string())?);
+        let store = log.clone();
         let raft = Raft::new(config.node_id, cfg, net::Network::new(), log, sm).await.map_err(|e| e.to_string())?;
         let lowest = config.peers.keys().next().copied();
         if empty && lowest == Some(config.node_id) {
@@ -148,7 +155,7 @@ impl Node {
                 Err(e) => tracing::info!(node = config.node_id, error = %e, "raft group not initialized here"),
             }
         }
-        Ok(Self { id: config.node_id, raft, wal, config })
+        Ok(Self { id: config.node_id, raft, wal, config, store })
     }
 
     pub fn leader(&self) -> Option<NodeId> {
@@ -200,9 +207,9 @@ impl Node {
         tokio::time::timeout(within, self.until_lead(false)).await.is_ok()
     }
 
-    /// The log the leader's engine runs on.
+    /// The log the leader's engine runs on, and a follower's replica reads.
     pub fn log(&self) -> Arc<RaftLog> {
-        Arc::new(RaftLog { raft: self.raft.clone(), wal: Arc::clone(&self.wal) })
+        Arc::new(RaftLog { raft: self.raft.clone(), wal: Arc::clone(&self.wal), store: self.store.clone() })
     }
 
     /// Status for `/cluster/status`.
@@ -226,12 +233,13 @@ impl Node {
 pub struct RaftLog {
     raft: AdbRaft,
     wal: Arc<LocalWal>,
+    store: store::LogStore,
 }
 
 impl RaftLog {
     async fn write(&self, record: LogRecord, new_segment: bool) -> LogResult<LogOffset> {
         let offset = record.offset;
-        match self.raft.client_write(Cmd { record, new_segment }).await {
+        match self.raft.client_write(Cmd { record, new_segment, pad: Vec::new() }).await {
             Ok(r) => Ok(LogOffset(r.data.0)),
             Err(e) => Err(LogError::Io(format!("record {} not committed by the replica set: {e}", offset.0))),
         }
@@ -268,7 +276,13 @@ impl Log for RaftLog {
         self.wal.purge_below(offset).await
     }
 
+    /// The WAL's closed segments, then openraft's own log: both hold every record's
+    /// effects, so a forgotten payload leaves this node's disk only once both are done.
+    /// Returns the WAL records changed.
     async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize> {
-        self.wal.rewrite_closed(redact).await
+        let n = self.wal.rewrite_closed(redact).await?;
+        let entries = self.store.redact(redact).map_err(|e| LogError::Io(format!("raft log redaction: {e}")))?;
+        tracing::info!(wal_records = n, raft_entries = entries, "forgotten payloads redacted from the logs");
+        Ok(n)
     }
 }
