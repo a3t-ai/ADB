@@ -584,6 +584,51 @@ pub struct DurableWrites<L: Log> {
     engine: Option<Arc<Mutex<adb_engine::EngineHost>>>,
     /// Its subscribers, reachable without the host lock.
     engine_subs: Option<Arc<adb_engine::Subs>>,
+    /// Pipelined engine writes: the committer (in log order) and the last engine
+    /// record submitted and committed. Reads wait for what was submitted before them.
+    engine_tickets: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineTicket>>>,
+    engine_submitted: std::sync::atomic::AtomicU64,
+    engine_committed: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+/// An engine operation for the committer: once `go` says its record committed (none:
+/// no durable change), the journal gets its episodes, the space's subscribers its
+/// notices, and the caller its answer — all in log order.
+struct EngineTicket {
+    space: String,
+    record: Option<LogRecord>,
+    go: Option<tokio::sync::oneshot::Receiver<bool>>,
+    notices: Vec<(String, serde_json::Value)>,
+    done: tokio::sync::oneshot::Sender<AdbResult<()>>,
+}
+
+fn spawn_engine_committer(host: Arc<Mutex<adb_engine::EngineHost>>, committed: Arc<tokio::sync::watch::Sender<u64>>) -> tokio::sync::mpsc::UnboundedSender<EngineTicket> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineTicket>();
+    tokio::spawn(async move {
+        // A record that did not commit: the engine restarts; nothing after it goes on.
+        let mut stopped = false;
+        while let Some(t) = rx.recv().await {
+            if let Some(go) = t.go {
+                stopped |= !matches!(go.await, Ok(true));
+            }
+            if stopped {
+                let _ = t.done.send(Err(AdbError::Internal("this ADB engine is restarting after a write failed to commit; retry".into())));
+                continue;
+            }
+            let mut h = host.lock().await;
+            let r = match &t.record {
+                Some(rec) => h.committed(rec).await.map_err(|e| AdbError::QueryError(e.to_string())),
+                None => Ok(()),
+            };
+            h.notify(&t.space, t.notices);
+            drop(h);
+            if let Some(rec) = &t.record {
+                committed.send_modify(|c| *c = (*c).max(rec.offset.0));
+            }
+            let _ = t.done.send(r);
+        }
+    });
+    tx
 }
 
 /// Records written since the last compaction that make one due (W7, user 28 Oct:
@@ -1858,7 +1903,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2089,7 +2134,9 @@ impl<L: Log + 'static> DurableWrites<L> {
         host.replayed(chrono::Utc::now());
         drop(seq);
         self.engine_subs = Some(host.subscribers());
-        self.engine = Some(Arc::new(Mutex::new(host)));
+        let host = Arc::new(Mutex::new(host));
+        *self.engine_tickets.lock().unwrap() = Some(spawn_engine_committer(Arc::clone(&host), Arc::clone(&self.engine_committed)));
+        self.engine = Some(host);
         Ok(replayed)
     }
 
@@ -2103,31 +2150,76 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub async fn engine_exec<T>(&self, space: &str, f: impl FnOnce(&mut flowr_storage::engine_core::EngineCore) -> T) -> AdbResult<T> {
         let eng = |e: adb_engine::EngineError| AdbError::QueryError(e.to_string());
         let host = self.engine_host()?;
+        self.writable()?;
+        let t0 = std::time::Instant::now();
         let mut seq = self.seq.lock().await;
         let mut h = host.lock().await;
+        let locked = t0.elapsed();
         let (out, effect, notices) = h.exec(space, f).await.map_err(eng)?;
-        if let Some(effect) = effect {
-            let ts = seq.begin();
-            match seq.append_record(ts, None, vec![effect]).await {
-                Ok(record) => {
-                    h.committed(&record).await.map_err(eng)?;
-                    drop(h);
-                    self.to_store(&record, seq.log()).await;
-                    h = host.lock().await;
-                }
-                Err(e) => {
-                    // The core holds changes the log never got: rebuild the space
-                    // from its snapshot and the log.
-                    tracing::error!(space, error = %e, "engine record not logged; rebuilding the space");
-                    if let Err(re) = Self::rebuild_space(&mut h, space, seq.log()).await {
-                        tracing::error!(space, error = %re, "engine space not rebuilt");
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        // Pipelined (as memory and platform writes, PF-1 / PF-4): under the sequencer
+        // only the core's change and the submission; the commit is awaited after it,
+        // and the committer writes the journal and delivers notices in log order.
+        let mut pending = None;
+        let ticket = match effect {
+            Some(effect) => {
+                let ts = seq.begin();
+                match seq.submit_record(ts, None, vec![effect]).await {
+                    Ok((record, wait)) => {
+                        drop(h);
+                        self.engine_submitted.fetch_max(record.offset.0, std::sync::atomic::Ordering::SeqCst);
+                        self.to_store_submitted(&record, seq.log()).await;
+                        let (go, go_rx) = tokio::sync::oneshot::channel();
+                        pending = Some((record.offset.0, wait, go));
+                        EngineTicket { space: space.to_string(), record: Some(record), go: Some(go_rx), notices, done }
                     }
-                    return Err(log_err(e));
+                    Err(e) => {
+                        // The core holds changes the log never got: rebuild the space
+                        // from its snapshot and the log.
+                        tracing::error!(space, error = %e, "engine record not logged; rebuilding the space");
+                        if let Err(re) = Self::rebuild_space(&mut h, space, seq.log()).await {
+                            tracing::error!(space, error = %re, "engine space not rebuilt");
+                        }
+                        return Err(log_err(e));
+                    }
                 }
             }
+            None => {
+                drop(h);
+                EngineTicket { space: space.to_string(), record: None, go: None, notices, done }
+            }
+        };
+        let sent = self.engine_tickets.lock().unwrap().as_ref().map(|tx| tx.send(ticket).is_ok()).unwrap_or(false);
+        drop(seq);
+        let submitted = t0.elapsed();
+        if let Some((off, wait, go)) = pending {
+            let ok = self.committed(off, wait).await.is_ok();
+            let _ = go.send(ok);
         }
-        h.notify(space, notices);
+        if !sent {
+            return Err(AdbError::Internal("the engine committer is not running".into()));
+        }
+        done_rx.await.unwrap_or_else(|_| Err(AdbError::Internal("engine write dropped".into())))?;
+        // Where an engine write's time goes (`RUST_LOG=adb::engine=debug`).
+        tracing::debug!(
+            target: "adb::engine",
+            lock_us = locked.as_micros() as u64,
+            submit_us = (submitted - locked).as_micros() as u64,
+            commit_us = (t0.elapsed() - submitted).as_micros() as u64,
+            "engine write"
+        );
         Ok(out)
+    }
+
+    /// Wait until every engine record submitted before now has committed and its
+    /// journal and notices are out: a read never sees a change that may not commit.
+    async fn engine_settled(&self) {
+        let want = self.engine_submitted.load(std::sync::atomic::Ordering::SeqCst);
+        if want == 0 {
+            return;
+        }
+        let mut rx = self.engine_committed.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|c| *c >= want)).await;
     }
 
     async fn rebuild_space(h: &mut adb_engine::EngineHost, space: &str, log: &L) -> AdbResult<()> {
@@ -2148,6 +2240,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Read `space`'s engine state (no log).
     pub async fn engine_read<T>(&self, space: &str, f: impl FnOnce(&flowr_storage::engine_core::EngineCore) -> T) -> AdbResult<T> {
         let eng = |e: adb_engine::EngineError| AdbError::QueryError(e.to_string());
+        self.engine_settled().await;
         self.engine_host()?.lock().await.read(space, f).await.map_err(eng)
     }
 
@@ -2155,6 +2248,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// else its EPISODIC history.
     pub async fn engine_journal(&self, space: &str, run: flowr_storage::engine::RunId, after_seq: u64) -> AdbResult<Vec<flowr_storage::engine::JournalEntry>> {
         let eng = |e: adb_engine::EngineError| AdbError::QueryError(e.to_string());
+        self.engine_settled().await;
         let mut h = self.engine_host()?.lock().await;
         match h.read(space, |c| c.read_from(run, after_seq)).await.map_err(eng)? {
             Some(entries) => Ok(entries),

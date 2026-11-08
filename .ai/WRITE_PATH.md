@@ -115,6 +115,22 @@ No log replay and no compaction hold on the log are needed (the PF-7 copy is gon
 Full rewrites remain only for migrations (embedding dimension, vector clearing, id
 schemes).
 
+### PF-17 Engine store writes pipelined (8 Nov)
+
+FlowR's engine store (runs, leases, journal) wrote through `engine_exec`, which held the
+sequencer and the engine-host lock across the Raft commit: every engine write in the
+system ran one after another. Measured on perf-a3t (605 flows, 8 callers): each engine
+write waited 20.7 ms (p50) for the lock and took 3.1 ms to commit; about 10 writes per
+flow capped durable flows at ~26/s whatever the number of callers.
+
+Now, as PF-1: under the locks only the core's change and the submission; the commit is
+awaited after them. A committer task, in log order, writes each committed record's
+journal episodes and delivers its notices, then answers the caller. Engine reads (and
+operations that change nothing) wait until every engine record submitted before them
+has committed, so no read sees a change that may not commit. A space takes no
+snapshot while one of its records is in flight (the snapshot names an offset). A
+commit failure poisons the engine and restarts it, as in PF-1.
+
 ### PF-8 to PF-10 Read path
 
 - PF-8: point lookups consult the memtable's key index first (new version or

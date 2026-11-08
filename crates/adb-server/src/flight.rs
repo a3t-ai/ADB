@@ -286,7 +286,11 @@ impl AdbFlight {
         let store = self.flowr_engine(b)?;
         let op = str_field(b, "op")?;
         let args = b.get("args").cloned().unwrap_or(Value::Null);
-        Ok(match flowr_storage::engine_wire::dispatch(store.as_ref(), op, &args).await {
+        let t0 = std::time::Instant::now();
+        let r = flowr_storage::engine_wire::dispatch(store.as_ref(), op, &args).await;
+        // One line per engine store call (`RUST_LOG=adb::engine=debug`).
+        tracing::debug!(target: "adb::engine", op, ok = r.is_ok(), us = t0.elapsed().as_micros() as u64, "engine op");
+        Ok(match r {
             Ok(v) => json!({ "ok": v }),
             Err(e) => json!({ "err": flowr_storage::engine_wire::err_json(&e) }),
         })

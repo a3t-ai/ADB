@@ -100,6 +100,10 @@ struct Space {
     last_offset: u64,
     since_snapshot: u64,
     snapshot_at: Instant,
+    /// Records with this space's changes that are submitted but not yet committed
+    /// (pipelined commits): the core holds their changes, so no snapshot is taken
+    /// until they are in (it would claim an offset below changes it holds).
+    in_flight: u64,
 }
 
 /// The core as a snapshot writes it (the fields of [`Snapshot`], borrowed: no copy).
@@ -212,7 +216,7 @@ async fn open_space(dir: &Path) -> EngineResult<Space> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (EngineCore::new(), 0),
         Err(e) => return Err(EngineError::Snapshot(e.to_string())),
     };
-    Ok(Space { core, journal, jobs, queued: applied, written, write_lock, snapshot_offset, last_offset: snapshot_offset, since_snapshot: 0, snapshot_at: Instant::now() })
+    Ok(Space { core, journal, jobs, queued: applied, written, write_lock, snapshot_offset, last_offset: snapshot_offset, since_snapshot: 0, snapshot_at: Instant::now(), in_flight: 0 })
 }
 
 /// A one-line summary of a journal record, the episode's text.
@@ -346,6 +350,9 @@ impl EngineHost {
             space: space.to_string(),
             changes: serde_json::to_value(&durable).unwrap_or(Value::Null),
         });
+        if effect.is_some() {
+            s.in_flight += 1;
+        }
         Ok((out, effect, fx.notices))
     }
 
@@ -363,6 +370,7 @@ impl EngineHost {
             let s = self.space(space).await?;
             s.last_offset = record.offset.0;
             s.since_snapshot += 1;
+            s.in_flight = s.in_flight.saturating_sub(1);
             let name = space.clone();
             self.write_journal(&name, record, &changes).await?;
         }
@@ -465,7 +473,7 @@ impl EngineHost {
         let names: Vec<String> = self.spaces.keys().cloned().collect();
         for name in names {
             let s = self.spaces.get_mut(&name).unwrap();
-            let due = s.since_snapshot > 0 && (force || s.since_snapshot >= SNAPSHOT_EVERY || s.snapshot_at.elapsed() >= SNAPSHOT_AFTER);
+            let due = s.since_snapshot > 0 && s.in_flight == 0 && (force || s.since_snapshot >= SNAPSHOT_EVERY || s.snapshot_at.elapsed() >= SNAPSHOT_AFTER);
             if !due {
                 continue;
             }
