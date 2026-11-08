@@ -433,7 +433,17 @@ pub struct DurableWrites<L: Log> {
 
 /// Records written since the last compaction that make one due (W7, user 28 Oct:
 /// thousands of small puts slow every scan; at least a quarter of the table).
-pub const COMPACT_AFTER_WRITES: u64 = 2_000;
+pub const COMPACT_AFTER_WRITES: u64 = 500;
+
+/// Compaction policy (7 Nov: reads slow down with every LSM layer and superseded
+/// version they merge; one 0.3 s compaction brought merged reads back to Lance-only
+/// speed). Due after `ADB_COMPACT_AFTER_WRITES` writes (default 500, or a 20th of the
+/// table's rows if more), or past `ADB_COMPACT_GENERATIONS` MemWAL generations
+/// (default 4). Until PF-7 a compaction pauses writes while it runs.
+pub async fn compaction_due_for(store: &adb_store::PartitionStore) -> bool {
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    store.writes_due(env("ADB_COMPACT_AFTER_WRITES", COMPACT_AFTER_WRITES)) || store.generation_count().await.is_ok_and(|n| n as u64 > env("ADB_COMPACT_GENERATIONS", 4))
+}
 
 /// Compaction pins (B4): per namespace, the oldest branch point read from this engine.
 pub type Pins = Arc<dyn Fn() -> std::collections::HashMap<String, CommitTs> + Send + Sync>;
@@ -1316,7 +1326,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub async fn compaction_due(&self) -> bool {
         let erase = self.forgotten_since.lock().unwrap().is_some_and(|t| t.elapsed() >= ERASE_WITHIN);
         match &self.store {
-            Some(s) => erase || s.writes_due(COMPACT_AFTER_WRITES) || s.generation_count().await.is_ok_and(|n| n > 16),
+            Some(s) => erase || compaction_due_for(s).await,
             None => false,
         }
     }

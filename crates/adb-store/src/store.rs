@@ -627,7 +627,7 @@ impl PartitionStore {
     /// from open when this process hasn't compacted yet.
     pub fn writes_due(&self, min: u64) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        self.puts_since_compaction.load(SeqCst) > min.max(self.rows_at_compaction.load(SeqCst) / 4)
+        self.puts_since_compaction.load(SeqCst) > min.max(self.rows_at_compaction.load(SeqCst) / 20)
     }
 
     /// MemWAL generations (sealed memtables) not yet compacted away: a W5 threshold.

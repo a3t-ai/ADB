@@ -35,7 +35,7 @@ pub struct Replica {
 }
 
 /// How often a follower checks whether its tables need compacting.
-const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A follower keeps every version it holds: history windows and branch pins are the
 /// leader's to apply, and a follower that applied its own could drop a version the
@@ -149,7 +149,7 @@ impl Replica {
             }
         }
         let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let due = self.store.writes_due(crate::writes::COMPACT_AFTER_WRITES) || self.store.generation_count().await.is_ok_and(|n| n > 16);
+        let due = crate::writes::compaction_due_for(&self.store).await;
         if due {
             match self.store.compact(FOLLOWER_HISTORY, now).await {
                 Ok(st) => tracing::info!(kept = st.kept, of = st.total, took = ?st.took, "follower table compacted"),

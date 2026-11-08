@@ -433,6 +433,8 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
         let mut ticks = 0u64;
         let nightly = compaction_hour();
         let mut last_nightly = None;
+        // How often (ticks of 1 s) compaction thresholds are checked (`ADB_COMPACT_CHECK_SECS`, default 10).
+        let check = std::env::var("ADB_COMPACT_CHECK_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(10);
         loop {
             tick.tick().await;
             ticks += 1;
@@ -443,7 +445,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 use chrono::Timelike;
                 now.hour() == h && now.minute() == m && last_nightly != Some(now.date_naive())
             });
-            if night || (ticks % 60 == 0 && w.compaction_due().await) {
+            if night || (ticks % check == 0 && w.compaction_due().await) {
                 if night {
                     last_nightly = Some(now.date_naive());
                 }
@@ -452,7 +454,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 }
             }
             // W5-L4: the platform tables, nightly and on their version count.
-            if night || (ticks % 60 == 30 && w.platform_compaction_due().await) {
+            if night || (ticks % check == check / 2 && w.platform_compaction_due().await) {
                 if let Err(e) = w.compact_platform().await {
                     tracing::warn!(error = %e, "platform compaction failed; retrying later");
                 }

@@ -14,6 +14,7 @@
  *   node tests/perf-memory.mjs --adb <bin> [--rows 10000] [--c 8] [--runs 200] [--secs 15]
  *     [--embed <model dir>]   (embeddings on, e.g. /var/tmp/a3t-build/models/bge-small-en-v1.5)
  *     [--single]              (one node, no Raft)
+ *     [--compact-before-merged] (POST /admin/compact after the writes of step 4)
  */
 import { spawn } from 'node:child_process';
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -127,6 +128,11 @@ await parallel('STORE SEMANTIC (new key, memtable)', UPD, i => `STORE INTO SEMAN
 await parallel('UPDATE WORKING', UPD, i => `UPDATE INTO WORKING WHERE key = "w${i}" (step = 2)`);
 await parallel('UPDATE EPISODIC', UPD, i => `UPDATE INTO EPISODIC WHERE key = "e${i}" (note = "seen")`);
 
+if ('compact-before-merged' in args) {
+  const t = performance.now(); const r = await (await fetch(`http://127.0.0.1:${leader.http}/admin/compact`, { method: 'POST' })).json();
+  if (!r.success) throw new Error(`compact: ${JSON.stringify(r)}`);
+  console.log(`\n   (compacted before the merged reads in ${((performance.now() - t) / 1000).toFixed(1)} s)`);
+}
 console.log('\n5. Reads, merged: newer versions and new keys in the memtable over Lance files');
 for (const [label, query] of reads('merged')) await seq(label, query, nonEmpty(label));
 await seq('merged: LOOKUP updated key (memtable over Lance)', i => `LOOKUP FROM SEMANTIC KEY id = "f${i % UPD}"`, d => {
