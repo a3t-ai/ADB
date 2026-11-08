@@ -105,7 +105,9 @@ impl Replica {
             let batch = self.read(&mut from).await?;
             let Some(last) = batch.last().map(|r| r.offset) else { break };
             // One Lance commit for a run of upserts into one table (PF-4), as the leader.
-            for r in self.platform.apply_batch(&batch).await {
+            // Boxed (once per 1,024 records): its future, a Lance write inside, would nest in
+            // every caller's — open's grew past rustc's layout depth limit.
+            for r in Box::pin(self.platform.apply_batch(&batch)).await {
                 r.map_err(s("platform"))?;
             }
             for r in &batch {
@@ -113,6 +115,8 @@ impl Replica {
             }
             self.platform_next = last.next();
         }
+        // PF-5: the memtable to Lance when due (the log is purged only below that).
+        self.platform.flush_due().await.map_err(s("platform"))?;
         loop {
             let mut from = self.engine_next;
             let batch = self.read(&mut from).await?;
@@ -134,7 +138,7 @@ impl Replica {
         self.purge().await?;
         if self.maintained.elapsed() >= MAINTAIN_EVERY {
             self.maintained = std::time::Instant::now();
-            self.maintain().await;
+            Box::pin(self.maintain()).await;
         }
         Ok(applied)
     }
@@ -221,7 +225,8 @@ impl Replica {
         }
         self.store.sync_to_disk().await.map_err(s("store"))?;
         let mut floor = durable.0 + 1;
-        floor = floor.min(self.platform_next.0);
+        // Below what the platform tables hold in Lance, not in memory (PF-5).
+        floor = floor.min(self.platform.applied_offset().await + 1);
         if let Some(f) = self.engine.floor().await {
             floor = floor.min(f.0);
         }

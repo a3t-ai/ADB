@@ -80,6 +80,20 @@ and `DELETE WHERE` are resolved in prepare against the merged view (memtable + L
 into per-key effects, so the log holds row-level effects and the applier never
 evaluates a filter. Interim (fast step): BTree index on upsert keys at platform compaction.
 
+**As built (8 Nov, `crates/adb-platform/src/mem.rs`):** ADB's own memtable rather than a
+Lance MemWAL per table (platform tables have no fixed primary key, and their schemas
+grow). Upserts on a key and inserts into an existing table are applied to memory and
+acknowledged after the Raft commit; the platform applier flushes memory to Lance, one
+commit per table, every 200 ms or 4,096 rows. Reads (`query`) evaluate the filter on
+memory with Lance's own planner (A3T's double-quoted values) and merge it over Lance,
+memory's version of a key winning; the SQL console and compaction flush first. Updates
+and deletes by filter, creates, replaces, purges and new columns flush first and apply
+to Lance directly, so they see every earlier write (no filter is resolved early).
+The platform's applied offset (the log's purge floor, leader and followers) moves only
+with a flush. A flush marker (each table's version before) and per-table flushed
+offsets make a crash mid-flush lose and double nothing; a table whose Lance version is
+not the recorded one takes the direct path, whose version count skips what landed.
+
 ### PF-6 FORGET (done in the fast step)
 
 A tombstone committed through Raft; bytes leave at normal compaction (due at most one
@@ -130,6 +144,12 @@ operations that change nothing) wait until every engine record submitted before 
 has committed, so no read sees a change that may not commit. A space takes no
 snapshot while one of its records is in flight (the snapshot names an offset). A
 commit failure poisons the engine and restarts it, as in PF-1.
+
+### PF-18 One engine write to start a run (planned)
+
+A run pays `start`, `claim_runs` and its first journal `append` as three Raft commits
+before its first step. Merge them into one engine write when the caller runs the flow
+itself.
 
 ### PF-8 to PF-10 Read path
 

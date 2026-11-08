@@ -125,20 +125,40 @@ async fn replay_after_a_crash_between_commit_and_checkpoint() {
     assert_eq!(want.0[0]["status"], "new", "a2 was inserted after the update");
 
     // For every crash point k: all of records 1..=k committed in Lance, but the
-    // checkpoint still says k-1. Reopen and replay the whole log.
+    // checkpoint still says k-1. Reopen and replay the whole log. A record that went
+    // through the memtable (PF-5) reached Lance in a flush, whose marker was written
+    // before its commit: the crash leaves that marker too.
     for k in 1..=log.len() {
         let d = dir.path().join(format!("crash-{k}"));
         let checkpoint;
+        let mut marker = None;
         {
             let s = PlatformStore::open(&d).await.unwrap();
             for r in &log[..k - 1] {
                 s.apply(r).await.unwrap();
             }
+            s.flush().await.unwrap();
             checkpoint = std::fs::read(d.join("_applied.json")).ok();
+            let mut bases = Vec::new();
+            for t in log[k - 1].effects.iter().filter_map(adb_platform::table_of) {
+                if let Some(v) = s.version(t).await {
+                    bases.push(json!([t, v]));
+                }
+            }
             s.apply(&log[k - 1]).await.unwrap();
+            if s.pending_rows() > 0 {
+                marker = Some(json!({ "to": k, "tables": bases }));
+            }
+            s.flush().await.unwrap();
         }
         match checkpoint {
-            Some(c) => std::fs::write(d.join("_applied.json"), c).unwrap(),
+            Some(c) => {
+                let mut c: Value = serde_json::from_slice(&c).unwrap();
+                if let Some(m) = marker {
+                    c["flush"] = m;
+                }
+                std::fs::write(d.join("_applied.json"), serde_json::to_vec(&c).unwrap()).unwrap()
+            }
             None => std::fs::remove_file(d.join("_applied.json")).unwrap(),
         }
         let s = PlatformStore::open(&d).await.unwrap();
@@ -224,6 +244,8 @@ async fn upsert_replaces_by_key_in_one_version() {
     let v1 = s.version("state").await.unwrap();
     // Replaces b, adds c; c twice: the last row wins.
     s.apply(&rec(2, vec![upsert(json!([{ "id": "2", "key": "b", "value": "20" }, { "id": "3", "key": "c", "value": "3" }, { "id": "3", "key": "c", "value": "30" }]))])).await.unwrap();
+    // It waits in memory (PF-5) and reaches Lance with the next flush.
+    s.flush().await.unwrap();
     assert_eq!(s.version("state").await.unwrap(), v1 + 1, "one version for the upsert");
     let all = select(&s, "state", None).await;
     assert_eq!(ids(&all), ["1", "2", "3"]);
@@ -312,35 +334,95 @@ async fn append_only_tables() {
     assert!(s.validate(&Effect::TablePurge { table: "a3t_errors".into(), column: "nope".into(), before: "x".into() }).await.is_err());
 }
 
-/// PF-4: a run of records that only upsert into one table on one key is one Lance
-/// commit; the last row per key wins; records between them for other targets are
-/// skipped; the result survives a reopen and nothing applies twice.
+/// PF-5: upserts into an existing table wait in memory and reach Lance in one commit
+/// per flush; a write of another kind flushes first; nothing applies twice after a
+/// reopen.
 #[tokio::test]
-async fn a_run_of_upserts_is_one_commit() {
+async fn upserts_wait_in_memory_and_flush_as_one_commit() {
     let dir = tempfile::tempdir().unwrap();
     let s = PlatformStore::open(dir.path()).await.unwrap();
     let up = |id: &str, v: &str| Effect::TableUpsert { table: "flow_state".into(), key: vec!["id".into()], rows: rows(json!([{"id": id, "v": v}])) };
-    s.apply(&rec(1, vec![up("a", "0")])).await.unwrap();
+    s.apply(&rec(1, vec![up("a", "0")])).await.unwrap(); // creates the table (direct)
     let before = s.version("flow_state").await.unwrap();
     let batch = vec![
         rec(2, vec![up("a", "1")]),
         rec(3, vec![]), // a memory record (no platform effect)
         rec(4, vec![up("b", "1")]),
         rec(5, vec![up("a", "2"), up("c", "1")]),
-        rec(6, vec![insert("other", json!([{"id": "x"}]))]),
+        rec(6, vec![insert("other", json!([{"id": "x"}]))]), // new table: flushes first
         rec(7, vec![up("b", "2")]),
     ];
     let results: Vec<bool> = s.apply_batch(&batch).await.into_iter().map(|r| r.unwrap()).collect();
     assert_eq!(results, [true, false, true, true, true, true]);
-    // Records 2–5 are one commit; 7 is its own (after the insert into `other`).
-    assert_eq!(s.version("flow_state").await.unwrap(), before + 2);
+    // Records 2–5 went to Lance as one commit when record 6 came; 7 waits in memory.
+    assert_eq!(s.version("flow_state").await.unwrap(), before + 1);
+    assert_eq!(s.pending_rows(), 1);
     let got = |rows: Vec<Value>| rows.iter().map(|r| (r["id"].as_str().unwrap().to_string(), r["v"].as_str().unwrap().to_string())).collect::<Vec<_>>();
     let want = vec![("a".to_string(), "2".to_string()), ("b".into(), "2".into()), ("c".into(), "1".into())];
-    assert_eq!(got(select(&s, "flow_state", None).await), want);
+    assert_eq!(got(select(&s, "flow_state", None).await), want, "reads see memory over Lance");
+    assert_eq!(s.applied_offset().await, 6, "the log may be purged only below what Lance holds");
+    s.flush().await.unwrap();
+    assert_eq!(s.version("flow_state").await.unwrap(), before + 2);
     assert_eq!(s.applied_offset().await, 7);
     drop(s);
     let s = PlatformStore::open(dir.path()).await.unwrap();
     assert_eq!(s.applied_offset().await, 7);
     assert!(s.apply_batch(&batch).await.into_iter().all(|r| !r.unwrap()), "nothing applies twice");
     assert_eq!(got(select(&s, "flow_state", None).await), want);
+}
+
+/// PF-5: a read over memory and Lance filters both the way Lance does (A3T's double
+/// quoted values), shows each key once (memory's version), keeps the limit, and an
+/// update by filter sees what waited in memory.
+#[tokio::test]
+async fn reads_merge_memory_over_lance() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    let up = |id: &str, org: &str, v: &str| Effect::TableUpsert { table: "t".into(), key: vec!["id".into()], rows: rows(json!([{"id": id, "org": org, "v": v}])) };
+    s.apply(&rec(1, vec![Effect::TableCreate { table: "t".into(), columns: vec!["id".into(), "org".into(), "v".into()] }])).await.unwrap();
+    s.apply(&rec(2, vec![up("a", "o1", "1"), up("b", "o1", "1"), up("c", "o2", "1")])).await.unwrap();
+    s.flush().await.unwrap();
+    // In memory: a changes org, b changes value, d is new.
+    s.apply(&rec(3, vec![up("a", "o2", "2"), up("b", "o1", "2"), up("d", "o1", "1")])).await.unwrap();
+    assert!(s.pending_rows() > 0);
+    let o1 = select(&s, "t", Some(r#"org = "o1""#)).await;
+    assert_eq!(o1.iter().map(|r| (r["id"].as_str().unwrap(), r["v"].as_str().unwrap())).collect::<Vec<_>>(), [("b", "2"), ("d", "1")]);
+    assert_eq!(select(&s, "t", None).await.len(), 4, "each key once");
+    assert_eq!(batches_to_json(&s.query("t", None, 2).await.unwrap()).len(), 2, "limit kept");
+    // An update by filter flushes first, so it changes the rows memory held too.
+    s.apply(&rec(4, vec![Effect::TableUpdate { table: "t".into(), filter: "org = 'o1'".into(), values: vec![("v".into(), "'9'".into())] }])).await.unwrap();
+    assert_eq!(s.pending_rows(), 0);
+    let o1 = select(&s, "t", Some("org = 'o1'")).await;
+    assert!(o1.iter().all(|r| r["v"] == "9") && o1.len() == 2, "{o1:?}");
+}
+
+/// PF-5: a crash after one table's flush commit and before the other's: on open the
+/// replay puts back only what did not reach Lance (inserts not doubled).
+#[tokio::test]
+async fn a_crash_mid_flush_neither_loses_nor_doubles_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    s.apply(&rec(1, vec![Effect::TableCreate { table: "a".into(), columns: vec!["id".into()] }])).await.unwrap();
+    s.apply(&rec(2, vec![Effect::TableCreate { table: "b".into(), columns: vec!["id".into()] }])).await.unwrap();
+    let base_a = s.version("a").await.unwrap();
+    let base_b = s.version("b").await.unwrap();
+    let r3 = rec(3, vec![insert("a", json!([{"id": "a1"}]))]);
+    let r4 = rec(4, vec![insert("b", json!([{"id": "b1"}]))]);
+    // Only a's rows reach Lance (b's commit "did not happen").
+    s.apply(&r3).await.unwrap();
+    s.flush().await.unwrap();
+    drop(s);
+    // The state a crash between the two commits leaves: the marker, the old offset.
+    let path = dir.path().join("_applied.json");
+    let mut applied: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    applied["offset"] = json!(2);
+    applied.as_object_mut().unwrap().remove("flushed");
+    applied["flush"] = json!({ "to": 4, "tables": [["a", base_a], ["b", base_b]] });
+    std::fs::write(&path, serde_json::to_vec(&applied).unwrap()).unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    assert_eq!(s.applied_offset().await, 2, "b's rows are not in Lance: the log replays from 3");
+    s.apply_batch(&[r3, r4]).await.into_iter().for_each(|r| { r.unwrap(); });
+    s.flush().await.unwrap();
+    assert_eq!(ids(&select(&s, "a", None).await), ["a1"], "a's insert not doubled");
+    assert_eq!(ids(&select(&s, "b", None).await), ["b1"], "b's insert not lost");
 }

@@ -9,6 +9,9 @@ description = "ADB platform tables: FlowR / A3T registry tables on the log, one 
 adb-core.workspace = true
 lance.workspace = true
 lance-index.workspace = true
+# PF-5: filters evaluated on the memtable as Lance evaluates them on its files.
+lance-datafusion-14 = { package = "lance-datafusion", version = "=14.0.2" }
+datafusion.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true

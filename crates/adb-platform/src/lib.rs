@@ -34,6 +34,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
+mod mem;
+pub use mem::{FLUSH_AFTER, FLUSH_ROWS};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
     #[error("no platform table {0}")]
@@ -94,32 +97,14 @@ struct Applied {
     /// upsert's merge looks keys up instead of scanning the table (PF-5).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     upsert_keys: BTreeMap<String, Vec<String>>,
-    /// A combined commit of several records' upserts in flight (PF-4,
-    /// [`PlatformStore::apply_batch`]): on open, a version of `table` above `base` means
-    /// it landed, so every record up to `to` is in.
+    /// A memtable flush in flight (PF-5, `mem.rs`): on open, a table whose version moved
+    /// past its `base` has its rows up to `to` in Lance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    folding: Option<Folding>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Folding {
-    table: String,
-    base: u64,
-    to: u64,
-}
-
-/// The one (table, key) a record upserts into, if upserts into it are all it holds.
-fn upsert_only(r: &LogRecord) -> Option<(&str, &[String])> {
-    let mut one: Option<(&str, &[String])> = None;
-    for e in &r.effects {
-        let Effect::TableUpsert { table, key, .. } = e else { return None };
-        match one {
-            None => one = Some((table.as_str(), key.as_slice())),
-            Some((t, k)) if t == table && k == key.as_slice() => {}
-            Some(_) => return None,
-        }
-    }
-    one
+    flush: Option<mem::FlushMarker>,
+    /// Per table: every record up to this offset has its rows in Lance (a replay after
+    /// a crash mid-flush skips those, so inserts are not applied twice).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    flushed: BTreeMap<String, u64>,
 }
 
 /// A BTree index on each of `keys` (named `<column>_idx`), created if missing, then
@@ -165,6 +150,8 @@ pub struct PlatformStore {
     tables: RwLock<HashMap<String, Arc<Dataset>>>,
     /// Held by scans while they read files; compaction takes it to delete old ones.
     files: RwLock<()>,
+    /// PF-5: rows applied but not yet in Lance, per table (`mem.rs`).
+    mem: mem::Mem,
 }
 
 /// A table name usable as a directory name.
@@ -256,8 +243,8 @@ impl PlatformStore {
             Err(e) => return Err(PlatformError::Io(e.to_string())),
         };
         let interrupted = applied.compacting.take();
-        let folding = applied.folding.take();
-        let store = Self { root, applied: Mutex::new(Applied::default()), tables: RwLock::new(HashMap::new()), files: RwLock::new(()) };
+        let flush = applied.flush.take();
+        let store = Self { root, applied: Mutex::new(Applied::default()), tables: RwLock::new(HashMap::new()), files: RwLock::new(()), mem: Default::default() };
         for name in store.list_tables()? {
             if let Ok(ds) = Dataset::open(&store.uri(&name)).await {
                 // A compaction a crash interrupted: its commits (if any) are no effects.
@@ -267,16 +254,23 @@ impl PlatformStore {
                 store.tables.write().await.insert(name, Arc::new(ds));
             }
         }
-        // A combined upsert a crash interrupted (PF-4): landed if the table moved past it.
-        if let Some(f) = &folding {
-            if let Some(ds) = store.tables.read().await.get(&f.table) {
-                if ds.version().version > f.base {
-                    applied.versions.insert(f.table.clone(), ds.version().version);
-                    applied.offset = applied.offset.max(f.to);
+        // A flush a crash interrupted (PF-5): each table it reached holds its rows.
+        if let Some(f) = &flush {
+            let mut all = true;
+            for (table, base) in &f.tables {
+                match store.tables.read().await.get(table).map(|d| d.version().version) {
+                    Some(v) if v > *base => {
+                        applied.versions.insert(table.clone(), v);
+                        applied.flushed.insert(table.clone(), f.to);
+                    }
+                    _ => all = false,
                 }
             }
+            if all {
+                applied.offset = applied.offset.max(f.to);
+            }
         }
-        if interrupted.is_some() || folding.is_some() {
+        if interrupted.is_some() || flush.is_some() {
             store.save(&applied)?;
         }
         *store.applied.lock().await = applied;
@@ -315,7 +309,16 @@ impl PlatformStore {
     /// Rows of `table` matching `filter` (Lance SQL), at most `limit`.
     pub async fn query(&self, table: &str, filter: Option<&str>, limit: usize) -> PlatformResult<Vec<RecordBatch>> {
         let _files = self.files.read().await;
-        let ds = self.dataset(table).await.ok_or_else(|| PlatformError::NoTable(table.to_string()))?;
+        // The dataset and the memtable together: a flush swaps both under this lock.
+        let (ds, rows) = {
+            let tables = self.tables.read().await;
+            let ds = tables.get(table).cloned().ok_or_else(|| PlatformError::NoTable(table.to_string()))?;
+            let rows = self.mem.rows_over(table, ds.version().version);
+            (ds, rows)
+        };
+        if let Some(rows) = rows {
+            return mem::merged_query(&ds, &rows, filter, limit).await;
+        }
         let mut scan = ds.scan();
         if let Some(f) = filter.filter(|f| !f.trim().is_empty()) {
             scan.filter(f).map_err(lance)?;
@@ -331,6 +334,10 @@ impl PlatformStore {
         F: FnOnce(Vec<(String, Arc<Dataset>)>) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
+        // SQL reads Lance only: what is in memory goes there first (PF-5).
+        if let Err(e) = self.flush().await {
+            tracing::warn!(error = %e, "platform memtable not flushed before a SQL read");
+        }
         let _files = self.files.read().await;
         let tables: Vec<(String, Arc<Dataset>)> =
             self.tables.read().await.iter().map(|(n, d)| (n.clone(), Arc::clone(d))).collect();
@@ -482,83 +489,51 @@ impl PlatformStore {
         self.apply_locked(&mut applied, record).await
     }
 
-    /// [`Self::apply`] for `records` in log order (PF-4): a run of records that only
-    /// upsert into one table on one key is one Lance commit instead of one each — the
-    /// commit is most of a platform write's time. One result per record; a run whose
-    /// commit fails is applied record by record, so only a bad one gets its error.
+    /// [`Self::apply`] for `records` in log order, under one lock. Upserts and inserts
+    /// into existing tables go to the memtable (PF-5) and reach Lance with the next
+    /// flush ([`Self::flush_due`]); anything else flushes first and applies to Lance.
     pub async fn apply_batch(&self, records: &[LogRecord]) -> Vec<PlatformResult<bool>> {
         let mut applied = self.applied.lock().await;
         let mut out: Vec<PlatformResult<bool>> = Vec::with_capacity(records.len());
-        let mut i = 0;
-        while i < records.len() {
-            let r = &records[i];
-            let Some((table, key)) = (r.offset.0 > applied.offset).then(|| upsert_only(r)).flatten() else {
-                out.push(self.apply_locked(&mut applied, r).await);
-                i += 1;
-                continue;
-            };
-            // The run: upserts into (table, key), with records for other targets between.
-            let mut j = i + 1;
-            let mut upserts = 1;
-            while j < records.len() {
-                let n = &records[j];
-                if !n.effects.iter().any(|e| table_of(e).is_some()) {
-                    j += 1;
-                } else if upsert_only(n) == Some((table, key)) {
-                    upserts += 1;
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            let base = self.dataset(table).await.map(|d| d.version().version);
-            let (Some(base), true) = (base, upserts > 1) else {
-                out.push(self.apply_locked(&mut applied, r).await);
-                i += 1;
-                continue;
-            };
-            let run = &records[i..j];
-            let rows: Vec<_> = run.iter().flat_map(|r| r.effects.iter()).flat_map(|e| match e {
-                Effect::TableUpsert { rows, .. } => rows.clone(),
-                _ => Vec::new(),
-            }).collect();
-            let combined = Effect::TableUpsert { table: table.to_string(), key: key.to_vec(), rows };
-            let to = run.last().map_or(0, |r| r.offset.0);
-            applied.folding = Some(Folding { table: table.to_string(), base, to });
-            let landed = match self.save(&applied) {
-                Ok(()) => self.apply_effect(&mut applied, &combined).await,
-                Err(e) => Err(e),
-            };
-            applied.folding = None;
-            match landed {
-                Ok(()) => {
-                    if let Some(ds) = self.dataset(table).await {
-                        applied.versions.insert(table.to_string(), ds.version().version);
-                    }
-                    applied.offset = to;
-                    let saved = self.save(&applied);
-                    for r in run {
-                        out.push(match &saved {
-                            Ok(()) => Ok(r.effects.iter().any(|e| table_of(e).is_some())),
-                            Err(e) => Err(PlatformError::Io(e.to_string())),
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(%table, records = run.len(), error = %e, "combined upsert failed; applying its records one at a time");
-                    for r in run {
-                        out.push(self.apply_locked(&mut applied, r).await);
-                    }
-                }
-            }
-            i = j;
+        for r in records {
+            out.push(self.apply_locked(&mut applied, r).await);
         }
         out
     }
 
     async fn apply_locked(&self, applied: &mut Applied, record: &LogRecord) -> PlatformResult<bool> {
-        if record.offset.0 <= applied.offset {
+        if record.offset.0 <= applied.offset.max(self.mem.through()) {
             return Ok(false);
+        }
+        // A replay after a crash mid-flush: what reached Lance for a table is skipped.
+        let flushed = |e: &Effect| table_of(e).and_then(|t| applied.flushed.get(t)).is_some_and(|f| record.offset.0 <= *f);
+        if record.effects.iter().any(|e| table_of(e).is_some()) && record.effects.iter().all(|e| table_of(e).is_none() || flushed(e)) {
+            self.mem.advance(record.offset.0, &mut applied.offset);
+            return Ok(false);
+        }
+        // PF-5: upserts and inserts into existing tables, to the memtable.
+        if self.mem_takes(record, applied).await {
+            for e in &record.effects {
+                if let Effect::TableUpsert { table, key, .. } = e {
+                    applied.upsert_keys.insert(table.clone(), key.clone());
+                }
+            }
+            let mut bases = HashMap::new();
+            for t in record.effects.iter().filter_map(table_of) {
+                if let Some(v) = self.version(t).await {
+                    bases.insert(t.to_string(), v);
+                }
+            }
+            // Only what no flush reached (a replay after a crash mid-flush).
+            let mut fresh = record.clone();
+            fresh.effects.retain(|e| !flushed(e));
+            self.mem.put(&fresh, &bases);
+            return Ok(true);
+        }
+        if record.effects.iter().any(|e| table_of(e).is_some()) {
+            // Anything else applies to Lance directly, after what is in memory. Boxed: the
+            // flush is rare and its future (a Lance write) would nest in every apply's.
+            Box::pin(self.flush_locked(applied)).await?;
         }
         // Nothing for the platform tables (most records: memory writes). The offset
         // moves in memory only: `_applied.json` is written and fsynced twice per save,
@@ -566,7 +541,7 @@ impl PlatformStore {
         // hundred records/s and made a takeover wait for it (8 Nov). After a restart the
         // records since the last save are read again and skipped again.
         if !record.effects.iter().any(|e| table_of(e).is_some()) {
-            applied.offset = record.offset.0;
+            self.mem.advance(record.offset.0, &mut applied.offset);
             return Ok(false);
         }
         for effect in &record.effects {
@@ -761,6 +736,8 @@ impl PlatformStore {
     pub async fn compact(&self) -> PlatformResult<PlatformCompactStats> {
         let started = std::time::Instant::now();
         let mut applied = self.applied.lock().await;
+        // What waits in memory first: compaction rewrites Lance only (PF-5).
+        Box::pin(self.flush_locked(&mut applied)).await?;
         let mut stats = PlatformCompactStats::default();
         for table in self.list_tables()? {
             let Some(ds) = self.dataset(&table).await else { continue };

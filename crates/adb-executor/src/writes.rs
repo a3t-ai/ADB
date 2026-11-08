@@ -335,7 +335,21 @@ fn spawn_platform_applier(platform: Arc<adb_platform::PlatformStore>, applied: A
     tokio::spawn(async move {
         // A record that did not commit: the engine restarts; nothing after it applies.
         let mut stopped = false;
-        while let Some(first) = rx.recv().await {
+        loop {
+            // PF-5: what waits in memory goes to Lance when due — between batches, or
+            // after FLUSH_AFTER when no write comes.
+            let first = tokio::select! {
+                t = rx.recv() => match t {
+                    Some(t) => t,
+                    None => break,
+                },
+                _ = tokio::time::sleep(adb_platform::FLUSH_AFTER), if platform.pending_rows() > 0 => {
+                    if let Err(e) = platform.flush_due().await {
+                        tracing::warn!(error = %e, "platform memtable flush failed; retrying");
+                    }
+                    continue;
+                }
+            };
             let mut batch = vec![first];
             while batch.len() < 1024 {
                 match rx.try_recv() {
@@ -366,6 +380,9 @@ fn spawn_platform_applier(platform: Arc<adb_platform::PlatformStore>, applied: A
                 }
             }
             applied.send_modify(|a| *a = (*a).max(last));
+            if let Err(e) = platform.flush_due().await {
+                tracing::warn!(error = %e, "platform memtable flush failed; retrying");
+            }
         }
     });
     tx
@@ -2095,6 +2112,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
             from = last.next();
         }
+        platform.flush().await.map_err(|e| AdbError::Internal(format!("platform: {e}")))?;
         self.platform_applied.send_replace(seq.log().last_offset().0);
         drop(seq);
         *self.platform_tickets.lock().unwrap() = Some(spawn_platform_applier(Arc::clone(&platform), Arc::clone(&self.platform_applied)));
