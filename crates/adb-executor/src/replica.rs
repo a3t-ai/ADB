@@ -104,8 +104,11 @@ impl Replica {
             let mut from = self.platform_next;
             let batch = self.read(&mut from).await?;
             let Some(last) = batch.last().map(|r| r.offset) else { break };
+            // One Lance commit for a run of upserts into one table (PF-4), as the leader.
+            for r in self.platform.apply_batch(&batch).await {
+                r.map_err(s("platform"))?;
+            }
             for r in &batch {
-                self.platform.apply(r).await.map_err(s("platform"))?;
                 self.note_forgets(r);
             }
             self.platform_next = last.next();

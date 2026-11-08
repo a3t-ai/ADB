@@ -311,3 +311,36 @@ async fn append_only_tables() {
     assert!(s.validate(&Effect::TableDelete { table: "a3t_errors".into(), filter: "id = 'e2'".into() }).await.is_err(), "still append-only after a reopen");
     assert!(s.validate(&Effect::TablePurge { table: "a3t_errors".into(), column: "nope".into(), before: "x".into() }).await.is_err());
 }
+
+/// PF-4: a run of records that only upsert into one table on one key is one Lance
+/// commit; the last row per key wins; records between them for other targets are
+/// skipped; the result survives a reopen and nothing applies twice.
+#[tokio::test]
+async fn a_run_of_upserts_is_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    let up = |id: &str, v: &str| Effect::TableUpsert { table: "flow_state".into(), key: vec!["id".into()], rows: rows(json!([{"id": id, "v": v}])) };
+    s.apply(&rec(1, vec![up("a", "0")])).await.unwrap();
+    let before = s.version("flow_state").await.unwrap();
+    let batch = vec![
+        rec(2, vec![up("a", "1")]),
+        rec(3, vec![]), // a memory record (no platform effect)
+        rec(4, vec![up("b", "1")]),
+        rec(5, vec![up("a", "2"), up("c", "1")]),
+        rec(6, vec![insert("other", json!([{"id": "x"}]))]),
+        rec(7, vec![up("b", "2")]),
+    ];
+    let results: Vec<bool> = s.apply_batch(&batch).await.into_iter().map(|r| r.unwrap()).collect();
+    assert_eq!(results, [true, false, true, true, true, true]);
+    // Records 2–5 are one commit; 7 is its own (after the insert into `other`).
+    assert_eq!(s.version("flow_state").await.unwrap(), before + 2);
+    let got = |rows: Vec<Value>| rows.iter().map(|r| (r["id"].as_str().unwrap().to_string(), r["v"].as_str().unwrap().to_string())).collect::<Vec<_>>();
+    let want = vec![("a".to_string(), "2".to_string()), ("b".into(), "2".into()), ("c".into(), "1".into())];
+    assert_eq!(got(select(&s, "flow_state", None).await), want);
+    assert_eq!(s.applied_offset().await, 7);
+    drop(s);
+    let s = PlatformStore::open(dir.path()).await.unwrap();
+    assert_eq!(s.applied_offset().await, 7);
+    assert!(s.apply_batch(&batch).await.into_iter().all(|r| !r.unwrap()), "nothing applies twice");
+    assert_eq!(got(select(&s, "flow_state", None).await), want);
+}

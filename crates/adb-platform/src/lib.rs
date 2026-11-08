@@ -94,6 +94,32 @@ struct Applied {
     /// upsert's merge looks keys up instead of scanning the table (PF-5).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     upsert_keys: BTreeMap<String, Vec<String>>,
+    /// A combined commit of several records' upserts in flight (PF-4,
+    /// [`PlatformStore::apply_batch`]): on open, a version of `table` above `base` means
+    /// it landed, so every record up to `to` is in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folding: Option<Folding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Folding {
+    table: String,
+    base: u64,
+    to: u64,
+}
+
+/// The one (table, key) a record upserts into, if upserts into it are all it holds.
+fn upsert_only(r: &LogRecord) -> Option<(&str, &[String])> {
+    let mut one: Option<(&str, &[String])> = None;
+    for e in &r.effects {
+        let Effect::TableUpsert { table, key, .. } = e else { return None };
+        match one {
+            None => one = Some((table.as_str(), key.as_slice())),
+            Some((t, k)) if t == table && k == key.as_slice() => {}
+            Some(_) => return None,
+        }
+    }
+    one
 }
 
 /// A BTree index on each of `keys` (named `<column>_idx`), created if missing, then
@@ -230,6 +256,7 @@ impl PlatformStore {
             Err(e) => return Err(PlatformError::Io(e.to_string())),
         };
         let interrupted = applied.compacting.take();
+        let folding = applied.folding.take();
         let store = Self { root, applied: Mutex::new(Applied::default()), tables: RwLock::new(HashMap::new()), files: RwLock::new(()) };
         for name in store.list_tables()? {
             if let Ok(ds) = Dataset::open(&store.uri(&name)).await {
@@ -240,7 +267,16 @@ impl PlatformStore {
                 store.tables.write().await.insert(name, Arc::new(ds));
             }
         }
-        if interrupted.is_some() {
+        // A combined upsert a crash interrupted (PF-4): landed if the table moved past it.
+        if let Some(f) = &folding {
+            if let Some(ds) = store.tables.read().await.get(&f.table) {
+                if ds.version().version > f.base {
+                    applied.versions.insert(f.table.clone(), ds.version().version);
+                    applied.offset = applied.offset.max(f.to);
+                }
+            }
+        }
+        if interrupted.is_some() || folding.is_some() {
             store.save(&applied)?;
         }
         *store.applied.lock().await = applied;
@@ -443,6 +479,84 @@ impl PlatformStore {
     /// below the applied offset is skipped). Returns whether it was new.
     pub async fn apply(&self, record: &LogRecord) -> PlatformResult<bool> {
         let mut applied = self.applied.lock().await;
+        self.apply_locked(&mut applied, record).await
+    }
+
+    /// [`Self::apply`] for `records` in log order (PF-4): a run of records that only
+    /// upsert into one table on one key is one Lance commit instead of one each — the
+    /// commit is most of a platform write's time. One result per record; a run whose
+    /// commit fails is applied record by record, so only a bad one gets its error.
+    pub async fn apply_batch(&self, records: &[LogRecord]) -> Vec<PlatformResult<bool>> {
+        let mut applied = self.applied.lock().await;
+        let mut out: Vec<PlatformResult<bool>> = Vec::with_capacity(records.len());
+        let mut i = 0;
+        while i < records.len() {
+            let r = &records[i];
+            let Some((table, key)) = (r.offset.0 > applied.offset).then(|| upsert_only(r)).flatten() else {
+                out.push(self.apply_locked(&mut applied, r).await);
+                i += 1;
+                continue;
+            };
+            // The run: upserts into (table, key), with records for other targets between.
+            let mut j = i + 1;
+            let mut upserts = 1;
+            while j < records.len() {
+                let n = &records[j];
+                if !n.effects.iter().any(|e| table_of(e).is_some()) {
+                    j += 1;
+                } else if upsert_only(n) == Some((table, key)) {
+                    upserts += 1;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let base = self.dataset(table).await.map(|d| d.version().version);
+            let (Some(base), true) = (base, upserts > 1) else {
+                out.push(self.apply_locked(&mut applied, r).await);
+                i += 1;
+                continue;
+            };
+            let run = &records[i..j];
+            let rows: Vec<_> = run.iter().flat_map(|r| r.effects.iter()).flat_map(|e| match e {
+                Effect::TableUpsert { rows, .. } => rows.clone(),
+                _ => Vec::new(),
+            }).collect();
+            let combined = Effect::TableUpsert { table: table.to_string(), key: key.to_vec(), rows };
+            let to = run.last().map_or(0, |r| r.offset.0);
+            applied.folding = Some(Folding { table: table.to_string(), base, to });
+            let landed = match self.save(&applied) {
+                Ok(()) => self.apply_effect(&mut applied, &combined).await,
+                Err(e) => Err(e),
+            };
+            applied.folding = None;
+            match landed {
+                Ok(()) => {
+                    if let Some(ds) = self.dataset(table).await {
+                        applied.versions.insert(table.to_string(), ds.version().version);
+                    }
+                    applied.offset = to;
+                    let saved = self.save(&applied);
+                    for r in run {
+                        out.push(match &saved {
+                            Ok(()) => Ok(r.effects.iter().any(|e| table_of(e).is_some())),
+                            Err(e) => Err(PlatformError::Io(e.to_string())),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%table, records = run.len(), error = %e, "combined upsert failed; applying its records one at a time");
+                    for r in run {
+                        out.push(self.apply_locked(&mut applied, r).await);
+                    }
+                }
+            }
+            i = j;
+        }
+        out
+    }
+
+    async fn apply_locked(&self, applied: &mut Applied, record: &LogRecord) -> PlatformResult<bool> {
         if record.offset.0 <= applied.offset {
             return Ok(false);
         }
@@ -456,7 +570,7 @@ impl PlatformStore {
             return Ok(false);
         }
         for effect in &record.effects {
-            self.apply_effect(&mut applied, effect).await?;
+            self.apply_effect(applied, effect).await?;
         }
         // Every effect of the record is in now: record each touched table's real
         // version, so an effect that made no commit (a no-op add of columns, an
@@ -467,7 +581,7 @@ impl PlatformStore {
             }
         }
         applied.offset = record.offset.0;
-        self.save(&applied)?;
+        self.save(applied)?;
         Ok(true)
     }
 

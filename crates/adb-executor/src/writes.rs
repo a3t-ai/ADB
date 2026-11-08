@@ -319,6 +319,58 @@ struct PlatformPending {
     tx: tokio::sync::oneshot::Sender<AdbResult<u64>>,
 }
 
+/// A submitted platform record for the applier (PF-4): applied once `go` says it
+/// committed, then each of `done` gets the answer.
+struct PlatformTicket {
+    record: LogRecord,
+    go: tokio::sync::oneshot::Receiver<bool>,
+    done: Vec<tokio::sync::oneshot::Sender<AdbResult<u64>>>,
+}
+
+/// The platform applier (PF-4): applies committed platform records in log order, off
+/// the sequencer, everything waiting at once (`apply_batch`: one Lance commit for a run
+/// of upserts into one table), and answers their writers.
+fn spawn_platform_applier(platform: Arc<adb_platform::PlatformStore>, applied: Arc<tokio::sync::watch::Sender<u64>>) -> tokio::sync::mpsc::UnboundedSender<PlatformTicket> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlatformTicket>();
+    tokio::spawn(async move {
+        // A record that did not commit: the engine restarts; nothing after it applies.
+        let mut stopped = false;
+        while let Some(first) = rx.recv().await {
+            let mut batch = vec![first];
+            while batch.len() < 1024 {
+                match rx.try_recv() {
+                    Ok(t) => batch.push(t),
+                    Err(_) => break,
+                }
+            }
+            let mut ready = Vec::with_capacity(batch.len());
+            for mut t in batch {
+                stopped |= !matches!((&mut t.go).await, Ok(true));
+                if stopped {
+                    for d in t.done {
+                        let _ = d.send(Err(AdbError::Internal("this ADB engine is restarting after a write failed to commit; retry".into())));
+                    }
+                } else {
+                    ready.push(t);
+                }
+            }
+            let Some(last) = ready.last().map(|t| t.record.offset.0) else { continue };
+            let records: Vec<LogRecord> = ready.iter().map(|t| t.record.clone()).collect();
+            let t0 = std::time::Instant::now();
+            let results = platform.apply_batch(&records).await;
+            tracing::debug!(target: "adb::write", records = records.len(), apply_us = t0.elapsed().as_micros() as u64, "platform apply");
+            for (t, r) in ready.into_iter().zip(results) {
+                let r = r.map(|_| t.record.offset.0).map_err(|e| e.to_string());
+                for d in t.done {
+                    let _ = d.send(r.clone().map_err(AdbError::QueryError));
+                }
+            }
+            applied.send_modify(|a| *a = (*a).max(last));
+        }
+    });
+    tx
+}
+
 /// Adjacent upserts to the same table on the same key, as one: `merge_insert` keeps the
 /// last row per key, which is what applying them one after another leaves. Everything
 /// else stays as it is and where it is.
@@ -463,8 +515,15 @@ pub struct DurableWrites<L: Log> {
     branches: Arc<crate::branches::Branches>,
     /// On a branch engine (B2 / B3): the parent its writes are read against.
     parent: Option<crate::branch_engine::ParentView>,
-    /// Platform tables (stage G), applied synchronously.
+    /// Platform tables (stage G), applied by their own applier (PF-4).
     platform: Option<Arc<adb_platform::PlatformStore>>,
+    /// PF-4: tickets for the platform applier, in log order (set by `attach_platform`).
+    platform_tickets: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<PlatformTicket>>>,
+    /// The highest offset the platform applier has applied.
+    platform_applied: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The last submitted record that creates a table or changes one's shape: writes
+    /// are validated against the tables, so they wait until the applier has it.
+    platform_reshape: std::sync::atomic::AtomicU64,
     /// The live keys of SEMANTIC / EPISODIC / PROCEDURAL (D3 S4 key check), with
     /// their TTL: built from Lance at open, kept by the writes below under the
     /// sequencer lock. Checking a key in Lance instead costs a read per STORE.
@@ -676,51 +735,82 @@ impl<L: Log + 'static> DurableWrites<L> {
     }
 
     /// Commit `batch` under the sequencer (see [`Self::platform_many`]).
-    async fn platform_group(&self, seq: &mut Sequencer<L>, batch: Vec<PlatformPending>, waited: Duration) {
+    async fn platform_group(&self, seq: &mut Sequencer<L>, batch: Vec<PlatformPending>, submitted: &mut Vec<(u64, adb_log::CommitWait, tokio::sync::oneshot::Sender<bool>)>) {
         let Some(platform) = self.platform.as_ref() else { return };
+        // Validation reads the tables' shape: a create or reshape still on its way to
+        // the applier must be in first.
+        self.platform_settled(self.platform_reshape.load(std::sync::atomic::Ordering::SeqCst)).await;
         let all: Vec<Effect> = batch.iter().flat_map(|p| p.effects.iter().cloned()).collect();
         let together = batch.len() == 1 || platform.validate_all(&all).await.is_ok();
         if !together {
             for p in batch {
-                let r = self.platform_commit(seq, p.effects, 1, waited).await.map_err(|e| e.to_string());
-                let _ = p.tx.send(r.map_err(AdbError::QueryError));
+                self.platform_submit(seq, p.effects, vec![p.tx], submitted).await;
             }
             return;
         }
-        let n = batch.len();
-        let r = self.platform_commit(seq, merge_upserts(all), n, waited).await.map_err(|e| e.to_string());
-        for p in batch {
-            let _ = p.tx.send(r.clone().map_err(AdbError::QueryError));
-        }
+        let txs = batch.into_iter().map(|p| p.tx).collect();
+        self.platform_submit(seq, merge_upserts(all), txs, submitted).await;
     }
 
-    async fn platform_commit(&self, seq: &mut Sequencer<L>, effects: Vec<Effect>, writes: usize, waited: Duration) -> AdbResult<u64> {
-        let platform = self.platform.as_ref().ok_or_else(|| AdbError::UnsupportedOperation("this engine has no platform tables".into()))?;
-        let perr = |e: adb_platform::PlatformError| AdbError::QueryError(e.to_string());
-        let t0 = std::time::Instant::now();
+    /// Validate `effects`, submit them as one record and hand it to the platform applier
+    /// (PF-4): no Lance work under the sequencer. `done` get the answer once it is
+    /// committed and applied; the caller awaits each `submitted` commit after the lock.
+    async fn platform_submit(
+        &self,
+        seq: &mut Sequencer<L>,
+        effects: Vec<Effect>,
+        done: Vec<tokio::sync::oneshot::Sender<AdbResult<u64>>>,
+        submitted: &mut Vec<(u64, adb_log::CommitWait, tokio::sync::oneshot::Sender<bool>)>,
+    ) {
+        let fail = |done: Vec<tokio::sync::oneshot::Sender<AdbResult<u64>>>, e: String| {
+            for d in done {
+                let _ = d.send(Err(AdbError::QueryError(e.clone())));
+            }
+        };
+        let Some(platform) = self.platform.as_ref() else { return fail(done, "this engine has no platform tables".into()) };
         // A logged effect must apply: check the tables, names and columns first.
-        platform.validate_all(&effects).await.map_err(perr)?;
-        let validated = t0.elapsed();
+        if let Err(e) = platform.validate_all(&effects).await {
+            return fail(done, e.to_string());
+        }
+        let mut reshape = false;
+        for e in &effects {
+            reshape |= match e {
+                Effect::TableInsert { table, .. } | Effect::TableUpsert { table, .. } => platform.version(table).await.is_none(),
+                Effect::TableCreate { .. } | Effect::TableReplace { .. } | Effect::TableAddColumns { .. } | Effect::TableAppendOnly { .. } => true,
+                _ => false,
+            };
+        }
         let ts = seq.begin();
-        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        let logged = t0.elapsed();
-        self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
-        platform.apply(&record).await.map_err(perr)?;
-        let applied = t0.elapsed();
-        self.to_store(&record, seq.log()).await;
-        // Where a platform write's time goes (`RUST_LOG=adb::write=debug`).
-        tracing::debug!(
-            target: "adb::write",
-            offset = record.offset.0,
-            writes,
-            lock_us = waited.as_micros() as u64,
-            validate_us = validated.as_micros() as u64,
-            log_us = (logged - validated).as_micros() as u64,
-            apply_us = (applied - logged).as_micros() as u64,
-            store_us = (t0.elapsed() - applied).as_micros() as u64,
-            "platform write"
-        );
-        Ok(record.offset.0)
+        let (record, wait) = match seq.submit_record(ts, None, effects).await {
+            Ok(r) => r,
+            Err(e) => return fail(done, log_err(e).to_string()),
+        };
+        let off = record.offset.0;
+        self.platform_last.store(off, std::sync::atomic::Ordering::SeqCst);
+        if reshape {
+            self.platform_reshape.store(off, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.to_store_submitted(&record, seq.log()).await;
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        let ticket = PlatformTicket { record, go: go_rx, done };
+        match self.platform_tickets.lock().unwrap().as_ref() {
+            Some(tx) => {
+                if let Err(t) = tx.send(ticket) {
+                    fail(t.0.done, "the platform applier stopped".into());
+                }
+            }
+            None => fail(ticket.done, "the platform applier is not running".into()),
+        }
+        submitted.push((off, wait, go));
+    }
+
+    /// Wait until the platform applier has applied everything up to `offset`.
+    async fn platform_settled(&self, offset: u64) {
+        if offset == 0 {
+            return;
+        }
+        let mut rx = self.platform_applied.subscribe();
+        let _ = rx.wait_for(|a| *a >= offset).await;
     }
 
     /// Unsubscribe every subscription idle for longer than `ADB_SUB_IDLE` (W9,
@@ -1394,10 +1484,13 @@ impl<L: Log + 'static> DurableWrites<L> {
             Effect::TableAppendOnly { table: MERGES.into() },
             Effect::TableInsert { table: MERGES.into(), rows: vec![merge_row] },
         ];
+        // Applied here, in order: everything the platform applier holds goes first (PF-4).
+        self.platform_settled(self.platform_last.load(std::sync::atomic::Ordering::SeqCst)).await;
         platform.validate_all(&table).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
         effects.extend(table);
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
+        self.platform_applied.send_modify(|a| *a = (*a).max(record.offset.0));
         platform.apply(&record).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
         self.live.lock().unwrap().extend(keys);
         self.to_store(&record, seq.log()).await;
@@ -1765,7 +1858,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1950,14 +2043,16 @@ impl<L: Log + 'static> DurableWrites<L> {
                 Err(e) => return Err(log_err(e)),
             };
             let Some(last) = batch.last().map(|r| r.offset) else { break };
-            for r in &batch {
-                if platform.apply(r).await.map_err(|e| AdbError::Internal(format!("platform: {e}")))? {
+            for r in platform.apply_batch(&batch).await {
+                if r.map_err(|e| AdbError::Internal(format!("platform: {e}")))? {
                     applied += 1;
                 }
             }
             from = last.next();
         }
+        self.platform_applied.send_replace(seq.log().last_offset().0);
         drop(seq);
+        *self.platform_tickets.lock().unwrap() = Some(spawn_platform_applier(Arc::clone(&platform), Arc::clone(&self.platform_applied)));
         self.platform = Some(platform);
         Ok(applied)
     }
@@ -2936,7 +3031,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if effects.is_empty() {
             return Err(AdbError::QueryError("a transaction needs at least one operation".into()));
         }
-        let t0 = std::time::Instant::now();
+        self.writable()?;
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         self.platform_queue.lock().unwrap().push(PlatformPending { effects, tx });
         loop {
@@ -2950,13 +3045,19 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                         let n = q.len().min(PLATFORM_GROUP_MAX);
                         q.drain(..n).collect()
                     };
-                    if !batch.is_empty() {
-                        self.platform_group(&mut seq, batch, t0.elapsed()).await;
+                    if batch.is_empty() {
+                        // Ours went with an earlier holder's group: its answer comes.
+                        drop(seq);
+                        return rx.await.unwrap_or_else(|_| Err(AdbError::Internal("platform write dropped".into())));
                     }
+                    let mut submitted = Vec::new();
+                    self.platform_group(&mut seq, batch, &mut submitted).await;
                     drop(seq);
-                    // Ours was in this group or an earlier one: its answer is in.
-                    if let Ok(r) = rx.try_recv() {
-                        return r;
+                    // PF-4: the commits are awaited outside the sequencer; the applier
+                    // applies each once its commit is in.
+                    for (off, wait, go) in submitted {
+                        let ok = self.committed(off, wait).await.is_ok();
+                        let _ = go.send(ok);
                     }
                 }
             }
