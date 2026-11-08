@@ -66,6 +66,9 @@ pub struct Sequencer<L: Log> {
     /// Committed `txn_id`s and their offsets. Unbounded here; stage C keeps a window.
     seen: HashMap<String, LogOffset>,
     wall: fn() -> CommitTs,
+    /// The last offset submitted: ahead of `log.last_offset()` while commits are in
+    /// flight (PF-1), so the next record still takes the next offset.
+    submitted: LogOffset,
 }
 
 fn wall_clock() -> CommitTs {
@@ -80,7 +83,7 @@ impl<L: Log> Sequencer<L> {
 
     /// As [`Sequencer::new`] with an injected wall clock (tests).
     pub fn with_wall_clock(log: L, epoch: Epoch, wall: fn() -> CommitTs) -> Self {
-        Self { log, epoch, clock: CommitClock::default(), ids: IdGen::new(), seen: HashMap::new(), wall }
+        Self { log, epoch, clock: CommitClock::default(), ids: IdGen::new(), seen: HashMap::new(), wall, submitted: LogOffset::ZERO }
     }
 
     pub fn log(&self) -> &L {
@@ -127,19 +130,33 @@ impl<L: Log> Sequencer<L> {
 
     /// As [`Sequencer::append`], returning the logged record (for appliers).
     pub async fn append_record(&mut self, commit_ts: CommitTs, txn_id: Option<String>, effects: Vec<Effect>) -> LogResult<LogRecord> {
+        let (record, wait) = self.submit_record(commit_ts, txn_id, effects).await?;
+        wait.await?;
+        Ok(record)
+    }
+
+    /// The offset the next record takes: after everything submitted, committed or not.
+    fn next_offset(&self) -> LogOffset {
+        self.log.last_offset().max(self.submitted).next()
+    }
+
+    /// As [`Sequencer::append_record`], returning once the record is submitted, in
+    /// order, with its commit to await (PF-1): the caller releases the sequencer first.
+    pub async fn submit_record(&mut self, commit_ts: CommitTs, txn_id: Option<String>, effects: Vec<Effect>) -> LogResult<(LogRecord, adb_log::CommitWait)> {
         let record = LogRecord {
             partition: self.log.partition(),
-            offset: self.log.last_offset().next(),
+            offset: self.next_offset(),
             epoch: self.epoch,
             commit_ts,
             txn_id: txn_id.clone(),
             effects,
         };
-        let offset = self.log.append(record.clone()).await?;
+        let wait = self.log.submit(record.clone()).await?;
+        self.submitted = record.offset;
         if let Some(id) = txn_id {
-            self.seen.insert(id, offset);
+            self.seen.insert(id, record.offset);
         }
-        Ok(record)
+        Ok((record, wait))
     }
 
     /// As [`Sequencer::append_record`], on a new log segment (W5: after a
@@ -147,13 +164,14 @@ impl<L: Log> Sequencer<L> {
     pub async fn append_record_on_new_segment(&mut self, commit_ts: CommitTs, effects: Vec<Effect>) -> LogResult<LogRecord> {
         let record = LogRecord {
             partition: self.log.partition(),
-            offset: self.log.last_offset().next(),
+            offset: self.next_offset(),
             epoch: self.epoch,
             commit_ts,
             txn_id: None,
             effects,
         };
         self.log.append_on_new_segment(record.clone()).await?;
+        self.submitted = record.offset;
         Ok(record)
     }
 

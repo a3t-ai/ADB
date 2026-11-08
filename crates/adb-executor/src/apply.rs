@@ -19,17 +19,34 @@ use tokio::sync::{mpsc, watch};
 pub struct ApplyBarrier {
     committed: AtomicU64,
     applied: watch::Sender<u64>,
+    /// Highest offset the log has made durable (committed by the replica set). With
+    /// pipelined commits (PF-1) a record is queued before it is durable; the applier
+    /// waits for this, so no read sees a write that might not commit.
+    durable: watch::Sender<u64>,
 }
 
 impl ApplyBarrier {
     /// Both offsets start at `start` (the table is caught up with the log on open).
     pub fn new(start: u64) -> Arc<Self> {
-        Arc::new(Self { committed: AtomicU64::new(start), applied: watch::Sender::new(start) })
+        Arc::new(Self { committed: AtomicU64::new(start), applied: watch::Sender::new(start), durable: watch::Sender::new(start) })
     }
 
     /// A record at `offset` was committed (called in log order, before queueing it).
     pub fn committed(&self, offset: u64) {
         self.committed.fetch_max(offset, Ordering::SeqCst);
+    }
+
+    /// The log made every record up to `offset` durable (log order: a later one
+    /// committed means the earlier ones are too).
+    pub fn durable(&self, offset: u64) {
+        self.durable.send_modify(|d| *d = (*d).max(offset));
+    }
+
+    /// A submitted record will not commit (PF-1): readers waiting for it stop
+    /// waiting; the engine restarts and rebuilds from the committed log.
+    pub fn abandon(&self) {
+        let committed = self.committed.load(Ordering::SeqCst);
+        self.applied(committed);
     }
 
     /// The applier finished the record at `offset` (applied, or failed and left to
@@ -79,6 +96,7 @@ impl Applier {
     pub fn spawn(store: Arc<PartitionStore>, barrier: Arc<ApplyBarrier>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<LogRecord>();
         let task_barrier = Arc::clone(&barrier);
+        let mut durable = barrier.durable.subscribe();
         tokio::spawn(async move {
             // Whatever is queued goes in as one put (W7: fewer, larger batches).
             let mut batch = Vec::with_capacity(APPLY_BATCH);
@@ -98,6 +116,8 @@ impl Applier {
                     }
                 }
                 let last = batch.last().map_or(0, |r| r.offset.0);
+                // Only what the log has committed reaches the table (PF-1).
+                let _ = durable.wait_for(|d| *d >= last).await;
                 if let Err(e) = store.apply_many(&batch).await {
                     tracing::warn!(first = batch[0].offset.0, last, error = %e, "Lance apply failed; the log has it, catch-up on next open");
                 }
@@ -110,6 +130,13 @@ impl Applier {
 
     /// Queue a committed record (call with the sequencer held, so in log order).
     pub fn enqueue(&self, record: LogRecord) {
+        self.barrier.durable(record.offset.0);
+        self.enqueue_submitted(record);
+    }
+
+    /// Queue a record that is submitted but maybe not yet durable (PF-1): it waits in
+    /// the queue for [`ApplyBarrier::durable`]. Call with the sequencer held.
+    pub fn enqueue_submitted(&self, record: LogRecord) {
         self.barrier.committed(record.offset.0);
         let offset = record.offset.0;
         if self.tx.send(record).is_err() {

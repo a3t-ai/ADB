@@ -219,11 +219,100 @@ pub(crate) async fn forgotten_rows(
     Ok(rows)
 }
 
+/// A log as readers outside the engine see it (subscriptions, the fact feed, WATCH):
+/// records hide what a later FORGET took until compaction redacts the log itself, so no
+/// read misses a FORGET (user, 7 Nov).
+pub(crate) struct RedactingLog {
+    pub(crate) inner: crate::engine::EngineLog,
+    pub(crate) forgotten: Arc<std::sync::Mutex<std::collections::HashSet<(Memory, String)>>>,
+}
+
+#[async_trait]
+impl Log for RedactingLog {
+    fn partition(&self) -> adb_core::log::PartitionId {
+        self.inner.partition()
+    }
+    async fn append(&self, record: LogRecord) -> adb_log::LogResult<LogOffset> {
+        self.inner.append(record).await
+    }
+    async fn read(&self, from: LogOffset, max: usize) -> adb_log::LogResult<Vec<LogRecord>> {
+        let mut records = self.inner.read(from, max).await?;
+        let gone = self.forgotten.lock().unwrap();
+        if !gone.is_empty() {
+            for r in &mut records {
+                redact_record(r, &gone);
+            }
+        }
+        Ok(records)
+    }
+    fn last_offset(&self) -> LogOffset {
+        self.inner.last_offset()
+    }
+    fn durable_offset(&self) -> LogOffset {
+        self.inner.durable_offset()
+    }
+    async fn purge_below(&self, offset: LogOffset) -> adb_log::LogResult<()> {
+        self.inner.purge_below(offset).await
+    }
+    async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> adb_log::LogResult<usize> {
+        self.inner.rewrite_closed(redact).await
+    }
+}
+
 /// The longest a FORGET's bytes wait on disk for a compaction when no other trigger runs one.
 const ERASE_WITHIN: Duration = Duration::from_secs(3600);
 
 /// The most platform writes one group commits (one record, one Raft entry).
 const PLATFORM_GROUP_MAX: usize = 256;
+
+/// Last write offset per record key (PF-1), bounded: entries at or below the applied
+/// offset are dropped once there are many, and a prepare older than what was dropped
+/// counts as a conflict (it retries under the sequencer).
+#[derive(Default)]
+struct KeyOffsets {
+    map: std::collections::HashMap<(Memory, String), u64>,
+    floor: u64,
+}
+
+impl KeyOffsets {
+    const MAX: usize = 100_000;
+
+    fn conflict<'a>(&self, keys: impl IntoIterator<Item = &'a (Memory, String)>, snapshot: u64) -> bool {
+        snapshot < self.floor || keys.into_iter().any(|k| self.map.get(k).is_some_and(|&o| o > snapshot))
+    }
+
+    fn note(&mut self, record: &LogRecord, applied: u64) {
+        let off = record.offset.0;
+        for e in &record.effects {
+            match e {
+                Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) | Effect::PutEdge(n) | Effect::Supersede { new: n, .. } => {
+                    self.map.insert((n.data.memory, n.lineage_id.0.clone()), off);
+                    // A fact about an entity: FORGET's cascade over that entity (GR-13)
+                    // must see it.
+                    for end in [&n.data.subject_id, &n.data.object_id].into_iter().flatten() {
+                        self.map.insert((n.data.memory, refs_key(end)), off);
+                    }
+                }
+                Effect::Patch { memory, id, .. } | Effect::Embed { memory, id, .. } => {
+                    self.map.insert((*memory, id.0.clone()), off);
+                }
+                Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
+                    self.map.insert((*memory, lineage_id.0.clone()), off);
+                }
+                _ => {}
+            }
+        }
+        if self.map.len() > Self::MAX {
+            self.map.retain(|_, o| *o > applied);
+            self.floor = self.floor.max(applied);
+        }
+    }
+}
+
+/// The pseudo key standing for "the facts about `entity`" in [`KeyOffsets`].
+fn refs_key(entity: &str) -> String {
+    format!("\u{0}refs:{}", adb_store::key_of(entity))
+}
 
 struct PlatformPending {
     effects: Vec<Effect>,
@@ -395,6 +484,17 @@ pub struct DurableWrites<L: Log> {
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
+    /// The offset of the last write to each record key (PF-1): a write prepared
+    /// outside the sequencer against offset N conflicts if one of its keys was
+    /// written after N.
+    key_offsets: std::sync::Mutex<KeyOffsets>,
+    /// A submitted record failed to commit: this engine takes no more writes and
+    /// restarts (as when it loses the lead).
+    poisoned: std::sync::atomic::AtomicBool,
+    /// The log to read without the sequencer (PF-7): online compaction replays from it
+    /// while writers hold the sequencer. Unset (a plain-log test engine): compaction
+    /// runs the serial way.
+    log_reader: std::sync::OnceLock<crate::engine::EngineLog>,
     /// DB-7: the last committed record (offset, commit time µs), for answers' memory point.
     last_off: std::sync::atomic::AtomicU64,
     last_ts: std::sync::atomic::AtomicI64,
@@ -414,7 +514,7 @@ pub struct DurableWrites<L: Log> {
     bounds: std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>,
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
-    forgotten: std::sync::Mutex<std::collections::HashSet<(Memory, String)>>,
+    forgotten: Arc<std::sync::Mutex<std::collections::HashSet<(Memory, String)>>>,
     /// DB-4: per namespace, (records, payload bytes) of current rows. Built by one scan when
     /// first needed, added to on each STORE, dropped by FORGET and compaction.
     usage: Mutex<Option<std::collections::HashMap<String, (u64, u64)>>>,
@@ -454,6 +554,131 @@ pub const HISTORY: Duration = Duration::from_secs(90 * 86_400);
 pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
 
 impl<L: Log + 'static> DurableWrites<L> {
+    /// UPDATE of named keys with the sequencer held only to order it (PF-1): targets and
+    /// current versions are read first, against what was committed at `snapshot`;
+    /// under the lock, a write to any of the keys after `snapshot` is a conflict and
+    /// `None` sends the UPDATE down the serial path. The commit is awaited unlocked.
+    async fn update_prepared(
+        &self,
+        memory_type: MemoryType,
+        predicate: &Predicate,
+        data: &serde_json::Value,
+        in_scope: Option<&str>,
+        namespace: Option<&str>,
+        vector: Option<Vec<half::f16>>,
+    ) -> AdbResult<Option<u64>> {
+        let Some(store) = &self.store else { return Ok(None) };
+        let snapshot = self.last_off.load(std::sync::atomic::Ordering::SeqCst);
+        let now = CommitTs::from_datetime(time::now());
+        let ids = self.targets(memory_type, predicate, now, false, in_scope, namespace).await?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let mut fields = match data {
+            serde_json::Value::Object(map) => map.clone(),
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("value".into(), other.clone());
+                m
+            }
+        };
+        if memory_type == MemoryType::Semantic {
+            normalize_validity(&mut fields, None)?;
+        }
+        let mut current = Vec::new();
+        if supersedes(memory_type) {
+            for key in &ids {
+                match store.current_version(memory_type.into(), key, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? {
+                    Some(cur) => current.push(cur),
+                    None => return Ok(None),
+                }
+            }
+        }
+        let keys: Vec<(Memory, String)> = ids.iter().map(|k| (memory_type.into(), k.clone())).collect();
+        let mut seq = self.seq.lock().await;
+        if self.key_offsets.lock().unwrap().conflict(&keys, snapshot) {
+            return Ok(None);
+        }
+        let ts = seq.begin();
+        let mut effects = Vec::with_capacity(ids.len());
+        if supersedes(memory_type) {
+            for (key, cur) in ids.iter().zip(&current) {
+                let mut new = next_version(cur, &fields, seq.new_id(ts));
+                if let (Kind::Fact, (Some(from), Some(to))) = (new.data.kind, time::validity(&new.data.value)) {
+                    if from >= to {
+                        return Err(AdbError::InvalidSyntax(format!("{key}: valid_from must be before valid_to")));
+                    }
+                }
+                if vector.is_some() {
+                    new.data.embedding = vector.clone();
+                }
+                effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new });
+            }
+        } else {
+            effects.extend(ids.iter().map(|id| Effect::Patch { memory: memory_type.into(), id: RecordId(id.clone()), fields: fields.clone(), version: 0 }));
+            if let Some(v) = &vector {
+                effects.extend(ids.iter().map(|id| Effect::Embed { memory: memory_type.into(), id: RecordId(id.clone()), embedding: v.clone() }));
+            }
+        }
+        let (record, wait) = seq.submit_record(ts, None, effects).await.map_err(log_err)?;
+        self.to_store_submitted(&record, seq.log()).await;
+        drop(seq);
+        self.committed(record.offset.0, wait).await?;
+        Ok(Some(ids.len() as u64))
+    }
+
+    /// FORGET of named keys as [`Self::update_prepared`]: targets, every version and
+    /// (SEMANTIC) the entity's facts are read first; a write to any of them, or a new
+    /// fact about a forgotten entity, after `snapshot` is a conflict.
+    async fn forget_prepared(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<Option<u64>> {
+        let snapshot = self.last_off.load(std::sync::atomic::Ordering::SeqCst);
+        let now = CommitTs::from_datetime(time::now());
+        let mut ids = self.targets(memory_type, predicate, now, true, in_scope, namespace).await?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let entities = ids.clone();
+        if memory_type == MemoryType::Semantic {
+            ids.extend(self.entity_facts(&ids, in_scope).await?);
+        }
+        let m: Memory = memory_type.into();
+        let mut keys: Vec<(Memory, String)> = ids.iter().map(|k| (m, k.clone())).collect();
+        if memory_type == MemoryType::Semantic {
+            keys.extend(entities.iter().map(|k| (m, refs_key(k))));
+        }
+        let mut seq = self.seq.lock().await;
+        if self.key_offsets.lock().unwrap().conflict(&keys, snapshot) {
+            return Ok(None);
+        }
+        let ts = seq.begin();
+        let effects: Vec<Effect> = ids.iter().map(|id| Effect::Forget { memory: m, lineage_id: RecordId(id.clone()) }).collect();
+        self.usage_stale().await;
+        let (record, wait) = seq.submit_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        self.keys_gone(&effects);
+        self.note_forgotten(ids.iter().map(|id| (m, id.clone())));
+        self.to_store_submitted(&record, seq.log()).await;
+        drop(seq);
+        self.committed(record.offset.0, wait).await?;
+        self.forget_on_branches(memory_type, &ids).await?;
+        Ok(Some(ids.len() as u64))
+    }
+
+    /// A FORGET on main reaches every branch's own engine (B4): forgotten means gone
+    /// everywhere. A branch in a pod that can't be reached now erases them when it
+    /// starts (B6).
+    async fn forget_on_branches(&self, memory_type: MemoryType, ids: &[String]) -> AdbResult<()> {
+        if let Some(host) = self.branch_host.get() {
+            let unreachable = host.forget(memory_type, ids).await.map_err(|e| {
+                AdbError::Internal(format!("forgotten on main, but a branch still holds a copy: {e}"))
+            })?;
+            for b in unreachable {
+                let pending = crate::branches::PendingForget { memory: memory_type, lineages: ids.to_vec() };
+                self.branch_change(&b.namespace, &b.name, |b| b.pending_forgets.push(pending)).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Commit `batch` under the sequencer (see [`Self::platform_many`]).
     async fn platform_group(&self, seq: &mut Sequencer<L>, batch: Vec<PlatformPending>, waited: Duration) {
         let Some(platform) = self.platform.as_ref() else { return };
@@ -559,23 +784,56 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub async fn compact_now(&self) -> AdbResult<Option<adb_store::CompactStats>> {
         let Some(store) = &self.store else { return Ok(None) };
         let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("compaction: {e}"));
-        let mut seq = self.seq.lock().await;
+        // PF-7: no write or read waits for the table's rewrite; the sequencer is held
+        // only for the erasure marker below. What committed before the compaction
+        // started is in the table first, so what was forgotten before it leaves with it.
         if let Some(b) = self.barrier() {
             b.wait_for_committed().await;
         }
         // Every row id (all versions) of the lineages forgotten since the last
         // compaction: their effects are redacted from the log below.
-        let forgotten: std::collections::HashSet<(Memory, String)> = std::mem::take(&mut *self.forgotten.lock().unwrap());
-        *self.forgotten_since.lock().unwrap() = None;
-        let rows = forgotten_rows(store, forgotten).await.map_err(store_err)?;
+        // Kept in the set until the log is redacted below: readers of the log
+        // (subscribers, through `RedactingLog`) hide them until then.
+        let forgotten: std::collections::HashSet<(Memory, String)> = self.forgotten.lock().unwrap().clone();
+        let rows = forgotten_rows(store, forgotten.clone()).await.map_err(store_err)?;
         let pins = self.pins.get().map(|f| f()).unwrap_or_default();
         // DB-8: a namespace's own history window, where a quota row sets one.
         let windows: Vec<(String, Duration)> = self.branches.quotas().into_iter()
             .filter_map(|q| q.history_days.map(|d| (q.pattern, Duration::from_secs(d * 86_400))))
             .collect();
-        let stats = store.compact_with_windows(HISTORY, CommitTs::from_datetime(time::now()), &pins, windows).await.map_err(store_err)?;
+        let now = CommitTs::from_datetime(time::now());
+        let stats = match self.log_reader.get() {
+            // The records applied while the copy is made, read back from the log without
+            // the sequencer: compaction holds the store's write lock at the end, and a
+            // writer holding the sequencer may be waiting for the store.
+            Some(log) => {
+                let read = |from: u64, to: u64| {
+                    let log = Arc::clone(log);
+                    async move {
+                        let mut out = Vec::new();
+                        let mut at = from;
+                        while at <= to {
+                            let batch = log.read(LogOffset(at), 1024).await.map_err(|e| adb_store::StoreError::Decode(format!("compaction: reading the log: {e}")))?;
+                            let Some(last) = batch.last().map(|r| r.offset.0) else { break };
+                            out.extend(batch.into_iter().filter(|r| r.offset.0 <= to));
+                            at = last + 1;
+                        }
+                        Ok(out)
+                    }
+                };
+                store.compact_online(HISTORY, now, &pins, windows, &read).await.map_err(store_err)?
+            }
+            None => {
+                let _seq = self.seq.lock().await;
+                if let Some(b) = self.barrier() {
+                    b.wait_for_committed().await;
+                }
+                store.compact_with_windows(HISTORY, now, &pins, windows).await.map_err(store_err)?
+            }
+        };
         let mut redacted = 0;
         if !rows.is_empty() {
+            let mut seq = self.seq.lock().await;
             // Close the segment holding the newest records, then rewrite the closed
             // ones without the forgotten payloads; offsets (and every subscriber's
             // position) stay.
@@ -584,6 +842,14 @@ impl<L: Log + 'static> DurableWrites<L> {
             self.to_store(&marker, seq.log()).await;
             let redact = |r: &mut LogRecord| redact_record(r, &rows);
             redacted = seq.log().rewrite_closed(&redact).await.map_err(log_err)?;
+        }
+        // Gone from the table and the log: no longer hidden at read time.
+        {
+            let mut f = self.forgotten.lock().unwrap();
+            f.retain(|k| !forgotten.contains(k));
+            if f.is_empty() {
+                *self.forgotten_since.lock().unwrap() = None;
+            }
         }
         tracing::info!(
             kept = stats.kept, of = stats.total, took = ?stats.took,
@@ -1202,6 +1468,53 @@ impl<L: Log + 'static> DurableWrites<L> {
     }
 
     /// The org's branch engines (B4): a FORGET on main erases their copies too.
+    /// Lineages forgotten but not yet redacted from the log (shared with
+    /// [`RedactingLog`]).
+    pub(crate) fn forgotten_set(&self) -> Arc<std::sync::Mutex<std::collections::HashSet<(Memory, String)>>> {
+        Arc::clone(&self.forgotten)
+    }
+
+    /// At open: the FORGETs still in the log, so readers keep hiding what they took and
+    /// the next compaction redacts it (the set lives in memory). Returns how many.
+    pub async fn seed_forgotten(&self) -> AdbResult<usize> {
+        let mut gone = Vec::new();
+        {
+            let seq = self.seq.lock().await;
+            let log = seq.log();
+            let mut from = LogOffset(1);
+            loop {
+                let batch = match log.read(from, 1024).await {
+                    Ok(b) => b,
+                    Err(LogError::Purged { oldest, .. }) if oldest.0 > from.0 => {
+                        from = oldest;
+                        continue;
+                    }
+                    Err(LogError::Purged { .. }) => break,
+                    Err(e) => return Err(log_err(e)),
+                };
+                let Some(last) = batch.last().map(|r| r.offset) else { break };
+                for r in &batch {
+                    for e in &r.effects {
+                        if let Effect::Forget { memory, lineage_id } = e {
+                            gone.push((*memory, lineage_id.0.clone()));
+                        }
+                    }
+                }
+                from = last.next();
+            }
+        }
+        let n = gone.len();
+        if n > 0 {
+            self.note_forgotten(gone);
+        }
+        Ok(n)
+    }
+
+    /// A handle on this engine's log for reads outside the sequencer (PF-7).
+    pub fn set_log_reader(&self, log: crate::engine::EngineLog) {
+        let _ = self.log_reader.set(log);
+    }
+
     pub fn set_branch_host(&self, host: Arc<crate::branch_engine::BranchHost>) {
         let _ = self.branch_host.set(host);
     }
@@ -1488,7 +1801,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), log_reader: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1863,6 +2176,47 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// needs the records above what Lance has made durable, so segments below
     /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
     async fn to_store(&self, record: &LogRecord, log: &L) {
+        self.to_store_with(record, log, true).await
+    }
+
+    /// As [`Self::to_store`] for a record submitted but maybe not yet durable (PF-1):
+    /// the applier holds it until [`Self::committed`] marks it.
+    async fn to_store_submitted(&self, record: &LogRecord, log: &L) {
+        self.to_store_with(record, log, false).await
+    }
+
+    /// Wait for a submitted record's commit, outside the sequencer. A failure stops
+    /// this engine's writes and asks for a restart (the leader lost the replica set).
+    async fn committed(&self, offset: u64, wait: adb_log::CommitWait) -> AdbResult<()> {
+        match wait.await {
+            Ok(_) => {
+                if let Some(b) = self.barrier() {
+                    b.durable(offset);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(b) = self.barrier() {
+                    b.abandon();
+                }
+                tracing::error!(offset, error = %e, "a submitted record did not commit: this engine stops taking writes and restarts");
+                crate::engine::request_restart();
+                Err(log_err(e))
+            }
+        }
+    }
+
+    fn writable(&self) -> AdbResult<()> {
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AdbError::Internal("this ADB engine is restarting after a write failed to commit; retry".into()));
+        }
+        Ok(())
+    }
+
+    async fn to_store_with(&self, record: &LogRecord, log: &L, durable: bool) {
+        let applied = self.barrier().map_or(0, |b| b.applied_offset());
+        self.key_offsets.lock().unwrap().note(record, applied);
         self.last_off.fetch_max(record.offset.0, std::sync::atomic::Ordering::SeqCst);
         self.last_ts.fetch_max(record.commit_ts.0, std::sync::atomic::Ordering::SeqCst);
         let (Some(s), Some(applier)) = (&self.store, &self.applier) else { return };
@@ -1882,7 +2236,11 @@ impl<L: Log + 'static> DurableWrites<L> {
                 }
             }
         }
-        applier.enqueue(record.clone());
+        if durable {
+            applier.enqueue(record.clone());
+        } else {
+            applier.enqueue_submitted(record.clone());
+        }
         if record.offset.0 % PURGE_EVERY == 0 {
             match s.durable_offset().await {
                 // Lance doesn't fsync on local disk (risk K8): sync first, so the
@@ -1975,6 +2333,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             self.check_sealed(memory_type, namespace, &bare, None, CommitTs::from_datetime(time::now())).await?;
         }
         let bytes = payload.to_string().len() as u64;
+        self.writable()?;
         let mut seq = self.seq.lock().await;
         self.check_quota(namespace, bytes).await?;
         let ts = seq.begin();
@@ -2010,14 +2369,18 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             MemoryType::Tools => Effect::PutTool(new.clone()),
             _ => Effect::PutEntity(new.clone()),
         };
-        let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        // Submitted in order under the sequencer, committed after it is released (PF-1).
+        let (record, wait) = seq.submit_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
         if unique_keys(memory_type) && self.store.is_some() {
             self.live.lock().unwrap().insert((memory_type.into(), new.lineage_id.0.clone()), new.data.ttl_at);
         }
         // The table is the only copy: answer with the record as reads shape it.
         let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
-        self.to_store(&record, seq.log()).await;
+        self.to_store_submitted(&record, seq.log()).await;
+        // Counted under the sequencer, so concurrent STOREs can't both pass the quota.
         self.note_stored(namespace, bytes).await;
+        drop(seq);
+        self.committed(record.offset.0, wait).await?;
         Ok(stored)
     }
 
@@ -2150,6 +2513,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             true => self.vector_of(data.get("content").and_then(|c| c.as_str()).map(String::from)).await,
             false => None,
         };
+        self.writable()?;
+        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate).is_some() {
+            if let Some(n) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
+                return Ok(n);
+            }
+        }
         let t0 = std::time::Instant::now();
         let mut seq = self.seq.lock().await;
         tracing::debug!(target: "adb::write", ?memory_type, lock_us = t0.elapsed().as_micros() as u64, "update locked");
@@ -2224,6 +2593,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     }
 
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
+        self.writable()?;
+        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate).is_some() {
+            if let Some(n) = self.forget_prepared(memory_type, predicate, in_scope, namespace).await? {
+                return Ok(n);
+            }
+        }
         let mut seq = self.seq.lock().await;
         let ts = seq.begin();
         // On a branch engine (B3): a delete marker hides the record on the branch; the
@@ -2251,17 +2626,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         drop(seq);
         // Hidden from every read from the commit on; the bytes leave disk at the next
         // compaction (user, 7 Nov: no read may miss a FORGET; disk removal can wait).
-        // And from every branch's own engine (B4): forgotten means gone everywhere.
-        if let Some(host) = self.branch_host.get() {
-            let unreachable = host.forget(memory_type, &ids).await.map_err(|e| {
-                AdbError::Internal(format!("forgotten on main, but a branch still holds a copy: {e}"))
-            })?;
-            // A branch in a pod that can't be reached now erases them when it starts (B6).
-            for b in unreachable {
-                let pending = crate::branches::PendingForget { memory: memory_type, lineages: ids.clone() };
-                self.branch_change(&b.namespace, &b.name, |b| b.pending_forgets.push(pending)).await?;
-            }
-        }
+        self.forget_on_branches(memory_type, &ids).await?;
         Ok(removed)
     }
 

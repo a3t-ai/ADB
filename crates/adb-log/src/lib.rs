@@ -35,6 +35,10 @@ pub enum LogError {
 
 pub type LogResult<T> = Result<T, LogError>;
 
+/// A submitted record's commit (PF-1/PF-2): resolves with its offset once it is
+/// durable (committed by the replica set); only then may the write be acknowledged.
+pub type CommitWait = std::pin::Pin<Box<dyn std::future::Future<Output = LogResult<LogOffset>> + Send>>;
+
 /// One partition's log.
 #[async_trait]
 pub trait Log: Send + Sync {
@@ -50,6 +54,15 @@ pub trait Log: Send + Sync {
     /// Logs without segments just append.
     async fn append_on_new_segment(&self, record: LogRecord) -> LogResult<LogOffset> {
         self.append(record).await
+    }
+
+    /// Submit one record in order and return before it is durable: the caller keeps
+    /// its place in the log without waiting for the commit (the sequencer submits
+    /// under its lock and waits after releasing it). The record's offset must follow
+    /// the previous submission's. Default: [`Log::append`], then a resolved wait.
+    async fn submit(&self, record: LogRecord) -> LogResult<CommitWait> {
+        let offset = self.append(record).await?;
+        Ok(Box::pin(std::future::ready(Ok(offset))))
     }
 
     /// Up to `max` records from `from` (inclusive), in offset order.
@@ -90,6 +103,10 @@ impl<L: Log + ?Sized> Log for std::sync::Arc<L> {
 
     async fn append_on_new_segment(&self, record: LogRecord) -> LogResult<LogOffset> {
         (**self).append_on_new_segment(record).await
+    }
+
+    async fn submit(&self, record: LogRecord) -> LogResult<CommitWait> {
+        (**self).submit(record).await
     }
 
     async fn read(&self, from: LogOffset, max: usize) -> LogResult<Vec<LogRecord>> {

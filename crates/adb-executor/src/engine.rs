@@ -678,6 +678,7 @@ impl LocalEngine {
         store.set_cache(hot_cache(cache_cfg)).await.map_err(|e| e.to_string())?;
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
+        writes.set_log_reader(Arc::clone(&wal));
         let platform = match platform_open {
             Some(p) => p,
             None => Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?),
@@ -693,9 +694,17 @@ impl LocalEngine {
             tracing::info!(records = replayed, "engine spaces replayed");
         }
         let barrier = writes.barrier();
-        let watch_log: Arc<dyn adb_log::Log> = Arc::clone(&wal);
+        // Readers outside the engine see the log with forgotten records hidden until
+        // compaction redacts it (FORGET returns before that).
+        match writes.seed_forgotten().await {
+            Ok(n) if n > 0 => tracing::info!(lineages = n, "forgotten records in the log hidden until the next compaction"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not read the log's FORGETs at open"),
+        }
+        let redacting: Arc<dyn adb_log::Log> = Arc::new(crate::writes::RedactingLog { inner: Arc::clone(&wal), forgotten: writes.forgotten_set() });
+        let watch_log: Arc<dyn adb_log::Log> = Arc::clone(&redacting);
         let gateway = barrier.as_ref().map(|b| {
-            let log: Arc<dyn adb_log::Log> = wal;
+            let log: Arc<dyn adb_log::Log> = redacting;
             let lineages: Arc<dyn adb_gateway::Lineages> = Arc::clone(&store) as Arc<dyn adb_gateway::Lineages>;
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });

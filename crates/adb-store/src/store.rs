@@ -128,6 +128,9 @@ pub struct PartitionStore {
     /// (W7 compaction trigger: many small puts slow every scan).
     puts_since_compaction: std::sync::atomic::AtomicU64,
     rows_at_compaction: std::sync::atomic::AtomicU64,
+    /// While an online compaction runs (PF-7): the applied offset it started from. The
+    /// log must keep every record after it, so [`Self::durable_offset`] reports no more.
+    compaction_hold: std::sync::atomic::AtomicU64,
     /// The table's vectors came from another embedding model (W9.10).
     model_changed: std::sync::atomic::AtomicBool,
     /// W10 hot cache, fed by every put (`set_cache`).
@@ -263,6 +266,118 @@ impl PartitionStore {
         self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
         self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(stats)
+    }
+
+    /// As [`Self::compact_with_windows`], without stopping writes or reads (PF-7): the
+    /// table is copied from a snapshot while the applier keeps writing to the old one,
+    /// the records applied meanwhile are replayed from the log (`read(from, to)`,
+    /// inclusive) into the copy, and only the last few and the swap happen under the
+    /// store's write lock. Applying a record twice leaves the same rows, so the
+    /// snapshot may already hold some of what is replayed.
+    pub async fn compact_online<F, Fut>(
+        &self,
+        history: Duration,
+        now: CommitTs,
+        pins: &std::collections::HashMap<String, CommitTs>,
+        windows: Vec<(String, Duration)>,
+        read: &F,
+    ) -> StoreResult<CompactStats>
+    where
+        F: Fn(u64, u64) -> Fut + Sync,
+        Fut: std::future::Future<Output = StoreResult<Vec<LogRecord>>> + Send,
+    {
+        let keep = compaction_row_windows(history, now, pins.clone(), windows);
+        let stats = self.rewrite_from_log(&keep, read).await;
+        self.compaction_hold.store(0, std::sync::atomic::Ordering::SeqCst);
+        let stats = stats?;
+        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(stats)
+    }
+
+    /// Put `records` (in log order) into `inner` as the applier would, `_meta` last.
+    async fn apply_into(&self, inner: &Inner, records: &[LogRecord]) -> StoreResult<()> {
+        for chunk in records.chunks(1000) {
+            let Some(last) = chunk.last() else { continue };
+            let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
+            for r in chunk {
+                Self::rows_of(inner, &mut out, r).await?;
+            }
+            out.insert(META_ID.into(), StoredRow::meta(last.offset.0, last.commit_ts, last.epoch.0, self.meta_extra()));
+            let rows: Vec<StoredRow> = out.into_values().collect();
+            for part in rows.chunks(REWRITE_CHUNK) {
+                inner.writer.put(vec![encode(part, &self.schema, self.dim)?]).await.map_err(lance)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn rewrite_from_log<F, Fut>(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), read: &F) -> StoreResult<CompactStats>
+    where
+        F: Fn(u64, u64) -> Fut + Sync,
+        Fut: std::future::Future<Output = StoreResult<Vec<LogRecord>>> + Send,
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        let started = std::time::Instant::now();
+        let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
+        let staged = dir.with_file_name("memory.rewrite.lance");
+        let trash = dir.with_file_name("memory.compacted.trash");
+        let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
+        let bytes_before = dir_size(&dir);
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged).map_err(err)?;
+        }
+        // 1. The copy, from a snapshot, sharing the lock with the applier and readers.
+        let start = self.applied.load(SeqCst);
+        self.compaction_hold.store(start.max(1), SeqCst);
+        let (total, kept) = {
+            let g = self.state.read().await;
+            self.write_kept(open_state(&g), keep, &staged).await?
+        };
+        // 2. Catch the copy up with what was applied meanwhile, still without locks.
+        let new = Self::open_inner(&self.cfg, self.partition, &staged).await?;
+        let mut at = start;
+        for _ in 0..4 {
+            let now = self.applied.load(SeqCst);
+            if now <= at + 64 {
+                break;
+            }
+            let records = read(at + 1, now).await?;
+            self.apply_into(&new, &records).await?;
+            at = records.last().map_or(now, |r| r.offset.0);
+        }
+        // 3. The rest and the swap, with the applier and readers held.
+        let mut g = self.state.write().await;
+        let applied = self.applied.load(SeqCst);
+        if applied > at {
+            let records = read(at + 1, applied).await?;
+            self.apply_into(&new, &records).await?;
+        }
+        new.writer.close().await.map_err(lance)?;
+        adb_core::disk::sync_fs_async(&staged).await.map_err(err)?;
+        let old = g.take().expect("the partition store is open");
+        let swapped = async {
+            old.writer.close().await.map_err(lance)?;
+            if trash.exists() {
+                std::fs::remove_dir_all(&trash).map_err(err)?;
+            }
+            std::fs::rename(&dir, &trash).map_err(err)?;
+            std::fs::rename(&staged, &dir).map_err(err)?;
+            StoreResult::Ok(())
+        }
+        .await;
+        if !dir.exists() && staged.exists() {
+            let _ = std::fs::rename(&staged, &dir);
+        }
+        let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
+        Self::reset_ledger(&inner, applied).await?;
+        *g = Some(inner);
+        drop(g);
+        swapped?;
+        adb_core::disk::sync_fs_async(&dir).await.map_err(err)?;
+        std::fs::remove_dir_all(&trash).map_err(err)?;
+        tracing::info!(total, kept, replayed = applied.saturating_sub(start), took_ms = started.elapsed().as_millis() as u64, "online compaction");
+        Ok(CompactStats { total, kept, bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
     }
 
     pub async fn compact_pinned(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>) -> StoreResult<CompactStats> {
@@ -726,6 +841,7 @@ impl PartitionStore {
             applied: std::sync::atomic::AtomicU64::new(0),
             puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
             rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
+            compaction_hold: std::sync::atomic::AtomicU64::new(0),
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
@@ -1274,6 +1390,12 @@ impl PartitionStore {
     /// below `durable_offset + 1` (stage D3.5). Maps the writer's durable batch count
     /// to the log offset of that put, as the R11 / R12 spikes validated.
     pub async fn durable_offset(&self) -> StoreResult<LogOffset> {
+        let d = self.durable_offset_inner().await?;
+        let hold = self.compaction_hold.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(if hold > 0 { LogOffset(d.0.min(hold)) } else { d })
+    }
+
+    async fn durable_offset_inner(&self) -> StoreResult<LogOffset> {
         let g = self.state.read().await;
         let inner = open_state(&g);
         let durable = inner.writer.memtable_stats().await.map_err(lance)?.durable_batch_count;

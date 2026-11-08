@@ -260,6 +260,27 @@ impl Log for RaftLog {
         self.write(record, true).await
     }
 
+    /// Hand the record to Raft's core (in submission order) and return: the commit is
+    /// awaited by the caller after it releases the sequencer (PF-1/PF-2), so records
+    /// pipeline into shared AppendEntries and fsyncs.
+    async fn submit(&self, record: LogRecord) -> LogResult<adb_log::CommitWait> {
+        let offset = record.offset;
+        let (responder, log_id, rx) = openraft::impls::ProgressResponder::<TypeConfig, _>::new();
+        self.raft
+            .client_write_ff(Cmd { record, new_segment: false, pad: Vec::new() }, Some(responder))
+            .await
+            .map_err(|e| LogError::Io(format!("record {} not submitted to the replica set: {e}", offset.0)))?;
+        Ok(Box::pin(async move {
+            // Held until the commit resolves: dropped early, openraft warns on every write.
+            let _log_id = log_id;
+            match rx.await {
+                Ok(Ok(r)) => Ok(LogOffset(r.data.0)),
+                Ok(Err(e)) => Err(LogError::Io(format!("record {} not committed by the replica set: {e}", offset.0))),
+                Err(_) => Err(LogError::Io(format!("record {}: the replica set dropped it before committing", offset.0))),
+            }
+        }))
+    }
+
     async fn read(&self, from: LogOffset, max: usize) -> LogResult<Vec<LogRecord>> {
         self.wal.read(from, max).await
     }
