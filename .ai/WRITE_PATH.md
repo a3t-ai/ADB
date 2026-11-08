@@ -92,6 +92,29 @@ sequencer; then, under a short lock, it applies the records after `N` to the new
 (or replays them through the applier) and swaps it in. Log redaction of forgotten
 payloads (`rewrite_closed`, `LogStore::redact`) needs no write lock (closed segments).
 
+### PF-16 Compaction in place (8 Nov)
+
+PF-7 took compaction off the locks but still copied the whole table each time, so its
+cost grew with the table. A fold (`crates/adb-store/src/store_fold.rs`) works on what
+changed:
+
+1. Seal the active memtable and wait for its SSTable: every applied row is in an SSTable.
+2. Read the SSTables (newest version per id) and, from the base table only, the rows
+   whose history window or TTL ran out (`superseded_by IS NOT NULL AND valid_to <
+   horizon`, `ttl_at <= now`).
+3. Apply the compaction rule: dropped ids are deleted from the base, the rest upserted by
+   `id` (Lance `merge_insert`).
+4. Rewrite only the base fragments that need it: those that held a tombstoned or expired
+   row (FORGET's bytes leave the disk), those with over 10% deleted rows, and runs of 8
+   small fragments of one size tier (8k / 64k / 512k live rows).
+5. Under the store's write lock (milliseconds): swap the base in, drop the folded
+   SSTables from the shard manifest (through the writer's own manifest store), delete
+   their directories, the MemWAL WAL entries they cover and the base's old versions.
+
+No log replay and no compaction hold on the log are needed (the PF-7 copy is gone).
+Full rewrites remain only for migrations (embedding dimension, vector clearing, id
+schemes).
+
 ### PF-8 to PF-10 Read path
 
 - PF-8: point lookups consult the memtable's key index first (new version or

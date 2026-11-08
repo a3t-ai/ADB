@@ -62,9 +62,8 @@ async fn a_namespace_sets_its_own_history_window() {
     }
     e.quota_set("short", None, None, Some(0)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
-    // A FORGET compacts before it returns (W5).
-    q(&e, r#"STORE INTO SEMANTIC (key = "x", content = "x") NAMESPACE "other""#).await;
-    q(&e, r#"FORGET FROM SEMANTIC WHERE key = "x" NAMESPACE "other""#).await;
+    // Compaction applies the windows (a FORGET no longer compacts: PF-6, 7 Nov).
+    e.compact().await.unwrap();
     let short = q(&e, r#"RECALL FROM SEMANTIC ALL WITH HISTORY NAMESPACE "short""#).await;
     assert!(short.contains("new short") && !short.contains("old short"), "{short}");
     let normal = q(&e, r#"RECALL FROM SEMANTIC ALL WITH HISTORY NAMESPACE "normal""#).await;

@@ -446,6 +446,15 @@ impl PlatformStore {
         if record.offset.0 <= applied.offset {
             return Ok(false);
         }
+        // Nothing for the platform tables (most records: memory writes). The offset
+        // moves in memory only: `_applied.json` is written and fsynced twice per save,
+        // and a follower applies every record — saving here held a follower to a few
+        // hundred records/s and made a takeover wait for it (8 Nov). After a restart the
+        // records since the last save are read again and skipped again.
+        if !record.effects.iter().any(|e| table_of(e).is_some()) {
+            applied.offset = record.offset.0;
+            return Ok(false);
+        }
         for effect in &record.effects {
             self.apply_effect(&mut applied, effect).await?;
         }

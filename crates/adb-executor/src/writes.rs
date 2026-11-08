@@ -491,10 +491,6 @@ pub struct DurableWrites<L: Log> {
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
     poisoned: std::sync::atomic::AtomicBool,
-    /// The log to read without the sequencer (PF-7): online compaction replays from it
-    /// while writers hold the sequencer. Unset (a plain-log test engine): compaction
-    /// runs the serial way.
-    log_reader: std::sync::OnceLock<crate::engine::EngineLog>,
     /// DB-7: the last committed record (offset, commit time µs), for answers' memory point.
     last_off: std::sync::atomic::AtomicU64,
     last_ts: std::sync::atomic::AtomicI64,
@@ -784,7 +780,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     pub async fn compact_now(&self) -> AdbResult<Option<adb_store::CompactStats>> {
         let Some(store) = &self.store else { return Ok(None) };
         let store_err = |e: adb_store::StoreError| AdbError::Internal(format!("compaction: {e}"));
-        // PF-7: no write or read waits for the table's rewrite; the sequencer is held
+        // PF-7/PF-16: no write or read waits for the compaction; the sequencer is held
         // only for the erasure marker below. What committed before the compaction
         // started is in the table first, so what was forgotten before it leaves with it.
         if let Some(b) = self.barrier() {
@@ -802,35 +798,8 @@ impl<L: Log + 'static> DurableWrites<L> {
             .filter_map(|q| q.history_days.map(|d| (q.pattern, Duration::from_secs(d * 86_400))))
             .collect();
         let now = CommitTs::from_datetime(time::now());
-        let stats = match self.log_reader.get() {
-            // The records applied while the copy is made, read back from the log without
-            // the sequencer: compaction holds the store's write lock at the end, and a
-            // writer holding the sequencer may be waiting for the store.
-            Some(log) => {
-                let read = |from: u64, to: u64| {
-                    let log = Arc::clone(log);
-                    async move {
-                        let mut out = Vec::new();
-                        let mut at = from;
-                        while at <= to {
-                            let batch = log.read(LogOffset(at), 1024).await.map_err(|e| adb_store::StoreError::Decode(format!("compaction: reading the log: {e}")))?;
-                            let Some(last) = batch.last().map(|r| r.offset.0) else { break };
-                            out.extend(batch.into_iter().filter(|r| r.offset.0 <= to));
-                            at = last + 1;
-                        }
-                        Ok(out)
-                    }
-                };
-                store.compact_online(HISTORY, now, &pins, windows, &read).await.map_err(store_err)?
-            }
-            None => {
-                let _seq = self.seq.lock().await;
-                if let Some(b) = self.barrier() {
-                    b.wait_for_committed().await;
-                }
-                store.compact_with_windows(HISTORY, now, &pins, windows).await.map_err(store_err)?
-            }
-        };
+        // PF-16: in place, without the sequencer; only the swap holds readers, briefly.
+        let stats = store.compact_with_windows(HISTORY, now, &pins, windows).await.map_err(store_err)?;
         let mut redacted = 0;
         if !rows.is_empty() {
             let mut seq = self.seq.lock().await;
@@ -1510,11 +1479,6 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(n)
     }
 
-    /// A handle on this engine's log for reads outside the sequencer (PF-7).
-    pub fn set_log_reader(&self, log: crate::engine::EngineLog) {
-        let _ = self.log_reader.set(log);
-    }
-
     pub fn set_branch_host(&self, host: Arc<crate::branch_engine::BranchHost>) {
         let _ = self.branch_host.set(host);
     }
@@ -1801,7 +1765,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), log_reader: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

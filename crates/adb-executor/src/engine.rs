@@ -678,7 +678,6 @@ impl LocalEngine {
         store.set_cache(hot_cache(cache_cfg)).await.map_err(|e| e.to_string())?;
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
-        writes.set_log_reader(Arc::clone(&wal));
         let platform = match platform_open {
             Some(p) => p,
             None => Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?),

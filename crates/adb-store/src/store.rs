@@ -36,6 +36,9 @@ use crate::rows::{decode, encode, key_of, qualified, row_id, scoped_id, unscoped
 use crate::schema::{memory_schema, META_ID, RECORD_KINDS, SCHEMA_VERSION};
 use crate::{StoreError, StoreResult};
 
+#[path = "store_fold.rs"]
+mod fold;
+
 /// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
 /// deployment (D3 S5); a table of another dimension is rewritten at open.
 pub const DEFAULT_EMBEDDING_DIM: i32 = 384;
@@ -128,9 +131,8 @@ pub struct PartitionStore {
     /// (W7 compaction trigger: many small puts slow every scan).
     puts_since_compaction: std::sync::atomic::AtomicU64,
     rows_at_compaction: std::sync::atomic::AtomicU64,
-    /// While an online compaction runs (PF-7): the applied offset it started from. The
-    /// log must keep every record after it, so [`Self::durable_offset`] reports no more.
-    compaction_hold: std::sync::atomic::AtomicU64,
+    /// One fold (compaction, PF-16) or table rewrite at a time.
+    folding: tokio::sync::Mutex<()>,
     /// The table's vectors came from another embedding model (W9.10).
     model_changed: std::sync::atomic::AtomicBool,
     /// W10 hot cache, fed by every put (`set_cache`).
@@ -244,12 +246,11 @@ impl PartitionStore {
         Self::rewrite_table(cfg, partition, cfg.embedding_dim, &keep, None, false).await
     }
 
-    /// W5 compaction on the open table: the same rewrite as [`Self::compact_offline`],
-    /// swapped in under the exclusive lock (reads wait for the whole rewrite: the
-    /// lock is held throughout).
-    /// The caller pauses writes (the sequencer) and makes sure every committed record
-    /// is applied first. The old table, its versions and MemWAL files, and any
-    /// rewrite backups (`memory.dim*.bak`) are deleted: forgotten data is gone.
+    /// W5 compaction on the open table, in place (PF-16, `store_fold.rs`): what the
+    /// rule of [`Self::compact_offline`] drops leaves the base table, and the bytes of
+    /// tombstoned and expired rows leave the disk (their fragments are rewritten, old
+    /// versions, folded SSTables and covered MemWAL entries deleted). Writes and reads
+    /// go on meanwhile; the caller makes sure every committed record is applied first.
     pub async fn compact(&self, history: Duration, now: CommitTs) -> StoreResult<CompactStats> {
         self.compact_pinned(history, now, &Default::default()).await
     }
@@ -261,131 +262,16 @@ impl PartitionStore {
     /// namespace (a namespace, or a prefix ending in `*`; DB-8). A pin older than the window
     /// still wins: a tag or a branch keeps what it reads.
     pub async fn compact_with_windows(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>, windows: Vec<(String, Duration)>) -> StoreResult<CompactStats> {
+        // The latest horizon any namespace uses (pins only move one earlier): base rows
+        // superseded before it are the candidates `keep` decides.
+        let shortest = windows.iter().map(|(_, w)| *w).fold(history, Duration::min);
+        let horizon = CommitTs(now.0 - shortest.as_micros() as i64);
         let keep = compaction_row_windows(history, now, pins.clone(), windows);
-        let stats = self.rewrite_online(&keep, false).await?;
-        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
-        Ok(stats)
-    }
-
-    /// As [`Self::compact_with_windows`], without stopping writes or reads (PF-7): the
-    /// table is copied from a snapshot while the applier keeps writing to the old one,
-    /// the records applied meanwhile are replayed from the log (`read(from, to)`,
-    /// inclusive) into the copy, and only the last few and the swap happen under the
-    /// store's write lock. Applying a record twice leaves the same rows, so the
-    /// snapshot may already hold some of what is replayed.
-    pub async fn compact_online<F, Fut>(
-        &self,
-        history: Duration,
-        now: CommitTs,
-        pins: &std::collections::HashMap<String, CommitTs>,
-        windows: Vec<(String, Duration)>,
-        read: &F,
-    ) -> StoreResult<CompactStats>
-    where
-        F: Fn(u64, u64) -> Fut + Sync,
-        Fut: std::future::Future<Output = StoreResult<Vec<LogRecord>>> + Send,
-    {
-        let keep = compaction_row_windows(history, now, pins.clone(), windows);
-        let stats = self.rewrite_from_log(&keep, read).await;
-        self.compaction_hold.store(0, std::sync::atomic::Ordering::SeqCst);
-        let stats = stats?;
-        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
-        Ok(stats)
-    }
-
-    /// Put `records` (in log order) into `inner` as the applier would, `_meta` last.
-    async fn apply_into(&self, inner: &Inner, records: &[LogRecord]) -> StoreResult<()> {
-        for chunk in records.chunks(1000) {
-            let Some(last) = chunk.last() else { continue };
-            let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
-            for r in chunk {
-                Self::rows_of(inner, &mut out, r).await?;
-            }
-            out.insert(META_ID.into(), StoredRow::meta(last.offset.0, last.commit_ts, last.epoch.0, self.meta_extra()));
-            let rows: Vec<StoredRow> = out.into_values().collect();
-            for part in rows.chunks(REWRITE_CHUNK) {
-                inner.writer.put(vec![encode(part, &self.schema, self.dim)?]).await.map_err(lance)?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn rewrite_from_log<F, Fut>(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), read: &F) -> StoreResult<CompactStats>
-    where
-        F: Fn(u64, u64) -> Fut + Sync,
-        Fut: std::future::Future<Output = StoreResult<Vec<LogRecord>>> + Send,
-    {
-        use std::sync::atomic::Ordering::SeqCst;
-        let started = std::time::Instant::now();
-        let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
-        let staged = dir.with_file_name("memory.rewrite.lance");
-        let trash = dir.with_file_name("memory.compacted.trash");
-        let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
-        let bytes_before = dir_size(&dir);
-        if staged.exists() {
-            std::fs::remove_dir_all(&staged).map_err(err)?;
-        }
-        // 1. The copy, from a snapshot, sharing the lock with the applier and readers.
-        let start = self.applied.load(SeqCst);
-        self.compaction_hold.store(start.max(1), SeqCst);
-        let (total, kept) = {
-            let g = self.state.read().await;
-            self.write_kept(open_state(&g), keep, &staged).await?
-        };
-        // 2. Catch the copy up with what was applied meanwhile, still without locks.
-        let new = Self::open_inner(&self.cfg, self.partition, &staged).await?;
-        let mut at = start;
-        for _ in 0..4 {
-            let now = self.applied.load(SeqCst);
-            if now <= at + 64 {
-                break;
-            }
-            let records = read(at + 1, now).await?;
-            self.apply_into(&new, &records).await?;
-            at = records.last().map_or(now, |r| r.offset.0);
-        }
-        // 3. The rest and the swap, with the applier and readers held.
-        let mut g = self.state.write().await;
-        let applied = self.applied.load(SeqCst);
-        if applied > at {
-            let records = read(at + 1, applied).await?;
-            self.apply_into(&new, &records).await?;
-        }
-        new.writer.close().await.map_err(lance)?;
-        adb_core::disk::sync_fs_async(&staged).await.map_err(err)?;
-        let old = g.take().expect("the partition store is open");
-        let swapped = async {
-            old.writer.close().await.map_err(lance)?;
-            if trash.exists() {
-                std::fs::remove_dir_all(&trash).map_err(err)?;
-            }
-            std::fs::rename(&dir, &trash).map_err(err)?;
-            std::fs::rename(&staged, &dir).map_err(err)?;
-            StoreResult::Ok(())
-        }
-        .await;
-        if !dir.exists() && staged.exists() {
-            let _ = std::fs::rename(&staged, &dir);
-        }
-        let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
-        Self::reset_ledger(&inner, applied).await?;
-        *g = Some(inner);
-        drop(g);
-        swapped?;
-        adb_core::disk::sync_fs_async(&dir).await.map_err(err)?;
-        std::fs::remove_dir_all(&trash).map_err(err)?;
-        tracing::info!(total, kept, replayed = applied.saturating_sub(start), took_ms = started.elapsed().as_millis() as u64, "online compaction");
-        Ok(CompactStats { total, kept, bytes_before, bytes_after: dir_size(&dir), took: started.elapsed() })
+        self.fold(&keep, now, horizon).await
     }
 
     pub async fn compact_pinned(&self, history: Duration, now: CommitTs, pins: &std::collections::HashMap<String, CommitTs>) -> StoreResult<CompactStats> {
-        let keep = compaction_row_pinned(history, now, pins.clone());
-        let stats = self.rewrite_online(&keep, false).await?;
-        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
-        Ok(stats)
+        self.compact_with_windows(history, now, pins, Vec::new()).await
     }
 
     /// Compaction for a table whose rows are written once and never come back
@@ -395,10 +281,7 @@ impl PartitionStore {
     pub async fn compact_append_only(&self, now: CommitTs) -> StoreResult<CompactStats> {
         let base = compaction_row(Duration::ZERO, now);
         let keep = move |r: StoredRow| if r.id != META_ID && r.tombstone { None } else { base(r) };
-        let stats = self.rewrite_online(&keep, false).await?;
-        self.puts_since_compaction.store(0, std::sync::atomic::Ordering::SeqCst);
-        self.rows_at_compaction.store(stats.kept as u64, std::sync::atomic::Ordering::SeqCst);
-        Ok(stats)
+        self.fold(&keep, now, now).await
     }
 
     /// The schema version `_meta` records (D3 §4): 3 until `scope_row_ids` ran.
@@ -665,6 +548,7 @@ impl PartitionStore {
         let staged = dir.with_file_name("memory.rewrite.lance");
         let trash = dir.with_file_name("memory.compacted.trash");
         let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
+        let _one = self.folding.lock().await;
         let mut g = self.state.write().await;
         let bytes_before = dir_size(&dir);
         // The new table, complete and closed, beside the old one.
@@ -841,7 +725,7 @@ impl PartitionStore {
             applied: std::sync::atomic::AtomicU64::new(0),
             puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
             rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
-            compaction_hold: std::sync::atomic::AtomicU64::new(0),
+            folding: tokio::sync::Mutex::new(()),
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
@@ -1390,9 +1274,7 @@ impl PartitionStore {
     /// below `durable_offset + 1` (stage D3.5). Maps the writer's durable batch count
     /// to the log offset of that put, as the R11 / R12 spikes validated.
     pub async fn durable_offset(&self) -> StoreResult<LogOffset> {
-        let d = self.durable_offset_inner().await?;
-        let hold = self.compaction_hold.load(std::sync::atomic::Ordering::SeqCst);
-        Ok(if hold > 0 { LogOffset(d.0.min(hold)) } else { d })
+        self.durable_offset_inner().await
     }
 
     async fn durable_offset_inner(&self) -> StoreResult<LogOffset> {

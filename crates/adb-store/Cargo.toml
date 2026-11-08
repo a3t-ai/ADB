@@ -11,12 +11,15 @@ adb-core.workspace = true
 lance.workspace = true
 lance-index.workspace = true
 lance-arrow = "=12.0.0"
+# Lance 14's own: Arrow JSON (what a plain scan returns) back to Lance JSONB (fold).
+lance-arrow-14 = { package = "lance-arrow", version = "=14.0.2" }
 lance-datafusion = "=12.0.0"
 jsonb = "=0.5.6"
 datafusion.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 half.workspace = true
 serde.workspace = true
 serde_json.workspace = true

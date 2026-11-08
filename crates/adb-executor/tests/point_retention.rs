@@ -13,7 +13,7 @@ async fn q(engine: &LocalEngine, aql: &str) -> Value {
 }
 
 /// Enough writes for the log to be trimmed (see `subscription_retention.rs`). The log
-/// drops whole segments, and a FORGET starts a new one.
+/// drops whole segments, and the compaction after a FORGET starts a new one.
 async fn flood(engine: &LocalEngine) {
     for round in 0..3 {
         for i in 0..300 {
@@ -36,6 +36,9 @@ async fn an_offset_that_left_the_log_needs_its_time_and_a_recent_one() {
     q(&engine, r#"UPDATE INTO SEMANTIC WHERE key = "fact" (content = "changed later") NAMESPACE "crm""#).await;
     q(&engine, r#"STORE INTO SEMANTIC (key = "roll", content = "x") NAMESPACE "crm""#).await;
     q(&engine, r#"FORGET FROM SEMANTIC WHERE key = "roll" NAMESPACE "crm""#).await;
+    // The compaction after a FORGET puts its marker on a new log segment (PF-6: the
+    // FORGET itself no longer compacts), so the old segment can leave the log.
+    engine.compact().await.unwrap();
     flood(&engine).await;
 
     // No time: the log can't say what the offset was.
