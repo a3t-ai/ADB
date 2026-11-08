@@ -469,12 +469,24 @@ fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, mod
 }
 
 /// The key a KEY predicate names, when it is the record's key.
-fn keyed(memory: MemoryType, predicate: &Predicate) -> Option<String> {
-    let Predicate::Key { field, value } = predicate else { return None };
-    let keyed = matches!(field.as_str(), "id" | "key")
-        || (memory == MemoryType::Procedural && field == "pattern_id")
-        || (memory == MemoryType::Tools && field == "tool_id");
-    keyed.then(|| value_text(value))
+pub(crate) fn keyed(memory: MemoryType, predicate: &Predicate) -> Option<String> {
+    match predicate {
+        Predicate::Key { field, value } => {
+            let keyed = matches!(field.as_str(), "id" | "key")
+                || (memory == MemoryType::Procedural && field == "pattern_id")
+                || (memory == MemoryType::Tools && field == "tool_id");
+            keyed.then(|| value_text(value))
+        }
+        // `WHERE key = "x"` alone (PF-11): the record whose key is x, so the same
+        // primary-key lookup. The callers still run `matches` on what it finds.
+        Predicate::Where { conditions } if conditions.len() == 1 && !matches!(memory, MemoryType::Procedural | MemoryType::Tools) => match &conditions[0] {
+            adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value, .. } if matches!(field.as_str(), "id" | "key") => {
+                Some(value_text(value))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The candidates of a read: current rows of `memory` passing the pushed-down part

@@ -39,10 +39,10 @@ const READS: &[&str] = &[
     r#"RECALL FROM SEMANTIC WHERE subject = "person:ada""#,
 ];
 
-/// Log records `WRITES` makes: one per write, plus the marker each FORGET's
-/// compaction puts on a new segment (W5).
+/// Log records `WRITES` makes: one per write (a FORGET commits a tombstone and
+/// compacts nothing, so it adds no erasure marker; user, 7 Nov).
 fn log_records() -> u64 {
-    (WRITES.len() + WRITES.iter().filter(|q| q.starts_with("FORGET")).count()) as u64
+    WRITES.len() as u64
 }
 
 /// A query result without timing fields.
@@ -83,7 +83,7 @@ async fn restart_rebuilds_identical_state() {
     assert!(working.contains(r#""step":5"#), "{working}");
 
     let (engine, replayed) = LocalEngine::durable(dir.path()).await.unwrap();
-    assert_eq!(replayed.records, log_records(), "one log record per write, plus FORGETs' markers");
+    assert_eq!(replayed.records, log_records(), "one log record per write");
     let after = snapshot(&engine).await;
     for (i, (b, a)) in before.iter().zip(&after).enumerate() {
         assert_eq!(b, a, "read {i} ({}) differs after restart", READS.get(i).unwrap_or(&"stats"));
@@ -590,11 +590,12 @@ fn files_with(dir: &std::path::Path, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// W5 (user, 27 Oct): FORGET is physical before it returns — the forgotten value is
-/// in no file under the data directory (table, versions, MemWAL, log), while the
-/// rest of memory, its history and links survive, also across a restart.
+/// FORGET (user, 7 Nov): hidden from every read when it returns; the next compaction
+/// takes the value out of every file under the data directory (table, versions,
+/// MemWAL, log), while the rest of memory, its history and links survive, also
+/// across a restart.
 #[tokio::test]
-async fn forget_erases_from_disk_before_it_returns() {
+async fn forget_hides_at_once_and_compaction_erases() {
     let dir = tempfile::tempdir().unwrap();
     let secret = "SECRET-card-4111-1111-1111-1111";
     {
@@ -607,7 +608,11 @@ async fn forget_erases_from_disk_before_it_returns() {
         assert!(!files_with(dir.path(), secret).is_empty(), "written to disk first (else this proves nothing)");
         let r = engine.query(r#"FORGET FROM SEMANTIC WHERE key = "card""#, None).await.unwrap();
         assert_eq!(r["data"]["count"], 1, "{r}");
-        assert_eq!(files_with(dir.path(), secret), Vec::<String>::new(), "gone from every file when FORGET returns");
+        let r = engine.query("RECALL FROM SEMANTIC ALL", None).await.unwrap().to_string();
+        assert!(!r.contains("SECRET"), "no read returns it once FORGET returns: {r}");
+        assert_eq!(engine.query(r#"LOOKUP FROM SEMANTIC KEY id = "card""#, None).await.unwrap()["data"]["count"], 0);
+        engine.compact().await.unwrap();
+        assert_eq!(files_with(dir.path(), secret), Vec::<String>::new(), "gone from every file after the compaction");
         let r = engine.query(r#"RECALL FROM SEMANTIC WHERE key = "keep" WITH LINKS ALL"#, None).await.unwrap();
         assert_eq!(r["data"]["records"][0]["data"]["links"].as_array().map(|l| l.len()), Some(1), "{r}");
         // Writes go on after the compaction.
@@ -642,4 +647,48 @@ async fn compaction_erases_deleted_platform_rows() {
     let mut ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
     ids.sort();
     assert_eq!(ids, ["u2", "u3"]);
+}
+
+/// Platform writes commit in groups: concurrent upserts share records (and Lance
+/// commits), each writer's own order holds, a bad write fails alone, and a reopen
+/// (replay from the log) ends with the same rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_platform_writes_commit_in_groups() {
+    use adb_core::log::Effect;
+    let dir = tempfile::tempdir().unwrap();
+    let row = |k: &str, v: u32| serde_json::json!({"key": k, "value": v.to_string()}).as_object().unwrap().clone();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    engine.platform_write(Effect::TableCreate { table: "state".into(), columns: vec!["key".into(), "value".into()] }).await.unwrap();
+    let upsert = |k: String, v: u32| Effect::TableUpsert { table: "state".into(), key: vec!["key".into()], rows: vec![row(&k, v)] };
+    let writers = (0..32).map(|w| {
+        let engine = &engine;
+        async move {
+            let mut offsets = Vec::new();
+            for v in 1..=5 {
+                offsets.push(engine.platform_write(upsert(format!("k{w}"), v)).await.unwrap());
+            }
+            offsets
+        }
+    });
+    let bad = engine.platform_write(Effect::TableUpdate { table: "no_such_table".into(), filter: "true".into(), values: Default::default() });
+    let (offsets, bad) = tokio::join!(futures::future::join_all(writers), bad);
+    assert!(bad.is_err(), "a write to a missing table fails");
+    for o in &offsets {
+        assert!(o.windows(2).all(|w| w[0] < w[1]), "one writer's writes commit in order: {o:?}");
+    }
+    let all: Vec<u64> = offsets.iter().flatten().copied().collect();
+    let distinct: std::collections::BTreeSet<u64> = all.iter().copied().collect();
+    assert!(distinct.len() < all.len(), "writes shared records: {} records for {} writes", distinct.len(), all.len());
+    let read = |rows: Vec<serde_json::Value>| {
+        let mut out: Vec<(String, String)> = rows.iter().map(|r| (r["key"].as_str().unwrap().to_string(), r["value"].as_str().unwrap().to_string())).collect();
+        out.sort();
+        out
+    };
+    let want: Vec<(String, String)> = { let mut w: Vec<_> = (0..32).map(|w| (format!("k{w}"), "5".to_string())).collect(); w.sort(); w };
+    let rows = adb_platform::batches_to_json(&engine.platform().unwrap().query("state", None, 1000).await.unwrap());
+    assert_eq!(read(rows), want);
+    drop(engine);
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let rows = adb_platform::batches_to_json(&engine.platform().unwrap().query("state", None, 1000).await.unwrap());
+    assert_eq!(read(rows), want, "the same after a reopen");
 }

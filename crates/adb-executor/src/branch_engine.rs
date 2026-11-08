@@ -335,6 +335,24 @@ impl BranchHost {
         Ok(unreachable)
     }
 
+    /// Compact every branch engine hosted here (with an admin's or a test's compaction
+    /// of the org's engine): a FORGET forwarded to them leaves their disk too. Branch
+    /// pods compact on their own timer.
+    pub async fn compact_hosted(&self) -> Result<usize, String> {
+        let mut n = 0;
+        for b in self.registry.list(None) {
+            if b.placement.is_some() || !self.hosted_exists(&b) {
+                continue;
+            }
+            let e = self.engine(&b.namespace, &b.name).await?;
+            if let Some(d) = e.durable_writes() {
+                d.compact().await.map_err(|e| format!("branch {}: {e}", b.id))?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Whether a hosted engine exists for `b` (it was opened and wrote its WAL).
     pub fn hosted_exists(&self, b: &Branch) -> bool {
         self.dir_of(b).exists()

@@ -90,6 +90,31 @@ struct Applied {
     /// Tables made append-only (DB-13, `TableAppendOnly`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     append_only: std::collections::BTreeSet<String>,
+    /// Each table's upsert key columns: compaction keeps a BTree index on them, so an
+    /// upsert's merge looks keys up instead of scanning the table (PF-5).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    upsert_keys: BTreeMap<String, Vec<String>>,
+}
+
+/// A BTree index on each of `keys` (named `<column>_idx`), created if missing, then
+/// brought up to date with the fragments written since (no rebuild).
+async fn index_keys(ds: &mut Dataset, keys: &[String]) -> PlatformResult<()> {
+    use lance::index::DatasetIndexExt;
+    let have: Vec<String> = ds.load_indices().await.map_err(lance)?.iter().map(|i| i.name.clone()).collect();
+    let mut created = false;
+    for col in keys {
+        let name = format!("{col}_idx");
+        if !have.contains(&name) {
+            ds.create_index(&[col.as_str()], lance_index::IndexType::BTree, Some(name), &lance_index::scalar::ScalarIndexParams::default(), true)
+                .await
+                .map_err(lance)?;
+            created = true;
+        }
+    }
+    if !created && !keys.is_empty() {
+        ds.optimize_indices(&Default::default()).await.map_err(lance)?;
+    }
+    Ok(())
 }
 
 /// What a platform compaction did (W5-L4).
@@ -517,6 +542,9 @@ impl PlatformStore {
                     .map_err(lance)?
             }
             Effect::TableUpsert { key, rows, .. } => {
+                if !key.is_empty() {
+                    applied.upsert_keys.insert(table.clone(), key.clone());
+                }
                 if rows.is_empty() {
                     return Ok(());
                 }
@@ -622,6 +650,13 @@ impl PlatformStore {
                 ..Default::default()
             };
             let compacted = lance::dataset::optimize::compact_files(&mut ds, options, None).await;
+            // Upsert keys indexed (built once, then extended to new fragments), under the
+            // same mark: these commits hold no effect either.
+            if let Some(keys) = applied.upsert_keys.get(&table).cloned() {
+                if let Err(e) = index_keys(&mut ds, &keys).await {
+                    tracing::warn!(%table, error = %e, "upsert key index not updated; upserts scan until the next compaction");
+                }
+            }
             // Whatever it committed, the latest version is now the applied one.
             ds.checkout_latest().await.map_err(lance)?;
             let version = ds.version().version;

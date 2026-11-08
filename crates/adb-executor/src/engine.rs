@@ -936,8 +936,14 @@ impl Engine for LocalEngine {
                 "bytes_removed": p.bytes_removed, "took_ms": p.took.as_millis() as u64,
             })
         });
-        match w.compact().await.map_err(|e| e.to_string())? {
+        let compacted = w.compact().await.map_err(|e| e.to_string())?;
+        let branches = match &self.branch_host {
+            Some(host) => host.compact_hosted().await?,
+            None => 0,
+        };
+        match compacted {
             Some(s) => Ok(json!({
+                "branches": branches,
                 "total": s.total, "kept": s.kept, "bytes_before": s.bytes_before, "bytes_after": s.bytes_after,
                 "took_ms": s.took.as_millis() as u64, "platform": platform,
             })),

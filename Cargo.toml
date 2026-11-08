@@ -120,3 +120,6 @@ lto = true
 inherits = "release"
 lto = false
 codegen-units = 16
+# Rebuilds recompile only what changed (minutes, not the release profile's ~40 with
+# fat LTO). Use for every benchmark / test iteration: `cargo build --profile perf`.
+incremental = true

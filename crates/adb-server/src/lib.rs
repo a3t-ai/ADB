@@ -82,6 +82,7 @@ fn routes(engine: Arc<dyn Engine>) -> Router {
         .route("/stats", get(stats))
         .route("/admin/embedding", get(embedding).put(set_embedding))
         .route("/admin/cache", get(cache).put(set_cache))
+        .route("/admin/compact", axum::routing::post(compact))
         .route("/mcp", post(mcp_post).get(mcp_get))
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
@@ -291,6 +292,13 @@ async fn cache(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
 /// applied at once (the cache is rebuilt from the table; no restart).
 async fn set_cache(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
     respond(s.engine.set_cache(body).await, StatusCode::BAD_REQUEST)
+}
+
+/// `POST /admin/compact` — compact now (memory table, platform tables, hosted
+/// branches): what FORGET left hidden leaves the disk. Normally the maintenance
+/// timer does this.
+async fn compact(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.compact().await, StatusCode::CONFLICT)
 }
 
 fn respond(r: Result<Value, String>, on_error: StatusCode) -> (StatusCode, Json<QueryResponse>) {

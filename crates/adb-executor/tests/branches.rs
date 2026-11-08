@@ -141,7 +141,8 @@ fn files_with(dir: &std::path::Path, needle: &[u8]) -> Vec<String> {
     files.into_iter().filter(|f| std::fs::read(f).map(|b| b.windows(needle.len()).any(|w| w == needle)).unwrap_or(false)).map(|f| f.display().to_string()).collect()
 }
 
-/// B4: FORGET on main reaches every branch (its view and its own copies, on disk too);
+/// B4: FORGET on main reaches every branch (its view and its own copies; on disk after
+/// the next compaction);
 /// dropping a branch deletes its engine, and a new branch of the same name starts clean.
 #[tokio::test]
 async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
@@ -162,6 +163,8 @@ async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
     assert_eq!(main(&e).await, ["a1"]);
     assert_eq!(on(&e, "try").await, ["a1"], "gone from the branch's view and its own copy");
     assert_eq!(on(&e, "deeper").await, ["a1"]);
+    // FORGET only hides (user, 7 Nov); compaction takes the bytes off main and the branches.
+    e.compact().await.unwrap();
     for needle in [&b"PII-on-main"[..], b"PII-copied-on-try", b"PII-copied-on-deeper"] {
         assert!(files_with(dir.path(), needle).is_empty(), "{} still on disk: {:?}", String::from_utf8_lossy(needle), files_with(dir.path(), needle));
     }

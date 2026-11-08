@@ -89,6 +89,18 @@ fn lance(e: impl std::fmt::Display) -> StoreError {
 }
 
 /// Quote a string for a Lance SQL filter.
+/// The table's indexes, kept up to date by the MemWAL as it flushes: `id_idx` (a row
+/// version by id) and `lineage_idx` (every version of a record: the current version an
+/// UPDATE follows, the versions a FORGET takes, the applier's FORGET; without it each
+/// of these scanned the table, PF-11, 7 Nov).
+async fn table_indexes(ds: &mut Dataset) -> StoreResult<()> {
+    for (col, name) in [("id", "id_idx"), ("lineage_id", "lineage_idx")] {
+        ds.create_index(&[col], IndexType::BTree, Some(name.into()), &ScalarIndexParams::default(), true).await.map_err(lance)?;
+    }
+    ds.initialize_mem_wal().unsharded().maintained_indexes(["id_idx", "lineage_idx"]).execute().await.map_err(lance)?;
+    Ok(())
+}
+
 pub fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -526,10 +538,7 @@ impl PartitionStore {
             Self::create(&uri, &self.schema, self.dim).await?;
             return Ok((total, kept));
         };
-        ds.create_index(&["id"], IndexType::BTree, Some("id_idx".into()), &ScalarIndexParams::default(), true)
-            .await
-            .map_err(lance)?;
-        ds.initialize_mem_wal().unsharded().maintained_indexes(["id_idx"]).execute().await.map_err(lance)?;
+        table_indexes(&mut ds).await?;
         Ok((total, kept))
     }
 
@@ -834,10 +843,7 @@ impl PartitionStore {
         let mut ds = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema.clone()), uri, Some(WriteParams::default()))
             .await
             .map_err(lance)?;
-        ds.create_index(&["id"], IndexType::BTree, Some("id_idx".into()), &ScalarIndexParams::default(), true)
-            .await
-            .map_err(lance)?;
-        ds.initialize_mem_wal().unsharded().maintained_indexes(["id_idx"]).execute().await.map_err(lance)?;
+        table_indexes(&mut ds).await?;
         Ok(())
     }
 
@@ -852,12 +858,16 @@ impl PartitionStore {
     }
 
     async fn scan_in(inner: &Inner, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
+        let t0 = std::time::Instant::now();
         let mut scanner = Self::scanner(inner).await?;
         if let Some(f) = filter {
             scanner = scanner.filter(f).map_err(lance)?;
         }
         let batch = scanner.try_into_batch().await.map_err(lance)?;
-        decode(&batch)
+        let rows = decode(&batch)?;
+        // One line per filtered LSM scan (`RUST_LOG=adb_store::scan=debug`).
+        tracing::debug!(target: "adb_store::scan", filter = filter.unwrap_or(""), rows = rows.len(), us = t0.elapsed().as_micros() as u64, "scan");
+        Ok(rows)
     }
 
     /// As [`PartitionStore::scan`] with a DataFusion expression, for filters the SQL
@@ -944,6 +954,11 @@ impl PartitionStore {
         }
         Ok(LsmScanner::new(inner.base.clone(), vec![snap], vec!["id".into()])
             .with_in_memory_memtables(inner.writer.shard_id(), inner.writer.in_memory_memtable_refs().await.map_err(lance)?)
+            // A filtered scan answers from the memtables' maintained indexes (id_idx,
+            // lineage_idx) instead of reading every in-memory row, which is Lance's
+            // default (PF-8/PF-11, 7 Nov). Same result: a match counts only as its
+            // key's newest visible version.
+            .with_memtable_filter_indexes(true)
             .with_sstable_cache(inner.cache.clone()))
     }
 

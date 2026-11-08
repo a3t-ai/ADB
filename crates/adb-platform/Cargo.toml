@@ -8,6 +8,7 @@ description = "ADB platform tables: FlowR / A3T registry tables on the log, one 
 [dependencies]
 adb-core.workspace = true
 lance.workspace = true
+lance-index.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true

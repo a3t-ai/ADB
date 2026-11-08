@@ -193,6 +193,7 @@ dependencies = [
  "chrono",
  "futures",
  "lance",
+ "lance-index",
  "serde",
  "serde_json",
  "tempfile",

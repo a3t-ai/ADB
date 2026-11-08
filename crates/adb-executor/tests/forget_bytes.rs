@@ -1,6 +1,7 @@
-//! M2 exit criterion (W9.9, spike S11): after FORGET nothing of the record is
-//! recoverable from disk — no file under the data directory (log, table, MemWAL,
-//! versions) contains its bytes, also after a restart.
+//! M2 exit criterion (W9.9, spike S11): after FORGET and the next compaction nothing
+//! of the record is recoverable from disk — no file under the data directory (log,
+//! table, MemWAL, versions) contains its bytes, also after a restart. FORGET itself
+//! only hides the record from every read (user, 7 Nov).
 
 use std::path::Path;
 
@@ -53,8 +54,9 @@ async fn a_forgotten_record_leaves_no_bytes_on_disk() {
 
         q(&engine, r#"FORGET FROM SEMANTIC WHERE key = "secret""#).await;
         q(&engine, r#"FORGET FROM WORKING WHERE key = "scratch""#).await;
+        engine.compact().await.unwrap();
         for m in [v1, v2, w] {
-            assert_eq!(holders(dir.path(), m), Vec::<String>::new(), "{m} after FORGET");
+            assert_eq!(holders(dir.path(), m), Vec::<String>::new(), "{m} after FORGET and compaction");
         }
     }
     // And after a restart (replay, rebuild): still nowhere.

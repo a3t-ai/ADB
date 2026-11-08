@@ -219,6 +219,34 @@ pub(crate) async fn forgotten_rows(
     Ok(rows)
 }
 
+/// The longest a FORGET's bytes wait on disk for a compaction when no other trigger runs one.
+const ERASE_WITHIN: Duration = Duration::from_secs(3600);
+
+/// The most platform writes one group commits (one record, one Raft entry).
+const PLATFORM_GROUP_MAX: usize = 256;
+
+struct PlatformPending {
+    effects: Vec<Effect>,
+    tx: tokio::sync::oneshot::Sender<AdbResult<u64>>,
+}
+
+/// Adjacent upserts to the same table on the same key, as one: `merge_insert` keeps the
+/// last row per key, which is what applying them one after another leaves. Everything
+/// else stays as it is and where it is.
+fn merge_upserts(effects: Vec<Effect>) -> Vec<Effect> {
+    let mut out: Vec<Effect> = Vec::with_capacity(effects.len());
+    for e in effects {
+        if let (Some(Effect::TableUpsert { table: t0, key: k0, rows: r0 }), Effect::TableUpsert { table, key, rows }) = (out.last_mut(), &e) {
+            if t0 == table && k0 == key {
+                r0.extend(rows.iter().cloned());
+                continue;
+            }
+        }
+        out.push(e);
+    }
+    out
+}
+
 pub(crate) fn redact_record(r: &mut LogRecord, rows: &std::collections::HashSet<(Memory, String)>) -> bool {
     let hit = |m: Memory, k: &str| rows.contains(&(m, k.to_string()));
     let before = r.effects.len();
@@ -357,12 +385,16 @@ pub struct DurableWrites<L: Log> {
     embedder: Option<Arc<adb_embed::Embedder>>,
     /// W5: FORGETs waiting for physical erasure, and those a compaction has covered;
     /// concurrent FORGETs share one compaction.
-    erase_requested: std::sync::atomic::AtomicU64,
-    erase_done: std::sync::atomic::AtomicU64,
+    /// When the oldest FORGET not yet erased from disk committed: compaction is due
+    /// once it waited [`ERASE_WITHIN`] (FORGET itself only commits a tombstone).
+    forgotten_since: std::sync::Mutex<Option<std::time::Instant>>,
     compactor: Mutex<()>,
     /// Offset of the last record with platform-table effects (stage G). The log
     /// must keep it until the platform tables have applied it.
     platform_last: std::sync::atomic::AtomicU64,
+    /// Platform writes waiting for the sequencer: the next holder commits them as one
+    /// group (one record, one Lance commit per table), see [`Self::platform_many`].
+    platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
     /// DB-7: the last committed record (offset, commit time µs), for answers' memory point.
     last_off: std::sync::atomic::AtomicU64,
     last_ts: std::sync::atomic::AtomicI64,
@@ -412,6 +444,54 @@ pub const HISTORY: Duration = Duration::from_secs(90 * 86_400);
 pub type LiveKeys = std::collections::HashMap<(Memory, String), Option<CommitTs>>;
 
 impl<L: Log + 'static> DurableWrites<L> {
+    /// Commit `batch` under the sequencer (see [`Self::platform_many`]).
+    async fn platform_group(&self, seq: &mut Sequencer<L>, batch: Vec<PlatformPending>, waited: Duration) {
+        let Some(platform) = self.platform.as_ref() else { return };
+        let all: Vec<Effect> = batch.iter().flat_map(|p| p.effects.iter().cloned()).collect();
+        let together = batch.len() == 1 || platform.validate_all(&all).await.is_ok();
+        if !together {
+            for p in batch {
+                let r = self.platform_commit(seq, p.effects, 1, waited).await.map_err(|e| e.to_string());
+                let _ = p.tx.send(r.map_err(AdbError::QueryError));
+            }
+            return;
+        }
+        let n = batch.len();
+        let r = self.platform_commit(seq, merge_upserts(all), n, waited).await.map_err(|e| e.to_string());
+        for p in batch {
+            let _ = p.tx.send(r.clone().map_err(AdbError::QueryError));
+        }
+    }
+
+    async fn platform_commit(&self, seq: &mut Sequencer<L>, effects: Vec<Effect>, writes: usize, waited: Duration) -> AdbResult<u64> {
+        let platform = self.platform.as_ref().ok_or_else(|| AdbError::UnsupportedOperation("this engine has no platform tables".into()))?;
+        let perr = |e: adb_platform::PlatformError| AdbError::QueryError(e.to_string());
+        let t0 = std::time::Instant::now();
+        // A logged effect must apply: check the tables, names and columns first.
+        platform.validate_all(&effects).await.map_err(perr)?;
+        let validated = t0.elapsed();
+        let ts = seq.begin();
+        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+        let logged = t0.elapsed();
+        self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
+        platform.apply(&record).await.map_err(perr)?;
+        let applied = t0.elapsed();
+        self.to_store(&record, seq.log()).await;
+        // Where a platform write's time goes (`RUST_LOG=adb::write=debug`).
+        tracing::debug!(
+            target: "adb::write",
+            offset = record.offset.0,
+            writes,
+            lock_us = waited.as_micros() as u64,
+            validate_us = validated.as_micros() as u64,
+            log_us = (logged - validated).as_micros() as u64,
+            apply_us = (applied - logged).as_micros() as u64,
+            store_us = (t0.elapsed() - applied).as_micros() as u64,
+            "platform write"
+        );
+        Ok(record.offset.0)
+    }
+
     /// Unsubscribe every subscription idle for longer than `ADB_SUB_IDLE` (W9,
     /// E-L3): an abandoned subscriber stops pinning the log. Returns the ids.
     pub async fn drop_idle_subscriptions(&self) -> AdbResult<Vec<String>> {
@@ -476,6 +556,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         // Every row id (all versions) of the lineages forgotten since the last
         // compaction: their effects are redacted from the log below.
         let forgotten: std::collections::HashSet<(Memory, String)> = std::mem::take(&mut *self.forgotten.lock().unwrap());
+        *self.forgotten_since.lock().unwrap() = None;
         let rows = forgotten_rows(store, forgotten).await.map_err(store_err)?;
         let pins = self.pins.get().map(|f| f()).unwrap_or_default();
         // DB-8: a namespace's own history window, where a quota row sets one.
@@ -501,22 +582,6 @@ impl<L: Log + 'static> DurableWrites<L> {
         );
         self.usage_stale().await;
         Ok(Some(stats))
-    }
-
-    /// After a FORGET: make sure a compaction that started after it has finished
-    /// (immediate physical erasure, W5, user 27 Oct). FORGETs arriving while one
-    /// runs wait for the next, which covers them all.
-    async fn erase(&self) -> AdbResult<()> {
-        use std::sync::atomic::Ordering::SeqCst;
-        let mine = self.erase_requested.fetch_add(1, SeqCst) + 1;
-        let _one_at_a_time = self.compactor.lock().await;
-        if self.erase_done.load(SeqCst) >= mine {
-            return Ok(());
-        }
-        let covering = self.erase_requested.load(SeqCst);
-        self.compact_now().await?;
-        self.erase_done.store(covering, SeqCst);
-        Ok(())
     }
 
     /// Compaction from the maintenance timer (thresholds, nightly) or an admin.
@@ -1165,10 +1230,9 @@ impl<L: Log + 'static> DurableWrites<L> {
         let effects: Vec<Effect> = held.iter().map(|k| Effect::Forget { memory: m, lineage_id: RecordId(k.clone()) }).collect();
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
-        self.forgotten.lock().unwrap().extend(held.iter().map(|k| (m, k.clone())));
+        self.note_forgotten(held.iter().map(|k| (m, k.clone())));
         self.to_store(&record, seq.log()).await;
         drop(seq);
-        self.erase().await?;
         Ok(held.len() as u64)
     }
 
@@ -1250,10 +1314,17 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Whether compaction is due on size: more than 16 MemWAL generations (W5), or
     /// many writes since the last one (W7).
     pub async fn compaction_due(&self) -> bool {
+        let erase = self.forgotten_since.lock().unwrap().is_some_and(|t| t.elapsed() >= ERASE_WITHIN);
         match &self.store {
-            Some(s) => s.writes_due(COMPACT_AFTER_WRITES) || s.generation_count().await.is_ok_and(|n| n > 16),
+            Some(s) => erase || s.writes_due(COMPACT_AFTER_WRITES) || s.generation_count().await.is_ok_and(|n| n > 16),
             None => false,
         }
+    }
+
+    /// Lineages a FORGET (or MERGE) just hid: their bytes go at a later compaction.
+    fn note_forgotten(&self, gone: impl IntoIterator<Item = (Memory, String)>) {
+        self.forgotten.lock().unwrap().extend(gone);
+        self.forgotten_since.lock().unwrap().get_or_insert_with(std::time::Instant::now);
     }
 
     pub fn set_embedder(&mut self, embedder: Option<Arc<adb_embed::Embedder>>) {
@@ -1407,7 +1478,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
             .collect();
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, erase_requested: Default::default(), erase_done: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -1436,12 +1507,21 @@ impl<L: Log + 'static> DurableWrites<L> {
         check_scope(memory, in_scope)?;
         let Some(store) = &self.store else { return Err(needs_table("UPDATE / FORGET")) };
         // Every earlier record is in Lance first.
+        let t0 = std::time::Instant::now();
         if let Some(b) = self.barrier() {
             b.wait_for_committed().await;
         }
+        let waited = t0.elapsed();
         let mut ids = crate::query::targets(store, memory, predicate, in_scope, namespace, ts).await?;
+        let found = t0.elapsed();
         if forget && supersedes(memory) {
-            let mut old = store.versions(memory.into(), None).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            // Every version FORGET takes: when the predicate names a key, only the
+            // lineages just found (PF-11), else all versions, filtered here.
+            let lineages = (crate::query::keyed(memory, predicate).is_some() && !ids.is_empty()).then(|| {
+                let list: Vec<String> = ids.iter().map(|id| adb_store::sql_str(&adb_store::row_id(memory.into(), id))).collect();
+                format!("lineage_id IN ({})", list.join(", "))
+            });
+            let mut old = store.versions(memory.into(), lineages.as_deref()).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
             if let Some(s) = in_scope {
                 old.retain(|r| r.data.scope == s);
             }
@@ -1456,6 +1536,14 @@ impl<L: Log + 'static> DurableWrites<L> {
             let mut seen = std::collections::HashSet::new();
             ids.retain(|id| seen.insert(id.clone()));
         }
+        // Where an UPDATE's / FORGET's time under the lock goes (`RUST_LOG=adb::write=debug`).
+        tracing::debug!(
+            target: "adb::write", ?memory, forget, targets = ids.len(),
+            apply_wait_us = waited.as_micros() as u64,
+            find_us = (found - waited).as_micros() as u64,
+            versions_us = (t0.elapsed() - found).as_micros() as u64,
+            "targets"
+        );
         Ok(ids)
     }
 
@@ -2052,7 +2140,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             true => self.vector_of(data.get("content").and_then(|c| c.as_str()).map(String::from)).await,
             false => None,
         };
+        let t0 = std::time::Instant::now();
         let mut seq = self.seq.lock().await;
+        tracing::debug!(target: "adb::write", ?memory_type, lock_us = t0.elapsed().as_micros() as u64, "update locked");
         let ts = seq.begin();
         if self.parent.is_some() {
             let mut fields = match &data {
@@ -2104,8 +2194,10 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                 }
                 effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new });
             }
+            let resolved = t0.elapsed();
             let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
             self.to_store(&record, seq.log()).await;
+            tracing::debug!(target: "adb::write", ?memory_type, held_us = resolved.as_micros() as u64, log_us = (t0.elapsed() - resolved).as_micros() as u64, "update committed");
             return Ok(effects.len() as u64);
         }
         let mut effects: Vec<Effect> = ids
@@ -2143,16 +2235,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.usage_stale().await;
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
-        self.forgotten.lock().unwrap().extend(ids.iter().map(|id| (Memory::from(memory_type), id.clone())));
+        self.note_forgotten(ids.iter().map(|id| (Memory::from(memory_type), id.clone())));
         let removed = ids.len() as u64;
         self.to_store(&record, seq.log()).await;
         drop(seq);
-        // Physically gone before FORGET returns (W5): table, versions, log.
-        if self.store.is_some() {
-            self.erase().await.map_err(|e| {
-                AdbError::Internal(format!("forgotten (hidden from every read), but not yet erased from disk: {e}; the next compaction erases it"))
-            })?;
-        }
+        // Hidden from every read from the commit on; the bytes leave disk at the next
+        // compaction (user, 7 Nov: no read may miss a FORGET; disk removal can wait).
         // And from every branch's own engine (B4): forgotten means gone everywhere.
         if let Some(host) = self.branch_host.get() {
             let unreachable = host.forget(memory_type, &ids).await.map_err(|e| {
@@ -2312,11 +2400,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             Effect::Forget { memory, lineage_id } => Some((*memory, lineage_id.0.clone())),
             _ => None,
         });
-        self.forgotten.lock().unwrap().extend(gone);
+        self.note_forgotten(gone);
         self.to_store(&record, seq.log()).await;
         drop(seq);
-        // The duplicate's old rows are gone from disk before MERGE returns (W5).
-        self.erase().await.map_err(|e| AdbError::Internal(format!("merged, but the old rows are not yet erased from disk: {e}; the next compaction erases them")))?;
         Ok(n)
     }
 
@@ -2498,22 +2584,46 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.platform_many(vec![effect]).await
     }
 
+    /// Platform writes commit in groups: each joins a queue, and whoever holds the
+    /// sequencer takes everything queued and commits it as one record, upserts to the
+    /// same table merged into one effect, so one Lance commit (most of a write's time)
+    /// serves the whole group. Each is still answered only once it is committed and
+    /// applied; a group whose combined check fails is committed one write at a time,
+    /// so only the bad write gets the error.
     async fn platform_many(&self, effects: Vec<Effect>) -> AdbResult<u64> {
-        let platform = self.platform.as_ref().ok_or_else(|| AdbError::UnsupportedOperation("this engine has no platform tables".into()))?;
-        let perr = |e: adb_platform::PlatformError| AdbError::QueryError(e.to_string());
+        if self.platform.is_none() {
+            return Err(AdbError::UnsupportedOperation("this engine has no platform tables".into()));
+        }
         if effects.is_empty() {
             return Err(AdbError::QueryError("a transaction needs at least one operation".into()));
         }
-        let mut seq = self.seq.lock().await;
-        // A logged effect must apply: check the tables, names and columns first.
-        platform.validate_all(&effects).await.map_err(perr)?;
-        let ts = seq.begin();
-        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
-        platform.apply(&record).await.map_err(perr)?;
-        self.to_store(&record, seq.log()).await;
-        Ok(record.offset.0)
+        let t0 = std::time::Instant::now();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        self.platform_queue.lock().unwrap().push(PlatformPending { effects, tx });
+        loop {
+            tokio::select! {
+                // Committed by another write's holder.
+                r = &mut rx => return r.unwrap_or_else(|_| Err(AdbError::Internal("platform write dropped".into()))),
+                seq = self.seq.lock() => {
+                    let mut seq = seq;
+                    let batch: Vec<PlatformPending> = {
+                        let mut q = self.platform_queue.lock().unwrap();
+                        let n = q.len().min(PLATFORM_GROUP_MAX);
+                        q.drain(..n).collect()
+                    };
+                    if !batch.is_empty() {
+                        self.platform_group(&mut seq, batch, t0.elapsed()).await;
+                    }
+                    drop(seq);
+                    // Ours was in this group or an earlier one: its answer is in.
+                    if let Ok(r) = rx.try_recv() {
+                        return r;
+                    }
+                }
+            }
+        }
     }
+
 }
 
 fn unknown_sub(id: &str) -> AdbError {

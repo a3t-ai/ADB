@@ -59,6 +59,14 @@ impl ApplyBarrier {
 /// Most queued records the applier puts into the table at once.
 const APPLY_BATCH: usize = 256;
 
+/// How long the applier waits to gather records into one memtable batch
+/// (`ADB_APPLY_GATHER_MS`, default 0 = put whatever is queued at once). Measured 7 Nov:
+/// while UPDATE / FORGET wait for the applier under the sequencer, 10 ms made them
+/// slower and did not speed up merged reads; revisit after PF-1.
+fn gather_window() -> std::time::Duration {
+    std::time::Duration::from_millis(std::env::var("ADB_APPLY_GATHER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 /// Queue of committed records for the background applier.
 #[derive(Debug, Clone)]
 pub struct Applier {
@@ -74,7 +82,21 @@ impl Applier {
         tokio::spawn(async move {
             // Whatever is queued goes in as one put (W7: fewer, larger batches).
             let mut batch = Vec::with_capacity(APPLY_BATCH);
+            let gather = gather_window();
             while rx.recv_many(&mut batch, APPLY_BATCH).await > 0 {
+                // Records arriving one at a time would each be a memtable batch, and a
+                // read walks every batch: wait briefly for more (PF-9). Nothing is at
+                // risk meanwhile: the log keeps every record until Lance has flushed it.
+                if !gather.is_zero() && batch.len() < APPLY_BATCH {
+                    let until = tokio::time::Instant::now() + gather;
+                    while batch.len() < APPLY_BATCH {
+                        let room = APPLY_BATCH - batch.len();
+                        match tokio::time::timeout_at(until, rx.recv_many(&mut batch, room)).await {
+                            Ok(n) if n > 0 => {}
+                            _ => break,
+                        }
+                    }
+                }
                 let last = batch.last().map_or(0, |r| r.offset.0);
                 if let Err(e) = store.apply_many(&batch).await {
                     tracing::warn!(first = batch[0].offset.0, last, error = %e, "Lance apply failed; the log has it, catch-up on next open");
