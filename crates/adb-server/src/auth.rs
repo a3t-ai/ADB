@@ -69,7 +69,8 @@ pub fn authorized(value: Option<&str>, token: &str) -> bool {
 
 /// HTTP middleware: `/health` stays open (probes); everything else needs the token.
 pub async fn require_token(token: Option<Arc<str>>, scopes: Arc<Vec<Arc<crate::scope::Scope>>>, mut req: Request, next: Next) -> Response {
-    if req.uri().path() == "/health" {
+    // `/metrics` too when ADB_METRICS_OPEN is set (a scraper inside the cluster, OB-1).
+    if req.uri().path() == "/health" || (req.uri().path() == "/metrics" && metrics_open()) {
         return next.run(req).await;
     }
     let value = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
@@ -78,12 +79,15 @@ pub async fn require_token(token: Option<Arc<str>>, scopes: Arc<Vec<Arc<crate::s
     } else if let Some(scope) = scopes.iter().find(|s| authorized(value, &s.token)) {
         // DB-3: only `/query`, which checks each statement; nothing else stays in a namespace.
         if req.uri().path() != "/query" {
+            adb_core::metrics::get().auth_failures.with_label_values(&["http", "scope"]).inc();
             let error = format!("{} is not open to the {} token", req.uri().path(), scope.name);
             return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({ "success": false, "code": "forbidden", "error": error }))).into_response();
         }
         req.extensions_mut().insert(Arc::clone(scope));
         next.run(req).await
     } else {
+        let reason = if value.is_some() { "bad_token" } else { "no_token" };
+        adb_core::metrics::get().auth_failures.with_label_values(&["http", reason]).inc();
         (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "success": false, "code": "unauthorized", "error": "unauthorized: ADB needs Authorization: Bearer <token>" })))
             .into_response()
     }
@@ -119,6 +123,8 @@ impl tonic::service::Interceptor for FlightAuth {
                 req.extensions_mut().insert(Arc::clone(scope));
                 Access::Scoped
             } else {
+                let reason = if value.is_some() { "bad_token" } else { "no_token" };
+                adb_core::metrics::get().auth_failures.with_label_values(&["flight", reason]).inc();
                 return Err(tonic::Status::unauthenticated("ADB needs authorization: Bearer <token>"));
             }
         };
@@ -181,4 +187,10 @@ mod tests {
         assert!(!authorized(Some("s3cret"), "s3cret"));
         assert!(!authorized(None, "s3cret"));
     }
+}
+
+/// `ADB_METRICS_OPEN=1`: `/metrics` needs no token (no secrets in it; for a scraper).
+fn metrics_open() -> bool {
+    static OPEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OPEN.get_or_init(|| std::env::var("ADB_METRICS_OPEN").is_ok_and(|v| v == "1" || v == "true"))
 }

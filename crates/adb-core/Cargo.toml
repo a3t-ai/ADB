@@ -16,5 +16,7 @@ half.workspace = true
 ulid.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 libc = "0.2"
+# OB-1: process metrics (`metrics.rs`); no protobuf (text format only).
+prometheus = { version = "=0.13.4", default-features = false }
 
 [dev-dependencies]

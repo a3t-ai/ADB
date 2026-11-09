@@ -877,53 +877,15 @@ impl Engine for LocalEngine {
     }
 
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
-        // B2: a statement on a branch runs on the branch's own engine.
-        match crate::branch_engine::statement_branch(aql)? {
-            Some((b, ns)) => match (&self.branch_host, &self.parent) {
-                (Some(host), _) => {
-                    let ns = ns.ok_or_else(|| format!("BRANCH \"{b}\" needs NAMESPACE: a branch belongs to one memory space"))?;
-                    // B6: a branch in its own pod runs the statement there.
-                    if let Some(url) = host.placement(&ns, &b) {
-                        let vars = variables.map(|v| serde_json::to_value(v).unwrap_or_default());
-                        return host.query_remote(&url, aql, vars).await;
-                    }
-                    return host.engine(&ns, &b).await?.query(aql, variables).await;
-                }
-                (None, Some(p)) => {
-                    if b != p.branch || ns.as_deref().is_some_and(|n| n != p.namespace) {
-                        return Err(format!("this is branch {:?} of {:?}, not {b:?}", p.branch, p.namespace));
-                    }
-                }
-                (None, None) => return Err("memory branches need a durable engine".into()),
-            },
-            None => {}
+        // OB-3: every AQL statement (HTTP, Flight, MCP) is timed here, once: a branch
+        // engine's statements came through its parent, which times them.
+        if self.parent.is_some() {
+            return self.query_unobserved(aql, variables).await;
         }
-        if let Some(stmt) = watch_statement(aql) {
-            return self.watch(stmt, variables).await;
-        }
-        let started = std::time::Instant::now();
-        let before = match &self.durable {
-            Some(d) => Some(d.point().await),
-            None => None,
-        };
-        let result = match variables {
-            Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
-            _ => self.executor.execute(aql).await,
-        };
-        let executed = started.elapsed();
-        let mut wire = result.map(|r| to_wire(&r)).map_err(|e| e.to_string());
-        // DB-7: the memory point: a write's own record, else the last commit before
-        // the statement ran (the answer includes at least that).
-        if let (Ok(w), Some(d), Some(before)) = (&mut wire, &self.durable, before) {
-            let after = d.point().await;
-            let (off, ts) = if after.0 > before.0 && is_write(aql) { after } else { before };
-            if let Some(m) = w.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                let at = ts.to_datetime().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-                m.insert("point".into(), json!({ "offset": off, "ts": ts.0, "at": at }));
-            }
-        }
-        tracing::debug!(?executed, total = ?started.elapsed(), "query");
-        wire
+        let t0 = std::time::Instant::now();
+        let r = self.query_unobserved(aql, variables).await;
+        observe_query(aql, t0.elapsed(), &r);
+        r
     }
 
     fn gateway(&self) -> Option<Arc<Gateway>> {
@@ -1693,5 +1655,80 @@ mod tests {
         assert!(engine.query("THIS IS NOT AQL", None).await.is_err());
         assert!(engine.query(r#"UNWATCH "no-such-watch""#, None).await.is_ok(), "unknown watch: unwatched = false");
         assert!(engine.query("RECALL FROM SEMANTIC LIKE $q", None).await.is_err(), "LIKE without a value");
+    }
+}
+
+impl LocalEngine {
+    async fn query_unobserved(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
+        // B2: a statement on a branch runs on the branch's own engine.
+        match crate::branch_engine::statement_branch(aql)? {
+            Some((b, ns)) => match (&self.branch_host, &self.parent) {
+                (Some(host), _) => {
+                    let ns = ns.ok_or_else(|| format!("BRANCH \"{b}\" needs NAMESPACE: a branch belongs to one memory space"))?;
+                    // B6: a branch in its own pod runs the statement there.
+                    if let Some(url) = host.placement(&ns, &b) {
+                        let vars = variables.map(|v| serde_json::to_value(v).unwrap_or_default());
+                        return host.query_remote(&url, aql, vars).await;
+                    }
+                    return host.engine(&ns, &b).await?.query(aql, variables).await;
+                }
+                (None, Some(p)) => {
+                    if b != p.branch || ns.as_deref().is_some_and(|n| n != p.namespace) {
+                        return Err(format!("this is branch {:?} of {:?}, not {b:?}", p.branch, p.namespace));
+                    }
+                }
+                (None, None) => return Err("memory branches need a durable engine".into()),
+            },
+            None => {}
+        }
+        if let Some(stmt) = watch_statement(aql) {
+            return self.watch(stmt, variables).await;
+        }
+        let started = std::time::Instant::now();
+        let before = match &self.durable {
+            Some(d) => Some(d.point().await),
+            None => None,
+        };
+        let result = match variables {
+            Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
+            _ => self.executor.execute(aql).await,
+        };
+        let executed = started.elapsed();
+        let mut wire = result.map(|r| to_wire(&r)).map_err(|e| e.to_string());
+        // DB-7: the memory point: a write's own record, else the last commit before
+        // the statement ran (the answer includes at least that).
+        if let (Ok(w), Some(d), Some(before)) = (&mut wire, &self.durable, before) {
+            let after = d.point().await;
+            let (off, ts) = if after.0 > before.0 && is_write(aql) { after } else { before };
+            if let Some(m) = w.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                let at = ts.to_datetime().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+                m.insert("point".into(), json!({ "offset": off, "ts": ts.0, "at": at }));
+            }
+        }
+        tracing::debug!(?executed, total = ?started.elapsed(), "query");
+        wire
+    }
+}
+
+/// OB-3: one AQL statement's metrics; a `debug` line (`adb::query`) for each, an `info`
+/// line for one slower than `ADB_SLOW_QUERY_MS`. Only the statement's fingerprint is
+/// logged, never its literals.
+fn observe_query(aql: &str, took: std::time::Duration, r: &Result<Value, String>) {
+    use adb_core::metrics;
+    let (statement, memory) = metrics::statement_of(aql);
+    let m = metrics::get();
+    let ok = r.is_ok();
+    m.queries.with_label_values(&[statement, memory, if ok { "ok" } else { "error" }]).inc();
+    m.query_seconds.with_label_values(&[statement, memory]).observe(took.as_secs_f64());
+    let rows = r.as_ref().ok().and_then(|v| v.pointer("/data/count").or_else(|| v.get("count"))).and_then(|c| c.as_u64());
+    if let Some(n) = rows {
+        m.query_rows.with_label_values(&[statement]).observe(n as f64);
+    }
+    let ms = took.as_secs_f64() * 1000.0;
+    if took >= metrics::slow_query() {
+        m.slow_queries.with_label_values(&[statement]).inc();
+        tracing::info!(target: "adb::query", statement, memory, ms, rows, ok, query = %metrics::fingerprint(aql), "slow query");
+    } else {
+        tracing::debug!(target: "adb::query", statement, memory, ms, rows, ok, query = %metrics::fingerprint(aql), "query");
     }
 }

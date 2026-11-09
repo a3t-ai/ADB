@@ -72,12 +72,36 @@ pub fn router_with_token(engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> Ro
     if token.is_some() || !scopes.is_empty() {
         r = r.layer(axum::middleware::from_fn(move |req, next| auth::require_token(token.clone(), Arc::clone(&scopes), req, next)));
     }
+    // Outside auth: refused requests are counted too (OB-2).
+    r = r.layer(axum::middleware::from_fn(http_metrics));
     r.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+}
+
+/// OB-2: every HTTP request by its route (the template, `/subscriptions/:id/events`,
+/// never the raw path), with status and duration.
+async fn http_metrics(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let op = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str().to_string()).unwrap_or_else(|| "other".into());
+    let f = adb_core::metrics::InFlight::start("http", op);
+    let r = next.run(req).await;
+    f.done(!(r.status().is_client_error() || r.status().is_server_error()));
+    r
+}
+
+/// OB-1: every metric, Prometheus text format.
+async fn metrics_text() -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], adb_core::metrics::render())
+}
+
+/// OB-1: every metric as JSON, histograms with p50 / p90 / p99 (for the A3T UI).
+async fn metrics_json() -> axum::Json<serde_json::Value> {
+    axum::Json(adb_core::metrics::snapshot())
 }
 
 fn routes(engine: Arc<dyn Engine>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_text))
+        .route("/admin/stats/metrics", get(metrics_json))
         .route("/query", post(query))
         .route("/stats", get(stats))
         .route("/admin/embedding", get(embedding).put(set_embedding))

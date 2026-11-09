@@ -72,9 +72,25 @@ pub async fn serve_flight_with_tokens(addr: SocketAddr, engine: Arc<dyn Engine>,
         tracing::info!(pools = ?pools.iter().map(|(p, _)| p.to_string()).collect::<Vec<_>>(), "engine pool tokens");
     }
     let svc = tonic::service::interceptor::InterceptedService::new(svc, crate::auth::FlightAuth { memory: token, engine: engine_token, pools, scopes: crate::scope::scopes_from_env() });
+    // Each connection counted while open (OB-2); TCP_NODELAY as tonic sets it itself.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let incoming = futures::stream::unfold(listener, |l| async move {
+        loop {
+            match l.accept().await {
+                Ok((io, _)) => {
+                    let _ = io.set_nodelay(true);
+                    return Some((Ok::<_, std::io::Error>(Counted { io, _open: adb_core::metrics::Connection::open("flight") }), l));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Flight accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    });
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
@@ -785,92 +801,24 @@ impl FlightService for AdbFlight {
     type DoExchangeStream = BoxStream<FlightData>;
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
-        not_engine_only(&req)?;
-        let scope = req.extensions().get::<Arc<crate::scope::Scope>>().cloned();
-        let q = body(&req.into_inner().ticket)?;
-        // DB-3: a scoped token follows its own namespace's fact feed, and reads no table.
-        if let Some(scope) = &scope {
-            let feed = q.get("feed").and_then(|f| f.as_str()) == Some("facts");
-            let ns = q.get("namespace").and_then(|n| n.as_str()).unwrap_or_default();
-            if !feed || !scope.may(ns, false) {
-                return Err(Status::permission_denied(format!("this read is not open to the {} token", scope.name)));
-            }
-        }
-        match q.get("feed").and_then(|f| f.as_str()) {
-            Some("facts") => return Ok(Response::new(self.fact_feed(&q).await?)),
-            Some(other) => return Err(Status::invalid_argument(format!("unknown feed {other} (the feed is \"facts\")"))),
-            None => {}
-        }
-        if let Some(sql) = q.get("sql").and_then(|s| s.as_str()) {
-            let limit = q.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
-            let r = self.engine.sql(sql, limit).await.map_err(Status::invalid_argument)?;
-            tracing::info!(rows = r.batches.iter().map(|b| b.num_rows()).sum::<usize>(), "SQL console query");
-            let stream = FlightDataEncoderBuilder::new()
-                .with_schema(r.schema)
-                .build(futures::stream::iter(r.batches.into_iter().map(Ok)))
-                .map_err(|e| Status::internal(e.to_string()));
-            return Ok(Response::new(Box::pin(stream)));
-        }
-        let table = str_field(&q, "table")?;
-        let filter = q.get("filter").and_then(|f| f.as_str());
-        let limit = q.get("limit").and_then(|l| l.as_u64()).unwrap_or(100) as usize;
-        let p = self.platform()?;
-        let schema = p.schema(table).await.map_err(platform_err)?;
-        let batches = p.query(table, filter, limit).await.map_err(platform_err)?;
-        // The schema goes first even with no rows, so the client always gets one.
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .map_err(|e| Status::internal(e.to_string()));
-        Ok(Response::new(Box::pin(stream)))
+        let f = adb_core::metrics::InFlight::start("flight", "get");
+        let r = self.do_get_inner(req).await;
+        f.done(r.is_ok());
+        r
     }
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
-        not_engine_only(&req)?;
-        not_scoped(&req)?;
-        let mut stream = req.into_inner().peekable();
-        // The table comes in the first message's descriptor; `[table, "replace"]`
-        // replaces the table with these rows instead of appending them;
-        // `[table, "upsert", key…]` replaces the rows with the same key columns.
-        let (table, replace, upsert_key) = {
-            let first = Pin::new(&mut stream).peek().await.ok_or_else(|| Status::invalid_argument("empty do_put"))?;
-            let first = first.as_ref().map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let path = first.flight_descriptor.as_ref().map(|d| d.path.clone()).unwrap_or_default();
-            let table = path.first().cloned().ok_or_else(|| Status::invalid_argument("do_put needs a descriptor path [table]"))?;
-            let mode = path.get(1).map(String::as_str);
-            let key: Vec<String> = if mode == Some("upsert") { path[2..].to_vec() } else { Vec::new() };
-            if mode == Some("upsert") && key.is_empty() {
-                return Err(Status::invalid_argument("an upsert needs key columns: [table, \"upsert\", key…]"));
-            }
-            (table, mode == Some("replace"), key)
-        };
-        let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
-            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
-        )
-        .try_collect()
-        .await
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let rows = batches_to_rows(&batches);
-        let n = rows.len();
-        let offset = if replace {
-            let columns: Vec<String> = batches
-                .first()
-                .map(|b| b.schema().fields().iter().map(|f| f.name().clone()).collect())
-                .unwrap_or_default();
-            self.write(Effect::TableReplace { table, columns, rows }).await?
-        } else if n == 0 {
-            0
-        } else if !upsert_key.is_empty() {
-            self.write(Effect::TableUpsert { table, key: upsert_key, rows }).await?
-        } else {
-            self.write(Effect::TableInsert { table, rows }).await?
-        };
-        let r = PutResult { app_metadata: json!({ "inserted": n, "offset": offset }).to_string().into() };
-        Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
+        let f = adb_core::metrics::InFlight::start("flight", "put");
+        let r = self.do_put_inner(req).await;
+        f.done(r.is_ok());
+        r
     }
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        self.do_action_inner(req).await.map_err(with_code)
+        let f = adb_core::metrics::InFlight::start("flight", action_op(&req.get_ref().r#type));
+        let r = self.do_action_inner(req).await.map_err(with_code);
+        f.done(r.is_ok());
+        r
     }
 
 
@@ -931,5 +879,146 @@ impl FlightService for AdbFlight {
     }
     async fn do_exchange(&self, _: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("not supported"))
+    }
+}
+
+impl AdbFlight {
+    async fn do_get_inner(&self, req: Request<Ticket>) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        not_engine_only(&req)?;
+        let scope = req.extensions().get::<Arc<crate::scope::Scope>>().cloned();
+        let q = body(&req.into_inner().ticket)?;
+        // DB-3: a scoped token follows its own namespace's fact feed, and reads no table.
+        if let Some(scope) = &scope {
+            let feed = q.get("feed").and_then(|f| f.as_str()) == Some("facts");
+            let ns = q.get("namespace").and_then(|n| n.as_str()).unwrap_or_default();
+            if !feed || !scope.may(ns, false) {
+                return Err(Status::permission_denied(format!("this read is not open to the {} token", scope.name)));
+            }
+        }
+        match q.get("feed").and_then(|f| f.as_str()) {
+            Some("facts") => return Ok(Response::new(self.fact_feed(&q).await?)),
+            Some(other) => return Err(Status::invalid_argument(format!("unknown feed {other} (the feed is \"facts\")"))),
+            None => {}
+        }
+        if let Some(sql) = q.get("sql").and_then(|s| s.as_str()) {
+            let limit = q.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize);
+            let r = self.engine.sql(sql, limit).await.map_err(Status::invalid_argument)?;
+            tracing::info!(rows = r.batches.iter().map(|b| b.num_rows()).sum::<usize>(), "SQL console query");
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(r.schema)
+                .build(futures::stream::iter(r.batches.into_iter().map(Ok)))
+                .map_err(|e| Status::internal(e.to_string()));
+            return Ok(Response::new(Box::pin(stream)));
+        }
+        let table = str_field(&q, "table")?;
+        let filter = q.get("filter").and_then(|f| f.as_str());
+        let limit = q.get("limit").and_then(|l| l.as_u64()).unwrap_or(100) as usize;
+        let p = self.platform()?;
+        let schema = p.schema(table).await.map_err(platform_err)?;
+        let batches = p.query(table, filter, limit).await.map_err(platform_err)?;
+        // The schema goes first even with no rows, so the client always gets one.
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(batches.into_iter().map(Ok)))
+            .map_err(|e| Status::internal(e.to_string()));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn do_put_inner(&self, req: Request<Streaming<FlightData>>) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
+        not_engine_only(&req)?;
+        not_scoped(&req)?;
+        let mut stream = req.into_inner().peekable();
+        // The table comes in the first message's descriptor; `[table, "replace"]`
+        // replaces the table with these rows instead of appending them;
+        // `[table, "upsert", key…]` replaces the rows with the same key columns.
+        let (table, replace, upsert_key) = {
+            let first = Pin::new(&mut stream).peek().await.ok_or_else(|| Status::invalid_argument("empty do_put"))?;
+            let first = first.as_ref().map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let path = first.flight_descriptor.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+            let table = path.first().cloned().ok_or_else(|| Status::invalid_argument("do_put needs a descriptor path [table]"))?;
+            let mode = path.get(1).map(String::as_str);
+            let key: Vec<String> = if mode == Some("upsert") { path[2..].to_vec() } else { Vec::new() };
+            if mode == Some("upsert") && key.is_empty() {
+                return Err(Status::invalid_argument("an upsert needs key columns: [table, \"upsert\", key…]"));
+            }
+            (table, mode == Some("replace"), key)
+        };
+        let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        )
+        .try_collect()
+        .await
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let rows = batches_to_rows(&batches);
+        let n = rows.len();
+        let offset = if replace {
+            let columns: Vec<String> = batches
+                .first()
+                .map(|b| b.schema().fields().iter().map(|f| f.name().clone()).collect())
+                .unwrap_or_default();
+            self.write(Effect::TableReplace { table, columns, rows }).await?
+        } else if n == 0 {
+            0
+        } else if !upsert_key.is_empty() {
+            self.write(Effect::TableUpsert { table, key: upsert_key, rows }).await?
+        } else {
+            self.write(Effect::TableInsert { table, rows }).await?
+        };
+        let r = PutResult { app_metadata: json!({ "inserted": n, "offset": offset }).to_string().into() };
+        Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))))
+    }
+}
+
+/// The metrics label of a Flight action (OB-2): its name if ADB knows it, else
+/// `other` (a client's made-up name never becomes a label).
+fn action_op(kind: &str) -> String {
+    const KNOWN: &[&str] = &[
+        "aql", "engine", "engine_subscribe", "engine_restore", "list_tables", "create_table", "update", "replace_table",
+        "delete", "table_changes", "transaction", "upsert", "compact", "branch_create", "branch_list", "branch_drop",
+        "branch_promote", "branch_parent_rows", "branch_place", "branch_pending", "branch_pending_ack", "branch_forget",
+        "space_clone", "space_stats", "space_records", "space_changes", "space_usage", "quota_set", "quota_drop",
+        "quota_list", "tag_create", "tag_list", "tag_drop", "layers_set", "layers_get", "layers_dependents", "merge",
+        "merge_revert", "fact_feed", "sql",
+    ];
+    match KNOWN.iter().find(|k| **k == kind) {
+        Some(k) => format!("action:{k}"),
+        None => "action:other".into(),
+    }
+}
+
+/// An accepted Flight connection, counted while it is open (OB-2).
+struct Counted {
+    io: tokio::net::TcpStream,
+    _open: adb_core::metrics::Connection,
+}
+
+impl tokio::io::AsyncRead for Counted {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Counted {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+    fn poll_write_vectored(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+}
+
+impl tonic::transport::server::Connected for Counted {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.io.connect_info()
     }
 }

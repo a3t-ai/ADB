@@ -19,7 +19,7 @@
  * (--transient marks bench/read3 `metadata.a3t.durability: transient`).
  */
 import { spawn } from 'node:child_process';
-import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -102,6 +102,14 @@ do:
   results.flow = await timed(async () => { const t = await tool('execute_flow', { namespace: 'bench', name: 'read3' }); if (!t.includes('completed')) throw new Error(t.slice(0, 200)); }, N); fmt('flow: read3 (sequential)', results.flow);
   { const t0 = performance.now(); const xs = []; await Promise.all(Array.from({ length: C }, async () => { for (let i = 0; i < Math.ceil(N / 2); i++) { const t = performance.now(); await tool('execute_flow', { namespace: 'bench', name: 'read3' }); xs.push(performance.now() - t); } })); const s = stat(xs); results.flow_c = { ...s, per_s: xs.length / ((performance.now() - t0) / 1000) }; fmt(`flow: read3 x${C} callers`, s); console.log(`  ${''.padEnd(30)} → ${results.flow_c.per_s.toFixed(1)} flows/s`); }
   { const xs = []; const end = performance.now() + SECS * 1000; let k = 0; await Promise.all(Array.from({ length: C }, async (_, w) => { while (performance.now() < end) { const t = performance.now(); await tool('set_state', { key: `bench:w${w}:${k++}`, value: { k } }); xs.push(performance.now() - t); } })); const s = stat(xs); results.write = { ...s, per_s: xs.length / SECS }; fmt(`write: set_state x${C} writers`, s); console.log(`  ${''.padEnd(30)} → ${results.write.per_s.toFixed(0)} writes/s`); }
+  // OB / AO: both processes' metrics after the run, into LOGS (when set).
+  if (process.env.LOGS) {
+    const save = async (name, u, headers) => {
+      try { writeFileSync(join(process.env.LOGS, name), JSON.stringify(await (await fetch(u, { headers })).json(), null, 1)); } catch (e) { console.error(`metrics ${name}: ${e}`); }
+    };
+    await save('flowr-metrics.json', `${url}/admin/stats/metrics`, BEARER ? { authorization: `Bearer ${BEARER}` } : {});
+    await save('adb-metrics.json', `http://127.0.0.1:${leader.http}/admin/stats/metrics`, { authorization: `Bearer ${AUTH}` });
+  }
   console.log('RESULTS ' + JSON.stringify(results));
 } catch (e) { console.error(e, F.log()); process.exitCode = 1; }
 finally { for (const k of kids) k.kill('SIGKILL'); await sleep(300); rmSync(tmp, { recursive: true, force: true }); process.exit(); }
