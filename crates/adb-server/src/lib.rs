@@ -23,7 +23,7 @@ pub mod branch_remote;
 pub mod flight;
 pub mod non_prod;
 pub mod scope;
-pub use flight::{serve_flight, serve_flight_with_token, serve_flight_with_tokens};
+pub use flight::{serve_flight, serve_flight_until, serve_flight_with_token, serve_flight_with_tokens};
 
 use std::collections::HashMap;
 use std::convert::Infallible;

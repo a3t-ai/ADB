@@ -20,6 +20,13 @@ adb-mcp = { path = "../crates/adb-mcp" }
 adb-raft = { path = "../crates/adb-raft" }
 axum = "0.7"
 tokio.workspace = true
+# Follower serving (C-16): reads here, the rest passed through to the leader.
+adb-core = { path = "../crates/adb-core" }
+adb-platform = { path = "../crates/adb-platform" }
+adb-embed = { path = "../crates/adb-embed" }
+async-trait.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+tower = { version = "0.5", features = ["util"] }
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

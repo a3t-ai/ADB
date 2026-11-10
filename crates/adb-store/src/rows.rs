@@ -369,6 +369,41 @@ fn opt_col<'a, T: 'static>(b: &'a RecordBatch, name: &str) -> Option<&'a T> {
     b.column_by_name(name).and_then(|c| c.as_any().downcast_ref::<T>())
 }
 
+/// A record's key as the write path tracks it (`hydrate`): its memory type, lineage
+/// and expiry, read without the payload and embedding columns.
+#[derive(Debug, Clone)]
+pub struct LiveKey {
+    pub memory: adb_core::log::Memory,
+    pub lineage_id: String,
+    pub ttl_at: Option<CommitTs>,
+}
+
+/// The rows of a batch projected to [`LIVE_KEY_COLUMNS`] that are live at `now`
+/// (as [`StoredRow::is_live`]).
+pub fn decode_live_keys(b: &RecordBatch, now: CommitTs) -> StoreResult<Vec<LiveKey>> {
+    let lineage = col::<StringArray>(b, "lineage_id")?;
+    let memory = col::<StringArray>(b, "memory")?;
+    let valid_to = col::<TimestampMicrosecondArray>(b, "valid_to")?;
+    let superseded_by = col::<StringArray>(b, "superseded_by")?;
+    let ttl_at = col::<TimestampMicrosecondArray>(b, "ttl_at")?;
+    let tombstone = col::<BooleanArray>(b, "tombstone")?;
+    let mut out = Vec::with_capacity(b.num_rows());
+    for i in 0..b.num_rows() {
+        let ttl = opt_ts(ttl_at, i);
+        let live = !tombstone.value(i)
+            && superseded_by.is_null(i)
+            && opt_ts(valid_to, i).is_none_or(|t| t > now)
+            && ttl.is_none_or(|t| t > now);
+        if live {
+            out.push(LiveKey { memory: parse_enum(memory.value(i), "memory")?, lineage_id: lineage.value(i).to_string(), ttl_at: ttl });
+        }
+    }
+    Ok(out)
+}
+
+/// The columns [`decode_live_keys`] reads.
+pub const LIVE_KEY_COLUMNS: [&str; 7] = ["id", "lineage_id", "memory", "valid_to", "superseded_by", "ttl_at", "tombstone"];
+
 /// A record batch → rows. Every column is needed but `embedding` and `sealed`, which
 /// reads that don't use them leave out (W7: a vector is 384 floats per row).
 pub fn decode(b: &RecordBatch) -> StoreResult<Vec<StoredRow>> {

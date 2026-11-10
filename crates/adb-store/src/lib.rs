@@ -13,7 +13,7 @@ pub use datafusion::logical_expr::Expr;
 pub use filter::predicate_filter;
 pub use hot::{CacheConfig, CacheStats, Cached, Hit, HotCache, Keep, Rule, Shape};
 pub use lance;
-pub use rows::{decode, key_of, namespace_of, namespaced, qualified, row_id, scoped_id, space_id, unscoped, valid_namespace, without_namespace, StoredRow, DEFAULT_SCOPE, NAMESPACE_SEP, SCOPE_SEP};
+pub use rows::{decode, key_of, LiveKey, namespace_of, namespaced, qualified, row_id, scoped_id, space_id, unscoped, valid_namespace, without_namespace, StoredRow, DEFAULT_SCOPE, NAMESPACE_SEP, SCOPE_SEP};
 pub use schema::{memory_schema, META_ID, RECORD_KINDS};
 pub use store::{configure_lance_runtime, sql_str, CompactStats, PartitionStore, StoreConfig, DEFAULT_EMBEDDING_DIM};
 

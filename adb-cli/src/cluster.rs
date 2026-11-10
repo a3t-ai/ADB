@@ -20,6 +20,7 @@ use std::time::Duration;
 use adb_executor::{Engine, EngineLog, LocalEngine, Replica};
 use adb_raft::{ClusterConfig, Node};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 
@@ -63,10 +64,19 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
     tracing::info!(node = node.id, peers = ?node.config.peers, raft_port, "ADB replica set member started");
 
     let status_node = Arc::clone(&node);
-    let raft_app = adb_raft::net::router(node.raft.clone()).route("/cluster/status", get(move || {
-        let n = Arc::clone(&status_node);
-        async move { Json(n.status()) }
-    }));
+    let raft_app = adb_raft::net::router(node.raft.clone())
+        .route("/cluster/status", get(move || {
+            let n = Arc::clone(&status_node);
+            async move { Json(n.status()) }
+        }))
+        // C-17b: the leader's embeddings, run on this node's model.
+        .route("/cluster/embed", axum::routing::post(|Json(req): Json<adb_embed::peers::EmbedRequest>| async move {
+            match adb_embed::peers::serve(req).await {
+                Ok(a) => Json(a).into_response(),
+                Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+            }
+        }));
+    adb_embed::peers::set_peers(node.config.peers.iter().filter(|(id, _)| **id != node.id).map(|(_, url)| url.clone()).collect());
     let raft_listener = bind(SocketAddr::new(host, raft_port)).await?;
     // A listener belongs to the runtime it was registered on: re-register it on Raft's.
     let raft_listener = raft_listener.into_std()?;
@@ -134,26 +144,56 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
         // A follower (or a candidate, or a leader not yet ready).
         // The Raft log, not only the WAL: erasure must reach openraft's own log too.
         let mut replica = Replica::open(dir, node.log() as EngineLog).await?;
-        let leader_node = Arc::clone(&node);
+        // C-16: reads served here (fresh: the leader's ReadIndex applied first), the
+        // rest of HTTP passed through to the leader; `ADB_FOLLOWER_READS=0` turns
+        // reads here off (every request then goes to the leader).
+        let serve_reads = std::env::var("ADB_FOLLOWER_READS").map_or(true, |v| v != "0");
+        let engine: Arc<dyn Engine> = Arc::new(crate::follower::FollowerEngine { node: Arc::clone(&node), reads: replica.reader(node.log() as EngineLog) });
+        let proxy = crate::follower::Proxy {
+            node: Arc::clone(&node),
+            port,
+            http: reqwest::Client::builder().connect_timeout(Duration::from_millis(500)).build()?,
+            local: adb_server::router(Arc::clone(&engine)),
+            reads: serve_reads,
+            http_peers: std::env::var("ADB_PEERS_HTTP").ok().map(|v| adb_raft::parse_peers(&v)).transpose()?,
+        };
         let app = Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route("/ready", get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "follower") }))
-            .fallback(move || {
-                let leader = leader_node.leader();
-                async move { (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "this ADB node is not the leader", "leader": leader }))) }
-            })
+            .fallback(crate::follower::route)
+            .with_state(proxy)
             // No kept-alive connection to a follower: once this node leads, a
             // client's pooled connection would still reach this router.
-            .layer(axum::middleware::map_response(|mut r: axum::response::Response| async move {
-                r.headers_mut().insert(axum::http::header::CONNECTION, axum::http::HeaderValue::from_static("close"));
-                r
-            }));
+            .layer(axum::middleware::map_response(crate::follower::close));
         let http = std::future::IntoFuture::into_future(axum::serve(bind(SocketAddr::new(host, port)).await?, app));
         tokio::pin!(http);
+        // Flight on a follower: reads; writes are told to go to the leader. Stopped
+        // (clients told to go away) before this node leads, so none keeps the follower's.
+        let (stop_flight, flight_stopped) = tokio::sync::oneshot::channel::<()>();
+        let flight = match (flight_port, serve_reads) {
+            (0, _) | (_, false) => None,
+            (p, true) => {
+                let engine = Arc::clone(&engine);
+                let addr = SocketAddr::new(host, p);
+                Some(tokio::spawn(async move {
+                    let stop = async move {
+                        let _ = flight_stopped.await;
+                    };
+                    if let Err(e) = adb_server::serve_flight_until(addr, engine, adb_server::auth::token_from_env(), adb_server::auth::engine_token_from_env(), stop).await {
+                        tracing::warn!(error = %e, "follower Flight stopped");
+                    }
+                }))
+            }
+        };
+        let wake = replica.wake();
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    if let Err(e) = replica.step().await {
+                        tracing::warn!(error = %e, "replica step failed; retrying");
+                    }
+                }
+                // A read waits for an offset not yet applied: apply now.
+                _ = wake.notified() => {
                     if let Err(e) = replica.step().await {
                         tracing::warn!(error = %e, "replica step failed; retrying");
                     }
@@ -167,6 +207,14 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
                 }
             }
         }
+        drop(http);
+        let _ = stop_flight.send(());
+        if let Some(f) = flight {
+            if tokio::time::timeout(Duration::from_secs(2), f).await.is_err() {
+                tracing::warn!("follower Flight connections still open after 2 s; leading anyway");
+            }
+        }
+        drop(engine);
         // Becoming leader: catch up, then (next turn) hand the open parts over.
         let keep_warm = std::env::var("ADB_WARM_HANDOVER").map_or(true, |v| v != "0");
         match replica.step().await {

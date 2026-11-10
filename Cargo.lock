@@ -6,8 +6,11 @@ version = 4
 name = "adb-cli"
 version = "0.1.0"
 dependencies = [
+ "adb-core",
+ "adb-embed",
  "adb-executor",
  "adb-mcp",
+ "adb-platform",
  "adb-raft",
  "adb-server",
  "adb-store",
@@ -15,11 +18,13 @@ dependencies = [
  "arrow-cast",
  "arrow-flight",
  "arrow-schema",
+ "async-trait",
  "axum 0.7.9",
  "chrono",
  "clap",
  "flowr-storage",
  "futures",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
@@ -28,6 +33,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

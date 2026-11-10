@@ -133,6 +133,10 @@ pub struct Node {
     pub config: ClusterConfig,
     /// openraft's log, shared with Raft: erasure rewrites it (see [`RaftLog`]).
     store: store::LogStore,
+    /// Follower reads (C-16): the leader's read index, fetched once for every read
+    /// that arrived before the fetch started.
+    read_gate: tokio::sync::Mutex<Option<(std::time::Instant, u64)>>,
+    http: reqwest::Client,
 }
 
 impl Node {
@@ -155,7 +159,12 @@ impl Node {
                 Err(e) => tracing::info!(node = config.node_id, error = %e, "raft group not initialized here"),
             }
         }
-        Ok(Self { id: config.node_id, raft, wal, config, store })
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { id: config.node_id, raft, wal, config, store, read_gate: Default::default(), http })
     }
 
     pub fn leader(&self) -> Option<NodeId> {
@@ -205,6 +214,49 @@ impl Node {
         }
         tracing::info!(node = self.id, to, "handing the lead over before stopping");
         tokio::time::timeout(within, self.until_lead(false)).await.is_ok()
+    }
+
+    /// The log index a linearizable read must see (C-16): the leader's ReadIndex, asked
+    /// of the leader over its Raft endpoint. Reads waiting together share one ask: a
+    /// result is reused only by reads that arrived before that ask started, so each
+    /// still sees every write acknowledged before it arrived.
+    pub async fn read_index(&self) -> Result<u64, String> {
+        let arrived = std::time::Instant::now();
+        let mut gate = self.read_gate.lock().await;
+        if let Some((started, index)) = *gate {
+            if started >= arrived {
+                return Ok(index);
+            }
+        }
+        let started = std::time::Instant::now();
+        let index = if self.is_leader() {
+            let (read, _) = self.raft.get_read_log_id(ReadPolicy::ReadIndex).await.map_err(|e| e.to_string())?;
+            read.index()
+        } else {
+            let leader = self.leader().ok_or("no leader")?;
+            let url = self.config.peers.get(&leader).ok_or_else(|| format!("leader {leader} is not in ADB_PEERS"))?;
+            let r = self.http.get(format!("{url}/raft/read_index")).send().await.map_err(|e| format!("leader {leader}: {e}"))?;
+            if !r.status().is_success() {
+                return Err(format!("leader {leader}: {}", r.text().await.unwrap_or_default()));
+            }
+            r.json::<u64>().await.map_err(|e| format!("leader {leader}: {e}"))?
+        };
+        *gate = Some((started, index));
+        Ok(index)
+    }
+
+    /// Wait until this node's state machine applied log index `index` (its WAL then
+    /// holds every record up to it).
+    pub async fn wait_applied(&self, index: u64, within: std::time::Duration) -> Result<(), String> {
+        self.raft.wait(Some(within)).applied_index_at_least(Some(index), "follower read").await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// The leader's address on `port` (its HTTP or Flight port; same host as its
+    /// Raft endpoint in ADB_PEERS).
+    pub fn leader_at(&self, port: u16) -> Option<String> {
+        let url = self.config.peers.get(&self.leader()?)?;
+        let (base, _) = url.rsplit_once(':')?;
+        Some(format!("{base}:{port}"))
     }
 
     /// The log the leader's engine runs on, and a follower's replica reads.

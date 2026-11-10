@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 mod alloc;
 mod branch;
 mod cluster;
+mod follower;
 mod import;
 mod import_engine;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

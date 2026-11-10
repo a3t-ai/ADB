@@ -13,8 +13,10 @@
 //! [`DEFAULT_MODEL_DIR`]. `ADB_EMBED_MODEL_DIR` points elsewhere; `ADB_EMBED=off`
 //! turns embedding off (records are then found by filters and text only).
 
+pub mod peers;
+
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc};
 
 use fastembed::{InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel};
 use half::f16;
@@ -124,12 +126,77 @@ impl EmbedConfig {
 }
 
 enum Backend {
-    Local(Mutex<TextEmbedding>),
+    Local(LocalModel),
     Http { client: reqwest::Client, url: String, key: Option<String> },
 }
 
-/// The embedding model, loaded once. Local models are CPU work: call
-/// [`Embedder::embed`] (it runs them on the blocking pool).
+/// Texts and where their vectors go.
+type Job = (Vec<String>, tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>, String>>);
+
+/// Texts the local model runs in one call: concurrent writers' texts share a call
+/// (C-17), which costs about what one text alone does.
+const LOCAL_BATCH: usize = 64;
+
+/// The local model, owned by one thread (`adb-embed`) that runs every queued
+/// request's texts in one call. Behind a lock, concurrent STOREs embedded one text
+/// at a time: ~100 writes/s on 2 vCPUs (AWS F-19).
+struct LocalModel {
+    jobs: mpsc::Sender<Job>,
+}
+
+impl LocalModel {
+    fn start(mut model: TextEmbedding) -> Result<Self, String> {
+        let (tx, rx) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("adb-embed".into())
+            .spawn(move || {
+                // Ends when the embedder (every sender) is dropped.
+                while let Ok(first) = rx.recv() {
+                    let mut n = first.0.len();
+                    let mut jobs = vec![first];
+                    while n < LOCAL_BATCH {
+                        match rx.try_recv() {
+                            Ok(j) => {
+                                n += j.0.len();
+                                jobs.push(j);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let texts: Vec<&String> = jobs.iter().flat_map(|(t, _)| t.iter()).collect();
+                    let out = match texts.is_empty() {
+                        true => Ok(Vec::new()),
+                        false => model.embed(&texts, Some(LOCAL_BATCH)).map_err(|e| format!("embedding: {e}")),
+                    };
+                    match out {
+                        Ok(mut out) => {
+                            out.iter_mut().for_each(|v| normalize(v));
+                            let mut out = out.into_iter();
+                            for (t, done) in jobs {
+                                let _ = done.send(Ok(out.by_ref().take(t.len()).collect()));
+                            }
+                        }
+                        Err(e) => {
+                            for (_, done) in jobs {
+                                let _ = done.send(Err(e.clone()));
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("embedding thread: {e}"))?;
+        Ok(Self { jobs: tx })
+    }
+
+    fn submit(&self, texts: Vec<String>) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, String> {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.jobs.send((texts, done)).map_err(|_| "embedding thread stopped".to_string())?;
+        Ok(wait)
+    }
+}
+
+/// The embedding model, loaded once. A local model runs on its own thread, batching
+/// concurrent requests; call [`Embedder::embed`].
 pub struct Embedder {
     backend: Backend,
     model: String,
@@ -150,7 +217,7 @@ impl Embedder {
         let model = UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer).with_pooling(Pooling::Cls);
         let options = InitOptionsUserDefined::new().with_max_length(MAX_TOKENS).with_intra_threads(threads.max(1));
         let model = TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| format!("embedding model: {e}"))?;
-        Ok(Self { backend: Backend::Local(Mutex::new(model)), model: MODEL.into(), dim: DIM })
+        Ok(Self { backend: Backend::Local(LocalModel::start(model)?), model: MODEL.into(), dim: DIM })
     }
 
     /// The embedder `cfg` describes (W9.10). A local model is loaded now; an
@@ -183,7 +250,7 @@ impl Embedder {
 
     /// Embed a sample and check the vector's length is the configured dimension.
     pub async fn verify(self: &Arc<Self>) -> Result<(), String> {
-        let v = self.embed_raw(vec!["ADB embedding check".into()]).await?;
+        let v = self.embed_here(vec!["ADB embedding check".into()]).await?;
         match v.first().map(Vec::len) {
             Some(n) if n == self.dim => Ok(()),
             Some(n) => Err(format!("the model returns {n} dimensions; the settings say {}", self.dim)),
@@ -237,16 +304,37 @@ impl Embedder {
         }
     }
 
-    /// Embed `texts` with the local model, on this thread (unit-length vectors).
+    /// Embed `texts` on this node's own model (never a peer's); an endpoint's as
+    /// [`Embedder::embed`].
+    pub async fn embed_here(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        match &self.backend {
+            Backend::Local(model) => {
+                peers::LOCAL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let r = match model.submit(texts) {
+                    Ok(wait) => wait.await.map_err(|_| "embedding thread stopped".to_string()).and_then(|r| r),
+                    Err(e) => Err(e),
+                };
+                peers::LOCAL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                r
+            }
+            Backend::Http { client, url, key } => {
+                let mut out = Vec::with_capacity(texts.len());
+                for chunk in texts.chunks(HTTP_BATCH) {
+                    out.extend(http_embed(client, url, key.as_deref(), &self.model, chunk).await?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Embed `texts` with the local model, waiting on this thread (unit-length vectors).
+    /// Not from async code: use [`Embedder::embed`].
     pub fn embed_blocking(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         let Backend::Local(model) = &self.backend else { return Err("embed_blocking: not a local model".into()) };
-        let mut model = model.lock().map_err(|_| "embedding model poisoned".to_string())?;
-        let mut out = model.embed(texts, Some(32)).map_err(|e| format!("embedding: {e}"))?;
-        out.iter_mut().for_each(|v| normalize(v));
-        Ok(out)
+        model.submit(texts.to_vec())?.blocking_recv().map_err(|_| "embedding thread stopped".to_string())?
     }
 
     /// Embed `texts`: unit-length vectors of the configured dimension.
@@ -261,8 +349,11 @@ impl Embedder {
     async fn embed_raw(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         match &self.backend {
             Backend::Local(_) => {
-                let me = Arc::clone(self);
-                tokio::task::spawn_blocking(move || me.embed_blocking(&texts)).await.map_err(|e| format!("embedding task: {e}"))?
+                // A less busy node of the replica set embeds them, when there is one.
+                if let Some(v) = peers::try_peer(self, &texts).await {
+                    return Ok(v);
+                }
+                self.embed_here(texts).await
             }
             Backend::Http { client, url, key } => {
                 let mut out = Vec::with_capacity(texts.len());

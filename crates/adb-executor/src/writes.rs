@@ -1912,13 +1912,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             .into_iter()
             .flat_map(|r| validity_bounds(&r.data.value).into_iter().filter(|t| *t > after).map(move |t| (t, r.lineage_id.clone())))
             .collect();
-        let aliases = store
-            .live(Some("kind = 'entity'"), CommitTs::from_datetime(time::now()))
-            .await
-            .map_err(|e| AdbError::Internal(format!("store: {e}")))?
-            .iter()
-            .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
-            .collect();
+        let aliases = load_aliases(&store).await?;
         let store = Some(store);
         Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
@@ -2123,10 +2117,15 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// The read barrier for Lance reads (stage D3.7), if there is a table.
     /// Attach FlowR's engine store (stage H): replay the log above its
     /// snapshots and journal partitions, then give every lease one fresh period.
-    pub async fn attach_engine(&mut self, mut host: adb_engine::EngineHost) -> AdbResult<u64> {
+    /// `seen`: the first record a warm host (a follower's, C-19) hasn't applied; the
+    /// replay starts there instead of at the snapshots.
+    pub async fn attach_engine(&mut self, mut host: adb_engine::EngineHost, seen: Option<LogOffset>) -> AdbResult<u64> {
         let eng = |e: adb_engine::EngineError| AdbError::Internal(e.to_string());
         let seq = self.seq.lock().await;
         let mut from = host.replay_from().await.map_err(eng)?;
+        if let Some(seen) = seen {
+            from = LogOffset(from.0.max(seen.0));
+        }
         let mut replayed = 0;
         loop {
             let batch = match seq.log().read(from, 1024).await {
@@ -3200,12 +3199,12 @@ pub struct ReplayStats {
 pub async fn hydrate(store: &PartitionStore) -> AdbResult<(u64, LiveKeys)> {
     let now = CommitTs::from_datetime(time::now());
     // Live, not current: a fact outside its validity still holds its key.
-    let rows = store.live(None, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-    let records: Vec<_> = rows.iter().filter(|r| matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool)).collect();
+    // Only the key columns (C-19): the full rows cost a takeover ~1.2 s at 160k rows.
+    let records = store.live_keys(now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
     let live: LiveKeys = records
         .iter()
-        .filter(|r| unique_keys(r.data.memory.into()))
-        .map(|r| ((r.data.memory, r.key().to_string()), r.data.ttl_at))
+        .filter(|r| unique_keys(r.memory.into()))
+        .map(|r| ((r.memory, adb_store::key_of(&r.lineage_id).to_string()), r.ttl_at))
         .collect();
     Ok((records.len() as u64, live))
 }
@@ -3260,6 +3259,17 @@ pub fn normalize_validity(fields: &mut serde_json::Map<String, serde_json::Value
 /// A fact's key: one current fact per (subject, predicate), or per (subject,
 /// predicate, object) for a `MULTI` predicate.
 /// An entity's `aliases` (GR-12): the keys of the entities merged into it.
+/// Entity aliases (GR-12) from the live entities' `aliases` fields: alias → entity.
+pub(crate) async fn load_aliases(store: &PartitionStore) -> AdbResult<std::collections::HashMap<String, String>> {
+    Ok(store
+        .live(Some("kind = 'entity'"), CommitTs::from_datetime(time::now()))
+        .await
+        .map_err(|e| AdbError::Internal(format!("store: {e}")))?
+        .iter()
+        .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
+        .collect())
+}
+
 fn aliases_of(value: &serde_json::Value) -> Vec<String> {
     value.get("aliases").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
 }

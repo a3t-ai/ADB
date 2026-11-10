@@ -63,6 +63,19 @@ pub async fn serve_flight_with_token(addr: SocketAddr, engine: Arc<dyn Engine>, 
 
 /// [`serve_flight`] with explicit tokens (both `None`: open).
 pub async fn serve_flight_with_tokens(addr: SocketAddr, engine: Arc<dyn Engine>, token: Option<Arc<str>>, engine_token: Option<Arc<str>>) -> std::io::Result<()> {
+    serve_flight_until(addr, engine, token, engine_token, std::future::pending()).await
+}
+
+/// [`serve_flight_with_tokens`] until `shutdown` resolves; then open connections are
+/// told to go away (a replica set follower that is about to lead, C-16: clients
+/// reconnect to its leader's engine instead of keeping the follower's).
+pub async fn serve_flight_until(
+    addr: SocketAddr,
+    engine: Arc<dyn Engine>,
+    token: Option<Arc<str>>,
+    engine_token: Option<Arc<str>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
     tracing::info!(auth = token.is_some(), engine_auth = engine_token.is_some(), "ADB Flight on grpc://{addr}");
     let svc = FlightServiceServer::new(AdbFlight { engine })
         .max_decoding_message_size(MAX_MESSAGE)
@@ -90,7 +103,7 @@ pub async fn serve_flight_with_tokens(addr: SocketAddr, engine: Arc<dyn Engine>,
     });
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
@@ -662,6 +675,20 @@ impl AdbFlight {
 
     /// `do_action`'s work; refusals get their stable code added by [`with_code`].
     async fn do_action_inner(&self, req: Request<Action>) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        // A follower (C-16) answers read queries and table listings; the rest is the
+        // leader's, refused here so the client moves on (an AQL write too, not answered
+        // as a failed query).
+        if self.engine.read_only() {
+            let a = req.get_ref();
+            let read = match a.r#type.as_str() {
+                "list_tables" => true,
+                "aql" => body(&a.body).ok().and_then(|b| b.get("query").and_then(|q| q.as_str()).map(adb_executor::follower_reads)).unwrap_or(false),
+                _ => false,
+            };
+            if !read {
+                return Err(Status::unavailable(adb_executor::NOT_LEADER));
+            }
+        }
         let access = access(&req);
         let pool = req.extensions().get::<crate::auth::EnginePool>().cloned();
         let scope = req.extensions().get::<Arc<crate::scope::Scope>>().cloned();
@@ -895,6 +922,14 @@ impl AdbFlight {
                 return Err(Status::permission_denied(format!("this read is not open to the {} token", scope.name)));
             }
         }
+        // The fact feed is the leader's; table and SQL reads on a follower first see
+        // every acknowledged write (C-16).
+        if self.engine.read_only() {
+            if q.get("feed").is_some() {
+                return Err(Status::unavailable(adb_executor::NOT_LEADER));
+            }
+            self.engine.read_fresh().await.map_err(Status::unavailable)?;
+        }
         match q.get("feed").and_then(|f| f.as_str()) {
             Some("facts") => return Ok(Response::new(self.fact_feed(&q).await?)),
             Some(other) => return Err(Status::invalid_argument(format!("unknown feed {other} (the feed is \"facts\")"))),
@@ -925,6 +960,9 @@ impl AdbFlight {
     }
 
     async fn do_put_inner(&self, req: Request<Streaming<FlightData>>) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
+        if self.engine.read_only() {
+            return Err(Status::unavailable(adb_executor::NOT_LEADER));
+        }
         not_engine_only(&req)?;
         not_scoped(&req)?;
         let mut stream = req.into_inner().peekable();

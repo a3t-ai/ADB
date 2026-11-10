@@ -31,7 +31,20 @@ const ONLY = args.phases ? new RegExp(args.phases, 'i') : null;
 let serverMetrics = null;
 async function snapshot() {
   if (!serverMetrics) return null;
-  try { return await (await fetch(serverMetrics.url, { headers: serverMetrics.token ? { authorization: `Bearer ${serverMetrics.token}` } : {} })).json(); } catch { return null; }
+  const get = async u => { try { return await (await fetch(u, { headers: serverMetrics.token ? { authorization: `Bearer ${serverMetrics.token}` } : {} })).json(); } catch { return null; } };
+  if (!serverMetrics.urls) return get(serverMetrics.url);
+  // Every node's (reads spread over followers): counts and sums added up per label set.
+  const fam = serverMetrics.family;
+  const merged = new Map();
+  for (const s of await Promise.all(serverMetrics.urls.map(get))) {
+    for (const x of s?.[fam] ?? []) {
+      const k = JSON.stringify(x.labels);
+      const m = merged.get(k) ?? { labels: x.labels, value: { count: 0, sum: 0 } };
+      m.value.count += x.value.count; m.value.sum += x.value.sum;
+      merged.set(k, m);
+    }
+  }
+  return { [fam]: [...merged.values()] };
 }
 function serverDelta(before, after) {
   if (!before || !after) return '';
@@ -86,10 +99,17 @@ async function adb() {
     }
   })();
   if (nodes.length > 1) await findLeader();
+  // C-16: reads (RECALL / LOOKUP / SCAN) go to every node in turn — followers answer
+  // them — and writes to the leader; `--spread 0` sends everything to the leader.
+  const spread = nodes.length > 1 && args.spread !== '0';
+  let turn = 0;
+  const isRead = aql => /^\s*(RECALL|LOOKUP|SCAN)\b/i.test(aql);
+  if (spread) console.log(`reads spread over ${nodes.length} nodes; writes to the leader`);
   const q = async aql => {
     let r;
+    const target = spread && isRead(aql) ? nodes[turn++ % nodes.length] : url;
     try {
-      r = await fetch(`${url}/query`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify({ query: aql }), signal: AbortSignal.timeout(30000) });
+      r = await fetch(`${target}/query`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify({ query: aql }), signal: AbortSignal.timeout(30000) });
     } catch (e) { if (nodes.length > 1) await findLeader(); throw e; }
     const j = await r.json();
     if (!j.success) {
@@ -100,7 +120,7 @@ async function adb() {
   };
   console.log(`ADB ${url}, run ${run}, ${SECS} s per phase, concurrency ${CS.join(', ')}`);
   // The leader's own timing per statement (looked up afresh each phase: the leader can move).
-  serverMetrics = { get url() { return `${url}/admin/stats/metrics`; }, token, family: 'adb_query_duration_seconds' };
+  serverMetrics = { get url() { return `${url}/admin/stats/metrics`; }, urls: spread ? nodes.map(n => `${n}/admin/stats/metrics`) : null, token, family: 'adb_query_duration_seconds' };
   // Writes first: each phase stores under its own prefix; reads and updates use the first
   // STORE SEMANTIC phase's keys, counted as they succeed.
   let keys = 0, ekeys = 0, wkeys = 0;

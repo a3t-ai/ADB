@@ -197,6 +197,15 @@ async fn snapshot(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::R
     }
 }
 
+/// Follower reads (C-16): the leader's ReadIndex — the log index a read must see,
+/// after a heartbeat round confirmed this node still leads. 503 when it doesn't.
+async fn read_index(State(raft): State<AdbRaft>) -> axum::response::Response {
+    match raft.get_read_log_id(openraft::ReadPolicy::ReadIndex).await {
+        Ok((read, _)) => axum::Json(read.index()).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
 async fn metrics(State(raft): State<AdbRaft>) -> axum::response::Response {
     let m = raft.metrics().borrow_watched().clone();
     axum::Json(serde_json::json!({
@@ -219,5 +228,6 @@ pub fn router(raft: AdbRaft) -> Router {
         .route("/raft/transfer", post(transfer))
         .route("/raft/snapshot", post(snapshot))
         .route("/raft/metrics", get(metrics))
+        .route("/raft/read_index", get(read_index))
         .with_state(raft)
 }

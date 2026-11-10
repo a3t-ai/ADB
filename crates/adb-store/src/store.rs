@@ -983,6 +983,23 @@ impl PartitionStore {
             .collect())
     }
 
+    /// The live records' keys (entities, facts, episodes, tools) at `now`: what the
+    /// write path's key check starts from. Reads only the key columns, so a takeover
+    /// doesn't decode every payload and embedding (C-19).
+    pub async fn live_keys(&self, now: CommitTs) -> StoreResult<Vec<crate::rows::LiveKey>> {
+        let g = self.state.read().await;
+        let scanner = Self::scanner(open_state(&g))
+            .await?
+            // Kind only: a row's kind never changes, so no older version can match
+            // where its newest doesn't; liveness is checked on the newest version.
+            .filter(RECORD_KINDS)
+            .map_err(lance)?
+            .project(&crate::rows::LIVE_KEY_COLUMNS)
+            .map_err(lance)?;
+        let batch = scanner.try_into_batch().await.map_err(lance)?;
+        crate::rows::decode_live_keys(&batch, now)
+    }
+
     /// Every version of `memory`'s records that isn't forgotten or expired, current
     /// and superseded (AQL v0.10 history reads; `filter` narrows it).
     pub async fn versions(&self, memory: adb_core::log::Memory, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {

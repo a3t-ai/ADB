@@ -219,6 +219,18 @@ pub trait Engine: Send + Sync {
         Err("the hot cache needs a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// A replica set follower's engine (C-16): reads only; every write goes to the
+    /// leader, and the transports answer them with [`crate::NOT_LEADER`].
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    /// Wait until reads here see every write acknowledged before this call (a
+    /// follower: the leader's commit index applied). Called before platform-table reads.
+    async fn read_fresh(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Read-only SQL over the memory and platform tables (the superadmin's debug
     /// view, `crate::sql`); at most `limit` rows.
     async fn sql(&self, _sql: &str, _limit: Option<usize>) -> Result<crate::sql::SqlResult, String> {
@@ -256,9 +268,17 @@ fn env_cache_rules() -> Result<Option<adb_store::CacheConfig>, String> {
     Ok(Some(c))
 }
 
+/// The hot cache settings saved in `dir`, else `ADB_CACHE_RULES`, else the defaults.
+pub(crate) fn cache_config(dir: &std::path::Path) -> Result<adb_store::CacheConfig, String> {
+    Ok(match adb_store::CacheConfig::load(dir)? {
+        Some(c) => c,
+        None => env_cache_rules()?.unwrap_or_default(),
+    })
+}
+
 /// The hot cache with `cfg`, unless
 /// `ADB_CACHE=off`.
-fn hot_cache(cfg: adb_store::CacheConfig) -> Option<adb_store::HotCache> {
+pub(crate) fn hot_cache(cfg: adb_store::CacheConfig) -> Option<adb_store::HotCache> {
     match cache_mode().as_str() {
         "off" => None,
         mode => Some(adb_store::HotCache::new(cfg, mode == "shadow").shaped(crate::query::record)),
@@ -392,11 +412,15 @@ pub struct Warm {
     pub(crate) embedder: Option<Arc<adb_embed::Embedder>>,
     pub(crate) platform: Arc<adb_platform::PlatformStore>,
     pub(crate) engine: adb_engine::EngineHost,
+    /// The first log record the follower's engine host hasn't seen.
+    pub(crate) engine_next: adb_core::log::LogOffset,
 }
 
 pub(crate) async fn open_store(dir: &std::path::Path) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
     let settings = adb_embed::EmbedConfig::load(dir)?;
     let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
+    // The replica set's other nodes may embed on this node's model (C-17b).
+    adb_embed::peers::serve_with(embedder.clone());
     let store_cfg = StoreConfig { embedding_dim, embedding_model, ..StoreConfig::new(dir.join("store")) };
     let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
     Ok((store, embedder))
@@ -662,8 +686,9 @@ impl LocalEngine {
     async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, warm: Option<Warm>, parent: Option<crate::branch_engine::ParentView>) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
+        let warm_cache = warm.is_some();
         let (store, embedder, platform_open, engine_open) = match warm {
-            Some(w) => (w.store, w.embedder, Some(w.platform), Some(w.engine)),
+            Some(w) => (w.store, w.embedder, Some(w.platform), Some((w.engine, Some(w.engine_next)))),
             None => {
                 let (store, embedder) = open_store(&dir).await?;
                 (store, embedder, None, None)
@@ -671,11 +696,10 @@ impl LocalEngine {
         };
 
         // W10: the hot cache follows every apply from here on (the catch-up too).
-        let cache_cfg = match adb_store::CacheConfig::load(&dir)? {
-            Some(c) => c,
-            None => env_cache_rules()?.unwrap_or_default(),
-        };
-        store.set_cache(hot_cache(cache_cfg)).await.map_err(|e| e.to_string())?;
+        // A follower kept one from the same settings (C-19): the takeover keeps it.
+        if !(warm_cache && store.hot().is_some()) {
+            store.set_cache(hot_cache(cache_config(&dir)?)).await.map_err(|e| e.to_string())?;
+        }
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
         let platform = match platform_open {
@@ -684,11 +708,11 @@ impl LocalEngine {
         };
         writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
         // FlowR's engine store (stage H): its spaces under `<dir>/engine`.
-        let engine = match engine_open {
+        let (engine, engine_next) = match engine_open {
             Some(e) => e,
-            None => adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?,
+            None => (adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?, None),
         };
-        let replayed = writes.attach_engine(engine).await.map_err(|e| e.to_string())?;
+        let replayed = writes.attach_engine(engine, engine_next).await.map_err(|e| e.to_string())?;
         if replayed > 0 {
             tracing::info!(records = replayed, "engine spaces replayed");
         }
@@ -886,10 +910,10 @@ impl Engine for LocalEngine {
         // C-5: reads take a permit; beyond the bound they queue here instead of all taking
         // the CPU at once (CPU-saturating reads lost the leader its lead on AWS, 10 Nov).
         // Writes are not bounded: they wait on the log, not the CPU.
-        let _permit = match adb_core::metrics::statement_of(aql).0 {
-            "RECALL" | "LOOKUP" | "SCAN" => Some(read_permits().acquire().await.map_err(|e| e.to_string())?),
-            _ => None,
-        };
+        // C-20: only reads that scan take a permit; keyed reads (LOOKUP, or `KEY id = …`)
+        // are answered from the hot cache or an index in about a millisecond, and queued
+        // behind 1 s scans they waited 1.3 s for nothing (AWS round 1).
+        let _permit = if scans(aql) { Some(read_permits().acquire().await.map_err(|e| e.to_string())?) } else { None };
         let r = self.query_unobserved(aql, variables).await;
         observe_query(aql, t0.elapsed(), &r);
         r
@@ -1717,8 +1741,17 @@ impl LocalEngine {
     }
 }
 
+/// Whether `aql` is a read that scans (RECALL or SCAN without `KEY`): the reads the
+/// permits below bound (C-5, C-20). Writes and keyed reads are not bounded.
+pub(crate) fn scans(aql: &str) -> bool {
+    match adb_core::metrics::statement_of(aql).0 {
+        "RECALL" | "SCAN" => !aql.split_whitespace().any(|w| w.eq_ignore_ascii_case("KEY")),
+        _ => false,
+    }
+}
+
 /// Reads running at once (C-5): `ADB_MAX_READS`, default twice the CPUs (at least 2).
-fn read_permits() -> &'static tokio::sync::Semaphore {
+pub(crate) fn read_permits() -> &'static tokio::sync::Semaphore {
     static P: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     P.get_or_init(|| {
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
@@ -1731,7 +1764,7 @@ fn read_permits() -> &'static tokio::sync::Semaphore {
 /// OB-3: one AQL statement's metrics; a `debug` line (`adb::query`) for each, an `info`
 /// line for one slower than `ADB_SLOW_QUERY_MS`. Only the statement's fingerprint is
 /// logged, never its literals.
-fn observe_query(aql: &str, took: std::time::Duration, r: &Result<Value, String>) {
+pub(crate) fn observe_query(aql: &str, took: std::time::Duration, r: &Result<Value, String>) {
     use adb_core::metrics;
     let (statement, memory) = metrics::statement_of(aql);
     let m = metrics::get();

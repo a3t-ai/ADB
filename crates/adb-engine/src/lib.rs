@@ -318,6 +318,12 @@ impl EngineHost {
             let Effect::Engine { space, changes } = effect else { continue };
             let changes: Vec<Change> = serde_json::from_value(changes.clone()).map_err(|e| EngineError::Snapshot(e.to_string()))?;
             let s = self.space(space).await?;
+            // Applied and journaled already: a follower's host handed to the leader
+            // (C-19) has applied the log past its snapshot; applying again would
+            // repeat each change.
+            if record.offset.0 > s.snapshot_offset && record.offset.0 <= s.last_offset {
+                continue;
+            }
             if record.offset.0 > s.snapshot_offset {
                 for c in &changes {
                     s.core.apply(c);

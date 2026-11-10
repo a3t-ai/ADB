@@ -216,6 +216,62 @@ replica_compact, replica_migrate, write_path_concurrency, flight — pass; clust
 failover 2.6 s, 0 of 30,628 lost), crash-durability (20 kills, 0 of 12,637 lost),
 subscriptions-crash, engine-crash — pass; FlowR engine tests 43/43.
 
+## Round 1 retest on AWS (10 Nov, 17:46–18:32; adb:2026-11-10-r1, flowr:2026-11-10-ee-r1)
+
+Comparable with the baseline (same tests and settings; writes and keyed reads do not
+depend on table size). Embeddings are on in both (the image loads bge-small-en-v1.5).
+
+| Measure | Baseline | Round 1 |
+|---|---|---|
+| STORE WORKING, 1 client | 84/s, 11.9 ms | **189/s, 5.2 ms** |
+| STORE WORKING, saturated | ~191/s | **~515/s** |
+| UPDATE WORKING, 64 clients | 356/s | **1,035/s** |
+| STORE SEMANTIC, 1 client | 45/s, 22.3 ms | 64/s, 15.4 ms |
+| STORE SEMANTIC / EPISODIC, saturated | ~98 / ~118/s | ~98 / ~121/s (unchanged: F-19) |
+| FORGET EPISODIC | 25–43/s | 28–29/s |
+| Keyed reads (SEMANTIC, WORKING) | ~3,000/s | ~3,000/s |
+| A3T set_state, 1 / 8 / 128 clients | 72 / 250 / 387 /s | **140 / 675 / 902 /s** |
+| A3T get_state, 128 clients | 888/s (server 112 ms) | **2,236/s (server 1.7 ms)** |
+| Durable flow noop, 1 client / 128 clients | 104 ms / 37/s | **49.6 ms / 153/s** |
+| Durable flow read3, 1 client / 128 clients | 75 ms / 57/s | **36.9 ms / 184/s** |
+| Transient flow read3, 1 / 128 clients | 9.7 ms / 334/s | 7.9 ms / 522/s |
+| Leader change under 64 clients of filtered RECALL | yes (twice) | **none in 60 s** (C-4) |
+| Leader kill: acknowledged writes lost | 0 of 7,384 | 0 of 6,726 |
+| Leader kill: longest gap with no write | 4,170 ms | **7,090 ms** (F-16) |
+
+Not comparable: filtered / ordered / aggregate reads and the mixed load — the SEMANTIC
+table grew from ~5–10k rows (baseline suite) to ~160k (after the first endurance run), and
+those reads scan every row (F-13): filtered RECALL now 108 ms alone, 6.5 s at 64 clients.
+
+New findings:
+
+F-9 (corrected). **Catch-up after a restart is ~1.6 s, not 42 s.** The restarted node logged
+`replica caught up` 1.6 s after its start. The resilience script began comparing indexes
+only after the 90 s writer run ended, so its "42 s" was the rest of the run — a test bug,
+in both runs.
+
+F-16. **Takeover grows with the data.** Kill at 18:09:13; election won at 18:09:16.2; the new
+leader's engine open took 5.1 s — hot cache 82k rows / 78 MB in 1.45 s, live-key hydration
+161k rows in 1.2 s, engine spaces 1.3 s — serving at 18:09:21.3. The follower holds the data
+but not the hot cache or the live keys.
+
+F-17. **The read bound (C-5) blocks cheap reads behind scans.** Mixed load at 32 clients:
+a LOOKUP waited 1,277 ms on the server (≈0 ms alone) — the few read permits were held by
+filtered RECALLs taking 1.6 s each.
+
+F-18. **FlowR fails fast while there is no leader.** Leader kill with FlowR under set_state
+load: FlowR moved to the new leader (C-8 works: 315/s over the 90 s), but answered 3,761
+errors during the ~7 s with no leader — every node refused, so the call gave up at once
+instead of waiting for an election.
+
+F-19. **SEMANTIC and EPISODIC writes are now limited by embedding, not syncs.** WORKING (no
+embedding) went 191 → ~515/s; SEMANTIC and EPISODIC stayed at ~100–120/s with the leader's
+two main threads at 80–93% (one embedding per STORE / UPDATE with content). Followers ~2%.
+
+F-20. **One node does all the work.** Leader CPU 196% during the runs, followers ~2%: every
+query and every write's preparation (incl. embedding) runs on the leader; followers only
+replicate.
+
 ## Proposed changes (log)
 
 | Id | Change | Why | Risk / test |
@@ -239,4 +295,23 @@ subscriptions-crash, engine-crash — pass; FlowR engine tests 43/43.
 | C-14 | Platform tables: index the upsert key as data is flushed (not only at compaction) and merge small flushed fragments | get_state slows as fragments pile up (F-11) | get_state under write load |
 | C-15 | Follower catch-up applies in batches (same as C-1 on the follower) | 42 s catch-up (F-9) | restart catch-up time |
 
+| C-16 | Reads on followers (wait for the leader's commit index, or bounded staleness by choice) | one node's CPU serves every read (F-20) | read sweep across 3 nodes |
+| C-17 | Embedding on its own thread pool, outside the write path; optionally a separate embedding service | SEMANTIC / EPISODIC writes capped at ~100/s by embedding (F-19) | STORE SEMANTIC sweep |
+| C-18 | Partitions per org or namespace (PF-12) led by different nodes | writes on one node (F-20) | multi-org write sweep |
+| C-19 | Keep the hot cache and live keys warm on followers | takeover rebuilds them: 5.1 s at 160k rows (F-16) | leader kill at 160k+ rows |
+| C-20 | Read permits for scans only (keyed reads never queue behind them) | cheap reads blocked (F-17) | mixed sweep |
+| C-21 | FlowR waits (bounded, e.g. 10 s) for a leader when no node serves a call | errors during an election (F-18) | leader kill with FlowR load: no errors |
+
 More findings and changes are added below as the full tests run.
+
+## Round 2 applied (10 Nov)
+
+| Change | What was done |
+|---|---|
+| C-20 | Done: only scans (RECALL / SCAN without KEY) take a read permit; LOOKUP and keyed reads never queue behind them (`adb-executor/src/engine.rs` `scans`) |
+| C-21 | Done in FlowR: when no node serves a call (not the leader, connection refused) FlowR keeps trying every node for up to 10 s (Flight calls) / 15 s (engine store) instead of failing at once (`handlers/call_adb.rs`, `engine_adb.rs`) |
+| C-19 | Done, three parts. (1) Followers keep the hot cache: `Replica::open` fills it from the same settings, every apply maintains it, and the takeover keeps it instead of rescanning. (2) Live-key hydration reads only the key columns (`PartitionStore::live_keys`, projected scan) instead of decoding every payload and embedding. (3) The engine replay at takeover starts where the follower's engine host got to (`Warm::engine_next`); `EngineHost::replay` skips records a space already applied. This also fixes a bug: the warm host re-applied every change since its snapshot at takeover |
+| C-17 | Done: the local model runs on one thread (`adb-embed`) that takes every queued request's texts into one model call (up to 64). Before, the model sat behind a lock and concurrent STOREs embedded one text at a time. Writes still wait for their own vector, so a SIMILAR read right after a STORE finds it. An endpoint (`embedding.json` provider `openai`) remains the way to take embedding off the ADB nodes |
+| C-16 | Done (F-20): followers serve reads. A follower answers RECALL / LOOKUP / SCAN (HTTP `/query`, Flight `aql`) and Flight table / SQL reads from its own copy, after asking the leader for its ReadIndex (`/raft/read_index`; concurrent reads share one ask) and waiting until its state machine and tables have applied it, so every node gives read-your-writes. Every other HTTP request is passed to the leader (SSE included), so any node takes any request; Flight writes on a follower answer `unavailable: this ADB node is not the leader`. Followers follow the branch registry and entity aliases from the log so their reads match the leader's; their compaction runs beside the applies so reads don't wait for it. `ADB_FOLLOWER_READS=0` turns it off. FlowR sends reads to the nodes in turn and writes to the leader (`FLOWR_ADB_SPREAD_READS=0` turns it off) |
+| C-17b | Done (F-20): embedding spread over the replica set. Each local-model request goes to the node with the fewest requests in flight (this one or a peer's `POST /cluster/embed` on its Raft port); a failing peer is left out for 10 s. `ADB_EMBED_PEERS=0` turns it off |
+| C-18 | Not in this round: partitions led by different nodes (write sequencing on several leaders) is a multi-Raft change |

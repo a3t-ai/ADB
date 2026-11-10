@@ -32,6 +32,17 @@ pub struct Replica {
     forgotten: std::collections::HashSet<(adb_core::log::Memory, String)>,
     /// The leader's erasure marker has arrived: erase [`Self::forgotten`] here too.
     erase_due: bool,
+    /// Branches, tags, layers and quotas, followed from the log (follower reads, C-16).
+    branches: Arc<crate::branches::Branches>,
+    /// Entity aliases (GR-12), for follower reads; rebuilt when a record carries any.
+    aliases: crate::follower::Aliases,
+    aliases_stale: bool,
+    /// Every record up to this offset is in the table and the platform tables.
+    applied: tokio::sync::watch::Sender<u64>,
+    /// A follower read waiting for an offset asks for an apply now.
+    wake: Arc<tokio::sync::Notify>,
+    /// Compaction runs beside the applies, so reads don't wait for it.
+    compacting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How often a follower checks whether its tables need compacting.
@@ -51,11 +62,34 @@ impl Replica {
     pub async fn open(dir: impl AsRef<std::path::Path>, log: EngineLog) -> Result<Self, String> {
         let dir = dir.as_ref();
         let (store, embedder) = crate::engine::open_store(dir).await?;
+        // The hot cache, kept by every apply, so a takeover doesn't refill it (C-19).
+        store.set_cache(crate::engine::hot_cache(crate::engine::cache_config(dir)?)).await.map_err(s("store"))?;
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(s("platform"))?);
         let platform_next = LogOffset(platform.applied_offset().await + 1);
         let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;
         let engine_next = engine.replay_from().await.map_err(s("engine"))?;
-        let mut r = Self { log, store, embedder, platform, engine, platform_next, engine_next, retain_max: retain_max(), maintained: std::time::Instant::now(), forgotten: Default::default(), erase_due: false };
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let branches = Arc::new(crate::branches::Branches::load(&store, now).await?);
+        let aliases = Arc::new(std::sync::RwLock::new(crate::writes::load_aliases(&store).await.map_err(s("store"))?));
+        let mut r = Self {
+            log,
+            store,
+            embedder,
+            platform,
+            engine,
+            platform_next,
+            engine_next,
+            retain_max: retain_max(),
+            maintained: std::time::Instant::now(),
+            forgotten: Default::default(),
+            erase_due: false,
+            branches,
+            aliases,
+            aliases_stale: false,
+            applied: tokio::sync::watch::Sender::new(0),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            compacting: Default::default(),
+        };
         let n = r.step().await?;
         tracing::info!(records = n, offset = r.log.last_offset().0, "replica caught up");
         // The table's schema migrations, as the leader's engine runs them on open
@@ -72,6 +106,25 @@ impl Replica {
         Ok(r)
     }
 
+    /// Reads on this replica's data (C-16); valid while the replica steps.
+    pub fn reader(&self, log: EngineLog) -> crate::follower::FollowerReads {
+        crate::follower::FollowerReads::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.platform),
+            self.embedder.clone(),
+            Arc::clone(&self.branches),
+            Arc::clone(&self.aliases),
+            log,
+            self.applied.subscribe(),
+            Arc::clone(&self.wake),
+        )
+    }
+
+    /// Notified when a follower read waits for an offset not yet applied.
+    pub fn wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.wake)
+    }
+
     /// The follower's own table (status, tests).
     pub fn store(&self) -> &Arc<PartitionStore> {
         &self.store
@@ -80,7 +133,7 @@ impl Replica {
     /// Hand what this replica keeps open to the leader's engine
     /// ([`crate::LocalEngine::durable_warm`]); call after a last [`Self::step`].
     pub fn into_warm(self) -> crate::engine::Warm {
-        crate::engine::Warm { store: self.store, embedder: self.embedder, platform: self.platform, engine: self.engine }
+        crate::engine::Warm { store: self.store, embedder: self.embedder, platform: self.platform, engine: self.engine, engine_next: self.engine_next }
     }
 
     /// Records from `from` on, skipping a purged stretch (its records were
@@ -112,9 +165,28 @@ impl Replica {
             }
             for r in &batch {
                 self.note_forgets(r);
+                self.note_reads(r);
             }
             self.platform_next = last.next();
         }
+        if self.aliases_stale {
+            self.aliases_stale = false;
+            match crate::writes::load_aliases(&self.store).await {
+                Ok(a) => *self.aliases.write().unwrap() = a,
+                Err(e) => {
+                    self.aliases_stale = true;
+                    tracing::warn!(error = %e, "follower could not reload entity aliases; retrying");
+                }
+            }
+        }
+        // Follower reads (C-16) wait for this.
+        let table = self.store.applied_offset().await.map_err(s("store"))?.0;
+        let through = table.min(self.platform_next.0.saturating_sub(1));
+        self.applied.send_if_modified(|a| {
+            let moved = through > *a;
+            *a = (*a).max(through);
+            moved
+        });
         // PF-5: the memtable to Lance when due (the log is purged only below that).
         self.platform.flush_due().await.map_err(s("platform"))?;
         loop {
@@ -143,6 +215,24 @@ impl Replica {
         Ok(applied)
     }
 
+    /// What follower reads need from a record: branch registrations and entity aliases.
+    fn note_reads(&mut self, r: &adb_core::log::LogRecord) {
+        self.branches.apply(r);
+        for e in &r.effects {
+            match e {
+                Effect::PutEntity(n) | Effect::Supersede { new: n, .. } if n.data.value.get("aliases").is_some() => self.aliases_stale = true,
+                Effect::Patch { fields, .. } if fields.contains_key("aliases") => self.aliases_stale = true,
+                Effect::Forget { memory: adb_core::log::Memory::Semantic, lineage_id } | Effect::Expire { memory: adb_core::log::Memory::Semantic, lineage_id } => {
+                    let mut a = self.aliases.write().unwrap();
+                    if !a.is_empty() {
+                        a.retain(|_, to| *to != lineage_id.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Compaction on the leader's thresholds. Without it a follower's sealed memtables,
     /// journal generations and table versions pile up until it leads: each flush then
     /// rewrites a longer manifest, and forgotten rows stay on its disk. Failures are
@@ -155,24 +245,34 @@ impl Replica {
                 tracing::warn!(error = %e, "follower erasure failed; retrying at the next check");
             }
         }
-        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let due = crate::writes::compaction_due_for(&self.store).await;
-        if due {
-            match self.store.compact(FOLLOWER_HISTORY, now).await {
-                Ok(st) => tracing::info!(kept = st.kept, of = st.total, took = ?st.took, "follower table compacted"),
-                Err(e) => tracing::warn!(error = %e, "follower compaction failed; retrying later"),
-            }
+        // Beside the applies (C-16): follower reads wait for applies, and a compaction
+        // held them for its whole run. The table's compaction runs with writes going
+        // on; the platform tables' holds their applies itself.
+        if self.compacting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
         }
-        for j in self.engine.journals_to_compact().await {
-            if let Err(e) = j.run().await {
-                tracing::warn!(space = %j.space, error = %e, "follower journal compaction failed");
+        let jobs = self.engine.journals_to_compact().await;
+        let (store, platform, compacting) = (Arc::clone(&self.store), Arc::clone(&self.platform), Arc::clone(&self.compacting));
+        tokio::spawn(async move {
+            let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+            if crate::writes::compaction_due_for(&store).await {
+                match store.compact(FOLLOWER_HISTORY, now).await {
+                    Ok(st) => tracing::info!(kept = st.kept, of = st.total, took = ?st.took, "follower table compacted"),
+                    Err(e) => tracing::warn!(error = %e, "follower compaction failed; retrying later"),
+                }
             }
-        }
-        if self.platform.compaction_due().await {
-            if let Err(e) = self.platform.compact().await {
-                tracing::warn!(error = %e, "follower platform compaction failed");
+            for j in jobs {
+                if let Err(e) = j.run().await {
+                    tracing::warn!(space = %j.space, error = %e, "follower journal compaction failed");
+                }
             }
-        }
+            if platform.compaction_due().await {
+                if let Err(e) = platform.compact().await {
+                    tracing::warn!(error = %e, "follower platform compaction failed");
+                }
+            }
+            compacting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     /// Note a record's FORGETs; the leader's erasure marker (the one record with no
