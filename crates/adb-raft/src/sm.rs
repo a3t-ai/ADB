@@ -35,7 +35,14 @@ pub struct StateMachine {
     wal: Arc<LocalWal>,
     state: Mutex<Persisted>,
     snapshot: Mutex<Option<SnapshotMetaOf<TC>>>,
+    /// When `applied` was last written (with its sync): at most once a second (C-2).
+    saved_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How stale the `applied` file may be: after a crash, openraft re-applies from it, and
+/// entries the WAL already holds are skipped, so a stale value costs a few skipped
+/// entries, never a wrong state.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl StateMachine {
     pub fn open(dir: impl Into<PathBuf>, wal: Arc<LocalWal>) -> io::Result<Self> {
@@ -43,18 +50,33 @@ impl StateMachine {
         std::fs::create_dir_all(&dir)?;
         let state: Persisted = get(&dir, "applied")?.unwrap_or_default();
         let snapshot: Option<SnapshotMetaOf<TC>> = get(&dir, "snapshot")?;
-        Ok(Self { dir, wal, state: Mutex::new(state), snapshot: Mutex::new(snapshot) })
+        Ok(Self { dir, wal, state: Mutex::new(state), snapshot: Mutex::new(snapshot), saved_at: Mutex::new(None) })
     }
 
     fn save(&self) -> io::Result<()> {
         let s = self.state.lock().unwrap().clone();
-        put(&self.dir, "applied", &s)
+        put(&self.dir, "applied", &s)?;
+        *self.saved_at.lock().unwrap() = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// [`Self::save`] when `must` (membership changed, a snapshot) or the last save is
+    /// older than [`SAVE_EVERY`].
+    fn save_due(&self, must: bool) -> io::Result<()> {
+        let due = must || self.saved_at.lock().unwrap().is_none_or(|t| t.elapsed() >= SAVE_EVERY);
+        if due {
+            self.save()?;
+        }
+        Ok(())
     }
 }
 
 impl RaftSnapshotBuilder<TC> for Arc<StateMachine> {
     type SnapshotData = Cursor<Vec<u8>>;
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<TC, Cursor<Vec<u8>>>, io::Error> {
+        // The snapshot names the last applied entry: that entry's `applied` is on disk
+        // first (C-2 writes it only once a second otherwise).
+        self.save()?;
         let s = self.state.lock().unwrap().clone();
         let meta = SnapshotMetaOf::<TC> {
             last_log_id: s.last_applied,
@@ -79,7 +101,12 @@ impl RaftStateMachine<TC> for Arc<StateMachine> {
     where
         Strm: Stream<Item = Result<EntryResponder<TC>, io::Error>> + Unpin + OptionalSend,
     {
-        let mut changed = false;
+        // C-1: every record of the batch is queued to the WAL first, then all are waited
+        // for together (one group sync), and only then is anyone answered. Awaiting each
+        // append before the next made every entry pay its own sync, in series.
+        let mut waits = Vec::new();
+        let mut answers = Vec::new();
+        let mut membership = false;
         while let Some((entry, responder)) = entries.try_next().await? {
             let mut answer = Applied(self.wal.last_offset().0);
             match entry.payload {
@@ -90,25 +117,31 @@ impl RaftStateMachine<TC> for Arc<StateMachine> {
                         if at.0 != last.0 + 1 {
                             return Err(io::Error::other(format!("raft entry {} holds WAL offset {} but the WAL ends at {}", entry.log_id.index, at.0, last.0)));
                         }
-                        let r = if cmd.new_segment { self.wal.append_on_new_segment(cmd.record).await } else { self.wal.append(cmd.record).await };
-                        r.map_err(|e| io::Error::other(format!("WAL append at {}: {e}", at.0)))?;
+                        let w = self.wal.enqueue(cmd.record, cmd.new_segment).map_err(|e| io::Error::other(format!("WAL append at {}: {e}", at.0)))?;
+                        waits.push((at.0, w));
                     }
                     answer = Applied(at.0);
                 }
                 EntryPayload::Membership(m) => {
                     self.state.lock().unwrap().membership = StoredMembershipOf::<TC>::new(Some(entry.log_id.clone()), m);
+                    membership = true;
                 }
                 EntryPayload::Blank => {}
             }
             self.state.lock().unwrap().last_applied = Some(entry.log_id.clone());
-            changed = true;
+            answers.push((responder, answer));
+        }
+        for (at, w) in waits {
+            w.await.map_err(|e| io::Error::other(format!("WAL append at {at}: {e}")))?;
+        }
+        for (responder, answer) in answers {
             if let Some(r) = responder {
                 r.send(answer);
             }
         }
-        if changed {
-            self.save()?;
-        }
+        // C-2: `applied` is written at most once a second (always on a membership change);
+        // a stale value only makes openraft re-apply entries the WAL already skips.
+        self.save_due(membership)?;
         Ok(())
     }
 

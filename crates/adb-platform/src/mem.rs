@@ -59,7 +59,13 @@ pub(crate) struct Mem {
     through: AtomicU64,
     rows: AtomicUsize,
     since: std::sync::Mutex<Option<Instant>>,
+    /// Flushes per upsert table since its key index was last brought up to date (C-14).
+    unindexed: std::sync::Mutex<HashMap<String, u32>>,
 }
+
+/// Flushes of an upsert table between key-index updates (C-14): ~2 s at one flush per
+/// 200 ms, so a keyed read never scans more than a few seconds of unindexed fragments.
+const INDEX_EVERY: u32 = 10;
 
 fn cell(v: &Value) -> String {
     match v {
@@ -303,6 +309,24 @@ impl PlatformStore {
             applied.flushed.insert(table.clone(), to);
             // Readers already pass it by: the table's version is past its base.
             self.mem.remove(table);
+            // C-14: the upsert key's index follows the flushed fragments every few flushes
+            // (not only at compaction): get_state and other keyed reads stop scanning a
+            // growing pile of small fragments.
+            if let Rows::Upserts { key, .. } = &m.rows {
+                let due = {
+                    let mut u = self.mem.unindexed.lock().unwrap();
+                    let n = u.entry(table.clone()).or_insert(0);
+                    *n += 1;
+                    let due = *n >= INDEX_EVERY;
+                    if due {
+                        *n = 0;
+                    }
+                    due
+                };
+                if due {
+                    self.index_upsert_key(applied, table, key).await;
+                }
+            }
         }
         applied.flush = None;
         applied.offset = applied.offset.max(to);
@@ -310,5 +334,30 @@ impl PlatformStore {
         self.save(applied)?;
         tracing::debug!(target: "adb::write", tables = tables.len(), rows, to, us = t0.elapsed().as_micros() as u64, "platform memtable flushed");
         Ok(())
+    }
+}
+
+impl PlatformStore {
+    /// Bring `table`'s key index up to date with its fragments, as a compaction does and
+    /// under the same marker (`compacting`): the index commit is no effect, and a crash
+    /// during it must not count as one on replay. Failures are logged; the next flush
+    /// tries again.
+    async fn index_upsert_key(&self, applied: &mut Applied, table: &str, key: &[String]) {
+        let Some(ds) = self.dataset(table).await else { return };
+        applied.compacting = Some(table.to_string());
+        if let Err(e) = self.save(applied) {
+            tracing::warn!(%table, error = %e, "key index not updated");
+            applied.compacting = None;
+            return;
+        }
+        let mut ds = (*ds).clone();
+        let r = index_keys(&mut ds, key).await;
+        let _ = ds.checkout_latest().await;
+        applied.versions.insert(table.to_string(), ds.version().version);
+        applied.compacting = None;
+        self.tables.write().await.insert(table.to_string(), Arc::new(ds));
+        if let Err(e) = r.and_then(|_| self.save(applied)) {
+            tracing::warn!(%table, error = %e, "key index not updated; next flush tries again");
+        }
     }
 }

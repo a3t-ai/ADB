@@ -44,7 +44,22 @@ async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
 pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, flight_port: u16, shutdown: impl std::future::Future<Output = &'static str>) -> Result<(), Box<dyn std::error::Error>> {
     let raft_port: u16 = std::env::var("ADB_RAFT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3002);
     let wal = LocalEngine::open_local_wal(dir).await?;
-    let node = Arc::new(Node::start(dir, Arc::clone(&wal), config).await?);
+    // C-4: Raft (its core, heartbeats, replication and RPC server) runs on its own
+    // threads. On the shared runtime, CPU-heavy queries kept the leader from sending
+    // heartbeats in time and lost it the lead (AWS, 10 Nov). Everything else talks to it
+    // through openraft's channels, as before.
+    let raft_rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(std::env::var("ADB_RAFT_THREADS").ok().and_then(|n| n.parse().ok()).unwrap_or(2))
+            .thread_name("adb-raft")
+            .enable_all()
+            .build()?,
+    ));
+    let start = {
+        let (dir, wal) = (dir.to_path_buf(), Arc::clone(&wal));
+        raft_rt.spawn(async move { Node::start(&dir, wal, config).await })
+    };
+    let node = Arc::new(start.await.map_err(|e| format!("raft runtime: {e}"))??);
     tracing::info!(node = node.id, peers = ?node.config.peers, raft_port, "ADB replica set member started");
 
     let status_node = Arc::clone(&node);
@@ -53,8 +68,14 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
         async move { Json(n.status()) }
     }));
     let raft_listener = bind(SocketAddr::new(host, raft_port)).await?;
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(raft_listener, raft_app).await {
+    // A listener belongs to the runtime it was registered on: re-register it on Raft's.
+    let raft_listener = raft_listener.into_std()?;
+    raft_rt.spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(raft_listener) {
+            Ok(l) => l,
+            Err(e) => return tracing::error!(error = %e, "raft endpoint not started"),
+        };
+        if let Err(e) = axum::serve(listener, raft_app).await {
             tracing::error!(error = %e, "raft endpoint stopped");
         }
     });

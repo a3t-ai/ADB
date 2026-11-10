@@ -100,6 +100,8 @@ pub struct LogStore {
     dir: PathBuf,
     inner: Arc<Mutex<Inner>>,
     writer: mpsc::Sender<Job>,
+    /// When `committed` was last written (C-3: at most once a second).
+    committed_saved_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 fn invalid(e: impl ToString) -> io::Error {
@@ -407,7 +409,7 @@ impl LogStore {
         let tail_limit = std::env::var("ADB_RAFT_LOG_TAIL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8) << 20;
         let inner = Arc::new(Mutex::new(inner));
         let writer = spawn_writer(path, Arc::clone(&inner), tail_limit)?;
-        Ok(Self { dir, inner, writer })
+        Ok(Self { dir, inner, writer, committed_saved_at: Default::default() })
     }
 
     /// Rewrite every entry whose record `redact` changes (W5 erasure: a forgotten
@@ -522,8 +524,22 @@ impl RaftLogStorage<TC> for LogStore {
         Ok(())
     }
 
+    /// C-3: openraft calls this on every commit, in its core loop, and the atomic rewrite
+    /// took two syncs each time. The committed index is optional to persist (openraft:
+    /// a restarted node re-applies up to the quorum's commit), so it is written at most
+    /// once a second; the Raft log entries themselves are what is durable.
     async fn save_committed(&mut self, c: Option<LogIdOf<TC>>) -> Result<(), io::Error> {
-        put(&self.dir, "committed", &c)?;
+        let due = {
+            let mut at = self.committed_saved_at.lock().unwrap();
+            let due = at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1));
+            if due {
+                *at = Some(std::time::Instant::now());
+            }
+            due
+        };
+        if due {
+            put(&self.dir, "committed", &c)?;
+        }
         self.inner.lock().unwrap().committed = c;
         Ok(())
     }

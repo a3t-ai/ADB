@@ -255,8 +255,19 @@ impl LocalWal {
     }
 }
 
+/// An append queued with [`LocalWal::enqueue`]: resolves once its group's sync is done.
+pub type WalWait = std::pin::Pin<Box<dyn std::future::Future<Output = LogResult<LogOffset>> + Send>>;
+
 impl LocalWal {
     async fn append_job(&self, record: LogRecord, roll: bool) -> LogResult<LogOffset> {
+        self.enqueue(record, roll)?.await
+    }
+
+    /// Queue `record` (on a new segment with `roll`) and return the wait for its sync,
+    /// without waiting: a caller with several records queues them all, then waits, and
+    /// one group sync covers them (the Raft state machine's apply, C-1). Records queue
+    /// in the order of the calls.
+    pub fn enqueue(&self, record: LogRecord, roll: bool) -> LogResult<WalWait> {
         if record.partition != self.partition {
             return Err(LogError::WrongPartition { log: self.partition, got: record.partition });
         }
@@ -283,7 +294,7 @@ impl LocalWal {
                 .send(Job { offset: record.offset, frame, done, roll })
                 .map_err(|_| LogError::Io("WAL writer stopped".into()))?;
         }
-        wait.await.map_err(|_| LogError::Io("WAL writer stopped".into()))?
+        Ok(Box::pin(async move { wait.await.map_err(|_| LogError::Io("WAL writer stopped".into()))? }))
     }
 }
 

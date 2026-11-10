@@ -883,6 +883,13 @@ impl Engine for LocalEngine {
             return self.query_unobserved(aql, variables).await;
         }
         let t0 = std::time::Instant::now();
+        // C-5: reads take a permit; beyond the bound they queue here instead of all taking
+        // the CPU at once (CPU-saturating reads lost the leader its lead on AWS, 10 Nov).
+        // Writes are not bounded: they wait on the log, not the CPU.
+        let _permit = match adb_core::metrics::statement_of(aql).0 {
+            "RECALL" | "LOOKUP" | "SCAN" => Some(read_permits().acquire().await.map_err(|e| e.to_string())?),
+            _ => None,
+        };
         let r = self.query_unobserved(aql, variables).await;
         observe_query(aql, t0.elapsed(), &r);
         r
@@ -1708,6 +1715,17 @@ impl LocalEngine {
         tracing::debug!(?executed, total = ?started.elapsed(), "query");
         wire
     }
+}
+
+/// Reads running at once (C-5): `ADB_MAX_READS`, default twice the CPUs (at least 2).
+fn read_permits() -> &'static tokio::sync::Semaphore {
+    static P: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        let n = std::env::var("ADB_MAX_READS").ok().and_then(|v| v.parse().ok()).unwrap_or((cpus * 2).max(2));
+        tracing::info!(permits = n, "concurrent reads bounded (ADB_MAX_READS)");
+        tokio::sync::Semaphore::new(n)
+    })
 }
 
 /// OB-3: one AQL statement's metrics; a `debug` line (`adb::query`) for each, an `info`
