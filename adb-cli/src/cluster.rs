@@ -184,18 +184,38 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
             }
         };
         let wake = replica.wake();
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        // PF-45: a step that applied records is followed by another at once (up to
+        // DRAIN_STEPS), so a follower under a write load applies continuously. On a
+        // 200 ms tick alone it applied ~5 times a second, idle 90% of the time, and lagged
+        // the leader at ~3,600 records/s: its reads waited for that (AWS PF-44 run).
+        const DRAIN_STEPS: usize = 100;
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Err(e) = replica.step().await {
-                        tracing::warn!(error = %e, "replica step failed; retrying");
+                    for _ in 0..DRAIN_STEPS {
+                        match replica.step().await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "replica step failed; retrying");
+                                break;
+                            }
+                        }
                     }
                 }
                 // A read waits for an offset not yet applied: apply now.
                 _ = wake.notified() => {
-                    if let Err(e) = replica.step().await {
-                        tracing::warn!(error = %e, "replica step failed; retrying");
+                    for _ in 0..DRAIN_STEPS {
+                        match replica.step().await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "replica step failed; retrying");
+                                break;
+                            }
+                        }
                     }
                 }
                 _ = node.until_lead(true) => break,

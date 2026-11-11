@@ -70,6 +70,7 @@ pub struct EmbedAnswer {
 
 /// A peer's request, on this node's own model (never passed on).
 pub async fn serve(req: EmbedRequest) -> Result<EmbedAnswer, String> {
+    let _t = adb_core::steps::timer("embed.served for a peer");
     let e = SERVING.read().unwrap().clone().ok_or("this node has no embedding model")?;
     if e.model() != req.model || e.dimension() != req.dimension {
         return Err(format!("this node embeds with {} ({} dimensions), not {} ({})", e.model(), e.dimension(), req.model, req.dimension));
@@ -96,7 +97,11 @@ fn pick() -> Option<(&'static Peers, &'static Peer)> {
 /// `texts` embedded by a less busy peer, or `None` (none is, or it failed: the
 /// caller embeds them here).
 pub(crate) async fn try_peer(e: &Embedder, texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    let (ps, peer) = pick()?;
+    adb_core::steps::value("embed.local in flight", LOCAL_IN_FLIGHT.load(Ordering::Relaxed) as u64);
+    let Some((ps, peer)) = pick() else {
+        adb_core::steps::add("embed.peer not picked", std::time::Duration::ZERO);
+        return None;
+    };
     peer.in_flight.fetch_add(1, Ordering::Relaxed);
     let body = EmbedRequest { model: e.model().to_string(), dimension: e.dimension(), texts: texts.to_vec() };
     let r = async {

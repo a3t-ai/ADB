@@ -16,6 +16,7 @@ pub mod reads;
 pub mod rank;
 pub mod sql;
 pub mod writes;
+pub use adb_core::steps;
 pub mod replica;
 pub mod follower;
 pub mod branches;

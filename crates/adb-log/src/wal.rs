@@ -325,6 +325,8 @@ fn writer_loop(
         while let Ok(more) = rx.try_recv() {
             batch.push(more);
         }
+        adb_core::steps::value("wal records per sync", batch.len() as u64);
+        let _t = adb_core::steps::timer("wal writer write + fsync");
 
         let mut written = Vec::with_capacity(batch.len());
         let result = (|| -> LogResult<()> {

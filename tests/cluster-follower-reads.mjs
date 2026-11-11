@@ -66,10 +66,16 @@ async function leader(timeoutMs = 30000) {
   }
   throw new Error(`no leader within ${timeoutMs} ms:\n${nodes.map(n => `--- node ${n.id}\n${n.log.slice(-3000)}`).join('\n')}`);
 }
-async function query(n, aql, variables) {
-  const r = await fetch(`${url(n)}/query`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: aql, variables }), signal: AbortSignal.timeout(15000) });
+// PF-46: a follower serves what it has applied; `after` (a write's metadata.point
+// offset) makes it wait for that write, `strict` asks the leader's read index first.
+async function query(n, aql, variables, { after, strict } = {}) {
+  const headers = { 'content-type': 'application/json' };
+  if (after != null) headers['x-adb-after'] = String(after);
+  if (strict) headers['x-adb-read'] = 'strict';
+  const r = await fetch(`${url(n)}/query`, { method: 'POST', headers, body: JSON.stringify({ query: aql, variables }), signal: AbortSignal.timeout(15000) });
   return r.json();
 }
+const pointOf = r => r?.data?.metadata?.point?.offset ?? r?.metadata?.point?.offset;
 const rows = r => r?.data?.data?.records ?? r?.data?.records ?? [];
 const found = r => r.success && rows(r).length > 0;
 const servedBy = r => r?.data?.metadata?.served_by ?? r?.metadata?.served_by;
@@ -94,24 +100,39 @@ try {
   const back = await query(lead, 'LOOKUP FROM SEMANTIC KEY id = "via-follower"');
   check('the leader holds it', found(back), JSON.stringify(back).slice(0, 300));
 
-  // 2 + 3. Read-your-writes on every node, rounds of STORE then immediate LOOKUPs.
-  let misses = 0, byFollower = 0, reads = 0;
+  // 2 + 3. Read-your-writes on every node, rounds of STORE then immediate LOOKUPs:
+  // with the write's token (applied reads), then with no token in strict mode.
+  let misses = 0, byFollower = 0, reads = 0, last = 0, noPoint = 0;
   const t0 = Date.now();
   for (let i = 0; i < ROUNDS; i++) {
     const writeAt = nodes[i % 3];
     const key = `ryw-${i}`;
     const s = await query(writeAt, `STORE INTO SEMANTIC (key = "${key}", topic = "fr", content = "follower read ${i}")`);
     if (!s.success) { misses++; console.log(`  write ${key} failed: ${JSON.stringify(s).slice(0, 200)}`); continue; }
+    const after = pointOf(s);
+    if (after == null) noPoint++;
+    last = Math.max(last, after ?? 0);
     for (const n of nodes) {
-      const r = await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`);
+      const r = await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`, undefined, { after });
       reads++;
       if (!found(r)) { misses++; if (misses < 5) console.log(`  node ${n.id} missed ${key}: ${JSON.stringify(r).slice(0, 200)}`); }
       if (servedBy(r) === 'follower') byFollower++;
     }
   }
-  check(`read-your-writes on every node (${ROUNDS} writes × 3 nodes, ${Date.now() - t0} ms)`, misses === 0, `${misses} misses`);
+  check(`read-your-writes on every node with the write's token (${ROUNDS} writes × 3 nodes, ${Date.now() - t0} ms)`, misses === 0 && noPoint === 0, `${misses} misses, ${noPoint} writes without a point`);
   check('followers served their reads', byFollower >= Math.floor(reads * 2 / 3) - 1, `${byFollower} of ${reads} served by a follower`);
-  const rc = await query(followers()[1], 'RECALL FROM SEMANTIC WHERE topic = "fr" LIMIT 1000');
+  let strictMisses = 0;
+  const t1 = Date.now();
+  for (let i = 0; i < 50; i++) {
+    const key = `strict-${i}`;
+    const s = await query(nodes[i % 3], `STORE INTO SEMANTIC (key = "${key}", topic = "fr2", content = "strict read ${i}")`);
+    if (!s.success) { strictMisses++; continue; }
+    for (const n of followers()) {
+      if (!found(await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`, undefined, { strict: true }))) strictMisses++;
+    }
+  }
+  check(`strict reads on followers see the write with no token (50 writes, ${Date.now() - t1} ms)`, strictMisses === 0, `${strictMisses} misses`);
+  const rc = await query(followers()[1], 'RECALL FROM SEMANTIC WHERE topic = "fr" LIMIT 1000', undefined, { after: last });
   check('a filtered RECALL on a follower sees every write', rc.success && rows(rc).length >= ROUNDS, JSON.stringify(rc).slice(0, 200));
 
   // 5. Leader kill under load: writers at any node, readers at the followers.
@@ -147,7 +168,7 @@ try {
   for (const key of acked) {
     for (const n of nodes) {
       let ok = false;
-      for (let t = 0; t < 3 && !ok; t++) { try { ok = found(await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`)); } catch {} if (!ok) await sleep(300); }
+      for (let t = 0; t < 3 && !ok; t++) { try { ok = found(await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`, undefined, { strict: true })); } catch {} if (!ok) await sleep(300); }
       if (!ok) { lost++; break; }
     }
   }
@@ -158,7 +179,7 @@ try {
     lead = await leader();
     const N = 64;
     await Promise.all(Array.from({ length: N }, (_, i) => query(lead, `STORE INTO SEMANTIC (key = "emb-${i}", topic = "emb", content = "the payments service ran out of memory ${i}")`)));
-    const r = await query(followers()[0], 'RECALL FROM SEMANTIC LIKE $q LIMIT 5', { q: 'payments pod out of memory' });
+    const r = await query(followers()[0], 'RECALL FROM SEMANTIC LIKE $q LIMIT 5', { q: 'payments pod out of memory' }, { strict: true });
     check('a similarity read on a follower finds the new records', found(r), JSON.stringify(r).slice(0, 300));
     const lent = followers().map(n => (n.log.match(/embedded for a peer/g) ?? []).length);
     check('followers embedded some of the leader\'s writes', lent.some(c => c > 0), `peer embeddings per follower: ${lent.join(', ')}`);

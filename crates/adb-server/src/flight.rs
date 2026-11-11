@@ -829,13 +829,16 @@ impl FlightService for AdbFlight {
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let f = adb_core::metrics::InFlight::start("flight", "get");
-        let r = self.do_get_inner(req).await;
+        let _t = adb_core::steps::timer("flight.do_get");
+        let opts = adb_core::read_opts::ReadOpts::from_lookup(|k| req.metadata().get(k).and_then(|v| v.to_str().ok()));
+        let r = adb_core::read_opts::scope(opts, self.do_get_inner(req)).await;
         f.done(r.is_ok());
         r
     }
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
         let f = adb_core::metrics::InFlight::start("flight", "put");
+        let _t = adb_core::steps::timer("flight.do_put");
         let r = self.do_put_inner(req).await;
         f.done(r.is_ok());
         r
@@ -843,7 +846,9 @@ impl FlightService for AdbFlight {
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let f = adb_core::metrics::InFlight::start("flight", action_op(&req.get_ref().r#type));
-        let r = self.do_action_inner(req).await.map_err(with_code);
+        let _t = adb_core::steps::timer("flight.do_action");
+        let opts = adb_core::read_opts::ReadOpts::from_lookup(|k| req.metadata().get(k).and_then(|v| v.to_str().ok()));
+        let r = adb_core::read_opts::scope(opts, self.do_action_inner(req)).await.map_err(with_code);
         f.done(r.is_ok());
         r
     }

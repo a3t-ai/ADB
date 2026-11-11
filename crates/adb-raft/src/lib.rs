@@ -133,10 +133,53 @@ pub struct Node {
     pub config: ClusterConfig,
     /// openraft's log, shared with Raft: erasure rewrites it (see [`RaftLog`]).
     store: store::LogStore,
-    /// Follower reads (C-16): the leader's read index, fetched once for every read
-    /// that arrived before the fetch started.
-    read_gate: tokio::sync::Mutex<Option<(std::time::Instant, u64)>>,
+    /// Strict follower reads (C-16, PF-46): reads queue here; one task asks the leader
+    /// for its read index, once for everything queued, and answers them all.
+    read_index_q: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<u64, String>>>,
+}
+
+/// The read-index batcher (PF-46): takes every read queued, makes one ReadIndex call to
+/// the leader, answers them all, and goes on. A read that arrives during a call waits
+/// for the next one, which starts after it arrived, so each still sees every write
+/// acknowledged before it arrived. Nothing is locked across the round trip (etcd and
+/// TiKV batch the same way). Before: one mutex, held per read; ~430 reads/s per
+/// follower, 50-190 ms waits, CPU idle (AWS).
+fn spawn_read_index_batcher(
+    id: NodeId,
+    raft: AdbRaft,
+    peers: std::collections::BTreeMap<NodeId, String>,
     http: reqwest::Client,
+) -> tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<u64, String>>> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<Result<u64, String>>>();
+    tokio::spawn(async move {
+        let mut waiting = Vec::new();
+        while rx.recv_many(&mut waiting, 65_536).await > 0 {
+            adb_core::steps::value("follower.read index requests per call", waiting.len() as u64);
+            let t = std::time::Instant::now();
+            let leader = raft.metrics().borrow_watched().current_leader;
+            let r = match leader {
+                Some(l) if l == id => net::leader_read_index(&raft).await,
+                Some(l) => match peers.get(&l) {
+                    Some(url) => ask_read_index(&http, l, url).await,
+                    None => Err(format!("leader {l} is not in ADB_PEERS")),
+                },
+                None => Err("no leader".to_string()),
+            };
+            adb_core::steps::add("follower.read.1c read index call", t.elapsed());
+            for w in waiting.drain(..) {
+                let _ = w.send(r.clone());
+            }
+        }
+    });
+    tx
+}
+
+async fn ask_read_index(http: &reqwest::Client, leader: NodeId, url: &str) -> Result<u64, String> {
+    let r = http.get(format!("{url}/raft/read_index")).send().await.map_err(|e| format!("leader {leader}: {e}"))?;
+    if !r.status().is_success() {
+        return Err(format!("leader {leader}: {}", r.text().await.unwrap_or_default()));
+    }
+    r.json::<u64>().await.map_err(|e| format!("leader {leader}: {e}"))
 }
 
 impl Node {
@@ -151,6 +194,22 @@ impl Node {
         let cfg = Arc::new(raft_config().validate().map_err(|e| e.to_string())?);
         let store = log.clone();
         let raft = Raft::new(config.node_id, cfg, net::Network::new(), log, sm).await.map_err(|e| e.to_string())?;
+        // openraft's own stage latencies and batch sizes every 10 s (ADB_STEP_STATS=1).
+        if adb_core::steps::on() {
+            let r = raft.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    match r.runtime_stats().await {
+                        Ok(mut st) => {
+                            st.build_log_stage_histograms();
+                            tracing::info!(target: "adb::steps", "openraft runtime stats\n{}", st.display().multiline().human_readable());
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
         let lowest = config.peers.keys().next().copied();
         if empty && lowest == Some(config.node_id) {
             let members: BTreeMap<NodeId, BasicNode> = config.peers.iter().map(|(id, url)| (*id, BasicNode { addr: url.clone() })).collect();
@@ -164,7 +223,8 @@ impl Node {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { id: config.node_id, raft, wal, config, store, read_gate: Default::default(), http })
+        let read_index_q = spawn_read_index_batcher(config.node_id, raft.clone(), config.peers.clone(), http);
+        Ok(Self { id: config.node_id, raft, wal, config, store, read_index_q })
     }
 
     pub fn leader(&self) -> Option<NodeId> {
@@ -192,7 +252,23 @@ impl Node {
     /// committed before it took over (so its WAL is complete). `false` if it
     /// lost the lead meanwhile.
     pub async fn ready_to_lead(&self) -> bool {
-        self.is_leader() && self.raft.ensure_linearizable(ReadPolicy::ReadIndex).await.is_ok() && self.is_leader()
+        if !(self.is_leader() && self.raft.ensure_linearizable(ReadPolicy::ReadIndex).await.is_ok()) {
+            return false;
+        }
+        // PF-44: the state machine answers before the WAL's sync, so records it was
+        // handed may still be queued in the WAL writer: readable only once written. The
+        // engine opens from the WAL, so it waits for them (else a takeover would open
+        // at the queued end and never apply what was still in flight).
+        let t = std::time::Instant::now();
+        while self.wal.durable_offset() < self.wal.last_offset() {
+            if t.elapsed() > std::time::Duration::from_secs(30) {
+                tracing::error!(durable = self.wal.durable_offset().0, last = self.wal.last_offset().0, "the WAL did not sync its queued records within 30 s; not taking the lead");
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        adb_core::steps::add("raft.takeover WAL settle wait", t.elapsed());
+        self.is_leader()
     }
 
     /// A leader that is about to stop (SIGTERM: a roll, a drain) hands the lead to
@@ -217,36 +293,22 @@ impl Node {
     }
 
     /// The log index a linearizable read must see (C-16): the leader's ReadIndex, asked
-    /// of the leader over its Raft endpoint. Reads waiting together share one ask: a
-    /// result is reused only by reads that arrived before that ask started, so each
-    /// still sees every write acknowledged before it arrived.
+    /// of the leader over its Raft endpoint through the batcher (PF-46).
     pub async fn read_index(&self) -> Result<u64, String> {
-        let arrived = std::time::Instant::now();
-        let mut gate = self.read_gate.lock().await;
-        if let Some((started, index)) = *gate {
-            if started >= arrived {
-                return Ok(index);
-            }
-        }
-        let started = std::time::Instant::now();
-        let index = if self.is_leader() {
-            net::leader_read_index(&self.raft).await?
-        } else {
-            let leader = self.leader().ok_or("no leader")?;
-            let url = self.config.peers.get(&leader).ok_or_else(|| format!("leader {leader} is not in ADB_PEERS"))?;
-            let r = self.http.get(format!("{url}/raft/read_index")).send().await.map_err(|e| format!("leader {leader}: {e}"))?;
-            if !r.status().is_success() {
-                return Err(format!("leader {leader}: {}", r.text().await.unwrap_or_default()));
-            }
-            r.json::<u64>().await.map_err(|e| format!("leader {leader}: {e}"))?
-        };
-        *gate = Some((started, index));
-        Ok(index)
+        let t = std::time::Instant::now();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.read_index_q.send(tx).map_err(|_| "the read-index batcher stopped".to_string())?;
+        let r = rx.await.map_err(|_| "the read-index batcher stopped".to_string())?;
+        adb_core::steps::add("follower.read.1 read index (queue + call)", t.elapsed());
+        r
     }
 
     /// Wait until this node's state machine applied log index `index` (its WAL then
     /// holds every record up to it).
     pub async fn wait_applied(&self, index: u64, within: std::time::Duration) -> Result<(), String> {
+        if let Some(a) = self.raft.metrics().borrow_watched().last_applied.as_ref() {
+            adb_core::steps::value("follower.read raft entries behind", index.saturating_sub(a.index));
+        }
         self.raft.wait(Some(within)).applied_index_at_least(Some(index), "follower read").await.map(|_| ()).map_err(|e| e.to_string())
     }
 
@@ -317,10 +379,12 @@ impl Log for RaftLog {
     async fn submit(&self, record: LogRecord) -> LogResult<adb_log::CommitWait> {
         let offset = record.offset;
         let (responder, log_id, rx) = openraft::impls::ProgressResponder::<TypeConfig, _>::new();
+        let t = std::time::Instant::now();
         self.raft
             .client_write_ff(Cmd { record, new_segment: false, pad: Vec::new() }, Some(responder))
             .await
             .map_err(|e| LogError::Io(format!("record {} not submitted to the replica set: {e}", offset.0)))?;
+        adb_core::steps::add("raft.client_write_ff", t.elapsed());
         Ok(Box::pin(async move {
             // Held until the commit resolves: dropped early, openraft warns on every write.
             let _log_id = log_id;

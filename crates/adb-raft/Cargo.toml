@@ -8,7 +8,7 @@ description = "ADB replica sets: openraft over the partition log (M3, .ai/M3_RAF
 [dependencies]
 adb-core = { workspace = true }
 adb-log = { path = "../adb-log" }
-openraft = { version = "=0.10.0-alpha.36", features = ["serde", "type-alias"] }
+openraft = { version = "=0.10.0-alpha.36", features = ["serde", "type-alias", "runtime-stats"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

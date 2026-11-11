@@ -154,7 +154,11 @@ impl Replica {
     /// Apply what the WAL gained since the last step; trim it. Returns the
     /// records applied to the table.
     pub async fn step(&mut self) -> Result<u64, String> {
+        let _all = crate::steps::timer("follower.step (all)");
+        let mut ft = std::time::Instant::now();
         let applied = catch_up(&self.store, &self.log).await.map_err(s("store"))?;
+        crate::steps::lap("follower.1 memory records applied", &mut ft);
+        crate::steps::value("follower records per step", applied);
         loop {
             let mut from = self.platform_next;
             let batch = self.read(&mut from).await?;
@@ -189,8 +193,10 @@ impl Replica {
             *a = (*a).max(through);
             moved
         });
+        crate::steps::lap("follower.2 platform + aliases", &mut ft);
         // PF-5: the memtable to Lance when due (the log is purged only below that).
         self.platform.flush_due().await.map_err(s("platform"))?;
+        crate::steps::lap("follower.3 platform flush", &mut ft);
         loop {
             let mut from = self.engine_next;
             let batch = self.read(&mut from).await?;
@@ -202,17 +208,22 @@ impl Replica {
             }
             self.engine_next = last.next();
         }
+        crate::steps::lap("follower.4 engine replay", &mut ft);
         self.engine.snapshot_due(false).await.map_err(s("engine"))?;
+        crate::steps::lap("follower.5 engine snapshot", &mut ft);
         if self.erase_due {
             self.erase_due = false;
             if let Err(e) = self.erase().await {
                 tracing::warn!(error = %e, "follower erasure failed; retrying at the next check");
             }
         }
+        crate::steps::lap("follower.6 erase", &mut ft);
         self.purge().await?;
+        crate::steps::lap("follower.7 purge", &mut ft);
         if self.maintained.elapsed() >= MAINTAIN_EVERY {
             self.maintained = std::time::Instant::now();
             Box::pin(self.maintain()).await;
+            crate::steps::lap("follower.8 maintain", &mut ft);
         }
         Ok(applied)
     }

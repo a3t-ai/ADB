@@ -1,8 +1,10 @@
 //! A replica set follower's serving side (C-16, AWS F-20).
 //!
 //! - **Reads** (RECALL, LOOKUP, SCAN over HTTP `POST /query` and Flight `aql`; Flight
-//!   table and SQL reads) run here, on the follower's copy, as fresh as on the leader:
-//!   the leader's ReadIndex, applied here first ([`FollowerEngine::fresh`]).
+//!   table and SQL reads) run here, on the follower's copy: by default as fresh as
+//!   what it has applied, and at least the client's read-your-writes token
+//!   (`x-adb-after`); strict reads (`x-adb-read: strict`) wait for the leader's
+//!   ReadIndex first ([`FollowerEngine::fresh`], PF-46, `adb_core::read_opts`).
 //! - **Everything else over HTTP** is passed through to the leader, streams included,
 //!   so a client can send any request to any node.
 //! - **Everything else over Flight** answers `unavailable: this ADB node is not the
@@ -31,9 +33,24 @@ impl FollowerEngine {
     /// The WAL offset a read here must wait for: the leader's commit index, applied
     /// by this node's state machine (its WAL then holds it).
     async fn fresh(&self) -> Result<adb_core::log::LogOffset, String> {
+        let mut t = std::time::Instant::now();
         let index = self.node.read_index().await.map_err(|e| format!("{NOT_LEADER} and could not reach the leader: {e}"))?;
+        adb_core::steps::lap("follower.read.1 read index (all)", &mut t);
         self.node.wait_applied(index, Duration::from_secs(5)).await?;
+        adb_core::steps::lap("follower.read.2 raft applied wait", &mut t);
         Ok(self.reads.log_tip())
+    }
+
+    /// The offset this read waits for (PF-46): the leader's read index only for a
+    /// strict read; else the client's read-your-writes token, if any (applied reads).
+    async fn upto(&self) -> Result<adb_core::log::LogOffset, String> {
+        let o = adb_core::read_opts::current();
+        if o.strict_here() {
+            adb_core::steps::add("follower.read mode strict", std::time::Duration::ZERO);
+            return self.fresh().await;
+        }
+        adb_core::steps::add(if o.after.is_some() { "follower.read mode applied + token" } else { "follower.read mode applied" }, std::time::Duration::ZERO);
+        Ok(adb_core::log::LogOffset(o.after.unwrap_or(0)))
     }
 }
 
@@ -43,8 +60,13 @@ impl Engine for FollowerEngine {
         if !adb_executor::follower_reads(aql) {
             return Err(NOT_LEADER.into());
         }
-        let upto = self.fresh().await?;
-        self.reads.query(aql, variables, upto).await
+        let t = std::time::Instant::now();
+        let upto = self.upto().await?;
+        let t2 = std::time::Instant::now();
+        let r = self.reads.query(aql, variables, upto).await;
+        adb_core::steps::add("follower.read.3 replica query (catch-up + exec)", t2.elapsed());
+        adb_core::steps::add("follower.read (all)", t.elapsed());
+        r
     }
 
     async fn stats(&self) -> Result<Value, String> {
@@ -60,12 +82,12 @@ impl Engine for FollowerEngine {
     }
 
     async fn read_fresh(&self) -> Result<(), String> {
-        let upto = self.fresh().await?;
+        let upto = self.upto().await?;
         self.reads.caught_up(upto, Duration::from_secs(10)).await
     }
 
     async fn sql(&self, sql: &str, limit: Option<usize>) -> Result<adb_executor::sql::SqlResult, String> {
-        let upto = self.fresh().await?;
+        let upto = self.upto().await?;
         self.reads.sql(sql, limit, upto).await
     }
 }

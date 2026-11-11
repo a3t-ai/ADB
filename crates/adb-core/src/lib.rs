@@ -9,6 +9,8 @@
 //! - Log records and effects (`log`)
 
 pub mod metrics;
+pub mod steps;
+pub mod read_opts;
 pub mod codes;
 pub mod disk;
 pub mod error;

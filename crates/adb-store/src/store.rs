@@ -486,7 +486,7 @@ impl PartitionStore {
         self.rewrite_online(&keep, false).await?;
         self.layout.store(4, std::sync::atomic::Ordering::SeqCst);
         if let Some(h) = self.hot().filter(|_| !moved.is_empty()) {
-            let g = self.state.write().await;
+            let g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
             Self::fill_cache(&g, &h).await?;
         }
         Ok(n.into_inner())
@@ -606,7 +606,7 @@ impl PartitionStore {
         self.rewrite_online_with(&keep, &extra, false).await?;
         self.layout.store(5, std::sync::atomic::Ordering::SeqCst);
         if let Some(h) = self.hot() {
-            let g = self.state.write().await;
+            let g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
             Self::fill_cache(&g, &h).await?;
         }
         Ok(n.into_inner())
@@ -682,13 +682,14 @@ impl PartitionStore {
     /// [`Self::rewrite_online`] adding `extra` rows to the new table (a migration's
     /// new rows: in the same swap, so all or nothing).
     async fn rewrite_online_with(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), extra: &[StoredRow], vectors_cleared: bool) -> StoreResult<CompactStats> {
+        let _t = adb_core::steps::timer("store.rewrite_online (compaction)");
         let started = std::time::Instant::now();
         let dir = self.root.join(format!("p{}", self.partition.0)).join("memory.lance");
         let staged = dir.with_file_name("memory.rewrite.lance");
         let trash = dir.with_file_name("memory.compacted.trash");
         let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
         let _one = self.folding.lock().await;
-        let mut g = self.state.write().await;
+        let mut g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
         let bytes_before = dir_size(&dir);
         // The new table, complete and closed, beside the old one.
         if staged.exists() {
@@ -778,13 +779,14 @@ impl PartitionStore {
 
     /// MemWAL generations (sealed memtables) not yet compacted away: a W5 threshold.
     pub async fn generation_count(&self) -> StoreResult<usize> {
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         Ok(open_state(&g).writer.manifest().await.map_err(lance)?.map(|m| m.sstables.len()).unwrap_or(0))
     }
 
     /// Put `rows` into the table (chunks of 10k), outside the log: rewrites only.
     async fn put_rows(&self, rows: &[StoredRow]) -> StoreResult<()> {
-        let g = self.state.read().await;
+        let _t = adb_core::steps::timer("store.put_rows");
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         for chunk in rows.chunks(10_000) {
             let put = open_state(&g).writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance);
             self.rows.drop_rows(chunk);
@@ -984,7 +986,7 @@ impl PartitionStore {
         let applied = self.applied.load(std::sync::atomic::Ordering::SeqCst);
         out.push(StoredRow::meta(applied, meta.commit_ts, meta.epoch, self.meta_extra()));
         let batch = encode(&out, &self.schema, self.dim)?;
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let put = open_state(&g).writer.put(vec![batch]).await.map_err(lance);
         self.rows.drop_rows(&out);
         put?;
@@ -1008,7 +1010,8 @@ impl PartitionStore {
 
     /// Every row version matching `filter` (Lance SQL), newest per id, `_meta` included.
     pub async fn scan(&self, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
-        let g = self.state.read().await;
+        let _t = adb_core::steps::timer("store.scan");
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         Self::scan_in(open_state(&g), filter).await
     }
 
@@ -1028,7 +1031,8 @@ impl PartitionStore {
     /// parser can't express: Lance's json_* functions on `value` (stage D3.6).
     /// Filtering happens after the LSM picks the newest version of each row.
     pub async fn scan_expr(&self, filter: Option<Expr>) -> StoreResult<Vec<StoredRow>> {
-        let g = self.state.read().await;
+        let _t = adb_core::steps::timer("store.scan_expr");
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let mut scanner = Self::scanner(open_state(&g)).await?;
         if let Some(f) = filter {
             scanner = scanner.filter_expr(f);
@@ -1064,7 +1068,7 @@ impl PartitionStore {
         F: FnOnce(datafusion::prelude::SessionContext) -> Fut,
         Fut: std::future::Future<Output = datafusion::error::Result<T>>,
     {
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let inner = open_state(&g);
         let table = Self::snapshot(inner).await?;
         let ctx = datafusion::prelude::SessionContext::new_with_config(config);
@@ -1150,7 +1154,7 @@ impl PartitionStore {
     /// write path's key check starts from. Reads only the key columns, so a takeover
     /// doesn't decode every payload and embedding (C-19).
     pub async fn live_keys(&self, now: CommitTs) -> StoreResult<Vec<crate::rows::LiveKey>> {
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let scanner = Self::scanner(open_state(&g))
             .await?
             // Kind only: a row's kind never changes, so no older version can match
@@ -1166,6 +1170,7 @@ impl PartitionStore {
     /// Every version of `memory`'s records that isn't forgotten or expired, current
     /// and superseded (AQL v0.10 history reads; `filter` narrows it).
     pub async fn versions(&self, memory: adb_core::log::Memory, filter: Option<&str>) -> StoreResult<Vec<StoredRow>> {
+        let _t = adb_core::steps::timer("store.versions");
         let mut f = format!("memory = {} AND {RECORD_KINDS} AND tombstone = false", sql_str(memory.tag()));
         if let Some(x) = filter {
             f.push_str(&format!(" AND ({x})"));
@@ -1177,7 +1182,8 @@ impl PartitionStore {
     /// [`PartitionStore::versions`] with a lineage filter — read by primary key through
     /// the links map, not by a scan of the table (C-25).
     pub async fn versions_of(&self, memory: adb_core::log::Memory, lineages: &[String]) -> StoreResult<Vec<StoredRow>> {
-        let g = self.state.read().await;
+        let _t = adb_core::steps::timer("store.versions_of");
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let inner = open_state(&g);
         if inner.links.lock().unwrap().is_none() {
             let built = Self::build_links(inner).await?;
@@ -1221,6 +1227,7 @@ impl PartitionStore {
     /// The current version of record `key` of memory type `memory` (its lineage's
     /// live row, D2 T1; a fact outside its validity too), if any.
     pub async fn current_version(&self, memory: adb_core::log::Memory, key: &str, now: CommitTs) -> StoreResult<Option<StoredRow>> {
+        let _t = adb_core::steps::timer("store.current_version");
         let filter = format!("lineage_id = {} AND {RECORD_KINDS}", sql_str(&row_id(memory, key)));
         Ok(self.live(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
     }
@@ -1252,6 +1259,7 @@ impl PartitionStore {
 
     /// [`get`](Self::get) through the row cache (exact: see `row_cache`).
     pub async fn get_cached(&self, id: &str) -> StoreResult<Option<StoredRow>> {
+        let _t = adb_core::steps::timer("store.get_cached");
         match self.rows.begin(id) {
             Ok(r) => Ok(Some(r)),
             Err(reading) => {
@@ -1302,9 +1310,10 @@ impl PartitionStore {
     /// The rows matching `filter`, decoded and handed to `f` a batch at a time, without
     /// the vector columns. Returns how many there were.
     async fn scan_each(&self, filter: &str, mut f: impl FnMut(Vec<StoredRow>)) -> StoreResult<usize> {
+        let _t = adb_core::steps::timer("store.scan_each");
         use futures::TryStreamExt;
         let cols: Vec<String> = self.schema.fields().iter().map(|c| c.name().clone()).filter(|n| n != "embedding" && n != "sealed").collect();
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let scanner = Self::scanner(open_state(&g)).await?.filter(filter).map_err(lance)?.project(&cols).map_err(lance)?;
         let mut stream = scanner.try_into_stream().await.map_err(lance)?;
         let mut n = 0;
@@ -1408,7 +1417,7 @@ impl PartitionStore {
     /// table's current record rows of the memory types it keeps, with applies
     /// held off (the store's exclusive lock), so it starts at the applied offset.
     pub async fn set_cache(&self, cache: Option<HotCache>) -> StoreResult<()> {
-        let g = self.state.write().await;
+        let g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
         let Some(cache) = cache else {
             *self.hot.write().unwrap() = None;
             return Ok(());
@@ -1457,7 +1466,10 @@ impl PartitionStore {
         let applied_before = self.applied_offset().await?;
         let records: Vec<&LogRecord> = records.iter().filter(|r| r.offset > applied_before).collect();
         let Some(last) = records.last().copied() else { return Ok(0) };
+        adb_core::steps::value("store.apply records per batch", records.len() as u64);
+        let mut at = std::time::Instant::now();
         let g = self.state.read().await;
+        adb_core::steps::lap("store.apply.1 state read-lock wait", &mut at);
         let inner = open_state(&g);
         // Rows these records write, one per id (later effects see earlier ones).
         let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
@@ -1468,9 +1480,12 @@ impl PartitionStore {
         out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, self.meta_extra()));
 
         let rows: Vec<StoredRow> = out.into_values().collect();
+        adb_core::steps::lap("store.apply.2 rows of records", &mut at);
         let batch = encode(&rows, &self.schema, self.dim)?;
+        adb_core::steps::lap("store.apply.3 encode arrow", &mut at);
         self.apply_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let put = inner.writer.put(vec![batch]).await.map_err(lance);
+        adb_core::steps::lap("store.apply.4 lance memwal put", &mut at);
         // Still under the state lock, so the cache moves with the table (W10).
         if let (Ok(_), Some(h)) = (&put, self.hot()) {
             h.apply(&rows);
@@ -1485,12 +1500,16 @@ impl PartitionStore {
                 }
             }
         }
+        adb_core::steps::lap("store.apply.5 caches + indexes", &mut at);
         self.apply_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         put?;
         self.applied.store(off, std::sync::atomic::Ordering::SeqCst);
         inner.puts.lock().unwrap().offsets.push_back(off);
         self.puts_since_compaction.fetch_add(records.len() as u64, std::sync::atomic::Ordering::SeqCst);
         let st = inner.writer.memtable_stats().await.map_err(lance)?;
+        adb_core::steps::lap("store.apply.6 memtable stats", &mut at);
+        adb_core::steps::value("store.memtable rows", st.row_count as u64);
+        adb_core::steps::value("store.memtable batches", st.batch_count as u64);
         let mem = inner.writer.memory();
         // Lance counts the buffers' contents; each batch also costs its arrays and
         // small allocations, which dominate when a put is a record or two.
@@ -1506,6 +1525,7 @@ impl PartitionStore {
         if seal {
             // Queued for flush; nothing here waits on it (the fence is dropped).
             inner.writer.force_freeze_active().await.map_err(lance)?;
+            adb_core::steps::lap("store.apply.7 seal memtable", &mut at);
         }
         Ok(records.len())
     }
@@ -1653,7 +1673,7 @@ impl PartitionStore {
     /// Batches the MemWAL has made durable, and the writer's batch numbering base
     /// (for mapping durable batches back to log offsets, D2 of the plan).
     pub async fn durable_batches(&self) -> StoreResult<(usize, usize)> {
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let st = open_state(&g).writer.memtable_stats().await.map_err(lance)?;
         Ok((st.durable_batch_count, st.global_offset))
     }
@@ -1663,11 +1683,12 @@ impl PartitionStore {
     /// below `durable_offset + 1` (stage D3.5). Maps the writer's durable batch count
     /// to the log offset of that put, as the R11 / R12 spikes validated.
     pub async fn durable_offset(&self) -> StoreResult<LogOffset> {
+        let _t = adb_core::steps::timer("store.durable_offset");
         self.durable_offset_inner().await
     }
 
     async fn durable_offset_inner(&self) -> StoreResult<LogOffset> {
-        let g = self.state.read().await;
+        let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let inner = open_state(&g);
         let durable = inner.writer.memtable_stats().await.map_err(lance)?.durable_batch_count;
         let mut p = inner.puts.lock().unwrap();
@@ -1699,6 +1720,7 @@ impl PartitionStore {
     /// purging its log below Lance's durable offset (stage D3.5), so the log is only
     /// dropped once what replaces it is on disk.
     pub async fn sync_to_disk(&self) -> StoreResult<()> {
+        let _t = adb_core::steps::timer("store.sync_to_disk (syncfs)");
         adb_core::disk::sync_fs_async(&self.root).await.map_err(|e| StoreError::Lance(format!("syncfs {}: {e}", self.root.display())))
     }
 

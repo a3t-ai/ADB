@@ -923,8 +923,29 @@ impl Engine for LocalEngine {
         // C-20: only reads that scan take a permit; keyed reads (LOOKUP, or `KEY id = …`)
         // are answered from the hot cache or an index in about a millisecond, and queued
         // behind 1 s scans they waited 1.3 s for nothing (AWS round 1).
-        let _permit = if scans(aql) { Some(read_permits().acquire().await.map_err(|e| e.to_string())?) } else { None };
+        let _permit = if scans(aql) {
+            let p = read_permits().acquire().await.map_err(|e| e.to_string())?;
+            crate::steps::add("query.read permit wait (ADB_MAX_READS)", t0.elapsed());
+            Some(p)
+        } else {
+            None
+        };
+        let t1 = std::time::Instant::now();
         let r = self.query_unobserved(aql, variables).await;
+        if crate::steps::on() {
+            let kind: &'static str = match adb_core::metrics::statement_of(aql).0 {
+                "STORE" => "query.exec STORE",
+                "UPDATE" => "query.exec UPDATE",
+                "FORGET" => "query.exec FORGET",
+                "LOOKUP" => "query.exec LOOKUP",
+                "RECALL" if scans(aql) => "query.exec RECALL (scan)",
+                "RECALL" => "query.exec RECALL (keyed)",
+                "AGGREGATE" => "query.exec AGGREGATE",
+                "SCAN" => "query.exec SCAN",
+                _ => "query.exec other",
+            };
+            crate::steps::add(kind, t1.elapsed());
+        }
         observe_query(aql, t0.elapsed(), &r);
         r
     }
@@ -1730,6 +1751,7 @@ impl LocalEngine {
             Some(d) => Some(d.point().await),
             None => None,
         };
+        crate::steps::add("query.point before", started.elapsed());
         let result = match variables {
             Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
             _ => self.executor.execute(aql).await,

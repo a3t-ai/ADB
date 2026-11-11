@@ -93,6 +93,8 @@ impl RaftNetworkV2<TC> for Conn {
     type SnapshotData = Cursor<Vec<u8>>;
 
     async fn append_entries(&mut self, rpc: AppendEntriesRequest<TC>, o: RPCOption) -> Result<AppendEntriesResponse<TC>, RPCError<TC>> {
+        adb_core::steps::value("raft.net entries per append RPC", rpc.entries.len() as u64);
+        let _t = adb_core::steps::timer("raft.net append RPC round trip (leader side)");
         match self.call::<_, AppendEntriesResponse<TC>, RaftError<TC>>("append", &rpc, o.hard_ttl()).await {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(RPCError::Network(NetworkError::new(&e))),
@@ -159,6 +161,7 @@ fn decode<T: DeserializeOwned>(b: &Bytes) -> Result<T, axum::response::Response>
 }
 
 async fn append(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::Response {
+    let _t = adb_core::steps::timer("raft.net append handled (follower side)");
     match decode::<AppendEntriesRequest<TC>>(&body) {
         Ok(req) => msgpack(&raft.append_entries(req).await),
         Err(r) => r,
@@ -210,6 +213,7 @@ async fn read_index(State(raft): State<AdbRaft>) -> axum::response::Response {
 /// (a quorum acknowledged it less than a lease ago) without contacting the
 /// followers; once the lease has lapsed, by a ReadIndex heartbeat round.
 pub async fn leader_read_index(raft: &AdbRaft) -> Result<u64, String> {
+    let _t = adb_core::steps::timer("leader.read_index (ensure linearizable)");
     match raft.get_read_log_id(openraft::ReadPolicy::LeaseRead).await {
         Ok((read, _)) => Ok(read.index()),
         Err(_) => raft.get_read_log_id(openraft::ReadPolicy::ReadIndex).await.map(|(read, _)| read.index()).map_err(|e| e.to_string()),

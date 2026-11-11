@@ -103,9 +103,13 @@ impl FollowerReads {
         if !follower_reads(aql) {
             return Err(NOT_LEADER.into());
         }
+        let tc = std::time::Instant::now();
+        crate::steps::value("follower.read tables behind (records)", upto.0.saturating_sub(*self.applied.borrow()));
         self.caught_up(upto, Duration::from_secs(10)).await?;
+        crate::steps::add("follower.read.3a tables catch-up wait", tc.elapsed());
         let t0 = std::time::Instant::now();
         let _permit = if crate::engine::scans(aql) { Some(crate::engine::read_permits().acquire().await.map_err(|e| e.to_string())?) } else { None };
+        crate::steps::add("follower.read.3b read permit wait", t0.elapsed());
         let result = match variables {
             Some(vars) if !vars.is_empty() => self.executor.execute_with_vars(aql, vars).await,
             _ => self.executor.execute(aql).await,

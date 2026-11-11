@@ -64,6 +64,12 @@ impl ApplyBarrier {
         *self.applied.borrow()
     }
 
+    /// Wait until the table has applied every record up to `offset`.
+    pub async fn wait_for_applied(&self, offset: u64) {
+        let mut rx = self.applied.subscribe();
+        let _ = rx.wait_for(|a| *a >= offset).await;
+    }
+
     /// Wait until the table has applied every record committed before this call.
     pub async fn wait_for_committed(&self) {
         let target = self.committed.load(Ordering::SeqCst);
@@ -117,8 +123,14 @@ impl Applier {
                 }
                 let last = batch.last().map_or(0, |r| r.offset.0);
                 // Only what the log has committed reaches the table (PF-1).
+                let t0 = std::time::Instant::now();
                 let _ = durable.wait_for(|d| *d >= last).await;
-                if let Err(e) = store.apply_many(&batch).await {
+                crate::steps::add("applier.1 wait durable", t0.elapsed());
+                let t1 = std::time::Instant::now();
+                let applied = store.apply_many(&batch).await;
+                crate::steps::add("applier.2 apply batch", t1.elapsed());
+                crate::steps::add(match batch.len() { 0..=1 => "applier.n batch 1", 2..=16 => "applier.n batch 2-16", 17..=128 => "applier.n batch 17-128", _ => "applier.n batch 129+" }, std::time::Duration::ZERO);
+                if let Err(e) = applied {
                     tracing::warn!(first = batch[0].offset.0, last, error = %e, "Lance apply failed; the log has it, catch-up on next open");
                 }
                 task_barrier.applied(last);

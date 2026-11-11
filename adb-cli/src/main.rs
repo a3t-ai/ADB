@@ -127,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .init();
     alloc::report_every(alloc::report_interval());
+    adb_core::steps::spawn_lag_probe();
 
     // A replica set member (M3): the engine opens only while this node leads.
     if let (Some(dir), Commands::Serve { http: true, host, port, flight_port } | Commands::ServeHttp { host, port, flight_port }) = (&cli.data_dir, &command) {

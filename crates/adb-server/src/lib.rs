@@ -273,14 +273,23 @@ fn code(error: &Option<String>) -> Option<&'static str> {
 }
 
 /// `POST /query` — ClawDB's shape: `data` is the whole wire `QueryResult`.
-async fn query(State(s): State<AppState>, scope: Option<axum::Extension<Arc<scope::Scope>>>, Json(req): Json<QueryRequest>) -> (StatusCode, Json<QueryResponse>) {
+async fn query(State(s): State<AppState>, headers: axum::http::HeaderMap, scope: Option<axum::Extension<Arc<scope::Scope>>>, Json(req): Json<QueryRequest>) -> (StatusCode, Json<QueryResponse>) {
+    let opts = adb_core::read_opts::ReadOpts::from_lookup(|k| headers.get(k).and_then(|v| v.to_str().ok()));
+    adb_core::read_opts::scope(opts, query_inner(s, scope, req)).await
+}
+
+async fn query_inner(s: AppState, scope: Option<axum::Extension<Arc<scope::Scope>>>, req: QueryRequest) -> (StatusCode, Json<QueryResponse>) {
     if let Some(axum::Extension(scope)) = scope {
         if let Err(e) = scope.check_aql(&req.query) {
             return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }));
         }
     }
     let start = Instant::now();
+    static IN_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    adb_core::steps::value("http.query in flight", IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
     let result = s.engine.query(&req.query, req.variables.as_ref()).await;
+    IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    adb_core::steps::add("http.query handler", start.elapsed());
     let ms = Some(start.elapsed().as_millis() as u64);
     match result {
         Ok(wire) => {

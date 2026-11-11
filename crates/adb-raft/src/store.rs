@@ -328,6 +328,8 @@ fn spawn_writer(path: PathBuf, inner: Arc<Mutex<Inner>>, tail_limit: usize) -> i
             while let Ok(more) = rx.try_recv() {
                 jobs.push(more);
             }
+            adb_core::steps::value("raft.log writer jobs per batch", jobs.len() as u64);
+            let wt = std::time::Instant::now();
             let mut pending: Vec<IOFlushed<TC>> = Vec::new();
             let mut pending_upto = 0u64;
             let mut result: io::Result<()> = Ok(());
@@ -368,8 +370,11 @@ fn spawn_writer(path: PathBuf, inner: Arc<Mutex<Inner>>, tail_limit: usize) -> i
                     }
                 }
             }
+            adb_core::steps::add("raft.log writer write", wt.elapsed());
             if !pending.is_empty() {
+                let st = std::time::Instant::now();
                 let flushed = result.and_then(|_| f.sync_data());
+                adb_core::steps::add("raft.log writer fsync", st.elapsed());
                 if flushed.is_ok() {
                     inner.lock().unwrap().mark_written(pending_upto, tail_limit);
                 }

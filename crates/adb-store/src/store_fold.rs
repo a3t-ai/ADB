@@ -129,6 +129,7 @@ impl PartitionStore {
     /// valid_to < horizon` (the latest horizon any namespace uses) or `ttl_at <= now`,
     /// and `keep` decides each. See the module docs.
     pub(super) async fn fold(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), now: CommitTs, horizon: CommitTs) -> StoreResult<CompactStats> {
+        let _t = adb_core::steps::timer("store.fold compaction (all)");
         let _one = self.folding.lock().await;
         // Only before step 3: from there on the base table is being rewritten.
         if self.compaction_yields() {
@@ -141,14 +142,14 @@ impl PartitionStore {
 
         // 1. Everything applied so far into SSTables.
         let fence = {
-            let g = self.state.read().await;
+            let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
             open_state(&g).writer.force_freeze_active().await.map_err(lance)?
         };
         fence.wait().await.map_err(lance)?;
 
         // 2. The delta (newest version per id, generation order), and the base snapshot.
         let (base, shard, sstables) = {
-            let g = self.state.read().await;
+            let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
             let inner = open_state(&g);
             let m = inner.writer.manifest().await.map_err(lance)?;
             (inner.base.clone(), inner.writer.shard_id(), m.map(|m| m.sstables).unwrap_or_default())
@@ -264,7 +265,7 @@ impl PartitionStore {
         // 4. The swap and the clean-up, with readers and the applier held.
         let folded: HashSet<u64> = sstables.iter().map(|t| t.generation).collect();
         let top = folded.iter().copied().max();
-        let mut g = self.state.write().await;
+        let mut g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
         let inner = g.as_mut().expect("the partition store is open");
         inner.base = Arc::new(ds);
         inner.cache = Arc::new(SsTableCache::new(64));

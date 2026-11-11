@@ -130,8 +130,8 @@ enum Backend {
     Http { client: reqwest::Client, url: String, key: Option<String> },
 }
 
-/// Texts and where their vectors go.
-type Job = (Vec<String>, tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>, String>>);
+/// Texts and where their vectors go (and when the job was queued).
+type Job = (Vec<String>, tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>, String>>, std::time::Instant);
 
 /// Texts the local model runs in one call: concurrent writers' texts share a call
 /// (C-17), which costs about what one text alone does.
@@ -174,6 +174,11 @@ impl LocalModel {
                             }
                             jobs
                         };
+                        for j in &jobs {
+                            adb_core::steps::add("embed.queue wait", j.2.elapsed());
+                        }
+                        adb_core::steps::value("embed.texts per model call", jobs.iter().map(|j| j.0.len() as u64).sum());
+                        let _t = adb_core::steps::timer("embed.model call");
                         run(&mut model, jobs);
                     }
                 })
@@ -184,14 +189,14 @@ impl LocalModel {
 
     fn submit(&self, texts: Vec<String>) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, String> {
         let (done, wait) = tokio::sync::oneshot::channel();
-        self.jobs.send((texts, done)).map_err(|_| "embedding thread stopped".to_string())?;
+        self.jobs.send((texts, done, std::time::Instant::now())).map_err(|_| "embedding thread stopped".to_string())?;
         Ok(wait)
     }
 }
 
 /// Embed the texts of `jobs` in one call and answer each job.
 fn run(model: &mut TextEmbedding, jobs: Vec<Job>) {
-    let texts: Vec<&String> = jobs.iter().flat_map(|(t, _)| t.iter()).collect();
+    let texts: Vec<&String> = jobs.iter().flat_map(|(t, _, _)| t.iter()).collect();
     let out = match texts.is_empty() {
         true => Ok(Vec::new()),
         false => model.embed(&texts, Some(LOCAL_BATCH)).map_err(|e| format!("embedding: {e}")),
@@ -200,12 +205,12 @@ fn run(model: &mut TextEmbedding, jobs: Vec<Job>) {
         Ok(mut out) => {
             out.iter_mut().for_each(|v| normalize(v));
             let mut out = out.into_iter();
-            for (t, done) in jobs {
+            for (t, done, _) in jobs {
                 let _ = done.send(Ok(out.by_ref().take(t.len()).collect()));
             }
         }
         Err(e) => {
-            for (_, done) in jobs {
+            for (_, done, _) in jobs {
                 let _ = done.send(Err(e.clone()));
             }
         }
@@ -370,10 +375,15 @@ impl Embedder {
         match &self.backend {
             Backend::Local(_) => {
                 // A less busy node of the replica set embeds them, when there is one.
+                let t = std::time::Instant::now();
                 if let Some(v) = peers::try_peer(self, &texts).await {
+                    adb_core::steps::add("embed.on a peer (round trip)", t.elapsed());
                     return Ok(v);
                 }
-                self.embed_here(texts).await
+                let t = std::time::Instant::now();
+                let r = self.embed_here(texts).await;
+                adb_core::steps::add("embed.here (queue + model)", t.elapsed());
+                r
             }
             Backend::Http { client, url, key } => {
                 let mut out = Vec::with_capacity(texts.len());
