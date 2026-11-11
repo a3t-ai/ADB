@@ -383,3 +383,13 @@ regression around FORGET or how records in a scope are filtered; not yet investi
 | C-22 | Point reads: skip the ReadIndex ask when the follower knows it is current (leader lease / last heartbeat's commit index), or send point reads to the leader and scans to followers | F-21 | stage F: LOOKUP on 3 nodes ≥ leader only |
 | C-23 | FlowR: retry idempotent calls (reads, set_state upserts) cut off by a transport error on another node | F-23 | leader kill with FlowR: 0 errors |
 | C-24 | Find and fix the regression behind the four failing tests; make the timeout test independent of build speed | F-24 | the five tests |
+
+## Rolled to vc-dev (11 Nov, 00:13 UTC; adb:2026-11-10-r2, flowr:2026-11-10-ee-r2)
+
+Rolled followers first, leader last, data kept; the leader handed over (adb-1 → adb-2, term 33) and
+the new leader's engine opened in 1.5 s (35,658 records). All three nodes at index 9,165, no restarts.
+The same Flight SQL read on each node gave identical answers (followers wait for the leader's ReadIndex);
+20 reads per node all succeeded. No errors in the ADB, console, gateway or rt-worker logs.
+Found: vc-dev FlowR still reaches ADB through the leader-only Service (PF-33); `count(*)` over the
+memory tables fails in SQL on old builds too (PF-34); gateway and rt-worker try run retention with a
+pool token and are refused, one WARN per start (PF-35).
