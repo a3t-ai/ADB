@@ -137,54 +137,48 @@ type Job = (Vec<String>, tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>, Stri
 /// (C-17), which costs about what one text alone does.
 const LOCAL_BATCH: usize = 64;
 
-/// The local model, owned by one thread (`adb-embed`) that runs every queued
-/// request's texts in one call. Behind a lock, concurrent STOREs embedded one text
-/// at a time: ~100 writes/s on 2 vCPUs (AWS F-19).
+/// The local model, run by `ADB_EMBED_WORKERS` threads (`adb-embed-N`), each with its
+/// own session, taking jobs from one queue: a worker takes every request queued (up
+/// to [`LOCAL_BATCH`] texts) and runs them in one call. Behind a lock, concurrent
+/// STOREs embedded one text at a time: ~100 writes/s on 2 vCPUs (AWS F-19). With one
+/// worker, its thread (tokenising, the session's own steps) capped STORE at ~600/s on
+/// 8 vCPUs while the other cores idled (AWS r7).
 struct LocalModel {
     jobs: mpsc::Sender<Job>,
 }
 
 impl LocalModel {
-    fn start(mut model: TextEmbedding) -> Result<Self, String> {
+    fn start(models: Vec<TextEmbedding>) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("adb-embed".into())
-            .spawn(move || {
-                // Ends when the embedder (every sender) is dropped.
-                while let Ok(first) = rx.recv() {
-                    let mut n = first.0.len();
-                    let mut jobs = vec![first];
-                    while n < LOCAL_BATCH {
-                        match rx.try_recv() {
-                            Ok(j) => {
-                                n += j.0.len();
-                                jobs.push(j);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        for (i, mut model) in models.into_iter().enumerate() {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("adb-embed-{i}"))
+                .spawn(move || {
+                    // Ends when the embedder (every sender) is dropped.
+                    loop {
+                        let jobs = {
+                            let Ok(q) = rx.lock() else { return };
+                            let Ok(first) = q.recv() else { return };
+                            let mut n = first.0.len();
+                            let mut jobs = vec![first];
+                            while n < LOCAL_BATCH {
+                                match q.try_recv() {
+                                    Ok(j) => {
+                                        n += j.0.len();
+                                        jobs.push(j);
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(_) => break,
-                        }
+                            jobs
+                        };
+                        run(&mut model, jobs);
                     }
-                    let texts: Vec<&String> = jobs.iter().flat_map(|(t, _)| t.iter()).collect();
-                    let out = match texts.is_empty() {
-                        true => Ok(Vec::new()),
-                        false => model.embed(&texts, Some(LOCAL_BATCH)).map_err(|e| format!("embedding: {e}")),
-                    };
-                    match out {
-                        Ok(mut out) => {
-                            out.iter_mut().for_each(|v| normalize(v));
-                            let mut out = out.into_iter();
-                            for (t, done) in jobs {
-                                let _ = done.send(Ok(out.by_ref().take(t.len()).collect()));
-                            }
-                        }
-                        Err(e) => {
-                            for (_, done) in jobs {
-                                let _ = done.send(Err(e.clone()));
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|e| format!("embedding thread: {e}"))?;
+                })
+                .map_err(|e| format!("embedding thread: {e}"))?;
+        }
         Ok(Self { jobs: tx })
     }
 
@@ -192,6 +186,29 @@ impl LocalModel {
         let (done, wait) = tokio::sync::oneshot::channel();
         self.jobs.send((texts, done)).map_err(|_| "embedding thread stopped".to_string())?;
         Ok(wait)
+    }
+}
+
+/// Embed the texts of `jobs` in one call and answer each job.
+fn run(model: &mut TextEmbedding, jobs: Vec<Job>) {
+    let texts: Vec<&String> = jobs.iter().flat_map(|(t, _)| t.iter()).collect();
+    let out = match texts.is_empty() {
+        true => Ok(Vec::new()),
+        false => model.embed(&texts, Some(LOCAL_BATCH)).map_err(|e| format!("embedding: {e}")),
+    };
+    match out {
+        Ok(mut out) => {
+            out.iter_mut().for_each(|v| normalize(v));
+            let mut out = out.into_iter();
+            for (t, done) in jobs {
+                let _ = done.send(Ok(out.by_ref().take(t.len()).collect()));
+            }
+        }
+        Err(e) => {
+            for (_, done) in jobs {
+                let _ = done.send(Err(e.clone()));
+            }
+        }
     }
 }
 
@@ -207,17 +224,20 @@ impl Embedder {
     /// Load the local model files in `dir`, running inference on `threads` CPU threads.
     pub fn load(dir: &Path, threads: usize) -> Result<Self, String> {
         let read = |f: &str| std::fs::read(dir.join(f)).map_err(|e| format!("embedding model: {}: {e}", dir.join(f).display()));
-        let tokenizer = TokenizerFiles {
-            tokenizer_file: read("tokenizer.json")?,
-            config_file: read("config.json")?,
-            special_tokens_map_file: read("special_tokens_map.json")?,
-            tokenizer_config_file: read("tokenizer_config.json")?,
-        };
-        // bge models embed the [CLS] token (fastembed's default for this model).
-        let model = UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer).with_pooling(Pooling::Cls);
-        let options = InitOptionsUserDefined::new().with_max_length(MAX_TOKENS).with_intra_threads(threads.max(1));
-        let model = TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| format!("embedding model: {e}"))?;
-        Ok(Self { backend: Backend::Local(LocalModel::start(model)?), model: MODEL.into(), dim: DIM })
+        let mut models = Vec::new();
+        for _ in 0..workers() {
+            let tokenizer = TokenizerFiles {
+                tokenizer_file: read("tokenizer.json")?,
+                config_file: read("config.json")?,
+                special_tokens_map_file: read("special_tokens_map.json")?,
+                tokenizer_config_file: read("tokenizer_config.json")?,
+            };
+            // bge models embed the [CLS] token (fastembed's default for this model).
+            let model = UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer).with_pooling(Pooling::Cls);
+            let options = InitOptionsUserDefined::new().with_max_length(MAX_TOKENS).with_intra_threads(threads.max(1));
+            models.push(TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| format!("embedding model: {e}"))?);
+        }
+        Ok(Self { backend: Backend::Local(LocalModel::start(models)?), model: MODEL.into(), dim: DIM })
     }
 
     /// The embedder `cfg` describes (W9.10). A local model is loaded now; an
@@ -294,7 +314,7 @@ impl Embedder {
         let t = std::time::Instant::now();
         match Self::load(&dir, threads) {
             Ok(e) => {
-                tracing::info!(model = MODEL, dir = %dir.display(), threads, took = ?t.elapsed(), "embedding model loaded");
+                tracing::info!(model = MODEL, dir = %dir.display(), threads, workers = workers(), took = ?t.elapsed(), "embedding model loaded");
                 Some(Arc::new(e))
             }
             Err(e) => {
@@ -402,8 +422,19 @@ async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, mode
     }).collect())
 }
 
+/// ONNX threads per worker (`ADB_EMBED_THREADS`, default 2).
 fn threads() -> usize {
     std::env::var("ADB_EMBED_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or(2)
+}
+
+/// Embedding workers, each its own session (`ADB_EMBED_WORKERS`; default one per 4
+/// CPUs, 1 to 4). Each holds a copy of the model (~130 MB for bge-small).
+pub fn workers() -> usize {
+    std::env::var("ADB_EMBED_WORKERS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() / 4).clamp(1, 4))
+        .max(1)
 }
 
 fn normalize(v: &mut [f32]) {
