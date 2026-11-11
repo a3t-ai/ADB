@@ -431,3 +431,79 @@ FlowR that took the call — the ~25 ms floor at c=1 is that hop, not ADB. ADB-o
 | Local checks | Workspace tests pass (incl. the five); cluster-follower-reads, cluster-raft (0 lost of 31,333; worst failover 2.1 s; handover 327 ms), crash-durability (50 kills, 0 lost of 35,165), subscriptions-crash pass. One node, 50k rows: RECALL WHERE topic LIMIT 10 0.3 ms server, RECALL ALL ORDER BY n LIMIT 10 2.1 ms, AGGREGATE COUNT 0.7 ms (hot cache + index) |
 | PF-34 | SQL `count(*)` over `memory` / `memory_raw`: the LSM scan kept its `id` column under an empty projection, failing DataFusion's schema check; the scan now returns exactly the planned projection (`adb-store/src/table.rs`) |
 | PF-35 | FlowR workers stop run retention after ADB refuses it as `forbidden` (a pool token): one info line instead of a warning per start (`engine_worker.rs`) |
+
+## Round 3 retest (11 Nov, 04:00–10:55 UTC): r3, then r4 (row cache), then r5 (bounded read memory)
+
+Images: ADB `adb:2026-11-11-r3` → `r4` (row cache) → `r5` (PF-37, built with the `perf` profile); FlowR
+`flowr:2026-11-11-ee-r3`. Raw output: `/home/coder/perf-run/round5/` (r5), round 4 numbers below from the r3 run.
+
+**r3 run (round 4, 04:00–05:20).** Filtered RECALL improved (22 → 60/s at c=64; mixed 23 → 114/s), but an
+indexed read still went to Lance for its rows every time (~50 ms for LIMIT 10 at 925k rows, CPU-bound on 2 vCPU).
+→ **C-26 / r4: an exact row cache** for rows the field index reads by id (`adb-store/src/row_cache.rs`,
+`ADB_ROW_CACHE_ROWS`, default 16,384): every put drops its ids, a table swap drops all, a read can't refill an id
+a put touched while it read. Local: repeat indexed read 276 → 3 ms.
+
+**r4 roll froze two nodes (07:09–07:15).** Retest stage A's `RECALL … ALL ORDER BY n LIMIT 10` at 32–64
+clients: one such read took a node from 1.0 to 3.7 GB (measured), `ADB_MAX_READS` (2 × CPUs = 4) let four run,
+and the 7.7 GB nodes 1 and 2 thrashed (sshd hung, one core pegged) until rebooted (user, ~07:35).
+→ **PF-37 / r5: bounded read memory** (ADB 4011653). Reads stream the DataFusion plan and decode batch by batch;
+a plain read keeps only the rows it can return (matching, and the first k for `LIMIT k` in its total order, pruned
+while scanning); `ADB_READ_MEMORY_MB` (default 40% of the cgroup / host memory) counts what every read holds (row
+size estimated, ×2.5 calibrated against RSS) and a read past it fails with "read memory budget exceeded".
+Local, 100k rows: ORDER BY … LIMIT 10 +60 MB (was +270 MB); 300k rows: ORDER BY 1.0 s (old 1.2–3.6 s),
+peak RSS 1,098 MB (old 1,600 MB). New test `read_budget`.
+
+**r5 on AWS (10:01–10:55).** The same stage A load: no node below 3.2 GB available (peak ADB RSS 4.2 / 2.1 /
+2.3 GB). Table now ~1.6M rows (925k at round 4).
+
+| Phase (c=64 unless noted) | Round 2 (r2) | Round 4 (r3) | **r5** |
+|---|---|---|---|
+| STORE SEMANTIC | 638/s | 653/s | 597/s |
+| STORE EPISODIC | 889/s | 896/s | 839/s |
+| LOOKUP KEY | 1,773/s | 1,774/s | 1,693/s |
+| RECALL WHERE topic LIMIT 10 | 22/s | 60/s, server 958 ms | **871/s, server 4.9 ms** |
+| D: RECALL WHERE under 64-client STORE load | 16/s | 54/s | **523/s** |
+| E: mixed 70/25/5, c=16 | 23/s | 114/s | **274/s** |
+| F: RECALL WHERE spread / leader-only | 9 / 3/s | 53 / 22/s | **611 / 244/s** |
+| RECALL ALL ORDER BY n LIMIT 10, c=1 | 912 ms | 2.7 s | 4.0 s (1.6M rows) |
+| AGGREGATE COUNT WHERE topic, c=1 | 176 ms | 401 ms | 682 ms |
+| UPDATE SEMANTIC | — | — | 51–65/s |
+| FORGET EPISODIC | ~25/s | — | 68/s (c=32–64) |
+| A3T set_state / durable flow / transient flow | 794 / 115 / 1,048/s | 806 / 124 / 1,027/s | 824 / 119 / 999/s |
+
+Quiet single-query probe after the run (each node): filtered RECALL LIMIT 10 **6–12 ms** (r4: 41–66 ms);
+AGGREGATE COUNT WHERE topic 0.86–0.98 s for 58,858 matches (r4: 0.61–0.71 s for 40,862); ORDER BY n LIMIT 10
+5.1–6.3 s at 1.6M rows (r4: 4.0–5.1 s at 925k) — the same per-row cost; full scans grow with the table.
+
+Leader kill with FlowR running: **0 lost of 19,041 acknowledged**; FlowR set_state 316/s with 16 errors in the
+switch. But the longest stretch without an acknowledged write was **24.2 s** (round 4: 8.2 s, round 2: 5.6 s):
+the new leader was elected 2 s after the kill, then took 22.5 s to open the engine (store reopened and 1.47M live
+keys rehydrated in 6.0 s, the rest in the engine open), then a 12 s fold compaction slowed writes.
+
+New findings:
+
+| Id | Finding | Next |
+|---|---|---|
+| PF-38 | Takeover grows with the table again: engine open 22.5 s at 1.6M rows (C-19 brought it to ~1.5 s at 36k); the store reopens and rehydrates live keys although the follower held them | keep the follower's open store and keys through the takeover; measure the engine-open phases |
+| PF-39 | `RECALL … ALL AGGREGATE COUNT(*)` over 1.33M rows is refused by the read budget (would hold 3.1 GB): aggregates keep every matching row | stream aggregates without GROUP BY (running totals), keep only the grouped fields otherwise |
+| PF-40 | Field indexes are built lazily after every restart: the first filtered reads on a new node took up to 8 s | build them in the background at open (or persist them) |
+| Ops | The pod restart for the 10-CPU limit wiped `/tmp` (scripts, key copy); the 80 GB build budget pruned whole target dirs (a cold 26 min image build) | scripts now in `/home/coder/perf-run/`; one `perf` profile per round (`BUILD_PROFILE=perf`, flowr-system c0da624) |
+
+## vc-dev r5 (11 Nov, 10:57–11:20 UTC; adb:2026-11-11-r5, flowr:2026-11-11-ee-r3)
+
+Rolled ADB (followers first, leader last) and FlowR (console, gateway, controller, rt-worker). All three ADB
+pods on r5 at log index 223,346 in term 34; leader engine open 3.4 s. The same SQL read on every node agrees;
+platform tables 158 on each; 20/20 local reads per node; no FlowR error lines since the roll. **adb-selftest
+14/14.** Bench flows (`bench/noop`, `read3`, `read3t`) deleted afterwards.
+
+| A3T phase | c=1 | c=64 | vc-dev r2, c=64 |
+|---|---|---|---|
+| get_state | 261/s, 3.6 ms | 1,766/s | 1,677/s |
+| list_flows | 243/s | 1,769/s | 1,666/s |
+| set_state | 262/s, 2.5 ms | **1,810/s**, p50 34 ms | 1,782/s |
+| flow noop (durable) | 31/s, 29 ms | 202/s | 234/s |
+| flow read3 (durable) | 29/s | 223/s | 245/s |
+| flow read3 (transient) | 28/s | 294/s | 317/s |
+
+Undo: `kubectl -n a3t set image statefulset/adb adb=ghcr.io/srirammails/adb:2026-11-10-r2` (pods one at a time);
+FlowR: the four image commands with `flowr:2026-11-10-ee-r2`, then delete pod rt-worker.
