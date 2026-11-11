@@ -393,3 +393,27 @@ The same Flight SQL read on each node gave identical answers (followers wait for
 Found: vc-dev FlowR still reaches ADB through the leader-only Service (PF-33); `count(*)` over the
 memory tables fails in SQL on old builds too (PF-34); gateway and rt-worker try run retention with a
 pool token and are refused, one WARN per start (PF-35).
+
+## vc-dev perf, A3T end to end (11 Nov, 00:25–00:44 UTC; adb:2026-11-10-r2, flowr:2026-11-10-ee-r2, PF-33 on)
+
+`perf-remote.mjs a3t --flowr http://flowr.a3t.svc.cluster.local:3002` (the Service over the 2 console pods) with the
+user's superadmin token (`A3T_TOKEN_FILE`), 15 s per phase. vc-dev = one 12-core node shared with everything else;
+ADB on local disk (hostPath), not EBS. Flows in namespace `bench` run on rt-worker (the router sends only a3t-* /
+system-* to the console), so every flow call includes the hop to the runtime pod. No errors.
+
+| Phase | c=1 | c=64 | AWS round 2, c=64 |
+|---|---|---|---|
+| get_state | 234/s, 3.9 ms | 1,677/s, p50 37 ms | 1,984/s |
+| list_flows | 277/s, 3.1 ms | 1,666/s | 1,940/s |
+| set_state | 341/s, 2.4 ms | **1,782/s**, p50 35 ms | 794/s |
+| flow noop (durable) | 35/s, 25 ms | **234/s**, p50 238 ms | 115/s |
+| flow read3 (durable) | 31/s, 28 ms | **245/s** | 141/s |
+| flow read3 (transient) | 32/s, 26 ms | 317/s, p99 1.2 s | **1,048/s** |
+
+CPU (avg over the run, cgroup counters): ADB leader adb-2 137% (peak 230%), followers adb-0 102%, adb-1 90%
+(peaks 172% / 158%); consoles 33% + 29%, rt-worker 31%, gateways idle. ADB memory ≤ 1.4 GiB per pod.
+
+Writes and durable flows are 2× AWS (local disk vs EBS gp3 syncs). Transient flows are 3× slower than AWS and no
+faster than durable ones: on vc-dev they go through the runtime dispatch (rt-worker), on AWS they ran on the
+FlowR that took the call — the ~25 ms floor at c=1 is that hop, not ADB. ADB-only phases not run on vc-dev
+(they write ~20k test records into the shared memory scope).

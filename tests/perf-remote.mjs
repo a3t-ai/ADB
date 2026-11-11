@@ -181,7 +181,9 @@ async function adb() {
 async function a3t() {
   const urls = String(args.flowr ?? '').split(',').filter(Boolean).map(u => u.replace(/\/$/, ''));
   const secret = process.env.FLOWR_JWT_SECRET;
-  if (!urls.length || !secret) throw new Error('--flowr <url,url> and FLOWR_JWT_SECRET needed');
+  // A3T_TOKEN_FILE: a token already issued (e.g. a superadmin login) instead of minting one with the secret.
+  const given = process.env.A3T_TOKEN_FILE ? (await import('node:fs')).readFileSync(process.env.A3T_TOKEN_FILE, 'utf8').trim() : null;
+  if (!urls.length || !(secret || given)) throw new Error('--flowr <url,url> and FLOWR_JWT_SECRET (or A3T_TOKEN_FILE) needed');
   const b64u = b => Buffer.from(b).toString('base64url');
   const jwt = aud => {
     const now = Math.floor(Date.now() / 1000);
@@ -189,7 +191,7 @@ async function a3t() {
     const p = b64u(JSON.stringify({ sub: 'perf', org: 'org-default', role: 'superadmin', email: 'perf@localhost', name: 'perf', aud, iat: now, exp: now + 86400 }));
     return `${h}.${p}.${createHmac('sha256', secret).update(`${h}.${p}`).digest('base64url')}`;
   };
-  const bearer = Object.fromEntries(urls.map(u => [u, jwt(u)]));
+  const bearer = Object.fromEntries(urls.map(u => [u, given ?? jwt(u)]));
   let id = 1;
   const tool = async (u, name, a) => {
     const r = await (await fetch(`${u}/message`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer[u]}` }, body: JSON.stringify({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name, arguments: a } }) })).json();
