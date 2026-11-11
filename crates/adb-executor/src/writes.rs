@@ -579,7 +579,7 @@ pub struct DurableWrites<L: Log> {
     key_offsets: std::sync::Mutex<KeyOffsets>,
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
-    poisoned: std::sync::atomic::AtomicBool,
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
     /// DB-7: the last committed record (offset, commit time µs), for answers' memory point.
     last_off: std::sync::atomic::AtomicU64,
     last_ts: std::sync::atomic::AtomicI64,
@@ -2246,8 +2246,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         drop(seq);
         let submitted = t0.elapsed();
         if let Some((off, wait, go)) = pending {
-            let ok = self.committed(off, wait).await.is_ok();
-            let _ = go.send(ok);
+            self.committed_then(off, wait, go).await;
         }
         if !sent {
             return Err(AdbError::Internal("the engine committer is not running".into()));
@@ -2394,23 +2393,49 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Wait for a submitted record's commit, outside the sequencer. A failure stops
     /// this engine's writes and asks for a restart (the leader lost the replica set).
     async fn committed(&self, offset: u64, wait: adb_log::CommitWait) -> AdbResult<()> {
-        match wait.await {
-            Ok(_) => {
-                if let Some(b) = self.barrier() {
-                    b.durable(offset);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(b) = self.barrier() {
-                    b.abandon();
-                }
-                tracing::error!(offset, error = %e, "a submitted record did not commit: this engine stops taking writes and restarts");
-                crate::engine::request_restart();
-                Err(log_err(e))
-            }
+        match self.commit_task(offset, wait, None).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(AdbError::Internal(format!("log: {e}"))),
+            Err(e) => Err(AdbError::Internal(format!("commit wait: {e}"))),
         }
+    }
+
+    /// [`Self::committed`], then the in-order committer (engine or platform) told on
+    /// `go` whether the record committed.
+    async fn committed_then(&self, offset: u64, wait: adb_log::CommitWait, go: tokio::sync::oneshot::Sender<bool>) -> bool {
+        matches!(self.commit_task(offset, wait, Some(go)).await, Ok(Ok(())))
+    }
+
+    /// The commit wait in a task of its own (PF-42): it marks the record durable (or
+    /// stops this engine) and answers `go` whatever happens to the request that
+    /// submitted it. Awaited in the request, a cancelled request (a client timeout, a
+    /// reset HTTP/2 stream) dropped `go` unanswered: the committer read that as "did
+    /// not commit" and refused every later write, with no log line and no restart.
+    fn commit_task(&self, offset: u64, wait: adb_log::CommitWait, go: Option<tokio::sync::oneshot::Sender<bool>>) -> tokio::task::JoinHandle<Result<(), String>> {
+        let (barrier, poisoned) = (self.barrier(), Arc::clone(&self.poisoned));
+        tokio::spawn(async move {
+            let r = match wait.await {
+                Ok(_) => {
+                    if let Some(b) = &barrier {
+                        b.durable(offset);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(b) = &barrier {
+                        b.abandon();
+                    }
+                    tracing::error!(offset, error = %e, "a submitted record did not commit: this engine stops taking writes and restarts");
+                    crate::engine::request_restart();
+                    Err(e.to_string())
+                }
+            };
+            if let Some(go) = go {
+                let _ = go.send(r.is_ok());
+            }
+            r
+        })
     }
 
     fn writable(&self) -> AdbResult<()> {
@@ -3203,8 +3228,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                     // PF-4: the commits are awaited outside the sequencer; the applier
                     // applies each once its commit is in.
                     for (off, wait, go) in submitted {
-                        let ok = self.committed(off, wait).await.is_ok();
-                        let _ = go.send(ok);
+                        self.committed_then(off, wait, go).await;
                     }
                 }
             }
