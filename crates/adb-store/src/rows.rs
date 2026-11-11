@@ -376,11 +376,14 @@ pub struct LiveKey {
     pub memory: adb_core::log::Memory,
     pub lineage_id: String,
     pub ttl_at: Option<CommitTs>,
+    /// The live version's row id.
+    pub id: String,
 }
 
 /// The rows of a batch projected to [`LIVE_KEY_COLUMNS`] that are live at `now`
 /// (as [`StoredRow::is_live`]).
 pub fn decode_live_keys(b: &RecordBatch, now: CommitTs) -> StoreResult<Vec<LiveKey>> {
+    let id = col::<StringArray>(b, "id")?;
     let lineage = col::<StringArray>(b, "lineage_id")?;
     let memory = col::<StringArray>(b, "memory")?;
     let valid_to = col::<TimestampMicrosecondArray>(b, "valid_to")?;
@@ -395,7 +398,7 @@ pub fn decode_live_keys(b: &RecordBatch, now: CommitTs) -> StoreResult<Vec<LiveK
             && opt_ts(valid_to, i).is_none_or(|t| t > now)
             && ttl.is_none_or(|t| t > now);
         if live {
-            out.push(LiveKey { memory: parse_enum(memory.value(i), "memory")?, lineage_id: lineage.value(i).to_string(), ttl_at: ttl });
+            out.push(LiveKey { memory: parse_enum(memory.value(i), "memory")?, lineage_id: lineage.value(i).to_string(), ttl_at: ttl, id: id.value(i).to_string() });
         }
     }
     Ok(out)

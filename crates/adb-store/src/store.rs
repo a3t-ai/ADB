@@ -141,6 +141,11 @@ pub struct PartitionStore {
     fields: crate::field_index::FieldIndex,
     /// Rows the field indexes read by id (`get_cached`), dropped by every put.
     rows: crate::row_cache::RowCache,
+    /// The live records' keys, kept by every apply once built (PF-38).
+    live: crate::live_index::LiveIndex,
+    /// Set while this node takes the lead: a compaction under way gives up between
+    /// its steps rather than compete with the takeover (PF-38).
+    yield_compaction: std::sync::atomic::AtomicBool,
     /// Odd while a put and its cache update are under way (`apply_seq`).
     apply_seq: std::sync::atomic::AtomicU64,
     /// The schema version `_meta` gets (`schema_version`).
@@ -733,6 +738,7 @@ impl PartitionStore {
         // (Compaction keeps every current row as it was, so they stay.)
         if !extra.is_empty() {
             self.fields.clear();
+            self.live.abandon();
         }
         if let (true, Some(h)) = (vectors_cleared, self.hot()) {
             h.drop_vectors();
@@ -873,6 +879,8 @@ impl PartitionStore {
             hot: std::sync::RwLock::new(None),
             fields: crate::field_index::FieldIndex::new(),
             rows: crate::row_cache::RowCache::new(),
+            live: crate::live_index::LiveIndex::new(),
+            yield_compaction: std::sync::atomic::AtomicBool::new(false),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
             layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
         };
@@ -1119,6 +1127,16 @@ impl PartitionStore {
 
     /// The live rows (transaction time, [`StoredRow::is_live`]) at `now`, without
     /// `_meta`: what writes and key checks see, facts outside their validity included.
+    /// [`Self::live`] with a DataFusion filter (payload fields: `filter::field_text`).
+    pub async fn live_expr(&self, filter: Option<Expr>, now: CommitTs) -> StoreResult<Vec<StoredRow>> {
+        Ok(self
+            .scan_expr(filter)
+            .await?
+            .into_iter()
+            .filter(|r| r.id != META_ID && r.data.kind != Kind::Meta && r.is_live(now))
+            .collect())
+    }
+
     pub async fn live(&self, filter: Option<&str>, now: CommitTs) -> StoreResult<Vec<StoredRow>> {
         Ok(self
             .scan(filter)
@@ -1256,6 +1274,131 @@ impl PartitionStore {
         &self.fields
     }
 
+    /// Build the field index of (`memory`, `field`) from one scan of the type's current
+    /// rows, a batch at a time (no embeddings, no table-sized vector of rows). `false`
+    /// when it is built, being built, or not indexable. The pair is remembered on disk,
+    /// so the next open builds it in the background (PF-40).
+    pub async fn build_field_index(&self, memory: adb_core::log::Memory, field: &str) -> StoreResult<bool> {
+        if !self.fields.begin(memory, field) {
+            return Ok(false);
+        }
+        let t0 = std::time::Instant::now();
+        let filter = format!("memory = '{}' AND {RECORD_KINDS} AND tombstone = false AND superseded_by IS NULL", memory.tag());
+        let mut b = self.fields.builder(memory, field);
+        match self.scan_each(&filter, |rows| rows.iter().for_each(|r| b.add(r))).await {
+            Ok(n) => {
+                self.fields.finish_build(b);
+                self.save_index_names();
+                tracing::debug!(target: "adb::index", ?memory, field, rows = n, ms = t0.elapsed().as_millis() as u64, "field index scan");
+                Ok(true)
+            }
+            Err(e) => {
+                self.fields.abandon(memory, field);
+                Err(e)
+            }
+        }
+    }
+
+    /// The rows matching `filter`, decoded and handed to `f` a batch at a time, without
+    /// the vector columns. Returns how many there were.
+    async fn scan_each(&self, filter: &str, mut f: impl FnMut(Vec<StoredRow>)) -> StoreResult<usize> {
+        use futures::TryStreamExt;
+        let cols: Vec<String> = self.schema.fields().iter().map(|c| c.name().clone()).filter(|n| n != "embedding" && n != "sealed").collect();
+        let g = self.state.read().await;
+        let scanner = Self::scanner(open_state(&g)).await?.filter(filter).map_err(lance)?.project(&cols).map_err(lance)?;
+        let mut stream = scanner.try_into_stream().await.map_err(lance)?;
+        let mut n = 0;
+        while let Some(b) = stream.try_next().await.map_err(|e| StoreError::Decode(format!("scan: {e}")))? {
+            let rows = decode(&b)?;
+            n += rows.len();
+            f(rows);
+        }
+        Ok(n)
+    }
+
+    fn index_names_file(&self) -> std::path::PathBuf {
+        self.root.join(format!("p{}", self.partition.0)).join("field_indexes.json")
+    }
+
+    /// Remember the built field indexes (PF-40): `[["semantic","topic"], …]`.
+    fn save_index_names(&self) {
+        let names: Vec<(&str, String)> = self.fields.names().into_iter().map(|(m, f)| (m.tag(), f)).collect();
+        let path = self.index_names_file();
+        let tmp = path.with_extension("json.tmp");
+        let r = serde_json::to_vec(&names).map_err(std::io::Error::other).and_then(|b| std::fs::write(&tmp, b)).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = r {
+            tracing::warn!(error = %e, path = %path.display(), "could not save the field index names");
+        }
+    }
+
+    fn saved_index_names(&self) -> Vec<(adb_core::log::Memory, String)> {
+        let Ok(b) = std::fs::read(self.index_names_file()) else { return Vec::new() };
+        let names: Vec<(String, String)> = serde_json::from_slice(&b).unwrap_or_default();
+        names.into_iter().filter_map(|(m, f)| Some((adb_core::log::Memory::from_tag(&m)?, f))).collect()
+    }
+
+    /// Warm up after open, in the background: with `live_keys`, the live-key index a
+    /// follower hands over when it takes the lead (PF-38); then the field indexes this
+    /// partition had (PF-40), so the first filtered reads don't wait for a build.
+    pub fn warm(self: &Arc<Self>, live_keys: bool) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            if live_keys {
+                if let Err(e) = me.build_live_keys().await {
+                    tracing::warn!(error = %e, "live keys not indexed");
+                }
+            }
+            let names = me.saved_index_names();
+            for (m, f) in &names {
+                if let Err(e) = me.build_field_index(*m, f).await {
+                    tracing::warn!(memory = ?m, field = %f, error = %e, "field index not built at open");
+                }
+            }
+            tracing::info!(live_keys = me.live.is_ready(), field_indexes = names.len(), took = ?t0.elapsed(), "store warmed");
+        });
+    }
+
+    /// Build the live-key index from one projected scan (PF-38).
+    pub async fn build_live_keys(&self) -> StoreResult<()> {
+        if !self.live.begin() {
+            return Ok(());
+        }
+        // Every version that isn't forgotten or superseded: time bounds are checked
+        // when the keys are taken.
+        match self.live_keys(CommitTs(i64::MIN)).await {
+            Ok(keys) => {
+                self.live.finish(keys);
+                Ok(())
+            }
+            Err(e) => {
+                self.live.abandon();
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the live-key index is built and not yet taken (PF-38).
+    pub fn live_keys_ready(&self) -> bool {
+        self.live.is_ready()
+    }
+
+    /// The live keys at `now` from the live-key index, once (PF-38); `None` when it
+    /// isn't built — the caller scans ([`Self::live_keys`]).
+    pub fn take_live_keys(&self, now: CommitTs) -> Option<Vec<crate::rows::LiveKey>> {
+        self.live.take(now)
+    }
+
+    /// While `on`, a compaction under way stops between its steps (PF-38: a follower's
+    /// fold ran 18 s inside a takeover on a 2-vCPU node).
+    pub fn yield_compaction(&self, on: bool) {
+        self.yield_compaction.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn compaction_yields(&self) -> bool {
+        self.yield_compaction.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The hot cache, if one is set (W10).
     pub fn hot(&self) -> Option<Arc<HotCache>> {
         self.hot.read().unwrap().clone()
@@ -1335,6 +1478,7 @@ impl PartitionStore {
         self.rows.drop_rows(&rows);
         if put.is_ok() {
             self.fields.apply(&rows);
+            self.live.apply(&rows);
             if let Some(l) = inner.links.lock().unwrap().as_mut() {
                 for r in &rows {
                     l.add(&r.id, &r.lineage_id, r.data.subject_id.as_deref(), r.data.object_id.as_deref());

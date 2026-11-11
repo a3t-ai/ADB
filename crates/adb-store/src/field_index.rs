@@ -130,6 +130,21 @@ pub enum Lookup {
     Absent,
 }
 
+/// A field index being built from a scan, a batch at a time.
+pub struct Build {
+    memory: Memory,
+    field: String,
+    p: Postings,
+}
+
+impl Build {
+    pub fn add(&mut self, r: &StoredRow) {
+        if r.data.memory == self.memory {
+            self.p.apply(&self.field, r);
+        }
+    }
+}
+
 /// The field indexes of one partition (see the module docs).
 pub struct FieldIndex {
     slots: RwLock<HashMap<(Memory, String), Slot>>,
@@ -221,6 +236,35 @@ impl FieldIndex {
         let (values, records) = (p.by_value.len(), p.of_lineage.len());
         slots.insert(k, Slot::Ready(p));
         tracing::info!(?memory, field, values, records, "field index built");
+    }
+
+    /// A build fed a batch at a time ([`Build::add`]), then [`FieldIndex::finish_build`]:
+    /// the scan's rows needn't be held all at once.
+    pub fn builder(&self, memory: Memory, field: &str) -> Build {
+        Build { memory, field: field.to_string(), p: Postings::default() }
+    }
+
+    /// Finish a build from [`FieldIndex::builder`]: its rows, then the applies held meanwhile.
+    pub fn finish_build(&self, b: Build) {
+        let Build { memory, field, mut p } = b;
+        let mut slots = self.slots.write().unwrap();
+        let k = (memory, field.clone());
+        if let Some(Slot::Building(held)) = slots.remove(&k) {
+            for r in &held {
+                p.apply(&field, r);
+            }
+        } else {
+            // Cleared (a migration) or abandoned meanwhile: a later read builds again.
+            return;
+        }
+        let (values, records) = (p.by_value.len(), p.of_lineage.len());
+        slots.insert(k, Slot::Ready(p));
+        tracing::info!(?memory, field, values, records, "field index built");
+    }
+
+    /// The (memory, field) pairs built or being built.
+    pub fn names(&self) -> Vec<(Memory, String)> {
+        self.slots.read().unwrap().keys().cloned().collect()
     }
 
     /// Drop every index (rows changed outside the applies): reads build again.

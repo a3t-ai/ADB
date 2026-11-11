@@ -130,6 +130,10 @@ impl PartitionStore {
     /// and `keep` decides each. See the module docs.
     pub(super) async fn fold(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), now: CommitTs, horizon: CommitTs) -> StoreResult<CompactStats> {
         let _one = self.folding.lock().await;
+        // Only before step 3: from there on the base table is being rewritten.
+        if self.compaction_yields() {
+            return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
+        }
         let started = std::time::Instant::now();
         let dir = self.table_dir();
         let bytes_before = dir_size(&dir);
@@ -165,6 +169,9 @@ impl PartitionStore {
             }
         }
         n.delta = delta.len();
+        if self.compaction_yields() {
+            return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
+        }
 
         let mut upserts: Vec<StoredRow> = Vec::new();
         let mut deletes: Vec<String> = Vec::new();
@@ -206,6 +213,9 @@ impl PartitionStore {
             }
         }
 
+        if self.compaction_yields() {
+            return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
+        }
         // 3. Into the base, without any lock: readers keep the old snapshot meanwhile.
         let mut ds = (*base).clone();
         ds.checkout_latest().await.map_err(lance)?;

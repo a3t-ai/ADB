@@ -21,6 +21,13 @@ pub trait Reads: Send + Sync {
 
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>>;
 
+    /// `RECALL … AGGREGATE` computed while reading (PF-39): the aggregate's value (an
+    /// object, or the group rows as an array), or `None` when this backend or this read
+    /// needs the records first — the executor then recalls them and aggregates.
+    async fn aggregate(&self, _memory: MemoryType, _predicate: &Predicate, _modifiers: &Modifiers) -> AdbResult<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
     async fn lookup(&self, memory: MemoryType, predicate: &Predicate) -> AdbResult<Vec<MemoryRecord>> {
         self.lookup_with_modifiers(memory, predicate, &Modifiers::default()).await
     }
@@ -385,6 +392,16 @@ impl Reads for LanceReads {
             .await
             .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
         Ok(rows.iter().filter_map(to_link).collect())
+    }
+
+    async fn aggregate(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Option<serde_json::Value>> {
+        check_scope(memory, modifiers.in_scope.as_deref())?;
+        // Branches, layered namespaces and history reads aggregate their records.
+        if self.parent.is_some() || self.layers_for(memory, modifiers).is_some() || crate::query::is_history(modifiers) || matches!(predicate, Predicate::Like { .. }) {
+            return Ok(None);
+        }
+        let now = self.committed().await;
+        crate::query::aggregate_read(&self.store, memory, predicate, modifiers, now).await
     }
 
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {

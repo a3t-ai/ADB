@@ -49,11 +49,14 @@ pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, v
 pub(crate) struct Keeper<T> {
     test: Box<dyn Fn(&T) -> bool + Send>,
     top: Option<(usize, Box<dyn Fn(&T, &T) -> Ordering + Send>)>,
+    /// Rows the test takes go here instead of being kept (PF-39: aggregates fold
+    /// them into running totals, so they hold nothing per row).
+    sink: Option<Box<dyn FnMut(T) + Send>>,
 }
 
 impl<T> Keeper<T> {
     pub(crate) fn all() -> Self {
-        Self { test: Box::new(|_| true), top: None }
+        Self { test: Box::new(|_| true), top: None, sink: None }
     }
 }
 
@@ -92,6 +95,7 @@ pub(crate) async fn scan_current<T: Send + 'static>(
                 df.select_columns(&cols.iter().map(String::as_str).collect::<Vec<_>>())?
             };
             let mut stream = df.execute_stream().await?;
+            let mut keeper = keeper;
             let mut out = Out { kept: Vec::new(), held: Held::default(), scanned: 0, failed: None };
             while let Some(b) = stream.next().await {
                 let b = b?;
@@ -113,8 +117,13 @@ pub(crate) async fn scan_current<T: Send + 'static>(
                         let n = row_bytes(&r);
                         let t = to(r);
                         if (keeper.test)(&t) {
-                            out.kept.push((t, n));
-                            added += n;
+                            match &mut keeper.sink {
+                                Some(sink) => sink(t),
+                                None => {
+                                    out.kept.push((t, n));
+                                    added += n;
+                                }
+                            }
                         }
                     }
                 }
@@ -597,8 +606,20 @@ struct Candidates {
     records: Vec<Arc<MemoryRecord>>,
     cached: bool,
     floor: Option<CommitTs>,
-    /// The records' share of the read memory budget (PF-37), while the read runs.
+    /// The records' share of the read memory budget (PF-37): given back when the
+    /// read drops its candidates.
+    #[allow(dead_code)]
     held: Held,
+    /// The scan fed an aggregate (`Keep::Fold`) instead of returning records.
+    folded: bool,
+}
+
+/// What a read's Lance scan keeps: every match (`All`), what a plain read can return
+/// (`Read`), or nothing — matches go into an aggregate's running totals (`Fold`).
+pub(crate) enum Keep {
+    All,
+    Read,
+    Fold(Arc<std::sync::Mutex<AggState>>),
 }
 
 /// A read's answer: from the cache, from Lance, or the cache's rows weren't
@@ -693,12 +714,12 @@ fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, mod
     if let Some(key) = keyed(memory, predicate, in_scope, namespace) {
         if let Some(Some(c)) = hot.lineage(m, &row_id(m, &key)) {
             if ok(&c.row) {
-                return Some(Candidates { records: vec![cached_record(&c)], cached: true, floor: None, held: Held::default() });
+                return Some(Candidates { records: vec![cached_record(&c)], cached: true, floor: None, held: Held::default(), folded: false });
             }
         }
     }
     let hit = hot.rows(m, in_scope)?;
-    Some(Candidates { records: hit.rows.iter().filter(|c| ok(&c.row)).map(cached_record).collect(), cached: true, floor: hit.floor, held: Held::default() })
+    Some(Candidates { records: hit.rows.iter().filter(|c| ok(&c.row)).map(cached_record).collect(), cached: true, floor: hit.floor, held: Held::default(), folded: false })
 }
 
 /// The key a KEY predicate names, when it is the record's key. `WHERE key = "x"`
@@ -740,7 +761,7 @@ async fn candidates(
     modifiers: &Modifiers,
     now: CommitTs,
     source: Source,
-    bounded: bool,
+    keep: Keep,
 ) -> AdbResult<Candidates> {
     // The field index first, from either source: it answers from the current rows,
     // as the cache and Lance do, without visiting every row (PF-27).
@@ -754,7 +775,7 @@ async fn candidates(
             return Ok(c);
         }
     }
-    let lance = |records: Vec<MemoryRecord>| Ok(Candidates { records: records.into_iter().map(Arc::new).collect(), cached: false, floor: None, held: Held::default() });
+    let lance = |records: Vec<MemoryRecord>| Ok(Candidates { records: records.into_iter().map(Arc::new).collect(), cached: false, floor: None, held: Held::default(), folded: false });
     let m: Memory = memory.into();
     // KEY lookups: the primary-key fast path first (W7).
     if let Some(key) = keyed(memory, predicate, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref()) {
@@ -771,9 +792,14 @@ async fn candidates(
         }
     }
     // A plain read keeps only what it can return (PF-37); others take every match.
-    let keeper = if bounded { read_keeper(memory, predicate, modifiers) } else { Keeper::all() };
+    let folded = matches!(keep, Keep::Fold(_));
+    let keeper = match keep {
+        Keep::All => Keeper::all(),
+        Keep::Read => read_keeper(memory, predicate, modifiers),
+        Keep::Fold(state) => fold_keeper(memory, predicate, modifiers, state),
+    };
     let (records, held) = scan_current(store, filter, now, false, |r| Arc::new(record(&r)), keeper).await?;
-    Ok(Candidates { records, cached: false, floor: None, held })
+    Ok(Candidates { records, cached: false, floor: None, held, folded })
 }
 
 /// What a `RECALL` / `LOOKUP` keeps while it scans: the records its predicate and
@@ -798,7 +824,15 @@ fn read_keeper(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers)
         let cmp: Box<dyn Fn(&Arc<MemoryRecord>, &Arc<MemoryRecord>) -> Ordering + Send> = Box::new(move |a, b| record_order(memory, order.as_ref(), a, b));
         (k, cmp)
     });
-    Keeper { test, top }
+    Keeper { test, top, sink: None }
+}
+
+/// An aggregate's keeper: the records the predicate and `SCOPE` take go into `state`.
+fn fold_keeper(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, state: Arc<std::sync::Mutex<AggState>>) -> Keeper<Arc<MemoryRecord>> {
+    let (p, scope) = (predicate.clone(), modifiers.scope.clone());
+    let test = Box::new(move |r: &Arc<MemoryRecord>| matches(memory, r, &p) && scope.as_ref().is_none_or(|v| &r.metadata.scope == v));
+    let sink: Box<dyn FnMut(Arc<MemoryRecord>) + Send> = Box::new(move |r| state.lock().unwrap().add(&r));
+    Keeper { test, top: None, sink: Some(sink) }
 }
 
 /// The order `top_k` and `default_order` + `order_by` give: `ORDER BY`'s value
@@ -855,23 +889,6 @@ fn early_stop(modifiers: &Modifiers) -> Option<usize> {
 /// cache); past it the read scans the type instead (PF-27).
 const INDEX_FETCH_MAX: usize = 256;
 
-/// Build the (`memory`, `field`) index from the type's current rows (PF-27).
-async fn build_index(store: &PartitionStore, memory: Memory, field: &str) -> AdbResult<()> {
-    let t0 = std::time::Instant::now();
-    let filter = format!("memory = '{}' AND {} AND tombstone = false AND superseded_by IS NULL", memory.tag(), adb_store::RECORD_KINDS);
-    match store.scan(Some(&filter)).await {
-        Ok(rows) => {
-            store.fields().finish(memory, field, &rows);
-            tracing::debug!(target: "adb::index", ?memory, field, rows = rows.len(), ms = t0.elapsed().as_millis() as u64, "field index scan");
-            Ok(())
-        }
-        Err(e) => {
-            store.fields().abandon(memory, field);
-            Err(store_err(e))
-        }
-    }
-}
-
 /// Candidates from the field index (PF-27): the records holding the value of one
 /// required `field = literal`, fetched by id (the hot cache first, then Lance), in
 /// the read's default order — stopping at LIMIT where the read allows. `None`: no
@@ -892,10 +909,9 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
         Some((f, k, _)) => (f.clone(), k.clone()),
         None => {
             let (f, k) = &eqs[0];
-            if !fields.begin(m, f) {
+            if !store.build_field_index(m, f).await.map_err(store_err)? {
                 return Ok(None);
             }
-            build_index(store, m, f).await?;
             (f.clone(), k.clone())
         }
     };
@@ -965,7 +981,7 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
             }
         }
     }
-    Ok(Some(Candidates { records: out, cached: false, floor: None, held: Held::default() }))
+    Ok(Some(Candidates { records: out, cached: false, floor: None, held: Held::default(), folded: false }))
 }
 
 /// `RECALL` / `LOOKUP` (not `LIKE`): candidates → exact predicate → visibility →
@@ -976,7 +992,7 @@ pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predic
 }
 
 async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
-    let c = candidates(store, memory, predicate, modifiers, now, source, true).await?;
+    let c = candidates(store, memory, predicate, modifiers, now, source, Keep::Read).await?;
     if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
         if memory != MemoryType::Procedural {
             return Ok(Answer::of(&c, Vec::new()));
@@ -1049,6 +1065,62 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
         project(&mut records, f);
     }
     Ok(Answer::of(&c, records))
+}
+
+/// `RECALL … AGGREGATE` folded while it scans (PF-39): the matches go into running
+/// totals, so an aggregate over every row holds none of them (it was refused by the
+/// read budget at 1.3M rows). `None` when the read needs its records first: a
+/// window, links, PATTERN, or `ORDER BY` / `LIMIT` before an aggregate without
+/// `GROUP BY` (those pick the records the aggregate sees) — the caller reads them.
+pub async fn aggregate_read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<serde_json::Value>> {
+    let Some(funcs) = modifiers.aggregate.as_deref() else { return Ok(None) };
+    let grouped = modifiers.group_by.is_some();
+    if matches!(predicate, Predicate::Pattern { .. } | Predicate::Like { .. })
+        || modifiers.window.is_some()
+        || modifiers.follow_links.is_some()
+        || modifiers.with_links.is_some()
+        || (!grouped && (modifiers.order_by.is_some() || modifiers.limit.is_some()))
+    {
+        return Ok(None);
+    }
+    // The records' read: no order, limit or projection (those apply to the groups).
+    let mut read = modifiers.clone();
+    read.order_by = None;
+    read.limit = None;
+    read.return_fields = None;
+    let v = served(store, "aggregate", |source| aggregate_from(store, memory, predicate, &read, modifiers, funcs, now, source), |a, b| a == b, |v| v.to_string()).await?;
+    Ok(Some(v))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn aggregate_from(
+    store: &PartitionStore,
+    memory: MemoryType,
+    predicate: &Predicate,
+    read: &Modifiers,
+    modifiers: &Modifiers,
+    funcs: &[AggregateFunc],
+    now: CommitTs,
+    source: Source,
+) -> AdbResult<Answer<serde_json::Value>> {
+    let state = Arc::new(std::sync::Mutex::new(AggState::new(memory, funcs, modifiers.group_by.as_deref())));
+    let c = candidates(store, memory, predicate, read, now, source, Keep::Fold(Arc::clone(&state))).await?;
+    if c.floor.is_some() {
+        return Ok(Answer::Insufficient);
+    }
+    if !c.folded {
+        // From the field index, the cache or a key: the records themselves.
+        let mut s = state.lock().unwrap();
+        for r in c.records.iter().filter(|r| matches(memory, r, predicate) && read.scope.as_ref().is_none_or(|v| &r.metadata.scope == v)) {
+            s.add(r);
+        }
+    }
+    let s = std::mem::replace(&mut *state.lock().unwrap(), AggState::new(memory, funcs, None));
+    let v = match modifiers.group_by {
+        Some(_) => serde_json::Value::Array(s.finish_groups(modifiers)),
+        None => s.finish(),
+    };
+    Ok(Answer::of(&c, v))
 }
 
 /// Whether a read asks for history (AQL v0.10): `AS OF`, `VALID AT` or `WITH HISTORY`.
@@ -1155,7 +1227,7 @@ pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) 
 }
 
 async fn scan_from(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
-    let c = candidates(store, MemoryType::Working, &Predicate::All, modifiers, now, source, false).await?;
+    let c = candidates(store, MemoryType::Working, &Predicate::All, modifiers, now, source, Keep::All).await?;
     let mut records = c.records.clone();
     default_order(MemoryType::Working, &mut records);
     // From an incomplete bucket: a window over the newest rows, all newer than the floor.
@@ -1190,7 +1262,7 @@ pub async fn load(store: &PartitionStore, predicate: &Predicate, limit: usize, n
 }
 
 async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
-    let c = candidates(store, MemoryType::Tools, predicate, &Modifiers::default(), now, source, false).await?;
+    let c = candidates(store, MemoryType::Tools, predicate, &Modifiers::default(), now, source, Keep::All).await?;
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
@@ -1229,7 +1301,7 @@ pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Pre
 
 async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
     let modifiers = Modifiers { in_scope: in_scope.map(String::from), namespace: namespace.map(String::from), ..Default::default() };
-    let c = candidates(store, memory, predicate, &modifiers, now, source, false).await?;
+    let c = candidates(store, memory, predicate, &modifiers, now, source, Keep::All).await?;
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
@@ -1361,27 +1433,133 @@ fn number(v: &serde_json::Value) -> Option<f64> {
 /// `AGGREGATE COUNT / SUM / AVG / MIN / MAX` over `records` (SUM of nothing is 0,
 /// the others null).
 pub fn aggregate(records: &[MemoryRecord], funcs: &[AggregateFunc]) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for f in funcs {
-        let alias = f.alias.clone().unwrap_or_else(|| format!("{:?}", f.func).to_lowercase());
-        let values: Vec<f64> = match &f.field {
-            Some(field) => records.iter().filter_map(|r| r.data.get(field)).filter_map(number).collect(),
-            None => Vec::new(),
-        };
-        let num = |x: f64| serde_json::Number::from_f64(if x == 0.0 { 0.0 } else { x }).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null);
-        let v = match (f.func, &f.field) {
-            (AggregateFuncType::Count, _) => serde_json::json!(records.len()),
-            (_, None) => serde_json::Value::Null,
-            (AggregateFuncType::Sum, _) if values.is_empty() => serde_json::json!(0),
-            (AggregateFuncType::Sum, _) => num(values.iter().sum()),
-            (_, _) if values.is_empty() => serde_json::Value::Null,
-            (AggregateFuncType::Avg, _) => num(values.iter().sum::<f64>() / values.len() as f64),
-            (AggregateFuncType::Min, _) => num(values.iter().cloned().fold(f64::INFINITY, f64::min)),
-            (AggregateFuncType::Max, _) => num(values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
-        };
-        out.insert(alias, v);
+    let mut s = AggState::new(MemoryType::Semantic, funcs, None);
+    records.iter().for_each(|r| s.add(r));
+    s.finish()
+}
+
+/// One aggregate function's running totals.
+#[derive(Debug, Clone, Copy)]
+struct FuncAcc {
+    count: u64,
+    sum: f64,
+    n: u64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for FuncAcc {
+    fn default() -> Self {
+        Self { count: 0, sum: 0.0, n: 0, min: f64::INFINITY, max: f64::NEG_INFINITY }
     }
-    serde_json::Value::Object(out)
+}
+
+/// Running totals of `AGGREGATE` (PF-39), per group with `GROUP BY`: what a read
+/// folds its matches into as it scans, so a count over every row holds no rows. The
+/// in-memory `aggregate` / `group_aggregate` use it too: one definition.
+pub struct AggState {
+    memory: MemoryType,
+    funcs: Vec<AggregateFunc>,
+    fields: Option<Vec<String>>,
+    index: HashMap<String, usize>,
+    /// Group key, its first member in default order (created, id), the totals.
+    groups: Vec<(Vec<serde_json::Value>, Option<(chrono::DateTime<chrono::Utc>, String)>, Vec<FuncAcc>)>,
+}
+
+impl AggState {
+    pub fn new(memory: MemoryType, funcs: &[AggregateFunc], fields: Option<&[String]>) -> Self {
+        let mut s = Self { memory, funcs: funcs.to_vec(), fields: fields.map(<[String]>::to_vec), index: HashMap::new(), groups: Vec::new() };
+        if s.fields.is_none() {
+            s.groups.push((Vec::new(), None, vec![FuncAcc::default(); funcs.len()]));
+        }
+        s
+    }
+
+    pub fn add(&mut self, r: &MemoryRecord) {
+        let i = match &self.fields {
+            None => 0,
+            Some(fs) => {
+                let key: Vec<serde_json::Value> = fs.iter().map(|f| r.resolve_field(f).unwrap_or(serde_json::Value::Null)).collect();
+                let k = serde_json::Value::Array(key.clone()).to_string();
+                match self.index.get(&k) {
+                    Some(i) => *i,
+                    None => {
+                        self.groups.push((key, None, vec![FuncAcc::default(); self.funcs.len()]));
+                        self.index.insert(k, self.groups.len() - 1);
+                        self.groups.len() - 1
+                    }
+                }
+            }
+        };
+        let memory = self.memory;
+        let g = &mut self.groups[i];
+        let me = (r.metadata.created_at, r.id.clone());
+        let earlier = |a: &(chrono::DateTime<chrono::Utc>, String), b: &(chrono::DateTime<chrono::Utc>, String)| if memory == MemoryType::Episodic { a > b } else { a < b };
+        if g.1.as_ref().is_none_or(|f| earlier(&me, f)) {
+            g.1 = Some(me);
+        }
+        for (acc, f) in g.2.iter_mut().zip(&self.funcs) {
+            acc.count += 1;
+            if let Some(x) = f.field.as_ref().and_then(|field| r.data.get(field)).and_then(number) {
+                acc.sum += x;
+                acc.n += 1;
+                acc.min = acc.min.min(x);
+                acc.max = acc.max.max(x);
+            }
+        }
+    }
+
+    fn values(funcs: &[AggregateFunc], accs: &[FuncAcc]) -> serde_json::Map<String, serde_json::Value> {
+        let num = |x: f64| serde_json::Number::from_f64(if x == 0.0 { 0.0 } else { x }).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null);
+        let mut out = serde_json::Map::new();
+        for (f, a) in funcs.iter().zip(accs) {
+            let alias = f.alias.clone().unwrap_or_else(|| format!("{:?}", f.func).to_lowercase());
+            let v = match (f.func, &f.field) {
+                (AggregateFuncType::Count, _) => serde_json::json!(a.count),
+                (_, None) => serde_json::Value::Null,
+                (AggregateFuncType::Sum, _) if a.n == 0 => serde_json::json!(0),
+                (AggregateFuncType::Sum, _) => num(a.sum),
+                (_, _) if a.n == 0 => serde_json::Value::Null,
+                (AggregateFuncType::Avg, _) => num(a.sum / a.n as f64),
+                (AggregateFuncType::Min, _) => num(a.min),
+                (AggregateFuncType::Max, _) => num(a.max),
+            };
+            out.insert(alias, v);
+        }
+        out
+    }
+
+    /// Without `GROUP BY`: the aggregates as one object.
+    pub fn finish(&self) -> serde_json::Value {
+        let accs = self.groups.first().map(|g| g.2.clone()).unwrap_or_else(|| vec![FuncAcc::default(); self.funcs.len()]);
+        serde_json::Value::Object(Self::values(&self.funcs, &accs))
+    }
+
+    /// With `GROUP BY`: one row per group, in the order of each group's first record
+    /// (default order), then `HAVING`, `ORDER BY`, `LIMIT` and `RETURN`.
+    pub fn finish_groups(mut self, modifiers: &Modifiers) -> Vec<serde_json::Value> {
+        let fields = self.fields.clone().unwrap_or_default();
+        let memory = self.memory;
+        self.groups.sort_by(|a, b| {
+            let c = a.1.cmp(&b.1);
+            if memory == MemoryType::Episodic { c.reverse() } else { c }
+        });
+        let rows: Vec<serde_json::Value> = self
+            .groups
+            .iter()
+            .map(|(key, _, accs)| {
+                let mut row = serde_json::json!({});
+                for (f, v) in fields.iter().zip(key) {
+                    set_path(&mut row, f, v.clone());
+                }
+                for (k, v) in Self::values(&self.funcs, accs) {
+                    row[k] = v;
+                }
+                row
+            })
+            .collect();
+        finish_group_rows(rows, modifiers)
+    }
 }
 
 /// Sets `path` (dotted) in `row`, making the objects on the way.
@@ -1407,31 +1585,28 @@ fn set_path(row: &mut serde_json::Value, path: &str, v: serde_json::Value) {
 /// first record does; `HAVING`, `ORDER BY`, `LIMIT` and `RETURN` apply to the rows.
 pub fn group_aggregate(records: &[MemoryRecord], fields: &[String], modifiers: &Modifiers) -> Vec<serde_json::Value> {
     let funcs = modifiers.aggregate.as_deref().unwrap_or_default();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let mut groups: Vec<(Vec<serde_json::Value>, Vec<MemoryRecord>)> = Vec::new();
-    for r in records {
-        let key: Vec<serde_json::Value> = fields.iter().map(|f| r.resolve_field(f).unwrap_or(serde_json::Value::Null)).collect();
-        let i = *index.entry(serde_json::Value::Array(key.clone()).to_string()).or_insert_with(|| {
-            groups.push((key, Vec::new()));
-            groups.len() - 1
-        });
-        groups[i].1.push(r.clone());
-    }
-    let mut rows: Vec<serde_json::Value> = groups
-        .into_iter()
-        .map(|(key, members)| {
+    let mut s = AggState::new(MemoryType::Semantic, funcs, Some(fields));
+    records.iter().for_each(|r| s.add(r));
+    // The records came in the read's order: keep the groups in it.
+    let rows = s
+        .groups
+        .iter()
+        .map(|(key, _, accs)| {
             let mut row = serde_json::json!({});
             for (f, v) in fields.iter().zip(key) {
-                set_path(&mut row, f, v);
+                set_path(&mut row, f, v.clone());
             }
-            if let serde_json::Value::Object(aggs) = aggregate(&members, funcs) {
-                for (k, v) in aggs {
-                    row[k] = v;
-                }
+            for (k, v) in AggState::values(funcs, accs) {
+                row[k] = v;
             }
             row
         })
         .collect();
+    finish_group_rows(rows, modifiers)
+}
+
+/// `HAVING`, `ORDER BY`, `LIMIT` and `RETURN` over grouped rows.
+fn finish_group_rows(mut rows: Vec<serde_json::Value>, modifiers: &Modifiers) -> Vec<serde_json::Value> {
     if let Some(having) = &modifiers.having {
         rows.retain(|row| evaluate_conditions(row, having));
     }

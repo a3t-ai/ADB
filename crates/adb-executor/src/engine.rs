@@ -688,12 +688,19 @@ impl LocalEngine {
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
         let warm_cache = warm.is_some();
         let (store, embedder, platform_open, engine_open) = match warm {
-            Some(w) => (w.store, w.embedder, Some(w.platform), Some((w.engine, Some(w.engine_next)))),
+            Some(w) => {
+                // A follower compaction under way stops before it writes (PF-38).
+                w.store.yield_compaction(true);
+                (w.store, w.embedder, Some(w.platform), Some((w.engine, Some(w.engine_next))))
+            }
             None => {
                 let (store, embedder) = open_store(&dir).await?;
+                // The field indexes it had, in the background (PF-40).
+                store.warm(false);
                 (store, embedder, None, None)
             }
         };
+        let opened = std::time::Instant::now();
 
         // W10: the hot cache follows every apply from here on (the catch-up too).
         // A follower kept one from the same settings (C-19): the takeover keeps it.
@@ -712,7 +719,10 @@ impl LocalEngine {
             Some(e) => e,
             None => (adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?, None),
         };
+        let t_engine = std::time::Instant::now();
         let replayed = writes.attach_engine(engine, engine_next).await.map_err(|e| e.to_string())?;
+        tracing::info!(write_path = ?(t_engine - opened), engine_spaces = ?t_engine.elapsed(), "engine open steps");
+        store.yield_compaction(false);
         if replayed > 0 {
             tracing::info!(records = replayed, "engine spaces replayed");
         }

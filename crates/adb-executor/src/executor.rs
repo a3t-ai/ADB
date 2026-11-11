@@ -641,6 +641,21 @@ impl Executor {
         // So we recall with predicate and filters, but apply RETURN later
         let has_aggregate = step.modifiers.aggregate.is_some();
 
+        // PF-39: the aggregate folded while the store reads, when it can be.
+        let folded = if has_aggregate { self.reads.aggregate(step.memory_type, &step.predicate, &step.modifiers).await? } else { None };
+        if let Some(v) = folded {
+            let ms = start.elapsed().as_millis() as u64;
+            if step.modifiers.group_by.is_some() {
+                return Ok(QueryResult::aggregation(v, ms));
+            }
+            if let Some(having) = &step.modifiers.having {
+                if !having.iter().all(|cond| cond.matches(&v)) {
+                    return Ok(QueryResult::aggregation(serde_json::json!(null), ms));
+                }
+            }
+            return Ok(QueryResult::aggregation(v, ms));
+        }
+
         let records = if has_aggregate {
             // Create modifiers without return_fields to preserve all fields for aggregation
             let mut mods_for_recall = step.modifiers.clone();

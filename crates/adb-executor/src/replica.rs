@@ -64,6 +64,8 @@ impl Replica {
         let (store, embedder) = crate::engine::open_store(dir).await?;
         // The hot cache, kept by every apply, so a takeover doesn't refill it (C-19).
         store.set_cache(crate::engine::hot_cache(crate::engine::cache_config(dir)?)).await.map_err(s("store"))?;
+        // The live keys a takeover hands over, and the field indexes (PF-38, PF-40).
+        store.warm(true);
         let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(s("platform"))?);
         let platform_next = LogOffset(platform.applied_offset().await + 1);
         let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;

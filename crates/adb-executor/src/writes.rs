@@ -1900,14 +1900,21 @@ impl<L: Log + 'static> DurableWrites<L> {
         // CA-27: a retried txn_id commits once across a restart or a failover too.
         let window = std::env::var("ADB_TXN_DEDUPE_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000u64);
         let t_recall = std::time::Instant::now();
+        let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
         let recalled = Box::pin(seq.recall_txns(window)).await.map_err(log_err)?;
+        steps.push(("txn recall", t_recall.elapsed()));
         if recalled > 0 {
             tracing::info!(recalled, window, took = ?t_recall.elapsed(), "transaction ids recalled from the log tail");
         }
         // Caught up with the log: the applier starts from its end.
         let applier = Some(Applier::spawn(Arc::clone(&store), ApplyBarrier::new(seq.log().last_offset().0)));
+        let t_step = std::time::Instant::now();
         let subs = Registry::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
+        steps.push(("subscriptions", t_step.elapsed()));
+        let t_step = std::time::Instant::now();
         let branches = crate::branches::Branches::load(&store, CommitTs::from_datetime(time::now())).await.map_err(AdbError::Internal)?;
+        steps.push(("branches", t_step.elapsed()));
+        let t_step = std::time::Instant::now();
         let timers = store
             .with_ttl()
             .await
@@ -1915,17 +1922,27 @@ impl<L: Log + 'static> DurableWrites<L> {
             .into_iter()
             .filter_map(|r| r.data.ttl_at.map(|t| (t.0, r.lineage_id)))
             .collect();
+        steps.push(("ttl timers", t_step.elapsed()));
+        let t_step = std::time::Instant::now();
         // Bounds after the last commit: one that passed while ADB was down has no
-        // event yet, and gets it on the first tick.
+        // event yet, and gets it on the first tick. Only facts with a bound are read
+        // (PF-38: every live fact was decoded here, ~1.6M rows at a takeover).
         let after = stats.last_commit_ts.map_or(i64::MIN, |t| t.0);
+        let bounded = datafusion::prelude::col("kind")
+            .eq(datafusion::prelude::lit("fact"))
+            .and(adb_store::filter::field_text("valid_from").is_not_null().or(adb_store::filter::field_text("valid_to").is_not_null()));
         let bounds = store
-            .live(Some("kind = 'fact'"), CommitTs::from_datetime(time::now()))
+            .live_expr(Some(bounded), CommitTs::from_datetime(time::now()))
             .await
             .map_err(|e| AdbError::Internal(format!("store: {e}")))?
             .into_iter()
             .flat_map(|r| validity_bounds(&r.data.value).into_iter().filter(|t| *t > after).map(move |t| (t, r.lineage_id.clone())))
             .collect();
+        steps.push(("validity bounds", t_step.elapsed()));
+        let t_step = std::time::Instant::now();
         let aliases = load_aliases(&store).await?;
+        steps.push(("aliases", t_step.elapsed()));
+        tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
         Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
@@ -3218,8 +3235,15 @@ pub struct ReplayStats {
 pub async fn hydrate(store: &PartitionStore) -> AdbResult<(u64, LiveKeys)> {
     let now = CommitTs::from_datetime(time::now());
     // Live, not current: a fact outside its validity still holds its key.
-    // Only the key columns (C-19): the full rows cost a takeover ~1.2 s at 160k rows.
-    let records = store.live_keys(now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+    // A follower taking the lead kept them by every apply (PF-38): no scan.
+    let records = match store.take_live_keys(now) {
+        Some(keys) => {
+            tracing::info!(keys = keys.len(), "live keys taken from the follower's index");
+            keys
+        }
+        // Only the key columns (C-19): the full rows cost a takeover ~1.2 s at 160k rows.
+        None => store.live_keys(now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?,
+    };
     let live: LiveKeys = records
         .iter()
         .filter(|r| unique_keys(r.memory.into()))

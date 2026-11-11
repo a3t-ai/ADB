@@ -5,6 +5,7 @@
 pub mod field_index;
 pub mod filter;
 pub mod hot;
+pub mod live_index;
 pub mod row_cache;
 pub mod rows;
 pub mod schema;
