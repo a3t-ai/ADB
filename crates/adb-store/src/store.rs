@@ -226,6 +226,67 @@ fn decode_parallel(b: &arrow_array::RecordBatch) -> StoreResult<Vec<StoredRow>> 
     Ok(rows)
 }
 
+/// A scan's batches decoded as they arrive, a few at a time on several cores (C-11),
+/// so the table is never held whole as Arrow next to its decoded rows (PF-37: one
+/// `ORDER BY` over 925k rows took a node from 1.0 to 3.7 GB). Rows in scan order.
+async fn decode_stream(scanner: &LsmScanner) -> StoreResult<Vec<StoredRow>> {
+    use futures::TryStreamExt;
+    const CHUNK_ROWS: usize = 65_536;
+    let mut stream = scanner.try_into_stream().await.map_err(lance)?;
+    let mut rows = Vec::new();
+    let mut pending: Vec<arrow_array::RecordBatch> = Vec::new();
+    let mut held = 0usize;
+    while let Some(b) = stream.try_next().await.map_err(|e| StoreError::Decode(format!("scan: {e}")))? {
+        held += b.num_rows();
+        pending.push(b);
+        if held >= CHUNK_ROWS {
+            rows.extend(decode_batches(std::mem::take(&mut pending))?);
+            held = 0;
+        }
+    }
+    rows.extend(decode_batches(pending)?);
+    Ok(rows)
+}
+
+/// [`decode`] over several batches, contiguous runs of them per thread, in order.
+fn decode_batches(batches: Vec<arrow_array::RecordBatch>) -> StoreResult<Vec<StoredRow>> {
+    match batches.len() {
+        0 => return Ok(Vec::new()),
+        1 => return decode_parallel(&batches[0]),
+        _ => {}
+    }
+    let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(8).min(batches.len()).max(1);
+    if threads == 1 || n < 8192 {
+        let mut rows = Vec::with_capacity(n);
+        for b in &batches {
+            rows.extend(decode(b)?);
+        }
+        return Ok(rows);
+    }
+    let per = batches.len().div_ceil(threads);
+    let parts: Vec<StoreResult<Vec<StoredRow>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(per)
+            .map(|run| {
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    for b in run {
+                        out.extend(decode(b)?);
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(StoreError::Decode("decode thread panicked".into())))).collect()
+    });
+    let mut rows = Vec::with_capacity(n);
+    for p in parts {
+        rows.extend(p?);
+    }
+    Ok(rows)
+}
+
 fn open_state(g: &Option<Inner>) -> &Inner {
     g.as_ref().expect("the partition store is open")
 }
@@ -949,8 +1010,7 @@ impl PartitionStore {
         if let Some(f) = filter {
             scanner = scanner.filter(f).map_err(lance)?;
         }
-        let batch = scanner.try_into_batch().await.map_err(lance)?;
-        let rows = decode_parallel(&batch)?;
+        let rows = decode_stream(&scanner).await?;
         // One line per filtered LSM scan (`RUST_LOG=adb_store::scan=debug`).
         tracing::debug!(target: "adb_store::scan", filter = filter.unwrap_or(""), rows = rows.len(), us = t0.elapsed().as_micros() as u64, "scan");
         Ok(rows)
@@ -965,8 +1025,7 @@ impl PartitionStore {
         if let Some(f) = filter {
             scanner = scanner.filter_expr(f);
         }
-        let batch = scanner.try_into_batch().await.map_err(lance)?;
-        decode_parallel(&batch)
+        decode_stream(&scanner).await
     }
 
     /// The current view at `now` of the rows matching `filter` (an expression).

@@ -37,14 +37,51 @@ fn records_of(memory: Memory, in_scope: Option<&str>, namespace: Option<&str>) -
 }
 
 /// The current rows matching `filter`, from one snapshot; `vectors`: with the
-/// `embedding` column (LIKE), otherwise without it.
-pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, vectors: bool) -> AdbResult<Vec<StoredRow>> {
+/// `embedding` column (LIKE), otherwise without it. The rows count against the read
+/// memory budget while the returned [`Held`] lives.
+pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, vectors: bool) -> AdbResult<(Vec<StoredRow>, Held)> {
+    scan_current(store, filter, now, vectors, |r| r, Keeper::all()).await
+}
+
+/// What a scan keeps of the rows it decodes (PF-37): those `test` takes, and with
+/// `top`, only the first k in that total order — a read that returns k rows holds
+/// about k, not the table.
+pub(crate) struct Keeper<T> {
+    test: Box<dyn Fn(&T) -> bool + Send>,
+    top: Option<(usize, Box<dyn Fn(&T, &T) -> Ordering + Send>)>,
+}
+
+impl<T> Keeper<T> {
+    pub(crate) fn all() -> Self {
+        Self { test: Box::new(|_| true), top: None }
+    }
+}
+
+/// [`current_rows`] streamed: each batch is decoded, converted by `to`, filtered by
+/// the keeper and charged to the read budget as it comes, so a scan never holds the
+/// whole result as Arrow next to its decoded rows (one `ORDER BY … LIMIT 10` over
+/// 925k rows took a node from 1.0 to 3.7 GB, 11 Nov).
+pub(crate) async fn scan_current<T: Send + 'static>(
+    store: &PartitionStore,
+    filter: Expr,
+    now: CommitTs,
+    vectors: bool,
+    to: impl Fn(StoredRow) -> T + Send + 'static,
+    keeper: Keeper<T>,
+) -> AdbResult<(Vec<T>, Held)> {
+    use futures::StreamExt;
     // Only cheap column filters go into the scan; the current view (D2 §3: not
     // superseded, closed or expired) is tested on the decoded rows — its timestamp
     // tests cost more in the scan (measured, W7).
     let filter = col("tombstone").eq(lit(false)).and(filter);
     let started = std::time::Instant::now();
-    let batches = store
+    struct Out<T> {
+        kept: Vec<(T, usize)>,
+        held: Held,
+        scanned: usize,
+        failed: Option<AdbError>,
+    }
+    let out = store
         .query(move |ctx| async move {
             let df = ctx.table("memory").await?.filter(filter)?;
             let df = if vectors {
@@ -54,19 +91,186 @@ pub async fn current_rows(store: &PartitionStore, filter: Expr, now: CommitTs, v
                     df.schema().fields().iter().map(|f| f.name().clone()).filter(|n| n != "embedding" && n != "sealed").collect();
                 df.select_columns(&cols.iter().map(String::as_str).collect::<Vec<_>>())?
             };
-            df.collect().await
+            let mut stream = df.execute_stream().await?;
+            let mut out = Out { kept: Vec::new(), held: Held::default(), scanned: 0, failed: None };
+            while let Some(b) = stream.next().await {
+                let b = b?;
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let rows = match decode(&b) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        out.failed = Some(store_err(e));
+                        break;
+                    }
+                };
+                out.scanned += rows.len();
+                drop(b);
+                let mut added = 0usize;
+                for r in rows {
+                    if r.is_current(now) && r.data.kind != Kind::Meta {
+                        let n = row_bytes(&r);
+                        let t = to(r);
+                        if (keeper.test)(&t) {
+                            out.kept.push((t, n));
+                            added += n;
+                        }
+                    }
+                }
+                // Keep only the first k so far once there are plenty more.
+                let mut dropped = 0usize;
+                if let Some((k, cmp)) = &keeper.top {
+                    let k = (*k).max(1);
+                    if out.kept.len() > 2 * k.max(64) {
+                        out.kept.select_nth_unstable_by(k - 1, |a, b| cmp(&a.0, &b.0));
+                        dropped = out.kept[k..].iter().map(|(_, n)| n).sum();
+                        out.kept.truncate(k);
+                    }
+                }
+                // Charge the batch's net change to the budget.
+                if added >= dropped {
+                    if let Err(e) = out.held.take(added - dropped) {
+                        out.failed = Some(e);
+                        break;
+                    }
+                } else {
+                    out.held.release(dropped - added);
+                }
+            }
+            // The first k of what is left.
+            if let (Some((k, cmp)), None) = (&keeper.top, &out.failed) {
+                if *k < out.kept.len() {
+                    out.kept.select_nth_unstable_by((*k).max(1) - 1, |a, b| cmp(&a.0, &b.0));
+                    let dropped: usize = out.kept[*k..].iter().map(|(_, n)| n).sum();
+                    out.kept.truncate(*k);
+                    out.held.release(dropped);
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(store_err)?;
-    let scanned = started.elapsed();
-    let mut rows = Vec::new();
-    for b in &batches {
-        rows.extend(decode(b).map_err(store_err)?);
+    if let Some(e) = out.failed {
+        return Err(e);
     }
-    tracing::debug!(?scanned, decoded = ?(started.elapsed() - scanned), rows = rows.len(), "query scan");
-    // The pushed-down filter ran in the LSM; the view is re-checked on the decoded rows.
-    rows.retain(|r| r.is_current(now) && r.data.kind != Kind::Meta);
-    Ok(rows)
+    let rows: Vec<T> = out.kept.into_iter().map(|(t, _)| t).collect();
+    tracing::debug!(took = ?started.elapsed(), scanned = out.scanned, kept = rows.len(), held = out.held.0, "query scan");
+    Ok((rows, out.held))
+}
+
+/// About what a decoded row holds in memory: its strings, payload tree and vector,
+/// × 2.5 for allocator overhead and the record it becomes (measured 11 Nov: 100k
+/// SEMANTIC rows counted 107 MB here and grew the process by 270 MB). An Arrow
+/// batch's size can't tell: a filtered batch still points at the scan's buffers.
+fn row_bytes(r: &StoredRow) -> usize {
+    raw_row_bytes(r) * 5 / 2
+}
+
+fn raw_row_bytes(r: &StoredRow) -> usize {
+    fn json(v: &serde_json::Value) -> usize {
+        32 + match v {
+            serde_json::Value::String(s) => s.len(),
+            serde_json::Value::Array(a) => a.iter().map(json).sum(),
+            serde_json::Value::Object(m) => m.iter().map(|(k, v)| 32 + k.len() + json(v)).sum(),
+            _ => 0,
+        }
+    }
+    let s = |o: &Option<String>| o.as_ref().map_or(0, String::len);
+    let d = &r.data;
+    std::mem::size_of::<StoredRow>()
+        + r.id.len()
+        + r.lineage_id.len()
+        + d.tenant_id.len()
+        + d.scope.len()
+        + s(&d.namespace)
+        + s(&d.key)
+        + s(&d.subject_id)
+        + s(&d.predicate)
+        + s(&d.object_id)
+        + s(&d.link_type)
+        + s(&d.text)
+        + d.sealed.as_ref().map_or(0, Vec::len)
+        + d.embedding.as_ref().map_or(0, |e| e.len() * 2)
+        + json(&d.value)
+}
+
+/// Bytes of decoded rows all reads on this node may hold at once (PF-37):
+/// `ADB_READ_MEMORY_MB`, default 40% of the container's (or host's) memory. Past it a
+/// read fails ("read memory budget exceeded") instead of running the node out of
+/// memory; the reads holding the budget finish and give it back.
+struct ReadBudget {
+    total: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+fn read_budget() -> &'static ReadBudget {
+    static B: std::sync::OnceLock<ReadBudget> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let total = std::env::var("ADB_READ_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .map_or_else(|| memory_limit() / 10 * 4, |mb| mb << 20);
+        tracing::info!(mb = total >> 20, "read memory budget (ADB_READ_MEMORY_MB)");
+        ReadBudget { total, used: std::sync::atomic::AtomicUsize::new(0) }
+    })
+}
+
+/// The cgroup's memory limit, else the host's memory, else 8 GiB.
+fn memory_limit() -> usize {
+    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let host = || {
+        std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+            m.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()).map(|kb| kb << 10)
+        })
+    };
+    cgroup.or_else(host).unwrap_or(8 << 30)
+}
+
+/// A read's share of the read memory budget, given back when dropped.
+#[derive(Debug, Default)]
+pub struct Held(usize);
+
+impl Held {
+    fn take(&mut self, bytes: usize) -> AdbResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let b = read_budget();
+        let mut used = b.used.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if used + bytes > b.total {
+                return Err(AdbError::QueryError(format!(
+                    "read memory budget exceeded: this read holds {} MB and the node's reads {} of {} MB (ADB_READ_MEMORY_MB); narrow the read (WHERE, LIMIT) or retry",
+                    (self.0 + bytes) >> 20,
+                    used >> 20,
+                    b.total >> 20
+                )));
+            }
+            match b.used.compare_exchange_weak(used, used + bytes, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => used = now,
+            }
+        }
+        self.0 += bytes;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.0);
+        if bytes > 0 {
+            read_budget().used.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+            self.0 -= bytes;
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let n = self.0;
+        self.release(n);
+    }
 }
 
 // ------------------------------------------------------------------ records
@@ -393,6 +597,8 @@ struct Candidates {
     records: Vec<Arc<MemoryRecord>>,
     cached: bool,
     floor: Option<CommitTs>,
+    /// The records' share of the read memory budget (PF-37), while the read runs.
+    held: Held,
 }
 
 /// A read's answer: from the cache, from Lance, or the cache's rows weren't
@@ -487,12 +693,12 @@ fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, mod
     if let Some(key) = keyed(memory, predicate, in_scope, namespace) {
         if let Some(Some(c)) = hot.lineage(m, &row_id(m, &key)) {
             if ok(&c.row) {
-                return Some(Candidates { records: vec![cached_record(&c)], cached: true, floor: None });
+                return Some(Candidates { records: vec![cached_record(&c)], cached: true, floor: None, held: Held::default() });
             }
         }
     }
     let hit = hot.rows(m, in_scope)?;
-    Some(Candidates { records: hit.rows.iter().filter(|c| ok(&c.row)).map(cached_record).collect(), cached: true, floor: hit.floor })
+    Some(Candidates { records: hit.rows.iter().filter(|c| ok(&c.row)).map(cached_record).collect(), cached: true, floor: hit.floor, held: Held::default() })
 }
 
 /// The key a KEY predicate names, when it is the record's key. `WHERE key = "x"`
@@ -534,6 +740,7 @@ async fn candidates(
     modifiers: &Modifiers,
     now: CommitTs,
     source: Source,
+    bounded: bool,
 ) -> AdbResult<Candidates> {
     // The field index first, from either source: it answers from the current rows,
     // as the cache and Lance do, without visiting every row (PF-27).
@@ -547,7 +754,7 @@ async fn candidates(
             return Ok(c);
         }
     }
-    let lance = |records: Vec<MemoryRecord>| Ok(Candidates { records: records.into_iter().map(Arc::new).collect(), cached: false, floor: None });
+    let lance = |records: Vec<MemoryRecord>| Ok(Candidates { records: records.into_iter().map(Arc::new).collect(), cached: false, floor: None, held: Held::default() });
     let m: Memory = memory.into();
     // KEY lookups: the primary-key fast path first (W7).
     if let Some(key) = keyed(memory, predicate, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref()) {
@@ -563,7 +770,53 @@ async fn candidates(
             filter = filter.and(p);
         }
     }
-    lance(current_rows(store, filter, now, false).await?.iter().map(record).collect())
+    // A plain read keeps only what it can return (PF-37); others take every match.
+    let keeper = if bounded { read_keeper(memory, predicate, modifiers) } else { Keeper::all() };
+    let (records, held) = scan_current(store, filter, now, false, |r| Arc::new(record(&r)), keeper).await?;
+    Ok(Candidates { records, cached: false, floor: None, held })
+}
+
+/// What a `RECALL` / `LOOKUP` keeps while it scans: the records its predicate and
+/// `SCOPE` take, and with `LIMIT k` the first k in its order (`ORDER BY`, then the
+/// default order: a total order, so the same k as sorting everything). A read with a
+/// window, aggregate, grouping, links or a PATTERN needs every match.
+fn read_keeper(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> Keeper<Arc<MemoryRecord>> {
+    let needs_all = matches!(predicate, Predicate::Pattern { .. })
+        || modifiers.window.is_some()
+        || modifiers.aggregate.is_some()
+        || modifiers.group_by.is_some()
+        || modifiers.having.is_some()
+        || modifiers.follow_links.is_some()
+        || modifiers.with_links.is_some();
+    if needs_all {
+        return Keeper::all();
+    }
+    let (p, scope) = (predicate.clone(), modifiers.scope.clone());
+    let test = Box::new(move |r: &Arc<MemoryRecord>| matches(memory, r, &p) && scope.as_ref().is_none_or(|v| &r.metadata.scope == v));
+    let top = modifiers.limit.map(|k| {
+        let order = modifiers.order_by.clone();
+        let cmp: Box<dyn Fn(&Arc<MemoryRecord>, &Arc<MemoryRecord>) -> Ordering + Send> = Box::new(move |a, b| record_order(memory, order.as_ref(), a, b));
+        (k, cmp)
+    });
+    Keeper { test, top }
+}
+
+/// The order `top_k` and `default_order` + `order_by` give: `ORDER BY`'s value
+/// (missing values last), then the default order (created, id; EPISODIC newest first).
+fn record_order(memory: MemoryType, order: Option<&OrderBy>, a: &MemoryRecord, b: &MemoryRecord) -> Ordering {
+    let by_value = order.map_or(Ordering::Equal, |o| {
+        let c = match (a.order_value(&o.field), b.order_value(&o.field)) {
+            (Some(x), Some(y)) => cmp_json(&x, &y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        if o.ascending { c } else { c.reverse() }
+    });
+    by_value.then_with(|| {
+        let c = (a.metadata.created_at, &a.id).cmp(&(b.metadata.created_at, &b.id));
+        if memory == MemoryType::Episodic { c.reverse() } else { c }
+    })
 }
 
 /// The `field = literal` conditions a predicate requires (a top-level AND chain), as
@@ -712,7 +965,7 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
             }
         }
     }
-    Ok(Some(Candidates { records: out, cached: false, floor: None }))
+    Ok(Some(Candidates { records: out, cached: false, floor: None, held: Held::default() }))
 }
 
 /// `RECALL` / `LOOKUP` (not `LIKE`): candidates → exact predicate → visibility →
@@ -723,7 +976,7 @@ pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predic
 }
 
 async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
-    let c = candidates(store, memory, predicate, modifiers, now, source).await?;
+    let c = candidates(store, memory, predicate, modifiers, now, source, true).await?;
     if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
         if memory != MemoryType::Procedural {
             return Ok(Answer::of(&c, Vec::new()));
@@ -902,7 +1155,7 @@ pub async fn scan(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs) 
 }
 
 async fn scan_from(store: &PartitionStore, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
-    let c = candidates(store, MemoryType::Working, &Predicate::All, modifiers, now, source).await?;
+    let c = candidates(store, MemoryType::Working, &Predicate::All, modifiers, now, source, false).await?;
     let mut records = c.records.clone();
     default_order(MemoryType::Working, &mut records);
     // From an incomplete bucket: a window over the newest rows, all newer than the floor.
@@ -937,7 +1190,7 @@ pub async fn load(store: &PartitionStore, predicate: &Predicate, limit: usize, n
 }
 
 async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
-    let c = candidates(store, MemoryType::Tools, predicate, &Modifiers::default(), now, source).await?;
+    let c = candidates(store, MemoryType::Tools, predicate, &Modifiers::default(), now, source, false).await?;
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
@@ -976,7 +1229,7 @@ pub async fn targets(store: &PartitionStore, memory: MemoryType, predicate: &Pre
 
 async fn targets_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<String>>> {
     let modifiers = Modifiers { in_scope: in_scope.map(String::from), namespace: namespace.map(String::from), ..Default::default() };
-    let c = candidates(store, memory, predicate, &modifiers, now, source).await?;
+    let c = candidates(store, memory, predicate, &modifiers, now, source, false).await?;
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
@@ -1011,6 +1264,8 @@ async fn similar_from(
     source: Source,
 ) -> AdbResult<Answer<Vec<MemoryRecord>>> {
     let m: Memory = memory.into();
+    // The scanned rows' share of the read memory budget, until the answer is built.
+    let mut _held = Held::default();
     let in_scope = modifiers.in_scope.as_deref();
     let hot = store.hot().filter(|h| source == Source::Cache && h.tracks(m));
     let (mut rows, cached): (Vec<Arc<StoredRow>>, bool) = match hot {
@@ -1024,7 +1279,9 @@ async fn similar_from(
             if let Some(s) = in_scope {
                 filter = filter.and(col("scope").eq(lit(s.to_string())));
             }
-            (current_rows(store, filter, now, true).await?.into_iter().map(Arc::new).collect(), false)
+            let (rows, held) = current_rows(store, filter, now, true).await?;
+            _held = held;
+            (rows.into_iter().map(Arc::new).collect(), false)
         }
     };
     if let Some(ns) = &modifiers.namespace {
@@ -1228,7 +1485,7 @@ pub async fn links_from(store: &PartitionStore, memory: MemoryType, keys: &[Stri
         if let Some(t) = link_type {
             filter = filter.and(col("link_type").eq(lit(t.to_string())));
         }
-        let mut rows = current_rows(store, filter, now, false).await?;
+        let (mut rows, _held) = current_rows(store, filter, now, false).await?;
         rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
         for l in rows.iter().filter_map(to_link) {
             out.entry(l.from_id.clone()).or_default().push(l);
@@ -1271,6 +1528,7 @@ async fn links_touching_from(
         }
     }
     let mut rows = Vec::new();
+    let mut held = Vec::new();
     for chunk in ends.chunks(500) {
         let ids: Vec<Expr> = chunk.iter().map(|e| lit(e.clone())).collect();
         let by_end = match select.direction {
@@ -1283,7 +1541,9 @@ async fn links_touching_from(
         if !select.types.is_empty() {
             filter = filter.and(col("link_type").in_list(select.types.iter().map(|t| lit(t.clone())).collect(), false));
         }
-        rows.extend(current_rows(store, filter, now, false).await?);
+        let (r, h) = current_rows(store, filter, now, false).await?;
+        rows.extend(r);
+        held.push(h);
     }
     // A link between two chunks' keys comes back twice.
     let mut seen = HashSet::new();
@@ -1360,7 +1620,7 @@ async fn by_keys_from(store: &PartitionStore, memory: MemoryType, keys: &[String
     for chunk in rest.chunks(500) {
         let ids: Vec<Expr> = chunk.iter().map(|k| lit(row_id(m, k))).collect();
         let filter = records_of(m, None, None).and(col("lineage_id").in_list(ids, false));
-        for r in current_rows(store, filter, now, false).await? {
+        for r in current_rows(store, filter, now, false).await?.0 {
             out.insert(r.key().to_string(), record(&r));
         }
     }
