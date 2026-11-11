@@ -315,3 +315,71 @@ More findings and changes are added below as the full tests run.
 | C-16 | Done (F-20): followers serve reads. A follower answers RECALL / LOOKUP / SCAN (HTTP `/query`, Flight `aql`) and Flight table / SQL reads from its own copy, after asking the leader for its ReadIndex (`/raft/read_index`; concurrent reads share one ask) and waiting until its state machine and tables have applied it, so every node gives read-your-writes. Every other HTTP request is passed to the leader (SSE included), so any node takes any request; Flight writes on a follower answer `unavailable: this ADB node is not the leader`. Followers follow the branch registry and entity aliases from the log so their reads match the leader's; their compaction runs beside the applies so reads don't wait for it. `ADB_FOLLOWER_READS=0` turns it off. FlowR sends reads to the nodes in turn and writes to the leader (`FLOWR_ADB_SPREAD_READS=0` turns it off) |
 | C-17b | Done (F-20): embedding spread over the replica set. Each local-model request goes to the node with the fewest requests in flight (this one or a peer's `POST /cluster/embed` on its Raft port); a failing peer is left out for 10 s. `ADB_EMBED_PEERS=0` turns it off |
 | C-18 | Not in this round: partitions led by different nodes (write sequencing on several leaders) is a multi-Raft change |
+
+## Round 2 retest on AWS (10–11 Nov, 23:13–00:03; adb:2026-11-10-r2, flowr:2026-11-10-ee-r2)
+
+Same tests as round 1, plus stage F: reads sent round-robin to all three nodes vs to the leader only.
+Stages A–E send reads to all three nodes (`--nodes`), writes to the leader. Results:
+`scratchpad/round3/`; per-node CPU from the samplers (2 vCPU each, 200% = a full node).
+
+| Measure | Round 1 | Round 2 |
+|---|---|---|
+| STORE SEMANTIC, 1 client | 64/s, 15.4 ms | 60/s, 16.4 ms |
+| STORE SEMANTIC, 64 clients | 99/s, p50 633 ms | **638/s, p50 100 ms** |
+| STORE EPISODIC, 64 clients | ~121/s | **889/s, p50 71 ms** |
+| STORE SEMANTIC, 10 min at 16 clients | 91/s, p50 175 ms | **410/s, p50 38 ms** (246k writes) |
+| UPDATE SEMANTIC, 64 clients | 87/s, p50 742 ms | 127/s, p50 501 ms |
+| LOOKUP KEY, 64 clients | 3,005/s, p50 18 ms | 1,773/s, p50 38 ms (worse: F-21) |
+| Filtered RECALL, 64 clients | 14/s, p50 4.5 s | 22/s, p50 2.8 s |
+| FORGET EPISODIC, 64 clients | 29/s | 27/s (unchanged, not in this round) |
+| Mixed 70/25/5, 16 clients, 10 min | 20/s, p50 858 ms, p90 1.4 s | 23/s, p50 120 ms, p90 3.8 s (F-22) |
+| Leader kill: acknowledged writes lost | 0 of 6,726 | 0 of 25,565 |
+| Leader kill: longest gap with no write | 7,090 ms | 5,568 ms |
+| FlowR errors during a leader kill (set_state, 16 clients) | 3,761 | **16** (F-23) |
+| A3T get_state / list_flows, 128 clients | ~2,236/s | 2,232 / 2,229/s |
+| A3T set_state, 128 clients | 902/s | 856/s |
+| Durable flow noop / read3, 128 clients | 153 / 184/s | 134 / 155/s |
+| Transient flow read3, 128 clients | 522/s | **1,219/s** |
+
+Stage F, 64 clients, 30 s each:
+
+| Phase | Reads on 3 nodes | Reads on the leader only |
+|---|---|---|
+| STORE SEMANTIC | 633/s | 631/s |
+| LOOKUP KEY | 1,841/s, p50 37 ms | **2,882/s, p50 19 ms** |
+| RECALL WHERE topic | **9/s, p50 6.1 s** | 3/s, p50 22.8 s |
+| CPU (avg) leader / follower / follower | 137% / 138% / 136% | 140% / 29% / 32% |
+
+CPU (avg %) per stage, leader 16.16.78.154 first: A 100/114/95 · D 184/166/179 ·
+E STORE 188/184/183 · E mixed 198/140/146. F-20 is fixed: the followers now do as much
+work as the leader (in round 1 they sat at ~2%).
+
+New findings:
+
+F-21. **Point reads on a follower are slower than on the leader.** A LOOKUP takes 0.1 ms
+on the server, but a follower first asks the leader for its ReadIndex and waits until it
+has applied it: one round trip plus the apply lag, ~20 ms at 64 clients. For point reads
+the leader-only path is 1.6× faster; for scans the follower path is 3× faster.
+
+F-22. **Mixed load: scans still set the tail.** p50 fell 858 → 120 ms (C-20: LOOKUPs no
+longer queue behind scans), but p90 rose to 3.8 s. Filtered RECALL takes 1.8 s on the
+server at ~250k rows (it scans every row: F-13 / C-7), and LOOKUPs on followers took
+45 ms on the server (waiting for applies while the node was busy with scans).
+
+F-23. **16 FlowR errors are left during a leader kill:** "transport error", i.e. calls that
+were in flight to the killed node. C-21 retries a call no node accepted, not one cut off
+mid-way (a write cut off may or may not have been applied).
+
+F-24. **Five ADB tests fail; they fail on the round-1 code too** (found while testing round 2):
+`space_flight` (a FORGET missing from the space feed), `branch_pod` (the pod's copy of a
+forgotten record is not erased), `subscription_retention` (no reset for a subscriber behind
+the log), `scoped_keys` (RECALL WHERE key = "x" finds only the default scope, not team:a /
+team:b), `integration::pipeline_timeout_is_a_hard_budget_when_enforced` (timing: the
+optimised build finishes inside the 1 ms budget). The first four look like one earlier
+regression around FORGET or how records in a scope are filtered; not yet investigated.
+
+| Id | Change | Why | Risk / test |
+|---|---|---|---|
+| C-22 | Point reads: skip the ReadIndex ask when the follower knows it is current (leader lease / last heartbeat's commit index), or send point reads to the leader and scans to followers | F-21 | stage F: LOOKUP on 3 nodes ≥ leader only |
+| C-23 | FlowR: retry idempotent calls (reads, set_state upserts) cut off by a transport error on another node | F-23 | leader kill with FlowR: 0 errors |
+| C-24 | Find and fix the regression behind the four failing tests; make the timeout test independent of build speed | F-24 | the five tests |
