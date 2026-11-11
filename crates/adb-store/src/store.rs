@@ -139,6 +139,8 @@ pub struct PartitionStore {
     hot: std::sync::RwLock<Option<Arc<HotCache>>>,
     /// Field indexes (PF-27), kept in step with every apply like the hot cache.
     fields: crate::field_index::FieldIndex,
+    /// Rows the field indexes read by id (`get_cached`), dropped by every put.
+    rows: crate::row_cache::RowCache,
     /// Odd while a put and its cache update are under way (`apply_seq`).
     apply_seq: std::sync::atomic::AtomicU64,
     /// The schema version `_meta` gets (`schema_version`).
@@ -664,6 +666,8 @@ impl PartitionStore {
         let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
         Self::reset_ledger(&inner, self.applied.load(std::sync::atomic::Ordering::SeqCst)).await?;
         *g = Some(inner);
+        // Compaction may drop or rewrite rows: cached ones read again.
+        self.rows.clear();
         // A migration's rows bypassed the applies: the field indexes rebuild on use.
         // (Compaction keeps every current row as it was, so they stay.)
         if !extra.is_empty() {
@@ -715,7 +719,9 @@ impl PartitionStore {
     async fn put_rows(&self, rows: &[StoredRow]) -> StoreResult<()> {
         let g = self.state.read().await;
         for chunk in rows.chunks(10_000) {
-            open_state(&g).writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
+            let put = open_state(&g).writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance);
+            self.rows.drop_rows(chunk);
+            put?;
         }
         Ok(())
     }
@@ -805,6 +811,7 @@ impl PartitionStore {
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
             fields: crate::field_index::FieldIndex::new(),
+            rows: crate::row_cache::RowCache::new(),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
             layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
         };
@@ -909,7 +916,9 @@ impl PartitionStore {
         out.push(StoredRow::meta(applied, meta.commit_ts, meta.epoch, self.meta_extra()));
         let batch = encode(&out, &self.schema, self.dim)?;
         let g = self.state.read().await;
-        open_state(&g).writer.put(vec![batch]).await.map_err(lance)?;
+        let put = open_state(&g).writer.put(vec![batch]).await.map_err(lance);
+        self.rows.drop_rows(&out);
+        put?;
         Ok(())
     }
 
@@ -1164,6 +1173,18 @@ impl PartitionStore {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())
     }
 
+    /// [`get`](Self::get) through the row cache (exact: see `row_cache`).
+    pub async fn get_cached(&self, id: &str) -> StoreResult<Option<StoredRow>> {
+        match self.rows.begin(id) {
+            Ok(r) => Ok(Some(r)),
+            Err(reading) => {
+                let r = self.get(id).await;
+                self.rows.finish(reading, r.as_ref().ok().and_then(|r| r.as_ref()));
+                r
+            }
+        }
+    }
+
     /// Counts puts in two steps (before the put, after the cache took its rows):
     /// odd while one is under way. Two reads between equal, even values saw the
     /// same state in the table and the cache (the W10 shadow check).
@@ -1252,6 +1273,7 @@ impl PartitionStore {
         if let (Ok(_), Some(h)) = (&put, self.hot()) {
             h.apply(&rows);
         }
+        self.rows.drop_rows(&rows);
         if put.is_ok() {
             self.fields.apply(&rows);
             if let Some(l) = inner.links.lock().unwrap().as_mut() {

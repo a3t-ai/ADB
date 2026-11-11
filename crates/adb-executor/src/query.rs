@@ -684,7 +684,7 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
             return Ok(None);
         }
         for group in missing.chunks(16) {
-            let got = futures::future::join_all(group.iter().map(|id| store.get(id))).await;
+            let got = futures::future::join_all(group.iter().map(|id| store.get_cached(id))).await;
             for (id, r) in group.iter().zip(got) {
                 if let Some(r) = r.map_err(store_err)? {
                     if ok(&r) {
