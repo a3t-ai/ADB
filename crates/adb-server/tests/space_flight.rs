@@ -149,8 +149,21 @@ async fn feed_follows_one_space_and_never_returns_an_erased_payload() {
     aql(&f, r#"STORE INTO SEMANTIC (key = "gone", content = "erase these words") NAMESPACE "crm""#).await;
     aql(&f, r#"FORGET FROM SEMANTIC WHERE key = "gone" NAMESPACE "crm""#).await;
 
-    let all = action(&f, "space_changes", json!({ "namespace": "crm", "from": from, "wait_ms": 2000 })).await.unwrap();
-    assert_eq!(all["reset"], json!(false), "{all}");
+    // A feed answers with what is applied when it is read: follow it (as a consumer
+    // does, from `next`) until the FORGET is in.
+    let mut gathered: Vec<serde_json::Value> = Vec::new();
+    let mut at = from.clone();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let page = action(&f, "space_changes", json!({ "namespace": "crm", "from": at, "wait_ms": 500 })).await.unwrap();
+        assert_eq!(page["reset"], json!(false), "{page}");
+        gathered.extend(page["changes"].as_array().cloned().unwrap_or_default());
+        at = page["next"].clone();
+        if gathered.iter().any(|c| c["op"] == "forget") || std::time::Instant::now() >= until {
+            break;
+        }
+    }
+    let all = json!({ "changes": gathered, "next": at });
     let changes = all["changes"].as_array().unwrap();
     let got: Vec<(String, String, String)> = changes
         .iter()

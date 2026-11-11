@@ -113,10 +113,13 @@ async fn a_branch_in_its_own_pod() {
     assert_eq!(on().await, ["PII-main-s", "PII-pod-copy", "a1", "e1"], "parent AS OF the point (no late1) + its own");
     assert_eq!(facts(&pod.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#, None).await.unwrap()), on().await);
 
-    // FORGET on main reaches the running pod (its copy too, on disk).
+    // FORGET on main reaches the running pod: no read there returns its copy from the
+    // FORGET's commit on, and the pod's next compaction takes it off the disk
+    // (FORGET semantics since 7 Nov: a tombstone; physical removal at compaction).
     q(r#"FORGET FROM SEMANTIC WHERE key = "p" NAMESPACE "crm""#).await.unwrap();
     assert_eq!(on().await, ["PII-main-s", "a1", "e1"]);
-    assert_eq!(files_with(pod_dir.path(), b"PII-pod-copy"), 0, "the pod's copy is erased");
+    pod.compact().await.unwrap();
+    assert_eq!(files_with(pod_dir.path(), b"PII-pod-copy"), 0, "the pod's copy is erased at its compaction");
 
     // The pod copies `s`, then goes down (hibernates): a FORGET on main waits for it.
     q(r#"UPDATE INTO SEMANTIC WHERE key = "s" (fact = "PII-pod-s") NAMESPACE "crm" BRANCH "pod-try""#).await.unwrap();
@@ -128,9 +131,10 @@ async fn a_branch_in_its_own_pod() {
     let pending = flight_action(&org_url, None, "branch_pending", json!({ "namespace": "crm", "name": "pod-try" })).await.unwrap();
     assert_eq!(pending["forgets"].as_array().map(|a| a.len()), Some(1), "{pending}");
     // It starts again: the pending FORGET is applied before it serves, then cleared.
-    let (_pod, _task) = start_pod(pod_dir.path(), &org_url, pod_port).await;
+    let (pod, _task) = start_pod(pod_dir.path(), &org_url, pod_port).await;
     assert_eq!(on().await, ["a1", "e1"]);
-    assert_eq!(files_with(pod_dir.path(), b"PII-pod-s"), 0, "erased from the pod's disk when it started");
+    pod.compact().await.unwrap();
+    assert_eq!(files_with(pod_dir.path(), b"PII-pod-s"), 0, "erased from the pod's disk at its compaction");
     let pending = flight_action(&org_url, None, "branch_pending", json!({ "namespace": "crm", "name": "pod-try" })).await.unwrap();
     assert_eq!(pending["forgets"].as_array().map(|a| a.len()), Some(0));
 

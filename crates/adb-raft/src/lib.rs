@@ -230,8 +230,7 @@ impl Node {
         }
         let started = std::time::Instant::now();
         let index = if self.is_leader() {
-            let (read, _) = self.raft.get_read_log_id(ReadPolicy::ReadIndex).await.map_err(|e| e.to_string())?;
-            read.index()
+            net::leader_read_index(&self.raft).await?
         } else {
             let leader = self.leader().ok_or("no leader")?;
             let url = self.config.peers.get(&leader).ok_or_else(|| format!("leader {leader} is not in ADB_PEERS"))?;

@@ -277,6 +277,33 @@ pub fn order_by<R: Borrow<MemoryRecord>>(records: &mut Vec<R>, order: &OrderBy) 
     records.extend(keyed.into_iter().map(|(_, r)| r));
 }
 
+/// `records` cut to the first `k` of `ORDER BY o` (stable over the default order:
+/// equal sort values keep `default_order`'s order), sorted.
+fn top_k<R: Borrow<MemoryRecord>>(memory: MemoryType, records: &mut Vec<R>, o: &OrderBy, k: usize) {
+    let mut keyed: Vec<(Option<serde_json::Value>, R)> = records.drain(..).map(|r| (r.borrow().order_value(&o.field), r)).collect();
+    let by_value = |a: &Option<serde_json::Value>, b: &Option<serde_json::Value>| {
+        let c = match (a, b) {
+            (Some(x), Some(y)) => cmp_json(x, y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        if o.ascending { c } else { c.reverse() }
+    };
+    let default = |a: &MemoryRecord, b: &MemoryRecord| {
+        let c = (a.metadata.created_at, &a.id).cmp(&(b.metadata.created_at, &b.id));
+        if memory == MemoryType::Episodic { c.reverse() } else { c }
+    };
+    let cmp = |(av, ar): &(Option<serde_json::Value>, R), (bv, br): &(Option<serde_json::Value>, R)| by_value(av, bv).then_with(|| default(ar.borrow(), br.borrow()));
+    if k == 0 {
+        return;
+    }
+    keyed.select_nth_unstable_by(k - 1, cmp);
+    keyed.truncate(k);
+    keyed.sort_by(cmp);
+    records.extend(keyed.into_iter().map(|(_, r)| r));
+}
+
 fn oldest_first<R: Borrow<MemoryRecord>>(records: &mut [R]) {
     records.sort_by(|a, b| {
         let (a, b) = (a.borrow(), b.borrow());
@@ -457,7 +484,7 @@ fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, mod
         r.is_current(now) && in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns))
     };
     // KEY: the lineage's current version, as the point lookup finds it.
-    if let Some(key) = keyed(memory, predicate) {
+    if let Some(key) = keyed(memory, predicate, in_scope, namespace) {
         if let Some(Some(c)) = hot.lineage(m, &row_id(m, &key)) {
             if ok(&c.row) {
                 return Some(Candidates { records: vec![cached_record(&c)], cached: true, floor: None });
@@ -468,8 +495,10 @@ fn cached(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, mod
     Some(Candidates { records: hit.rows.iter().filter(|c| ok(&c.row)).map(cached_record).collect(), cached: true, floor: hit.floor })
 }
 
-/// The key a KEY predicate names, when it is the record's key.
-pub(crate) fn keyed(memory: MemoryType, predicate: &Predicate) -> Option<String> {
+/// The key a KEY predicate names, when it is the record's key. `WHERE key = "x"`
+/// is a point lookup only within one scope (`in_scope`): without IN SCOPE it means
+/// the payload key in every scope (E-L12), where several records can hold it.
+pub(crate) fn keyed(memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> Option<String> {
     match predicate {
         Predicate::Key { field, value } => {
             let keyed = matches!(field.as_str(), "id" | "key")
@@ -480,8 +509,15 @@ pub(crate) fn keyed(memory: MemoryType, predicate: &Predicate) -> Option<String>
         // `WHERE key = "x"` alone (PF-11): the record whose key is x, so the same
         // primary-key lookup. The callers still run `matches` on what it finds.
         Predicate::Where { conditions } if conditions.len() == 1 && !matches!(memory, MemoryType::Procedural | MemoryType::Tools) => match &conditions[0] {
-            adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value, .. } if matches!(field.as_str(), "id" | "key") => {
-                Some(value_text(value))
+            adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value, .. }
+                if field == "id" || (field == "key" && in_scope.is_some()) =>
+            {
+                // `id` arrives as the scoped id already (`scope_ids`); `key` is the bare
+                // payload key, so its row id is built here.
+                Some(match (field.as_str(), in_scope) {
+                    ("key", Some(scope)) => adb_store::space_id(namespace, scope, &value_text(value)),
+                    _ => value_text(value),
+                })
             }
             _ => None,
         },
@@ -499,6 +535,13 @@ async fn candidates(
     now: CommitTs,
     source: Source,
 ) -> AdbResult<Candidates> {
+    // The field index first, from either source: it answers from the current rows,
+    // as the cache and Lance do, without visiting every row (PF-27).
+    if keyed(memory, predicate, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref()).is_none() {
+        if let Some(c) = indexed(store, memory, predicate, modifiers, now).await? {
+            return Ok(c);
+        }
+    }
     if source == Source::Cache {
         if let Some(c) = cached(store, memory, predicate, modifiers, now) {
             return Ok(c);
@@ -507,7 +550,7 @@ async fn candidates(
     let lance = |records: Vec<MemoryRecord>| Ok(Candidates { records: records.into_iter().map(Arc::new).collect(), cached: false, floor: None });
     let m: Memory = memory.into();
     // KEY lookups: the primary-key fast path first (W7).
-    if let Some(key) = keyed(memory, predicate) {
+    if let Some(key) = keyed(memory, predicate, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref()) {
         if let Some(r) = point(store, m, &key, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref(), now).await? {
             return lance(vec![record(&r)]);
         }
@@ -521,6 +564,155 @@ async fn candidates(
         }
     }
     lance(current_rows(store, filter, now, false).await?.iter().map(record).collect())
+}
+
+/// The `field = literal` conditions a predicate requires (a top-level AND chain), as
+/// (field, index key) pairs; empty when it has none, or any OR.
+fn required_equalities(predicate: &Predicate) -> Vec<(String, String)> {
+    let Predicate::Where { conditions } = predicate else { return Vec::new() };
+    if conditions.iter().skip(1).any(|c| matches!(c.logical_op(), Some(adb_core::LogicalOp::Or))) {
+        return Vec::new();
+    }
+    conditions
+        .iter()
+        .filter_map(|c| match c {
+            Condition::Simple { field, operator: adb_core::Operator::Eq, value, .. } if field != "id" && !field.is_empty() && !field.contains('.') => {
+                adb_store::field_index::literal_key(value).map(|k| (field.clone(), k))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many records a read can stop at, when the index's order is the read's order:
+/// default order, a LIMIT, nothing that needs every match (ORDER BY, WINDOW,
+/// AGGREGATE, GROUP BY, HAVING, links).
+fn early_stop(modifiers: &Modifiers) -> Option<usize> {
+    let all = modifiers.order_by.is_some()
+        || modifiers.window.is_some()
+        || modifiers.aggregate.is_some()
+        || modifiers.group_by.is_some()
+        || modifiers.having.is_some()
+        || modifiers.follow_links.is_some()
+        || modifiers.with_links.is_some();
+    (!all).then_some(modifiers.limit).flatten()
+}
+
+/// Most rows an index read fetches from Lance by key (the rest come from the hot
+/// cache); past it the read scans the type instead (PF-27).
+const INDEX_FETCH_MAX: usize = 256;
+
+/// Build the (`memory`, `field`) index from the type's current rows (PF-27).
+async fn build_index(store: &PartitionStore, memory: Memory, field: &str) -> AdbResult<()> {
+    let t0 = std::time::Instant::now();
+    let filter = format!("memory = '{}' AND {} AND tombstone = false AND superseded_by IS NULL", memory.tag(), adb_store::RECORD_KINDS);
+    match store.scan(Some(&filter)).await {
+        Ok(rows) => {
+            store.fields().finish(memory, field, &rows);
+            tracing::debug!(target: "adb::index", ?memory, field, rows = rows.len(), ms = t0.elapsed().as_millis() as u64, "field index scan");
+            Ok(())
+        }
+        Err(e) => {
+            store.fields().abandon(memory, field);
+            Err(store_err(e))
+        }
+    }
+}
+
+/// Candidates from the field index (PF-27): the records holding the value of one
+/// required `field = literal`, fetched by id (the hot cache first, then Lance), in
+/// the read's default order — stopping at LIMIT where the read allows. `None`: no
+/// usable index (no such condition, a field not indexable, a build under way).
+async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<Candidates>> {
+    let m: Memory = memory.into();
+    let fields = store.fields();
+    if !fields.enabled() || !adb_store::field_index::indexable(m) {
+        return Ok(None);
+    }
+    let eqs = required_equalities(predicate);
+    if eqs.is_empty() {
+        return Ok(None);
+    }
+    // The built index with the fewest records for its value; else build the first.
+    let best = eqs.iter().filter_map(|(f, k)| fields.count(m, f, k).map(|n| (f, k, n))).min_by_key(|(_, _, n)| *n);
+    let (field, key) = match best {
+        Some((f, k, _)) => (f.clone(), k.clone()),
+        None => {
+            let (f, k) = &eqs[0];
+            if !fields.begin(m, f) {
+                return Ok(None);
+            }
+            build_index(store, m, f).await?;
+            (f.clone(), k.clone())
+        }
+    };
+    let adb_store::Lookup::Ready(mut entries) = fields.lookup(m, &field, &key) else { return Ok(None) };
+    if memory == MemoryType::Episodic {
+        entries.reverse(); // newest first, as EPISODIC reads come
+    }
+    let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
+    let ok = |r: &StoredRow| {
+        r.is_current(now) && in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns))
+    };
+    let stop = early_stop(modifiers);
+    let hot = store.hot();
+    let mut out: Vec<Arc<MemoryRecord>> = Vec::new();
+    let mut matched = 0usize;
+    let mut fetched = 0usize;
+    let page = stop.map_or(512, |k| (k * 2).clamp(16, 512));
+    let mut i = 0;
+    while i < entries.len() {
+        let chunk = &entries[i..(i + page).min(entries.len())];
+        i += chunk.len();
+        let mut rows: HashMap<&str, Arc<MemoryRecord>> = HashMap::new();
+        let mut missing: Vec<&str> = Vec::new();
+        for (_, id, lineage) in chunk {
+            match hot.as_ref().and_then(|h| h.lineage(m, lineage)) {
+                Some(Some(c)) if c.row.id.as_str() == &**id => {
+                    if ok(&c.row) {
+                        rows.insert(id, cached_record(&c));
+                    }
+                }
+                _ => missing.push(id),
+            }
+        }
+        // Rows the cache doesn't hold: by primary key, one at a time (an `id IN (…)`
+        // filter scans the whole table). Past INDEX_FETCH_MAX of them, one scan of the
+        // type is cheaper: the regular path.
+        fetched += missing.len();
+        if fetched > INDEX_FETCH_MAX {
+            return Ok(None);
+        }
+        for group in missing.chunks(16) {
+            let got = futures::future::join_all(group.iter().map(|id| store.get(id))).await;
+            for (id, r) in group.iter().zip(got) {
+                if let Some(r) = r.map_err(store_err)? {
+                    if ok(&r) {
+                        rows.insert(id, Arc::new(record(&r)));
+                    }
+                }
+            }
+        }
+        // In index order; count the ones the whole predicate takes, to stop early.
+        let mut last_ts = None;
+        for (ts, id, _) in chunk {
+            if let Some(r) = rows.remove(&**id) {
+                if matches(memory, &r, predicate) && modifiers.scope.as_ref().is_none_or(|v| &r.metadata.scope == v) {
+                    matched += 1;
+                    last_ts = Some(*ts);
+                }
+                out.push(r);
+            }
+        }
+        // Enough, and the next entry isn't a tie with the last one taken (ties are
+        // ordered by id afterwards, so all of a tie must be in).
+        if let (Some(k), Some(t)) = (stop, last_ts) {
+            if matched >= k && entries.get(i).is_none_or(|e| e.0 != t) {
+                break;
+            }
+        }
+    }
+    Ok(Some(Candidates { records: out, cached: false, floor: None }))
 }
 
 /// `RECALL` / `LOOKUP` (not `LIKE`): candidates → exact predicate → visibility →
@@ -576,9 +768,16 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
         }
         records = in_window(records, w);
     }
-    default_order(memory, &mut records);
-    if let Some(o) = &modifiers.order_by {
-        order_by(&mut records, o);
+    match (&modifiers.order_by, modifiers.limit) {
+        // ORDER BY … LIMIT k (C-11): the k first in the full order, without sorting
+        // every record — same answer, as the order is total (ties by default order).
+        (Some(o), Some(k)) if c.floor.is_none() && k < records.len() => top_k(memory, &mut records, o, k),
+        (o, _) => {
+            default_order(memory, &mut records);
+            if let Some(o) = o {
+                order_by(&mut records, o);
+            }
+        }
     }
     // From an incomplete bucket: only a newest-first read whose rows are all newer
     // than the floor (rows that may be missing are older, so they'd rank below).

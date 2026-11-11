@@ -46,7 +46,10 @@ pub struct WalConfig {
 
 impl WalConfig {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), segment_bytes: 64 * 1024 * 1024 }
+        // `ADB_WAL_SEGMENT_BYTES` (at least 4 KiB): the log is purged a whole closed
+        // segment at a time, so retention (`ADB_LOG_RETAIN`) is as fine as a segment.
+        let segment_bytes = std::env::var("ADB_WAL_SEGMENT_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).map_or(64 * 1024 * 1024, |b| b.max(4096));
+        Self { dir: dir.into(), segment_bytes }
     }
 }
 

@@ -137,6 +137,8 @@ pub struct PartitionStore {
     model_changed: std::sync::atomic::AtomicBool,
     /// W10 hot cache, fed by every put (`set_cache`).
     hot: std::sync::RwLock<Option<Arc<HotCache>>>,
+    /// Field indexes (PF-27), kept in step with every apply like the hot cache.
+    fields: crate::field_index::FieldIndex,
     /// Odd while a put and its cache update are under way (`apply_seq`).
     apply_seq: std::sync::atomic::AtomicU64,
     /// The schema version `_meta` gets (`schema_version`).
@@ -151,6 +153,75 @@ struct Inner {
     /// Log offset of each put since open, to map the MemWAL's durable batch count
     /// back to a log offset (`durable_offset`).
     puts: std::sync::Mutex<PutLedger>,
+    /// Row ids by lineage and by the records an edge or fact touches (built on first
+    /// FORGET, kept by every put): a FORGET finds what it erases by id, not by a
+    /// scan of the whole table (PF-36). Per open table: a rewrite starts it again.
+    links: std::sync::Mutex<Option<Links>>,
+}
+
+/// Row ids by lineage, and by subject / object id (see `Inner::links`). Ids of rows a
+/// compaction removed may linger until the next rewrite: lookups are a superset.
+#[derive(Default)]
+struct Links {
+    by_lineage: std::collections::HashMap<String, Vec<String>>,
+    by_node: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Links {
+    fn add(&mut self, id: &str, lineage: &str, subject: Option<&str>, object: Option<&str>) {
+        fn put(m: &mut std::collections::HashMap<String, Vec<String>>, k: &str, id: &str) {
+            let v = m.entry(k.to_string()).or_default();
+            if !v.iter().any(|x| x == id) {
+                v.push(id.to_string());
+            }
+        }
+        if id == META_ID {
+            return;
+        }
+        put(&mut self.by_lineage, lineage, id);
+        for n in [subject, object].into_iter().flatten() {
+            put(&mut self.by_node, n, id);
+        }
+    }
+
+    /// Ids of every row of `lineage` and every row touching it.
+    fn of(&self, lineage: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self.by_lineage.get(lineage).cloned().unwrap_or_default();
+        for id in self.by_node.get(lineage).into_iter().flatten() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+}
+
+/// [`decode`] on several cores for a large batch (C-11): decoding parses every row's
+/// payload, the bulk of a scan's CPU. Slices of one batch share its buffers; the
+/// rows come back in batch order.
+fn decode_parallel(b: &arrow_array::RecordBatch) -> StoreResult<Vec<StoredRow>> {
+    const PER_THREAD: usize = 8192;
+    let n = b.num_rows();
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(8).min(n / PER_THREAD).max(1);
+    if threads == 1 {
+        return decode(b);
+    }
+    let per = n.div_ceil(threads);
+    let parts: Vec<StoreResult<Vec<StoredRow>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (off, len) = (t * per, per.min(n.saturating_sub(t * per)));
+                let slice = b.slice(off, len);
+                s.spawn(move || decode(&slice))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(StoreError::Decode("decode thread panicked".into())))).collect()
+    });
+    let mut rows = Vec::with_capacity(n);
+    for p in parts {
+        rows.extend(p?);
+    }
+    Ok(rows)
 }
 
 fn open_state(g: &Option<Inner>) -> &Inner {
@@ -593,6 +664,11 @@ impl PartitionStore {
         let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
         Self::reset_ledger(&inner, self.applied.load(std::sync::atomic::Ordering::SeqCst)).await?;
         *g = Some(inner);
+        // A migration's rows bypassed the applies: the field indexes rebuild on use.
+        // (Compaction keeps every current row as it was, so they stay.)
+        if !extra.is_empty() {
+            self.fields.clear();
+        }
         if let (true, Some(h)) = (vectors_cleared, self.hot()) {
             h.drop_vectors();
         }
@@ -728,6 +804,7 @@ impl PartitionStore {
             folding: tokio::sync::Mutex::new(()),
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
+            fields: crate::field_index::FieldIndex::new(),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
             layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
         };
@@ -794,7 +871,7 @@ impl PartitionStore {
             .with_max_unflushed_memtable_bytes(memtable_limits().1);
         let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
         let _ = schema;
-        Ok(Inner { base, writer, cache: Arc::new(SsTableCache::new(64)), puts: std::sync::Mutex::new(PutLedger::default()) })
+        Ok(Inner { base, writer, cache: Arc::new(SsTableCache::new(64)), puts: std::sync::Mutex::new(PutLedger::default()), links: std::sync::Mutex::new(None) })
     }
 
     /// Schema v2 → v3: rewrite every record and edge row under its memory-qualified id
@@ -864,7 +941,7 @@ impl PartitionStore {
             scanner = scanner.filter(f).map_err(lance)?;
         }
         let batch = scanner.try_into_batch().await.map_err(lance)?;
-        let rows = decode(&batch)?;
+        let rows = decode_parallel(&batch)?;
         // One line per filtered LSM scan (`RUST_LOG=adb_store::scan=debug`).
         tracing::debug!(target: "adb_store::scan", filter = filter.unwrap_or(""), rows = rows.len(), us = t0.elapsed().as_micros() as u64, "scan");
         Ok(rows)
@@ -880,7 +957,7 @@ impl PartitionStore {
             scanner = scanner.filter_expr(f);
         }
         let batch = scanner.try_into_batch().await.map_err(lance)?;
-        decode(&batch)
+        decode_parallel(&batch)
     }
 
     /// The current view at `now` of the rows matching `filter` (an expression).
@@ -1010,6 +1087,32 @@ impl PartitionStore {
         self.scan(Some(&f)).await
     }
 
+    /// Every version of the given lineages (row lineage ids) that isn't forgotten, as
+    /// [`PartitionStore::versions`] with a lineage filter — read by primary key through
+    /// the links map, not by a scan of the table (C-25).
+    pub async fn versions_of(&self, memory: adb_core::log::Memory, lineages: &[String]) -> StoreResult<Vec<StoredRow>> {
+        let g = self.state.read().await;
+        let inner = open_state(&g);
+        if inner.links.lock().unwrap().is_none() {
+            let built = Self::build_links(inner).await?;
+            inner.links.lock().unwrap().get_or_insert(built);
+        }
+        let ids: Vec<String> = {
+            let l = inner.links.lock().unwrap();
+            let l = l.as_ref().expect("links built above");
+            lineages.iter().flat_map(|x| l.by_lineage.get(x).cloned().unwrap_or_default()).collect()
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(r) = Self::scan_in(inner, Some(&format!("id = {}", sql_str(&id)))).await?.into_iter().next() {
+                if r.data.memory == memory && !r.tombstone && matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The current edges leaving record `from` of memory type `memory`, of
     /// `link_type` if given, oldest first (D4.1: links are read from the table, so
     /// a forgotten record's edges are gone, live and after a restart alike).
@@ -1066,6 +1169,11 @@ impl PartitionStore {
     /// same state in the table and the cache (the W10 shadow check).
     pub fn apply_seq(&self) -> u64 {
         self.apply_seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The field indexes (PF-27).
+    pub fn fields(&self) -> &crate::field_index::FieldIndex {
+        &self.fields
     }
 
     /// The hot cache, if one is set (W10).
@@ -1143,6 +1251,14 @@ impl PartitionStore {
         // Still under the state lock, so the cache moves with the table (W10).
         if let (Ok(_), Some(h)) = (&put, self.hot()) {
             h.apply(&rows);
+        }
+        if put.is_ok() {
+            self.fields.apply(&rows);
+            if let Some(l) = inner.links.lock().unwrap().as_mut() {
+                for r in &rows {
+                    l.add(&r.id, &r.lineage_id, r.data.subject_id.as_deref(), r.data.object_id.as_deref());
+                }
+            }
         }
         self.apply_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         put?;
@@ -1261,12 +1377,43 @@ impl PartitionStore {
         }
     }
 
+    /// The links map of the table (`Inner::links`), from its id, lineage, subject and
+    /// object columns only.
+    async fn build_links(inner: &Inner) -> StoreResult<Links> {
+        use arrow_array::{Array, StringArray};
+        let t0 = std::time::Instant::now();
+        let scanner = Self::scanner(inner).await?.project(&["id", "lineage_id", "subject_id", "object_id"]).map_err(lance)?;
+        let b = scanner.try_into_batch().await.map_err(lance)?;
+        let col = |n: &str| -> StoreResult<&StringArray> {
+            b.column_by_name(n).and_then(|c| c.as_any().downcast_ref::<StringArray>()).ok_or_else(|| StoreError::Decode(format!("links: column {n}")))
+        };
+        let (id, lineage, subject, object) = (col("id")?, col("lineage_id")?, col("subject_id")?, col("object_id")?);
+        let opt = |a: &StringArray, i: usize| (!a.is_null(i)).then(|| a.value(i).to_string());
+        let mut links = Links::default();
+        for i in 0..b.num_rows() {
+            let (s, o) = (opt(subject, i), opt(object, i));
+            links.add(id.value(i), lineage.value(i), s.as_deref(), o.as_deref());
+        }
+        tracing::info!(rows = b.num_rows(), ms = t0.elapsed().as_millis() as u64, "links map built");
+        Ok(links)
+    }
+
     /// Every version of a lineage, and every edge touching it (D2 §5).
     async fn lineage_and_edges(inner: &Inner, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
-        let l = sql_str(lineage);
-        let filter = format!("lineage_id = {l} OR subject_id = {l} OR object_id = {l}");
-        let mut rows: BTreeMap<String, StoredRow> =
-            Self::scan_in(inner, Some(&filter)).await?.into_iter().map(|r| (r.id.clone(), r)).collect();
+        // PF-36: the row ids from the links map (built once per open table), then the
+        // rows by primary key; the same rows the old OR-filter scan found.
+        if inner.links.lock().unwrap().is_none() {
+            let built = Self::build_links(inner).await?;
+            inner.links.lock().unwrap().get_or_insert(built);
+        }
+        let ids = inner.links.lock().unwrap().as_ref().map(|l| l.of(lineage)).unwrap_or_default();
+        // One primary-key read per row (an `id IN (…)` filter scans the whole table).
+        let mut rows: BTreeMap<String, StoredRow> = BTreeMap::new();
+        for id in &ids {
+            if let Some(r) = Self::scan_in(inner, Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next() {
+                rows.insert(r.id.clone(), r);
+            }
+        }
         for r in out.values() {
             let hit = r.lineage_id == lineage
                 || r.data.subject_id.as_deref() == Some(lineage)

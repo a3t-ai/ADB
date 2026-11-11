@@ -76,7 +76,23 @@ impl TableProvider for LsmTable {
         if let Some(f) = conjunction(filters.iter().cloned()) {
             scanner = scanner.filter_expr(f);
         }
-        let plan = scanner.create_plan().await.map_err(df)?;
+        let mut plan = scanner.create_plan().await.map_err(df)?;
+        // PF-34: the LSM scan keeps the columns it merges versions by (`id`) even when
+        // fewer are asked for (none, for `count(*)`): give DataFusion exactly the
+        // projection it planned with, or its schema check fails.
+        if let Some(p) = projection {
+            let want: Vec<String> = p.iter().map(|i| self.schema.field(*i).name().clone()).collect();
+            let got = plan.schema();
+            if got.fields().len() != want.len() || got.fields().iter().zip(&want).any(|(f, w)| f.name() != w) {
+                let exprs = want
+                    .iter()
+                    .map(|n| -> Result<(Arc<dyn datafusion::physical_plan::PhysicalExpr>, String)> {
+                        Ok((Arc::new(datafusion::physical_expr::expressions::Column::new_with_schema(n, &got)?), n.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                plan = Arc::new(datafusion::physical_plan::projection::ProjectionExec::try_new(exprs, plan)?);
+            }
+        }
         Ok(Arc::new(LsmExec::new(plan)))
     }
 }

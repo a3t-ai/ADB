@@ -169,6 +169,19 @@ pub fn unique_keys(memory: MemoryType) -> bool {
 /// Whether a STORE must check its key: a key the caller chose (`key` / `id`, or
 /// PROCEDURAL's `pattern_id`). Without one the planner made a fresh ULID, which
 /// can't collide — and checking means waiting for the applier and scanning Lance.
+/// Whether `predicate` is only `key = literal` or `id = literal` (in any scope): its
+/// matches are fixed by the key, which every version of a lineage shares.
+fn key_only(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::Key { field, .. } => matches!(field.as_str(), "id" | "key"),
+        Predicate::Where { conditions } => {
+            conditions.len() == 1
+                && matches!(&conditions[0], adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, .. } if matches!(field.as_str(), "id" | "key"))
+        }
+        _ => false,
+    }
+}
+
 fn caller_keyed(memory: MemoryType, payload: &serde_json::Value) -> bool {
     unique_keys(memory)
         && (payload.get("key").is_some()
@@ -1951,13 +1964,19 @@ impl<L: Log + 'static> DurableWrites<L> {
         let mut ids = crate::query::targets(store, memory, predicate, in_scope, namespace, ts).await?;
         let found = t0.elapsed();
         if forget && supersedes(memory) {
-            // Every version FORGET takes: when the predicate names a key, only the
-            // lineages just found (PF-11), else all versions, filtered here.
-            let lineages = (crate::query::keyed(memory, predicate).is_some() && !ids.is_empty()).then(|| {
-                let list: Vec<String> = ids.iter().map(|id| adb_store::sql_str(&adb_store::row_id(memory.into(), id))).collect();
-                format!("lineage_id IN ({})", list.join(", "))
-            });
-            let mut old = store.versions(memory.into(), lineages.as_deref()).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            // Every version FORGET takes. A key never changes between versions, so when
+            // the predicate is a key (KEY, or `WHERE key =` / `WHERE id =`), only the
+            // lineages just found can hold it: their versions, by primary key (PF-11,
+            // C-25). Else every version, filtered here (a value may live only in an
+            // older version).
+            let by_key = crate::query::keyed(memory, predicate, in_scope, namespace).is_some() || key_only(predicate);
+            let old = if by_key {
+                let lineages: Vec<String> = ids.iter().map(|id| adb_store::row_id(memory.into(), id)).collect();
+                store.versions_of(memory.into(), &lineages).await
+            } else {
+                store.versions(memory.into(), None).await
+            };
+            let mut old = old.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
             if let Some(s) = in_scope {
                 old.retain(|r| r.data.scope == s);
             }
@@ -2684,7 +2703,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             false => None,
         };
         self.writable()?;
-        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate).is_some() {
+        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
             if let Some(n) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
                 return Ok(n);
             }
@@ -2764,7 +2783,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
 
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         self.writable()?;
-        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate).is_some() {
+        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
             if let Some(n) = self.forget_prepared(memory_type, predicate, in_scope, namespace).await? {
                 return Ok(n);
             }

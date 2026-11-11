@@ -2,6 +2,7 @@
 //! the applier from the partition log (ARCHITECTURE.md §9.2–9.3, D2_TEMPORAL.md,
 //! D3_SCHEMA.md; DELIVERY_PLAN.md stage D).
 
+pub mod field_index;
 pub mod filter;
 pub mod hot;
 pub mod rows;
@@ -10,6 +11,7 @@ pub mod store;
 pub mod table;
 
 pub use datafusion::logical_expr::Expr;
+pub use field_index::{FieldIndex, Lookup};
 pub use filter::predicate_filter;
 pub use hot::{CacheConfig, CacheStats, Cached, Hit, HotCache, Keep, Rule, Shape};
 pub use lance;

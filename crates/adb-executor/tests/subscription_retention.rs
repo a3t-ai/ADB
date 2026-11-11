@@ -34,6 +34,8 @@ async fn flood(engine: &LocalEngine) {
 async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
     let _serial = SERIAL.lock().await;
     std::env::set_var("ADB_LOG_RETAIN", "10");
+    // Small segments: the log is purged a closed segment at a time.
+    std::env::set_var("ADB_WAL_SEGMENT_BYTES", "16384");
     std::env::remove_var("ADB_SUB_IDLE");
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();

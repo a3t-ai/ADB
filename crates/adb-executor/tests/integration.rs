@@ -937,7 +937,9 @@ async fn procedures_keep_their_payload_and_namespace() {
 #[tokio::test]
 async fn pipeline_timeout_is_a_hard_budget_when_enforced() {
     let adb = Mem::new().await;
-    for i in 0..200 {
+    // Each stage returns ~4,000 records: well over 1 ms in any build (with 200 rows an
+    // optimised build finished all three stages inside the budget).
+    for i in 0..20_000 {
         adb.store(MemoryType::Semantic, &format!("f{i}"), json!({"topic": format!("t{}", i % 5)})).await.unwrap();
     }
     let q = r#"PIPELINE slow TIMEOUT 1ms RECALL FROM SEMANTIC WHERE topic = "t1" | RECALL FROM SEMANTIC WHERE topic = "t2" | RECALL FROM SEMANTIC WHERE topic = "t3""#;

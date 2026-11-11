@@ -197,12 +197,22 @@ async fn snapshot(State(raft): State<AdbRaft>, body: Bytes) -> axum::response::R
     }
 }
 
-/// Follower reads (C-16): the leader's ReadIndex — the log index a read must see,
-/// after a heartbeat round confirmed this node still leads. 503 when it doesn't.
+/// Follower reads (C-16): the leader's ReadIndex — the log index a read must see.
+/// 503 when this node doesn't lead.
 async fn read_index(State(raft): State<AdbRaft>) -> axum::response::Response {
-    match raft.get_read_log_id(openraft::ReadPolicy::ReadIndex).await {
-        Ok((read, _)) => axum::Json(read.index()).into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    match leader_read_index(&raft).await {
+        Ok(index) => axum::Json(index).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// The index a linearizable read must see, on the leader (PF-30): within its lease
+/// (a quorum acknowledged it less than a lease ago) without contacting the
+/// followers; once the lease has lapsed, by a ReadIndex heartbeat round.
+pub async fn leader_read_index(raft: &AdbRaft) -> Result<u64, String> {
+    match raft.get_read_log_id(openraft::ReadPolicy::LeaseRead).await {
+        Ok((read, _)) => Ok(read.index()),
+        Err(_) => raft.get_read_log_id(openraft::ReadPolicy::ReadIndex).await.map(|(read, _)| read.index()).map_err(|e| e.to_string()),
     }
 }
 
