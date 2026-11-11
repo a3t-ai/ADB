@@ -507,3 +507,21 @@ platform tables 158 on each; 20/20 local reads per node; no FlowR error lines si
 
 Undo: `kubectl -n a3t set image statefulset/adb adb=ghcr.io/srirammails/adb:2026-11-10-r2` (pods one at a time);
 FlowR: the four image commands with `flowr:2026-11-10-ee-r2`, then delete pod rt-worker.
+
+## Follow-up checks (11 Nov, 11:00–11:20 UTC; same images)
+
+Second leader kill on AWS (11:00, leader node 1): **0 lost of 19,660 acknowledged**; longest stretch without an
+acknowledged write **24.7 s**. New leader (node 2) elected at +3 s; then a **follower fold compaction ran during
+the takeover** (6 sstables, 1.69M rows, 17.9 s), live-key hydration re-read 1.64M rows (8.4 s), engine open 22.8 s
+in all; writes resumed at ~270 ms per STORE while the killed node caught up and its embedding share fell back on
+the leader. Same cause as PF-38, plus: a takeover must not wait behind a compaction.
+
+vc-dev, first A3T run at c=64: **10 durable `bench/noop` runs failed** with `could not read the run journal: store:
+ADB at http://adb-0…,adb-1…,adb-2…:3001: h2 protocol error: http2 error` — FlowR's engine client retries that
+error (`engine_adb::retriable`), so the HTTP/2 connection to ADB stayed broken past its 15 s window. Nothing in
+ADB's log. A rerun at 11:18 (c=32 and 64, 30 s each) gave 172 and 200/s with **0 errors**: intermittent.
+
+| Id | Finding | Next |
+|---|---|---|
+| PF-41 | FlowR → ADB engine calls can fail for > 15 s on an HTTP/2 protocol error under 64 concurrent durable runs (vc-dev, once) | log the h2 error's reason on both sides, open a fresh channel after repeated protocol errors instead of reusing the broken one |
+| PF-38 (add) | A follower's fold compaction ran inside the takeover (17.9 s) | skip or abort a follower compaction when it becomes leader |
