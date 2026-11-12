@@ -123,3 +123,16 @@ codegen-units = 16
 # Rebuilds recompile only what changed (minutes, not the release profile's ~40 with
 # fat LTO). Use for every benchmark / test iteration: `cargo build --profile perf`.
 incremental = true
+
+[profile.prof]
+# Profiling (perf / flamegraphs): the perf profile with line tables and symbols. Build
+# with RUSTFLAGS="-C force-frame-pointers=yes" into its own target dir.
+inherits = "perf"
+debug = "line-tables-only"
+strip = false
+
+# Local patch of lance 14.0.2 (no fork): third_party/lance is the published crate plus
+# ADB's fixes, kept as a clean diff for an upstream PR (third_party/lance has its own
+# git history: the first commit is the crate as published).
+[patch.crates-io]
+lance = { path = "third_party/lance" }
