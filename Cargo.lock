@@ -4513,8 +4513,6 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 [[package]]
 name = "lance"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6895913cb87c0ca8140d13a3c980ceb5b6c67d95f5e96093a3e157347021c61b"
 dependencies = [
  "arc-swap",
  "arrow",
