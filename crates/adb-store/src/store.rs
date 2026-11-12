@@ -174,6 +174,9 @@ struct Inner {
     /// FORGET, kept by every put): a FORGET finds what it erases by id, not by a
     /// scan of the whole table (PF-36). Per open table: a rewrite starts it again.
     links: std::sync::Mutex<Option<Links>>,
+    /// One build of `links` at a time (PF-53): concurrent first users each built it,
+    /// 64 full-table scans at once (34 s).
+    links_build: tokio::sync::Mutex<()>,
 }
 
 /// Row ids by lineage, and by subject / object id (see `Inner::links`). Ids of rows a
@@ -247,7 +250,10 @@ fn decode_parallel(b: &arrow_array::RecordBatch) -> StoreResult<Vec<StoredRow>> 
 async fn decode_stream(scanner: &LsmScanner) -> StoreResult<Vec<StoredRow>> {
     use futures::TryStreamExt;
     const CHUNK_ROWS: usize = 65_536;
+    let t0 = std::time::Instant::now();
     let mut stream = scanner.try_into_stream().await.map_err(lance)?;
+    adb_core::steps::add("lance.read.3 plan + start stream", t0.elapsed());
+    let t1 = std::time::Instant::now();
     let mut rows = Vec::new();
     let mut pending: Vec<arrow_array::RecordBatch> = Vec::new();
     let mut held = 0usize;
@@ -259,7 +265,10 @@ async fn decode_stream(scanner: &LsmScanner) -> StoreResult<Vec<StoredRow>> {
             held = 0;
         }
     }
+    adb_core::steps::add("lance.read.4 stream batches", t1.elapsed());
+    let t2 = std::time::Instant::now();
     rows.extend(decode_batches(pending)?);
+    adb_core::steps::add("lance.read.5 decode rows", t2.elapsed());
     Ok(rows)
 }
 
@@ -966,7 +975,7 @@ impl PartitionStore {
             .with_max_unflushed_memtable_bytes(memtable_limits().1);
         let writer = base.mem_wal_writer(shard, config).await.map_err(lance)?;
         let _ = schema;
-        Ok(Inner { base, writer, cache: Arc::new(SsTableCache::new(64)), puts: std::sync::Mutex::new(PutLedger::default()), links: std::sync::Mutex::new(None) })
+        Ok(Inner { base, writer, cache: Arc::new(SsTableCache::new(64)), puts: std::sync::Mutex::new(PutLedger::default()), links: std::sync::Mutex::new(None), links_build: tokio::sync::Mutex::new(()) })
     }
 
     /// Schema v2 → v3: rewrite every record and edge row under its memory-qualified id
@@ -1118,7 +1127,10 @@ impl PartitionStore {
 
     /// An LSM scanner over memtable + flushed generations + base table.
     async fn scanner(inner: &Inner) -> StoreResult<LsmScanner> {
+        let t0 = std::time::Instant::now();
         let manifest = inner.writer.manifest().await.map_err(lance)?;
+        adb_core::steps::add("lance.read.1 manifest", t0.elapsed());
+        adb_core::steps::value("lance.sstables per read", manifest.as_ref().map_or(0, |m| m.sstables.len() as u64));
         let mut snap = ShardSnapshot::new(inner.writer.shard_id());
         if let Some(m) = &manifest {
             snap = snap.with_current_generation(m.current_generation);
@@ -1127,7 +1139,13 @@ impl PartitionStore {
             }
         }
         Ok(LsmScanner::new(inner.base.clone(), vec![snap], vec!["id".into()])
-            .with_in_memory_memtables(inner.writer.shard_id(), inner.writer.in_memory_memtable_refs().await.map_err(lance)?)
+            .with_in_memory_memtables(inner.writer.shard_id(), {
+                let t1 = std::time::Instant::now();
+                let r = inner.writer.in_memory_memtable_refs().await.map_err(lance)?;
+                adb_core::steps::add("lance.read.2 memtable refs", t1.elapsed());
+                adb_core::steps::value("lance.frozen memtables per read", r.frozen.len() as u64);
+                r
+            })
             // A filtered scan answers from the memtables' maintained indexes (id_idx,
             // lineage_idx) instead of reading every in-memory row, which is Lance's
             // default (PF-8/PF-11, 7 Nov). Same result: a match counts only as its
@@ -1202,10 +1220,7 @@ impl PartitionStore {
         let _t = adb_core::steps::timer("store.versions_of");
         let g = { let _w = adb_core::steps::timer("store.state read-lock wait"); self.state.read().await };
         let inner = open_state(&g);
-        if inner.links.lock().unwrap().is_none() {
-            let built = Self::build_links(inner).await?;
-            inner.links.lock().unwrap().get_or_insert(built);
-        }
+        Self::ensure_links(inner).await?;
         let ids: Vec<String> = {
             let l = inner.links.lock().unwrap();
             let l = l.as_ref().expect("links built above");
@@ -1245,8 +1260,38 @@ impl PartitionStore {
     /// live row, D2 T1; a fact outside its validity too), if any.
     pub async fn current_version(&self, memory: adb_core::log::Memory, key: &str, now: CommitTs) -> StoreResult<Option<StoredRow>> {
         let _t = adb_core::steps::timer("store.current_version");
-        let filter = format!("lineage_id = {} AND {RECORD_KINDS}", sql_str(&row_id(memory, key)));
-        Ok(self.live(Some(&filter), now).await?.into_iter().max_by_key(|r| r.version))
+        self.live_of_lineage(memory, &row_id(memory, key), now).await
+    }
+
+    /// The live version of lineage `lineage` (a row lineage id) at `now` (PF-53): its
+    /// version ids from the links map, then those rows by primary key (`id IN (…)`,
+    /// Lance's BTree point-lookup path). A `lineage_id = …` filter took the general LSM
+    /// scan (base ∪ every SSTable ∪ memtables, deduplicated): ~90 ms of leader CPU per
+    /// UPDATE at 470k records (AWS r11).
+    pub async fn live_of_lineage(&self, memory: adb_core::log::Memory, lineage: &str, now: CommitTs) -> StoreResult<Option<StoredRow>> {
+        let ids: Vec<String> = {
+            let g = self.state.read().await;
+            let inner = open_state(&g);
+            Self::ensure_links(inner).await?;
+            let ids = inner.links.lock().unwrap().as_ref().and_then(|l| l.by_lineage.get(lineage).cloned()).unwrap_or_default();
+            ids
+        };
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let keep = |r: &StoredRow| r.data.memory == memory && matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool);
+        // The newest version first: the first version's id is the lineage's own; later
+        // ones are ULIDs from the sequencer, in time order. One primary-key read.
+        let newest = ids.iter().filter(|i| i.as_str() != lineage).max().unwrap_or(&ids[0]).clone();
+        if let Some(r) = self.get_cached(&newest).await? {
+            if keep(&r) && r.superseded_by.is_none() {
+                return Ok(r.is_live(now).then_some(r));
+            }
+        }
+        // Not the live version after all (a lingering id, a rewrite): every version.
+        let list = ids.iter().map(|i| sql_str(i)).collect::<Vec<_>>().join(", ");
+        let rows = self.scan(Some(&format!("id IN ({list})"))).await?;
+        Ok(rows.into_iter().filter(|r| keep(r) && r.is_live(now)).max_by_key(|r| r.version))
     }
 
     /// Current versions of records with a TTL whose expiry isn't logged yet (the
@@ -1524,7 +1569,7 @@ impl PartitionStore {
             }
         }
         adb_core::steps::value("store.apply rows hinted", hinted.len() as u64);
-        let pre = Self::prefetch(inner, &records, hinted).await?;
+        let pre = Self::prefetch(inner, &self.rows, &records, hinted).await?;
         adb_core::steps::value("store.apply rows prefetched", pre.len() as u64);
         adb_core::steps::lap("store.apply.1b prefetch rows", &mut at);
         for record in &records {
@@ -1684,7 +1729,7 @@ impl PartitionStore {
     /// with their edges, …), read by primary key [`PREFETCH_AT_ONCE`] at a time (PF-47).
     /// The table doesn't change while a batch is built (the applier is its only
     /// writer), so these are the rows the per-record reads would find.
-    async fn prefetch(inner: &Inner, records: &[&LogRecord], hinted: Prefetched) -> StoreResult<Prefetched> {
+    async fn prefetch(inner: &Inner, cache: &crate::row_cache::RowCache, records: &[&LogRecord], hinted: Prefetched) -> StoreResult<Prefetched> {
         use futures::StreamExt;
         let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut lineages: Vec<String> = Vec::new();
@@ -1709,10 +1754,7 @@ impl PartitionStore {
             }
         }
         if !lineages.is_empty() {
-            if inner.links.lock().unwrap().is_none() {
-                let built = Self::build_links(inner).await?;
-                inner.links.lock().unwrap().get_or_insert(built);
-            }
+            Self::ensure_links(inner).await?;
             let links = inner.links.lock().unwrap();
             if let Some(l) = links.as_ref() {
                 for lineage in &lineages {
@@ -1722,6 +1764,14 @@ impl PartitionStore {
         }
         ids.retain(|id| !hinted.contains_key(id));
         let mut found = hinted;
+        // PF-54: rows the exact row cache holds (no write to them since it read them).
+        ids.retain(|id| match cache.peek(id) {
+            Some(r) => {
+                found.insert(id.clone(), Some(r));
+                false
+            }
+            None => true,
+        });
         if ids.len() < 2 {
             return Ok(found);
         }
@@ -1735,6 +1785,19 @@ impl PartitionStore {
             found.insert(id, r?);
         }
         Ok(found)
+    }
+
+    /// Build `links` once if missing; concurrent callers wait for that one build.
+    async fn ensure_links(inner: &Inner) -> StoreResult<()> {
+        if inner.links.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let _one = inner.links_build.lock().await;
+        if inner.links.lock().unwrap().is_none() {
+            let built = Self::build_links(inner).await?;
+            inner.links.lock().unwrap().get_or_insert(built);
+        }
+        Ok(())
     }
 
     /// The links map of the table (`Inner::links`), from its id, lineage, subject and
@@ -1762,10 +1825,7 @@ impl PartitionStore {
     async fn lineage_and_edges(inner: &Inner, pre: &Prefetched, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
         // PF-36: the row ids from the links map (built once per open table), then the
         // rows by primary key; the same rows the old OR-filter scan found.
-        if inner.links.lock().unwrap().is_none() {
-            let built = Self::build_links(inner).await?;
-            inner.links.lock().unwrap().get_or_insert(built);
-        }
+        Self::ensure_links(inner).await?;
         let ids = inner.links.lock().unwrap().as_ref().map(|l| l.of(lineage)).unwrap_or_default();
         // One primary-key read per row (an `id IN (…)` filter scans the whole table).
         let mut rows: BTreeMap<String, StoredRow> = BTreeMap::new();

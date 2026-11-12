@@ -8,14 +8,16 @@
 //! a drop that meets a registered id marks it, and the reader then leaves the cache
 //! alone.
 //!
-//! Bounded (`ADB_ROW_CACHE_ROWS`, default 16384; 0 turns it off), oldest out first.
+//! Bounded (`ADB_ROW_CACHE_ROWS`, default 262144; 0 turns it off), oldest out first.
+//! Every primary-key read goes through it (PF-54): a Lance point read of a row no
+//! longer in a memtable builds a DataFusion plan for the one key, ~6 ms of CPU.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::StoredRow;
 
-pub const DEFAULT_ROWS: usize = 16_384;
+pub const DEFAULT_ROWS: usize = 262_144;
 
 #[derive(Default)]
 struct State {
@@ -61,6 +63,15 @@ impl RowCache {
         let id: Arc<str> = Arc::from(id);
         s.reading.entry(id.clone()).or_insert((0, false)).0 += 1;
         Err(Reading(Some(id)))
+    }
+
+    /// The cached row, if any, without registering a read (the applier: it only
+    /// reads rows it is about to change, and its own put drops them after).
+    pub fn peek(&self, id: &str) -> Option<StoredRow> {
+        if self.cap == 0 {
+            return None;
+        }
+        self.state.lock().unwrap().rows.get(id).cloned()
     }
 
     /// The read is done: keep `row` unless a drop met its id while it was read.

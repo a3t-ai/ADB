@@ -582,7 +582,15 @@ pub fn project(records: &mut [MemoryRecord], fields: &[String]) {
 /// when it isn't — updated, forgotten, missing, or its first version compacted away —
 /// and the caller scans by lineage instead (exact either way).
 async fn point(store: &PartitionStore, memory: Memory, key: &str, in_scope: Option<&str>, namespace: Option<&str>, now: CommitTs) -> AdbResult<Option<StoredRow>> {
-    let Some(r) = store.get(&row_id(memory, key)).await.map_err(store_err)? else { return Ok(None) };
+    let Some(mut r) = store.get_cached(&row_id(memory, key)).await.map_err(store_err)? else { return Ok(None) };
+    // PF-53: the key's row is its first version; once updated, the current version
+    // has another id. Follow the lineage by primary key, not a full filtered scan.
+    if r.superseded_by.is_some() {
+        match store.live_of_lineage(memory, &r.lineage_id, now).await.map_err(store_err)? {
+            Some(cur) => r = cur,
+            None => return Ok(None),
+        }
+    }
     let ok = r.is_current(now)
         && r.data.memory == memory
         && matches!(r.data.kind, Kind::Entity | Kind::Fact | Kind::Episode | Kind::Tool)

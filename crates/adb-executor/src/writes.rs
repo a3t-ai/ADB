@@ -796,16 +796,15 @@ impl<L: Log + 'static> DurableWrites<L> {
         // PF-48: the rows this record changes, for the applier (in-place types: the row).
         let hint: Vec<adb_store::StoredRow> = if supersedes(memory_type) {
             current.clone()
-        } else if crate::reads::lance_owned(memory_type) {
+        } else {
+            // Every type's patched row is read by the applier (WORKING too): hand it over.
             let mut rows = Vec::with_capacity(ids.len());
             for key in &ids {
-                if let Ok(Some(r)) = store.get(&adb_store::row_id(memory_type.into(), key)).await {
+                if let Ok(Some(r)) = store.get_cached(&adb_store::row_id(memory_type.into(), key)).await {
                     rows.push(r);
                 }
             }
             rows
-        } else {
-            Vec::new()
         };
         crate::steps::lap("update.2 current versions", &mut t);
         let keys: Vec<(Memory, String)> = ids.iter().map(|k| (memory_type.into(), k.clone())).collect();
