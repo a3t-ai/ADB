@@ -441,7 +441,7 @@ fn compaction_hour() -> Option<(u32, u32)> {
 const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// Rows the embedding backfill embeds per tick (MVP W4 T7), and how many ticks it
 /// rests once nothing is left (new rows are embedded on write).
-const BACKFILL_BATCH: usize = 64;
+const BACKFILL_BATCH: usize = 256;
 const BACKFILL_IDLE_TICKS: u32 = 60;
 
 /// The maintenance timer: every tick, `expire_due`, and the embedding backfill
@@ -503,6 +503,12 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
             }
             if backfill_rest > 0 {
                 backfill_rest -= 1;
+                continue;
+            }
+            // `ADB_EMBED_BACKFILL=off`: no backfill (records stored without a vector
+            // stay without one until it is on again).
+            if std::env::var("ADB_EMBED_BACKFILL").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+                backfill_rest = BACKFILL_IDLE_TICKS;
                 continue;
             }
             match w.embed_backfill(BACKFILL_BATCH).await {

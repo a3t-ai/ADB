@@ -77,6 +77,13 @@ const REWRITE_CHUNK: usize = 10_000;
 const BATCH_OVERHEAD: usize = 24 << 10;
 
 /// Bytes at which ADB seals the active memtable, whatever its row count, and of unsealed
+/// Batches in the active memtable at which it is sealed (`ADB_MEMTABLE_BATCHES`,
+/// default 256, PF-52).
+fn memtable_batches() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("ADB_MEMTABLE_BATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(256).max(8))
+}
+
 /// plus unflushed memtables at which writes wait: `ADB_MEMTABLE_MB` (default 64) and
 /// `ADB_MEMTABLE_BACKLOG_MB` (default 1024).
 fn memtable_limits() -> (usize, usize) {
@@ -1561,7 +1568,10 @@ impl PartitionStore {
         // Lance counts the buffers' contents; each batch also costs its arrays and
         // small allocations, which dominate when a put is a record or two.
         let held = mem.active_bytes() + st.batch_count * BATCH_OVERHEAD;
-        let seal = st.row_count >= self.memtable_rows || held >= memtable_limits().0;
+        // PF-52: and on batch count. A point read walks every batch of the active
+        // memtable; small applies (backfill vectors, single writes) grew it to ~850
+        // batches under the row and byte limits, and keyed reads took ~1 s (AWS r10).
+        let seal = st.row_count >= self.memtable_rows || held >= memtable_limits().0 || st.batch_count >= memtable_batches();
         if seal || (self.apply_seq.load(std::sync::atomic::Ordering::Relaxed) / 2) % 1000 == 0 {
             tracing::debug!(
                 target: "adb_store::memtable",

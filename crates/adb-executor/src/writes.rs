@@ -637,6 +637,8 @@ pub struct DurableWrites<L: Log> {
     /// outside the sequencer against offset N conflicts if one of its keys was
     /// written after N.
     key_offsets: std::sync::Mutex<KeyOffsets>,
+    /// Records waiting for a vector (PF-51): memory, row id, text.
+    backfill_queue: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
     poisoned: Arc<std::sync::atomic::AtomicBool>,
@@ -1933,15 +1935,29 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// between just gets a vector it no longer needs. Returns how many.
     pub async fn embed_backfill(&self, batch: usize) -> AdbResult<u64> {
         let (Some(_), Some(embedder)) = (&self.store, &self.embedder) else { return Ok(0) };
-        let todo: Vec<(adb_store::StoredRow, String)> = self.unembedded().await?.into_iter().take(batch).collect();
+        // PF-51: one scan fills a queue (memory, row id, text) and the batches come from
+        // it; the table is scanned again only when the queue is empty. Scanning every
+        // unembedded row for each batch of 64 pinned the leader's CPU for hours with
+        // 700k records to embed (AWS r10). A queued row that changed meanwhile gets a
+        // vector on its old version (harmless); its new version is found by the next scan.
+        const QUEUE_MAX: usize = 50_000;
+        if self.backfill_queue.lock().unwrap().is_empty() {
+            let found: Vec<(Memory, String, String)> = self.unembedded().await?.into_iter().take(QUEUE_MAX).map(|(r, t)| (r.data.memory, adb_store::key_of(&r.id).to_string(), t)).collect();
+            self.backfill_queue.lock().unwrap().extend(found);
+        }
+        let todo: Vec<(Memory, String, String)> = {
+            let mut q = self.backfill_queue.lock().unwrap();
+            let n = batch.min(q.len());
+            q.drain(..n).collect()
+        };
         if todo.is_empty() {
             return Ok(0);
         }
-        let vectors = embedder.embed(todo.iter().map(|(_, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+        let vectors = embedder.embed(todo.iter().map(|(_, _, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
         let effects: Vec<Effect> = todo
             .iter()
             .zip(vectors)
-            .map(|((r, _), v)| Effect::Embed { memory: r.data.memory, id: RecordId(adb_store::key_of(&r.id).to_string()), embedding: adb_embed::to_f16(&v) })
+            .map(|((memory, id, _), v)| Effect::Embed { memory: *memory, id: RecordId(id.clone()), embedding: adb_embed::to_f16(&v) })
             .collect();
         let n = effects.len() as u64;
         let mut seq = seq_lock!(self);
@@ -2050,7 +2066,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
