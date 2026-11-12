@@ -71,10 +71,22 @@ struct Postings {
     by_value: HashMap<String, BTreeSet<Entry>>,
     /// lineage → (value key, its entry)
     of_lineage: HashMap<Arc<str>, (String, Entry)>,
+    /// lineage → what an exact count needs to know about its record (PF-50).
+    meta: HashMap<Arc<str>, Meta>,
+}
+
+/// What decides whether an indexed record counts for a read, without its row.
+struct Meta {
+    namespace: Option<Arc<str>>,
+    scope: Arc<str>,
+    /// Its visibility to a read can change with time or needs the row (a TTL, a
+    /// closed validity, a fact, an edge): a count that meets one scans instead.
+    timed: bool,
 }
 
 impl Postings {
     fn remove(&mut self, lineage: &str) {
+        self.meta.remove(lineage);
         if let Some((key, e)) = self.of_lineage.remove(lineage) {
             if let Some(set) = self.by_value.get_mut(&key) {
                 set.remove(&e);
@@ -111,6 +123,8 @@ impl Postings {
             let lineage: Arc<str> = Arc::from(r.lineage_id.as_str());
             let e: Entry = (ts, Arc::from(r.id.as_str()), lineage.clone());
             self.by_value.entry(key.clone()).or_default().insert(e.clone());
+            let timed = r.data.ttl_at.is_some() || r.valid_to.is_some() || !matches!(r.data.kind, Kind::Entity | Kind::Episode | Kind::Tool);
+            self.meta.insert(lineage.clone(), Meta { namespace: r.data.namespace.as_deref().map(Arc::from), scope: Arc::from(r.data.scope.as_str()), timed });
             self.of_lineage.insert(lineage, (key, e));
         }
     }
@@ -201,6 +215,27 @@ impl FieldIndex {
             Some(Slot::Ready(p)) => Some(p.by_value.get(key).map_or(0, |s| s.len())),
             _ => None,
         }
+    }
+
+    /// The exact number of current records of `memory` whose `field` has the value
+    /// with `key`, in `in_scope` / `namespace` if given (PF-50), kept as records are
+    /// written. `None` when the index isn't built or one of them needs its row to
+    /// decide (a TTL, a validity, a fact): the caller scans.
+    pub fn count_exact(&self, memory: Memory, field: &str, key: &str, in_scope: Option<&str>, namespace: Option<&str>) -> Option<u64> {
+        let slots = self.slots.read().unwrap();
+        let Some(Slot::Ready(p)) = slots.get(&(memory, field.to_string())) else { return None };
+        let Some(set) = p.by_value.get(key) else { return Some(0) };
+        let mut n = 0;
+        for e in set {
+            let m = p.meta.get(&e.2)?;
+            if m.timed {
+                return None;
+            }
+            if in_scope.is_none_or(|s| &*m.scope == s) && namespace.is_none_or(|ns| m.namespace.as_deref() == Some(ns)) {
+                n += 1;
+            }
+        }
+        Some(n)
     }
 
     /// Start building (`memory`, `field`): `true` if the caller should now scan and

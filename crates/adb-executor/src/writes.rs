@@ -235,6 +235,22 @@ fn caller_keyed(memory: MemoryType, payload: &serde_json::Value) -> bool {
 /// unique per (scope, memory type), so a named scope's keys are `<scope>~<key>`. A
 /// key already in that form is taken as it is; any other `~` is refused.
 /// The record id of `key` in `in_scope` and `namespace` (E-L12; NS, schema v5).
+
+/// An UPDATE / FORGET that names no single record (no `IN SCOPE` key, no `WHERE id =`):
+/// it runs under the sequencer, reading Lance and waiting for its commit there (the
+/// slow path, ~15 ms held each on AWS). `ADB_UNSCOPED_WRITES=reject` refuses it;
+/// the default runs it and counts it (`ADB_STEP_STATS`).
+fn slow_write_allowed(memory: MemoryType, statement: &str) -> AdbResult<()> {
+    static REJECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *REJECT.get_or_init(|| std::env::var("ADB_UNSCOPED_WRITES").is_ok_and(|v| v.eq_ignore_ascii_case("reject"))) {
+        return Err(AdbError::QueryError(format!(
+            "{statement} INTO/FROM {memory:?} must name one record: IN SCOPE \"<scope>\" with WHERE key = …, or WHERE id = … (this ADB has ADB_UNSCOPED_WRITES=reject)"
+        )));
+    }
+    crate::steps::add(if statement == "UPDATE" { "update.slow path (no single key)" } else { "forget.slow path (no single key)" }, std::time::Duration::ZERO);
+    Ok(())
+}
+
 fn scoped_key(namespace: Option<&str>, in_scope: Option<&str>, key: &str) -> AdbResult<String> {
     if let Some(ns) = namespace.filter(|ns| !adb_store::valid_namespace(ns)) {
         return Err(AdbError::QueryError(format!("NAMESPACE {ns:?}: a namespace can't be empty or contain '|' or '~'")));
@@ -775,6 +791,20 @@ impl<L: Log + 'static> DurableWrites<L> {
                 }
             }
         }
+        // PF-48: the rows this record changes, for the applier (in-place types: the row).
+        let hint: Vec<adb_store::StoredRow> = if supersedes(memory_type) {
+            current.clone()
+        } else if crate::reads::lance_owned(memory_type) {
+            let mut rows = Vec::with_capacity(ids.len());
+            for key in &ids {
+                if let Ok(Some(r)) = store.get(&adb_store::row_id(memory_type.into(), key)).await {
+                    rows.push(r);
+                }
+            }
+            rows
+        } else {
+            Vec::new()
+        };
         crate::steps::lap("update.2 current versions", &mut t);
         let keys: Vec<(Memory, String)> = ids.iter().map(|k| (memory_type.into(), k.clone())).collect();
         let mut seq = seq_lock!(self);
@@ -805,6 +835,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
         }
         let (record, wait) = seq.submit_record(ts, None, effects).await.map_err(log_err)?;
+        store.hint_rows(record.offset.0, hint);
         self.to_store_submitted(&record, seq.log()).await;
         drop(seq);
         crate::steps::lap("update.4 submit under lock", &mut t);
@@ -834,7 +865,15 @@ impl<L: Log + 'static> DurableWrites<L> {
         if memory_type == MemoryType::Semantic {
             keys.extend(entities.iter().map(|k| (m, refs_key(k))));
         }
-        crate::steps::lap("forget.2 entity facts", &mut t);
+        // PF-48: every version of what it forgets, for the applier (edges are read there).
+        let hint = match &self.store {
+            Some(store) => {
+                let lineages: Vec<String> = ids.iter().map(|id| adb_store::row_id(m, id)).collect();
+                store.versions_of(m, &lineages).await.unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        crate::steps::lap("forget.2 entity facts + rows", &mut t);
         let mut seq = seq_lock!(self);
         crate::steps::lap("forget.3 sequencer lock wait", &mut t);
         if self.key_offsets.lock().unwrap().conflict(&keys, snapshot) {
@@ -845,6 +884,9 @@ impl<L: Log + 'static> DurableWrites<L> {
         let effects: Vec<Effect> = ids.iter().map(|id| Effect::Forget { memory: m, lineage_id: RecordId(id.clone()) }).collect();
         self.usage_stale().await;
         let (record, wait) = seq.submit_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        if let Some(store) = &self.store {
+            store.hint_rows(record.offset.0, hint);
+        }
         self.keys_gone(&effects);
         self.note_forgotten(ids.iter().map(|id| (m, id.clone())));
         self.to_store_submitted(&record, seq.log()).await;
@@ -2917,9 +2959,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             false => None,
         };
         self.writable()?;
-        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
-            if let Some(n) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
-                return Ok(n);
+        if self.parent.is_none() && self.store.is_some() {
+            if crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
+                if let Some(n) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
+                    return Ok(n);
+                }
+            } else {
+                slow_write_allowed(memory_type, "UPDATE")?;
             }
         }
         let t0 = std::time::Instant::now();
@@ -2997,6 +3043,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
 
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         self.writable()?;
+        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_none() {
+            slow_write_allowed(memory_type, "FORGET")?;
+        }
         if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
             if let Some(n) = self.forget_prepared(memory_type, predicate, in_scope, namespace).await? {
                 return Ok(n);

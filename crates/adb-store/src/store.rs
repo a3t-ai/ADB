@@ -133,6 +133,9 @@ pub struct PartitionStore {
     rows_at_compaction: std::sync::atomic::AtomicU64,
     /// One fold (compaction, PF-16) or table rewrite at a time.
     folding: tokio::sync::Mutex<()>,
+    /// Rows the write path read for a record it then submitted (PF-48), by the
+    /// record's offset: the applier uses them instead of reading the table again.
+    hints: std::sync::Mutex<std::collections::HashMap<u64, Vec<StoredRow>>>,
     /// The table's vectors came from another embedding model (W9.10).
     model_changed: std::sync::atomic::AtomicBool,
     /// W10 hot cache, fed by every put (`set_cache`).
@@ -325,6 +328,12 @@ pub fn configure_lance_runtime() {
         }
     });
 }
+
+/// Table rows read ahead for a batch of records (PF-47): `None` = not in the table.
+type Prefetched = std::collections::HashMap<String, Option<StoredRow>>;
+
+/// Primary-key reads running at once in an apply's prefetch.
+const PREFETCH_AT_ONCE: usize = 32;
 
 impl PartitionStore {
     /// Open (creating if needed) the partition's table and become its writer.
@@ -877,6 +886,7 @@ impl PartitionStore {
             puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
             rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
             folding: tokio::sync::Mutex::new(()),
+            hints: Default::default(),
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
             fields: crate::field_index::FieldIndex::new(),
@@ -1257,6 +1267,24 @@ impl PartitionStore {
         Ok(self.scan(Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next())
     }
 
+    /// The table rows the record at `offset` changes, as its writer read them (PF-48).
+    /// Only for rows no other record can change in between: the writer read them after
+    /// every earlier write to them was applied, and submitted the record under the
+    /// sequencer's conflict check, so the applier would read these same rows. Reading
+    /// them again there cost ~4 ms each, in series: ~200 UPDATEs / FORGETs a second,
+    /// and every read waiting behind the applier.
+    pub fn hint_rows(&self, offset: u64, rows: Vec<StoredRow>) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut h = self.hints.lock().unwrap();
+        // Never applied (a failed commit, a restart of the applier): don't keep them.
+        if h.len() > 100_000 {
+            h.clear();
+        }
+        h.insert(offset, rows);
+    }
+
     /// [`get`](Self::get) through the row cache (exact: see `row_cache`).
     pub async fn get_cached(&self, id: &str) -> StoreResult<Option<StoredRow>> {
         let _t = adb_core::steps::timer("store.get_cached");
@@ -1473,8 +1501,27 @@ impl PartitionStore {
         let inner = open_state(&g);
         // Rows these records write, one per id (later effects see earlier ones).
         let mut out: BTreeMap<String, StoredRow> = BTreeMap::new();
+        // PF-47: the table rows these records change, read together first. Read one by
+        // one inside the loop (a ~5 ms Lance point read each), the applier managed ~180
+        // UPDATEs / FORGETs a second and every read waited behind it.
+        let mut hinted = Prefetched::new();
+        {
+            let mut h = self.hints.lock().unwrap();
+            for r in &records {
+                for row in h.remove(&r.offset.0).into_iter().flatten() {
+                    hinted.insert(row.id.clone(), Some(row));
+                }
+            }
+            if !h.is_empty() {
+                h.retain(|off, _| *off > last.offset.0);
+            }
+        }
+        adb_core::steps::value("store.apply rows hinted", hinted.len() as u64);
+        let pre = Self::prefetch(inner, &records, hinted).await?;
+        adb_core::steps::value("store.apply rows prefetched", pre.len() as u64);
+        adb_core::steps::lap("store.apply.1b prefetch rows", &mut at);
         for record in &records {
-            Self::rows_of(inner, &mut out, record).await?;
+            Self::rows_of(inner, &pre, &mut out, record).await?;
         }
         let (off, ts, epoch) = (last.offset.0, last.commit_ts, last.epoch.0);
         out.insert(META_ID.into(), StoredRow::meta(off, ts, epoch, self.meta_extra()));
@@ -1531,7 +1578,7 @@ impl PartitionStore {
     }
 
     /// The rows `record` writes, into `out`.
-    async fn rows_of(inner: &Inner, out: &mut BTreeMap<String, StoredRow>, record: &LogRecord) -> StoreResult<()> {
+    async fn rows_of(inner: &Inner, pre: &Prefetched, out: &mut BTreeMap<String, StoredRow>, record: &LogRecord) -> StoreResult<()> {
         let ts = record.commit_ts;
         let (off, epoch) = (record.offset.0, record.epoch.0);
         let out = &mut *out;
@@ -1547,7 +1594,7 @@ impl PartitionStore {
                 }
                 Effect::Supersede { old, new } => {
                     let new = qualified(new);
-                    if let Some(mut prev) = Self::row(inner, &out, &row_id(new.data.memory, &old.0)).await? {
+                    if let Some(mut prev) = Self::row(inner, pre, &out, &row_id(new.data.memory, &old.0)).await? {
                         prev.valid_to = Some(ts);
                         prev.superseded_by = Some(new.id.0.clone());
                         prev.log_offset = off;
@@ -1556,7 +1603,7 @@ impl PartitionStore {
                     out.insert(new.id.0.clone(), StoredRow::from_new(&new, ts, off, epoch));
                 }
                 Effect::Patch { memory, id, fields, .. } => {
-                    if let Some(mut cur) = Self::row(inner, &out, &row_id(*memory, &id.0)).await? {
+                    if let Some(mut cur) = Self::row(inner, pre, &out, &row_id(*memory, &id.0)).await? {
                         adb_core::merge_fields(&mut cur.data.value, fields);
                         if let Some(c) = fields.get("content") {
                             cur.data.text = c.as_str().map(String::from);
@@ -1572,14 +1619,14 @@ impl PartitionStore {
                     }
                 }
                 Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
-                    for mut r in Self::lineage_and_edges(inner, &out, &row_id(*memory, &lineage_id.0)).await? {
+                    for mut r in Self::lineage_and_edges(inner, pre, &out, &row_id(*memory, &lineage_id.0)).await? {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
                     }
                 }
                 Effect::Embed { memory, id, embedding } => {
-                    if let Some(mut cur) = Self::row(inner, &out, &row_id(*memory, &id.0)).await? {
+                    if let Some(mut cur) = Self::row(inner, pre, &out, &row_id(*memory, &id.0)).await? {
                         // Not a change to the record: `log_offset` stays its version's, or a
                         // merge would see main as moved when only its vector arrived (DB-19).
                         cur.data.embedding = Some(embedding.clone());
@@ -1587,7 +1634,7 @@ impl PartitionStore {
                     }
                 }
                 Effect::UpdateSubCursor { sub_id, cursor } => {
-                    if let Some(mut sub) = Self::row(inner, &out, &sub_id.0).await? {
+                    if let Some(mut sub) = Self::row(inner, pre, &out, &sub_id.0).await? {
                         if let serde_json::Value::Object(v) = &mut sub.data.value {
                             v.insert("cursor".into(), cursor.0.into());
                         }
@@ -1596,7 +1643,7 @@ impl PartitionStore {
                     }
                 }
                 Effect::Unregister { id } => {
-                    if let Some(mut r) = Self::row(inner, &out, &id.0).await? {
+                    if let Some(mut r) = Self::row(inner, pre, &out, &id.0).await? {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
@@ -1615,11 +1662,69 @@ impl PartitionStore {
     }
 
     /// A row as this record has it so far, else as stored.
-    async fn row(inner: &Inner, out: &BTreeMap<String, StoredRow>, id: &str) -> StoreResult<Option<StoredRow>> {
-        match out.get(id) {
-            Some(r) => Ok(Some(r.clone())),
-            None => Ok(Self::scan_in(inner, Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next()),
+    async fn row(inner: &Inner, pre: &Prefetched, out: &BTreeMap<String, StoredRow>, id: &str) -> StoreResult<Option<StoredRow>> {
+        match (out.get(id), pre.get(id)) {
+            (Some(r), _) => Ok(Some(r.clone())),
+            (None, Some(r)) => Ok(r.clone()),
+            (None, None) => Ok(Self::scan_in(inner, Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next()),
         }
+    }
+
+    /// The table's rows that `records` change (superseded, patched, embedded, forgotten
+    /// with their edges, …), read by primary key [`PREFETCH_AT_ONCE`] at a time (PF-47).
+    /// The table doesn't change while a batch is built (the applier is its only
+    /// writer), so these are the rows the per-record reads would find.
+    async fn prefetch(inner: &Inner, records: &[&LogRecord], hinted: Prefetched) -> StoreResult<Prefetched> {
+        use futures::StreamExt;
+        let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut lineages: Vec<String> = Vec::new();
+        for record in records {
+            for effect in &record.effects {
+                match effect {
+                    Effect::Supersede { old, new } => {
+                        ids.insert(row_id(new.data.memory, &old.0));
+                    }
+                    Effect::Patch { memory, id, .. } | Effect::Embed { memory, id, .. } => {
+                        ids.insert(row_id(*memory, &id.0));
+                    }
+                    Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => lineages.push(row_id(*memory, &lineage_id.0)),
+                    Effect::UpdateSubCursor { sub_id, .. } => {
+                        ids.insert(sub_id.0.clone());
+                    }
+                    Effect::Unregister { id } => {
+                        ids.insert(id.0.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !lineages.is_empty() {
+            if inner.links.lock().unwrap().is_none() {
+                let built = Self::build_links(inner).await?;
+                inner.links.lock().unwrap().get_or_insert(built);
+            }
+            let links = inner.links.lock().unwrap();
+            if let Some(l) = links.as_ref() {
+                for lineage in &lineages {
+                    ids.extend(l.of(lineage));
+                }
+            }
+        }
+        ids.retain(|id| !hinted.contains_key(id));
+        let mut found = hinted;
+        if ids.len() < 2 {
+            return Ok(found);
+        }
+        adb_core::steps::value("store.apply rows read (no hint)", ids.len() as u64);
+        let mut reads = futures::stream::iter(ids.into_iter().map(|id| async move {
+            let r = Self::scan_in(inner, Some(&format!("id = {}", sql_str(&id)))).await.map(|v| v.into_iter().next());
+            (id, r)
+        }))
+        .buffer_unordered(PREFETCH_AT_ONCE);
+        while let Some((id, r)) = reads.next().await {
+            found.insert(id, r?);
+        }
+        Ok(found)
     }
 
     /// The links map of the table (`Inner::links`), from its id, lineage, subject and
@@ -1644,7 +1749,7 @@ impl PartitionStore {
     }
 
     /// Every version of a lineage, and every edge touching it (D2 §5).
-    async fn lineage_and_edges(inner: &Inner, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
+    async fn lineage_and_edges(inner: &Inner, pre: &Prefetched, out: &BTreeMap<String, StoredRow>, lineage: &str) -> StoreResult<Vec<StoredRow>> {
         // PF-36: the row ids from the links map (built once per open table), then the
         // rows by primary key; the same rows the old OR-filter scan found.
         if inner.links.lock().unwrap().is_none() {
@@ -1655,7 +1760,11 @@ impl PartitionStore {
         // One primary-key read per row (an `id IN (…)` filter scans the whole table).
         let mut rows: BTreeMap<String, StoredRow> = BTreeMap::new();
         for id in &ids {
-            if let Some(r) = Self::scan_in(inner, Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next() {
+            let r = match pre.get(id.as_str()) {
+                Some(r) => r.clone(),
+                None => Self::scan_in(inner, Some(&format!("id = {}", sql_str(id)))).await?.into_iter().next(),
+            };
+            if let Some(r) = r {
                 rows.insert(r.id.clone(), r);
             }
         }

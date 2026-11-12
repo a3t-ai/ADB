@@ -1083,6 +1083,13 @@ pub async fn aggregate_read(store: &PartitionStore, memory: MemoryType, predicat
     {
         return Ok(None);
     }
+    // PF-50: COUNT(*) of `WHERE field = "value"` from the field index's own count,
+    // when it can answer exactly (see `FieldIndex::count_exact`); else the scan below.
+    if let Some(n) = indexed_count(store, memory, predicate, modifiers, funcs) {
+        let mut s = AggState::new(memory, funcs, None);
+        s.groups[0].2[0].count = n;
+        return Ok(Some(s.finish()));
+    }
     // The records' read: no order, limit or projection (those apply to the groups).
     let mut read = modifiers.clone();
     read.order_by = None;
@@ -1090,6 +1097,24 @@ pub async fn aggregate_read(store: &PartitionStore, memory: MemoryType, predicat
     read.return_fields = None;
     let v = served(store, "aggregate", |source| aggregate_from(store, memory, predicate, &read, modifiers, funcs, now, source), |a, b| a == b, |v| v.to_string()).await?;
     Ok(Some(v))
+}
+
+/// The count of [`aggregate_read`] from the field index, when the statement is only
+/// `WHERE <field> = "<string>" AGGREGATE COUNT(*)` on current records.
+fn indexed_count(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, funcs: &[AggregateFunc]) -> Option<u64> {
+    let [f] = funcs else { return None };
+    if f.func != AggregateFuncType::Count || f.field.is_some() || modifiers.group_by.is_some() || modifiers.having.is_some() || modifiers.scope.is_some() || is_history(modifiers) {
+        return None;
+    }
+    let Predicate::Where { conditions } = predicate else { return None };
+    let [adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value: value @ Value::String(_), .. }] = conditions.as_slice() else { return None };
+    if matches!(field.as_str(), "id" | "key") || field.contains('.') || !adb_store::field_index::indexable(memory.into()) {
+        return None;
+    }
+    let key = adb_store::field_index::literal_key(value)?;
+    let n = store.fields().count_exact(memory.into(), field, &key, modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
+    crate::steps::add(if n.is_some() { "query.count from the field index" } else { "query.count by scan" }, std::time::Duration::ZERO);
+    n
 }
 
 #[allow(clippy::too_many_arguments)]

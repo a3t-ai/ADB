@@ -127,6 +127,9 @@ impl EmbedConfig {
 
 enum Backend {
     Local(LocalModel),
+    /// An embedding pool (`ADB_EMBED_URL`, PF-49): `adb serve-embed` processes on other
+    /// machines, taken in turn; the database nodes then run no model.
+    Pool { client: reqwest::Client, urls: Vec<String>, next: std::sync::atomic::AtomicUsize },
     Http { client: reqwest::Client, url: String, key: Option<String> },
 }
 
@@ -251,6 +254,11 @@ impl Embedder {
         cfg.check()?;
         match cfg.provider {
             Provider::Local => {
+                if let Some(mut pool) = Self::pool_from_env() {
+                    pool.model = cfg.model.clone();
+                    pool.dim = cfg.dimension;
+                    return Ok(pool);
+                }
                 let dir = cfg
                     .model_dir
                     .clone()
@@ -297,6 +305,18 @@ impl Embedder {
         SHARED.get_or_init(Self::from_env).clone()
     }
 
+    /// The embedding pool of `ADB_EMBED_URL` (comma-separated `adb serve-embed` URLs),
+    /// if set: the same model and dimension as the local one, run elsewhere (PF-49).
+    pub fn pool_from_env() -> Option<Self> {
+        let urls: Vec<String> = std::env::var("ADB_EMBED_URL").ok()?.split(',').map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).collect();
+        if urls.is_empty() {
+            return None;
+        }
+        let client = reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(500)).timeout(std::time::Duration::from_secs(30)).build().ok()?;
+        tracing::info!(pool = ?urls, model = MODEL, "embeddings from the embedding pool (ADB_EMBED_URL); no model on this node");
+        Some(Self { backend: Backend::Pool { client, urls, next: Default::default() }, model: MODEL.into(), dim: DIM })
+    }
+
     /// Whether `ADB_EMBED=off` turns embedding off.
     pub fn disabled() -> bool {
         std::env::var("ADB_EMBED").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
@@ -309,6 +329,9 @@ impl Embedder {
         if Self::disabled() {
             tracing::info!("embeddings off (ADB_EMBED=off)");
             return None;
+        }
+        if let Some(pool) = Self::pool_from_env() {
+            return Some(Arc::new(pool));
         }
         let dir: PathBuf = std::env::var("ADB_EMBED_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(DEFAULT_MODEL_DIR));
         if !dir.join("model.onnx").exists() {
@@ -341,6 +364,30 @@ impl Embedder {
                 };
                 peers::LOCAL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 r
+            }
+            Backend::Pool { client, urls, next } => {
+                let t = std::time::Instant::now();
+                let mut out = Vec::with_capacity(texts.len());
+                for chunk in texts.chunks(HTTP_BATCH) {
+                    let mut last = String::new();
+                    let mut done = false;
+                    for _ in 0..urls.len() {
+                        let url = &urls[next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % urls.len()];
+                        match http_embed(client, url, None, &self.model, chunk).await {
+                            Ok(v) => {
+                                out.extend(v);
+                                done = true;
+                                break;
+                            }
+                            Err(e) => last = e,
+                        }
+                    }
+                    if !done {
+                        return Err(format!("embedding pool: {last}"));
+                    }
+                }
+                adb_core::steps::add("embed.pool round trip", t.elapsed());
+                Ok(out)
             }
             Backend::Http { client, url, key } => {
                 let mut out = Vec::with_capacity(texts.len());
@@ -384,6 +431,30 @@ impl Embedder {
                 let r = self.embed_here(texts).await;
                 adb_core::steps::add("embed.here (queue + model)", t.elapsed());
                 r
+            }
+            Backend::Pool { client, urls, next } => {
+                let t = std::time::Instant::now();
+                let mut out = Vec::with_capacity(texts.len());
+                for chunk in texts.chunks(HTTP_BATCH) {
+                    let mut last = String::new();
+                    let mut done = false;
+                    for _ in 0..urls.len() {
+                        let url = &urls[next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % urls.len()];
+                        match http_embed(client, url, None, &self.model, chunk).await {
+                            Ok(v) => {
+                                out.extend(v);
+                                done = true;
+                                break;
+                            }
+                            Err(e) => last = e,
+                        }
+                    }
+                    if !done {
+                        return Err(format!("embedding pool: {last}"));
+                    }
+                }
+                adb_core::steps::add("embed.pool round trip", t.elapsed());
+                Ok(out)
             }
             Backend::Http { client, url, key } => {
                 let mut out = Vec::with_capacity(texts.len());

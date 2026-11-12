@@ -61,6 +61,15 @@ enum Commands {
         #[arg(long, default_value_t = 3001)]
         flight_port: u16,
     },
+    /// Run an embedding worker (PF-49): `POST /embeddings` (the OpenAI wire format)
+    /// from the local model. ADB nodes with `ADB_EMBED_URL=http://<host>:<port>[,…]`
+    /// send their texts here and run no model themselves.
+    ServeEmbed {
+        #[arg(long, default_value = "0.0.0.0")]
+        host: IpAddr,
+        #[arg(short, long, default_value_t = 3003)]
+        port: u16,
+    },
     /// Copy an embedded LanceDB directory (A3T's a3t-platform.lance) into a running
     /// ADB's platform tables over Arrow Flight
     ImportLancedb {
@@ -128,6 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     alloc::report_every(alloc::report_interval());
     adb_core::steps::spawn_lag_probe();
+    if let Commands::ServeEmbed { host, port } = &command {
+        return serve_embed(*host, *port).await;
+    }
 
     // A replica set member (M3): the engine opens only while this node leads.
     if let (Some(dir), Commands::Serve { http: true, host, port, flight_port } | Commands::ServeHttp { host, port, flight_port }) = (&cli.data_dir, &command) {
@@ -188,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = adb_executor::restart_requested() => tracing::info!("ADB stopping to apply its new settings"),
             }
         }
-        Commands::ImportLancedb { .. } | Commands::ImportFlowrEngine { .. } | Commands::Sql { .. } => unreachable!("handled before the engine opens"),
+        Commands::ImportLancedb { .. } | Commands::ImportFlowrEngine { .. } | Commands::Sql { .. } | Commands::ServeEmbed { .. } => unreachable!("handled before the engine opens"),
         Commands::Query { query } => match engine.query(&query, None).await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
             Err(e) => {
@@ -241,4 +253,36 @@ mod log_tests {
         assert_eq!(log_spec(Some("info,lance=debug".into())), "info,lance=debug,datafusion=warn");
         assert_eq!(log_spec(Some(" ".into())), "adb=info,adb_server=info,lance=warn,datafusion=warn");
     }
+}
+
+/// `adb serve-embed`: the local model behind `POST /embeddings` and `/v1/embeddings`.
+async fn serve_embed(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    use axum::routing::{get, post};
+    // The worker embeds with its own model, never through a pool.
+    std::env::remove_var("ADB_EMBED_URL");
+    let embedder = adb_embed::Embedder::from_env().ok_or("serve-embed needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?;
+    async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        let texts: Vec<String> = match req.get("input") {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            _ => Vec::new(),
+        };
+        let _t = adb_core::steps::timer("embed.served by this worker");
+        match e.embed_here(texts).await {
+            Ok(v) => {
+                let data: Vec<serde_json::Value> = v.into_iter().enumerate().map(|(i, e)| serde_json::json!({ "object": "embedding", "index": i, "embedding": e })).collect();
+                (axum::http::StatusCode::OK, axum::Json(serde_json::json!({ "object": "list", "model": e.model(), "data": data })))
+            }
+            Err(err) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({ "error": err }))),
+        }
+    }
+    let app = axum::Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/embeddings", post(embed))
+        .route("/v1/embeddings", post(embed))
+        .with_state(embedder);
+    let addr = std::net::SocketAddr::new(host, port);
+    tracing::info!(%addr, workers = adb_embed::workers(), "ADB embedding worker");
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).with_graceful_shutdown(async { shutdown_signal().await; }).await?;
+    Ok(())
 }

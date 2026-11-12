@@ -172,22 +172,22 @@ async function adb() {
     ['RECALL WORKING KEY', i => `RECALL FROM WORKING KEY id = "${run}w${(i * 7) % wkeys}"`],
   ];
   for (const [name, f] of reads) for (const c of CS) await phase(name, c, i => q(f(i)));
-  for (const c of CS) await phase('UPDATE SEMANTIC (existing key)', c, i => q(`UPDATE INTO SEMANTIC WHERE key = "${run}f${(i * 53) % keys}" (v = 2, content = "fact ${i} updated")`));
-  for (const c of CS) await phase('UPDATE WORKING', c, i => q(`UPDATE INTO WORKING WHERE key = "${run}w${(i * 11) % wkeys}" (step = 2)`));
+  for (const c of CS) await phase('UPDATE SEMANTIC (existing key)', c, i => q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 53) % keys}" (v = 2, content = "fact ${i} updated")`));
+  for (const c of CS) await phase('UPDATE WORKING', c, i => q(`UPDATE INTO WORKING WHERE id = "${run}w${(i * 11) % wkeys}" (step = 2)`));
   // FORGET each key once: the c-th phase takes its own slice of the episodic keys.
   // FORGET each stored EPISODIC key once (from the newest; the reads above used the first
   // phase's); a phase that runs out of keys stops counting.
   for (const c of CS) await phase('FORGET EPISODIC (one key each)', c, async () => {
     const k = episodic.pop();
     if (!k) throw new Error('out of keys');
-    await q(`FORGET FROM EPISODIC WHERE key = "${k}"`);
+    await q(`FORGET FROM EPISODIC WHERE id = "${k}"`);
   });
   for (const c of CS) {
     await phase('mixed 70% read / 25% STORE / 5% UPDATE', c, i => {
       const k = i % 20;
       if (k < 14) return q(k % 2 ? `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 97) % keys}"` : `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10`);
       if (k < 19) return q(`STORE INTO SEMANTIC (key = "${run}m${c}x${i}", topic = "t${i % 20}", n = 1, content = "mixed ${i}")`);
-      return q(`UPDATE INTO SEMANTIC WHERE key = "${run}f${(i * 31) % keys}" (v = 3)`);
+      return q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 31) % keys}" (v = 3)`);
     });
   }
 }
