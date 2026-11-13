@@ -13670,6 +13670,114 @@ mod tests {
         assert_eq!(reopened.count_rows(Some("id < 20".to_string())).await.unwrap(), 10);
     }
 
+    /// Against real object storage (Hetzner, S3): run with
+    /// `ADB_S3_TEST_URI=s3://bucket/prefix` and the `AWS_*` variables set, and
+    /// `cargo test --lib -- --ignored --nocapture test_s3_tiering`. A local root
+    /// with a cold base on S3: compact into it, read, filter, delete; then copy
+    /// the root to an S3 mirror and open that mirror as a dataset from S3 alone.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn test_s3_tiering() {
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+        use std::time::Instant;
+
+        let Ok(prefix) = std::env::var("ADB_S3_TEST_URI") else { return };
+        let run = format!("{}/run-{}", prefix.trim_end_matches('/'), chrono::Utc::now().timestamp_millis());
+        let cold_uri = format!("{run}/cold");
+        let mirror_uri = format!("{run}/mirror");
+        let root = TempDir::default();
+        let ms = |t: Instant| t.elapsed().as_millis();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let n = 20_000;
+        let ids: ArrayRef = Arc::new(Int32Array::from((0..n).collect::<Vec<i32>>()));
+        let texts: ArrayRef = Arc::new(arrow_array::StringArray::from(
+            (0..n).map(|i| format!("memory {i}: the agent noted something worth keeping")).collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, texts]).unwrap();
+        let t = Instant::now();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &root.path_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2_000,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("cold".to_string()),
+                    path: cold_uri.clone(),
+                    is_dataset_root: true,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        println!("write {n} rows to the local root (10 fragments): {} ms", ms(t));
+
+        let t = Instant::now();
+        compact_files(
+            &mut dataset,
+            CompactionOptions { target_rows_per_fragment: 1_000_000, target_bases: Some(vec![1]), ..Default::default() },
+            None,
+        )
+        .await
+        .unwrap();
+        println!("compact into the cold base on S3: {} ms", ms(t));
+        let frags = dataset.get_fragments();
+        assert_eq!(frags.len(), 1);
+        assert!(frags[0].metadata().files.iter().all(|f| f.base_id == Some(1)));
+
+        let t = Instant::now();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), n as usize);
+        println!("count all rows (cold, from S3): {} ms", ms(t));
+        let t = Instant::now();
+        assert_eq!(dataset.count_rows(Some("id >= 19990".to_string())).await.unwrap(), 10);
+        println!("filter id >= 19990 (cold, from S3): {} ms", ms(t));
+        let t = Instant::now();
+        let rows = dataset.take(&[5, 12_345, 19_999], dataset.schema().clone()).await.unwrap();
+        assert_eq!(rows.num_rows(), 3);
+        println!("take 3 rows by position (cold, from S3): {} ms", ms(t));
+        let t = Instant::now();
+        dataset.delete("id < 100").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), (n - 100) as usize);
+        println!("delete 100 rows on the cold fragment (deletion file local): {} ms", ms(t));
+
+        // S1: the mirror. Copy every root file to S3 under the same relative
+        // paths, then open the mirror as a dataset from S3 alone.
+        let t = Instant::now();
+        let (mirror_store, mirror_base) = crate::io::ObjectStore::from_uri(&mirror_uri).await.unwrap();
+        let mut copied = 0;
+        let mut stack = vec![root.std_path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(root.std_path()).unwrap().to_string_lossy().to_string();
+                    let bytes = std::fs::read(&p).unwrap();
+                    // One path segment at a time: `join` encodes a '/' inside a segment.
+                    let dest = rel.split('/').fold(mirror_base.clone(), |p, part| p.join(part));
+                    mirror_store.put(&dest, &bytes).await.unwrap();
+                    copied += 1;
+                }
+            }
+        }
+        println!("copy the local root to the S3 mirror ({copied} files): {} ms", ms(t));
+        let t = Instant::now();
+        let mirror = Dataset::open(&mirror_uri).await.unwrap();
+        println!("open the mirror from S3: {} ms", ms(t));
+        let t = Instant::now();
+        assert_eq!(mirror.count_rows(None).await.unwrap(), (n - 100) as usize);
+        assert_eq!(mirror.count_rows(Some("id < 200".to_string())).await.unwrap(), 100);
+        println!("read the mirror (manifest on S3, data in the cold base): {} ms", ms(t));
+        println!("objects are under {run}");
+    }
+
     /// An unregistered or empty target base is refused before anything is written.
     #[tokio::test]
     async fn test_compact_into_target_base_rejects_unknown() {
