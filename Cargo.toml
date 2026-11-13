@@ -18,6 +18,9 @@ members = [
     "crates/adb-engine",
     "adb-cli",
 ]
+# The patched lance crate is a dependency, not a member: excluded so its own tests
+# build standalone (`cd third_party/lance && cargo test`).
+exclude = ["third_party/lance"]
 
 [workspace.package]
 version = "0.1.0"

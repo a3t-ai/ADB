@@ -367,6 +367,15 @@ pub struct CompactionOptions {
     #[doc(hidden)]
     #[serde(default)]
     pub has_eager_remappable_index: Option<bool>,
+    /// Write the compacted fragments into these registered bases (ids from
+    /// `Manifest.base_paths`) instead of the dataset root: tiered storage moves
+    /// cold fragments to another base (e.g. object storage) by compacting them
+    /// into it. Several ids are filled round-robin. Each base is written through
+    /// the store the dataset already holds for it, so per-base credentials
+    /// (`DatasetBuilder::with_base_store_params`) apply. Binary copy writes only
+    /// to the root, so it is skipped when this is set.
+    #[serde(default)]
+    pub target_bases: Option<Vec<u32>>,
 }
 
 #[allow(deprecated)]
@@ -396,6 +405,7 @@ impl Default for CompactionOptions {
             data_storage_version: None,
             transaction_properties: None,
             has_eager_remappable_index: None,
+            target_bases: None,
         }
     }
 }
@@ -2610,6 +2620,35 @@ async fn live_row_addrs(
     Ok(addrs)
 }
 
+/// The bases [`CompactionOptions::target_bases`] names, each with the store the
+/// dataset already holds for it (so per-base credentials apply).
+async fn compaction_target_bases(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+) -> Result<Option<Vec<crate::dataset::write::TargetBaseInfo>>> {
+    let Some(ids) = options.target_bases.as_ref() else {
+        return Ok(None);
+    };
+    if ids.is_empty() {
+        return Err(Error::invalid_input(
+            "target_bases cannot be empty. Omit the option to compact into the dataset root.",
+        ));
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let base = dataset.manifest.base_paths.get(&id).ok_or_else(|| {
+            Error::invalid_input(format!("compaction target base {id} is not registered"))
+        })?;
+        out.push(crate::dataset::write::TargetBaseInfo {
+            base_id: id,
+            object_store: dataset.object_store(Some(id)).await?,
+            base_dir: base.extract_path(dataset.session.store_registry())?,
+            is_dataset_root: base.is_dataset_root,
+        });
+    }
+    Ok(Some(out))
+}
+
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
@@ -2679,7 +2718,14 @@ async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    // Binary copy writes its output to the dataset root only.
+    let can_binary_copy = options.target_bases.is_none()
+        && can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    if options.target_bases.is_some() && matches!(mode, CompactionMode::ForceBinaryCopy) {
+        return Err(Error::invalid_input(format!(
+            "compaction task {task_id}: binary copy cannot write to target_bases"
+        )));
+    }
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         if let Some((path, actual)) = first_binary_copy_version_mismatch(&fragments, write_version)?
         {
@@ -2899,6 +2945,7 @@ async fn rewrite_files(
             }
             None => None,
         };
+        let target_bases_info = compaction_target_bases(dataset.as_ref(), options).await?;
         let (frags, _) = write_fragments_internal_with_file_row_counts(
             write_version,
             Some(dataset.as_ref()),
@@ -2907,7 +2954,7 @@ async fn rewrite_files(
             write_schema,
             stream,
             params,
-            None,
+            target_bases_info,
             Some(file_row_counts),
         )
         .await?;
@@ -13539,6 +13586,114 @@ mod tests {
         .unwrap();
 
         assert_compaction_preserves_blob_values(dataset, &expected).await;
+    }
+
+    /// Tiered storage: compaction moves the root's fragments into a second
+    /// registered base. Reads, filters and deletes keep working; cleanup removes
+    /// the superseded root files and never touches the other base.
+    #[tokio::test]
+    async fn test_compact_into_target_base() {
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let root = TempDir::default();
+        let cold = TempDir::default();
+        let cold_uri = format!("file://{}", cold.std_path().display());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ids: ArrayRef = Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            &root.path_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("cold".to_string()),
+                    path: cold_uri,
+                    is_dataset_root: true,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+        let count_files = |dir: std::path::PathBuf| {
+            std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+        };
+        let root_data = root.std_path().join("data");
+        let cold_data = cold.std_path().join("data");
+        assert_eq!(count_files(root_data.clone()), 10);
+        assert_eq!(count_files(cold_data.clone()), 0);
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000_000,
+            target_bases: Some(vec![1]),
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let frags = dataset.get_fragments();
+        assert_eq!(frags.len(), 1);
+        let files = &frags[0].metadata().files;
+        assert!(files.iter().all(|f| f.base_id == Some(1)), "compacted files must be in the cold base");
+        assert_eq!(count_files(cold_data.clone()), 1);
+
+        // The same rows, through a scan and a filter.
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1000);
+        assert_eq!(dataset.count_rows(Some("id >= 990".to_string())).await.unwrap(), 10);
+
+        // A delete on the cold fragment keeps its deletion file in the root.
+        dataset.delete("id < 10").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 990);
+        let del = dataset.get_fragments()[0].metadata().deletion_file.clone().unwrap();
+        assert_eq!(del.base_id, None);
+
+        // Cleanup removes the ten superseded root files, never the cold one.
+        // Lance's test build runs on a mock clock: move it on so the earlier
+        // versions are old (as the cleanup tests do).
+        mock_instant::thread_local::MockClock::set_system_time(
+            chrono::TimeDelta::try_days(10).unwrap().to_std().unwrap(),
+        );
+        dataset
+            .cleanup_old_versions(chrono::Duration::days(1), Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(count_files(root_data.clone()), 0);
+        assert_eq!(count_files(cold_data.clone()), 1);
+
+        // A fresh open resolves the cold base from the manifest.
+        let reopened = Dataset::open(&root.path_str()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 990);
+        assert_eq!(reopened.count_rows(Some("id < 20".to_string())).await.unwrap(), 10);
+    }
+
+    /// An unregistered or empty target base is refused before anything is written.
+    #[tokio::test]
+    async fn test_compact_into_target_base_rejects_unknown() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ids: ArrayRef = Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams { max_rows_per_file: 10, ..Default::default() }),
+        )
+        .await
+        .unwrap();
+        for bases in [vec![7], vec![]] {
+            let options = CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                target_bases: Some(bases),
+                ..Default::default()
+            };
+            assert!(compact_files(&mut dataset, options, None).await.is_err());
+        }
+        assert_eq!(dataset.get_fragments().len(), 10);
     }
 
     #[tokio::test]
