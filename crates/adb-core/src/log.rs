@@ -162,6 +162,10 @@ pub enum Kind {
     Meta,
     /// A memory branch (agents as repos, B1): a control row, never a record.
     Branch,
+    /// The tombstone log: one row per FORGET or expiry, written with the tombstones it
+    /// records and kept forever (physical deletion is only by a manual purge). Never a
+    /// record: reads of memory skip it (`RECORD_KINDS`).
+    TombLog,
 }
 
 /// AQL v0.5 `SCOPE private | shared | cluster`.

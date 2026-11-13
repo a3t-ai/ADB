@@ -202,7 +202,27 @@ Table `_tombstones`: one row per FORGET.
 
 ### Phase 3: more replica sets, and a control plane for placement (§6.1)
 
+## 5b. Status (13 Nov 2026)
+
+| Step | Status | Commits |
+|---|---|---|
+| P1 Lance: compaction into a target base | done; tests local + Hetzner `adb-1` | `dc2dc62`, `1a358c3` |
+| S1 open the mirror from object storage alone | done on `adb-1` (open 144–216 ms, read across mirror + cold ~200 ms) | `1a358c3` |
+| S2 takeover by shallow clone | done on `adb-1` (clone 28 ms, no data copied); needed two Lance fixes: the clone was written through the source's store, and the source manifest was read through the target's | `f3ff2c3` |
+| T1 adb-store: cold base, lineage, archive, watermark, cleanup guard | done; tests local + `adb-1` | `2f9cae0` |
+| T1 tier job (local → cold within a byte budget) | done; local data 742 KB → 315 KB in the test | `b683759` |
+| T2 tombstone log (`Kind::TombLog`, `tombstone_log()`) | done; one row per FORGET/expiry in the same put, never in memory views, kept by compaction, archived | (this commit) |
+| P2 cleanup guard | done as part of T1 (`cleanup_local_versions`: only versions older than the archived one) | `2f9cae0` |
+
+Measured on Hetzner `nbg1` from the code-server pod (curl, a TLS handshake per request, so pessimistic): PUT 4 KB 42 ms, 1 MB 98 ms, 16 MB 911 ms (~18 MB/s per stream); GET 1 MB 98 ms, 16 MB 347 ms (~46 MB/s); 64 KB range 35 ms; 32 parallel range reads 187 req/s, no 429s.
+
 ## 6. Open points
+
+- **Who asked (tombstone log `actor`, `reason`).** ADB has no caller identity on the write path today (`Provenance::default()`; one shared service token). FlowR would send the caller (e.g. `x-adb-actor`), ADB carry it in the log record. Needs approval (touches FlowR and ADB).
+- **The fold rewrites cold fragments back into the root** when they hold tombstoned rows or fall in a size tier; the tier job moves them out again and the old cold file stays (never deleted). Correct, but it costs object-storage space; restrict the fold to local fragments, or give it a target base.
+- **Tier policy** is "oldest fragments by id"; per-memory-type priority (keep `WORKING`/`SEMANTIC`/`PROCEDURAL` local, tier `EPISODIC` first) needs fragments split by memory type, or by time, to mean anything.
+- **Archive scheduling**: today it runs at each fold and rewrite and on demand; Phase 1 runs it on a timer (5–30 s) to bound log retention.
+- **Lance clone test** `test_deep_clone_repairs_legacy_schema_without_activation` fails in our copy because the crates.io package ships no fixture data; not ours.
 
 - **Hetzner request limits:** 750 req/s per bucket. Archiving and tiering batch files;
   one bucket per cluster at first, more if needed.

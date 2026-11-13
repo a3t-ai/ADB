@@ -100,8 +100,9 @@ async fn spike(n: usize) {
     assert!(!before.is_empty(), "the secret should be on disk before compaction (else this test proves nothing)");
     assert!(files_with(dir.path(), secret).is_empty(), "forgotten data must be gone from every file");
     // n/2 public facts (10 of them at version 2), a payload-free stub per forgotten
-    // lineage, and _meta; the 10 old versions dropped.
-    assert_eq!(stats.kept, n / 2 + n / 2 + 1, "{stats:?}");
+    // lineage, the tombstone log's entry per FORGET (kept forever, no payload), and
+    // _meta; the 10 old versions dropped.
+    assert_eq!(stats.kept, n / 2 + n / 2 + n / 2 + 1, "{stats:?}");
     let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
     assert_eq!(store.applied_offset().await.unwrap(), LogOffset(off));
     assert_eq!(store.count_current(Memory::Semantic, now).await.unwrap(), (n / 2) as u64);

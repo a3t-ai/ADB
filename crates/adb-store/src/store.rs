@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, NewRow, PartitionId, RecordId};
+use adb_core::log::{CommitTs, Effect, Kind, LogOffset, LogRecord, NewRow, PartitionId, RecordId, RowData};
 use arrow_array::RecordBatchIterator;
 use arrow_schema::SchemaRef;
 use datafusion::logical_expr::Expr;
@@ -1354,6 +1354,32 @@ impl PartitionStore {
     /// sequencer's conflict check, so the applier would read these same rows. Reading
     /// them again there cost ~4 ms each, in series: ~200 UPDATEs / FORGETs a second,
     /// and every read waiting behind the applier.
+    /// The tombstone log after `after_offset`, oldest first (at most `limit`): every
+    /// FORGET and expiry, kept forever, whatever compaction or tiering did since.
+    pub async fn tombstone_log(&self, after_offset: u64, limit: usize) -> StoreResult<Vec<TombEntry>> {
+        let mut rows = self.scan(Some(&format!("kind = 'tomb_log' AND log_offset > {after_offset}"))).await?;
+        rows.sort_by_key(|r| (r.log_offset, r.id.clone()));
+        rows.truncate(limit);
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let v = &r.data.value;
+                TombEntry {
+                    event: v.get("event").and_then(|e| e.as_str()).unwrap_or("").to_string(),
+                    memory: r.data.memory,
+                    lineage: v.get("lineage").and_then(|e| e.as_str()).unwrap_or("").to_string(),
+                    key: r.data.key.clone(),
+                    scope: r.data.scope.clone(),
+                    namespace: r.data.namespace.clone(),
+                    rows: v.get("rows").and_then(|e| e.as_u64()).unwrap_or(0),
+                    at: r.commit_ts,
+                    offset: r.log_offset,
+                    txn_id: v.get("txn_id").and_then(|e| e.as_str()).map(String::from),
+                }
+            })
+            .collect())
+    }
+
     pub fn hint_rows(&self, offset: u64, rows: Vec<StoredRow>) {
         if rows.is_empty() {
             return;
@@ -1703,11 +1729,15 @@ impl PartitionStore {
                     }
                 }
                 Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => {
-                    for mut r in Self::lineage_and_edges(inner, pre, &out, &row_id(*memory, &lineage_id.0)).await? {
+                    let hidden = Self::lineage_and_edges(inner, pre, &out, &row_id(*memory, &lineage_id.0)).await?;
+                    let event = if matches!(effect, Effect::Forget { .. }) { "forget" } else { "expire" };
+                    let log = tomb_log_row(*memory, &lineage_id.0, event, &hidden, record, epoch);
+                    for mut r in hidden {
                         r.tombstone = true;
                         r.log_offset = off;
                         out.insert(r.id.clone(), r);
                     }
+                    out.insert(log.id.clone(), log);
                 }
                 Effect::Embed { memory, id, embedding } => {
                     if let Some(mut cur) = Self::row(inner, pre, &out, &row_id(*memory, &id.0)).await? {
@@ -1988,6 +2018,74 @@ fn compaction_row_windows(history: Duration, now: CommitTs, pins: std::collectio
             && !(r.superseded_by.is_some() && r.valid_to.is_some_and(|t| t < horizon));
         live.then_some(r)
     }
+}
+
+/// The tombstone-log row of one FORGET or expiry (`Kind::TombLog`): what was hidden,
+/// where, when, by which record — kept forever, in the same put as the tombstones.
+fn tomb_log_row(memory: adb_core::log::Memory, lineage: &str, event: &str, hidden: &[StoredRow], record: &LogRecord, epoch: u64) -> StoredRow {
+    let root = hidden.iter().find(|r| r.id == r.lineage_id).or_else(|| hidden.first());
+    let (tenant_id, scope, visibility, namespace, key) = match root {
+        Some(r) => (r.data.tenant_id.clone(), r.data.scope.clone(), r.data.visibility, r.data.namespace.clone(), r.data.key.clone()),
+        None => (String::new(), String::new(), Default::default(), None, None),
+    };
+    let id = format!("_tomb:{}:{}:{}", record.offset.0, memory.tag(), lineage);
+    StoredRow {
+        id: id.clone(),
+        lineage_id: id,
+        data: RowData {
+            tenant_id,
+            scope,
+            visibility,
+            namespace,
+            memory,
+            kind: Kind::TombLog,
+            key,
+            subject_id: None,
+            predicate: None,
+            object_id: None,
+            link_type: None,
+            weight: None,
+            text: None,
+            value: serde_json::json!({
+                "event": event,
+                "lineage": lineage,
+                "memory": memory.tag(),
+                "rows": hidden.len(),
+                "at": record.commit_ts.0,
+                "offset": record.offset.0,
+                "txn_id": record.txn_id,
+            }),
+            sealed: None,
+            embedding: None,
+            ttl_at: None,
+            provenance: Default::default(),
+        },
+        commit_ts: record.commit_ts,
+        valid_from: record.commit_ts,
+        valid_to: None,
+        superseded_by: None,
+        version: 1,
+        tombstone: false,
+        log_offset: record.offset.0,
+        epoch,
+    }
+}
+
+/// One entry of the tombstone log ([`PartitionStore::tombstone_log`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TombEntry {
+    /// `forget` or `expire`.
+    pub event: String,
+    pub memory: adb_core::log::Memory,
+    pub lineage: String,
+    pub key: Option<String>,
+    pub scope: String,
+    pub namespace: Option<String>,
+    /// Row versions and edges it hid.
+    pub rows: u64,
+    pub at: CommitTs,
+    pub offset: u64,
+    pub txn_id: Option<String>,
 }
 
 /// What a table rewrite did (W5).

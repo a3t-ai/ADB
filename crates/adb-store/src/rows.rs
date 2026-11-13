@@ -173,8 +173,10 @@ impl StoredRow {
     /// The lineage's version at `now` in transaction time: not superseded, not
     /// closed, not expired, not forgotten — whatever a fact's own validity says.
     /// Writes (supersede, key checks) and the hot cache work on live rows.
+    /// The tombstone log is never memory: it is kept, but no view of memory holds it.
     pub fn is_live(&self, now: CommitTs) -> bool {
         !self.tombstone
+            && self.data.kind != Kind::TombLog
             && self.superseded_by.is_none()
             && self.valid_to.is_none_or(|t| t > now)
             && self.data.ttl_at.is_none_or(|t| t > now)
@@ -194,6 +196,7 @@ impl StoredRow {
     /// history read. Forgotten and expired records have no history.
     pub fn is_current_at(&self, tx: CommitTs, valid: CommitTs) -> bool {
         !self.tombstone
+            && self.data.kind != Kind::TombLog
             && self.commit_ts <= tx
             && self.valid_to.is_none_or(|t| t > tx)
             && self.data.ttl_at.is_none_or(|t| t > tx)
