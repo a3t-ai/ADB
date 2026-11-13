@@ -76,7 +76,7 @@ async fn reads(store: &PartitionStore, stage: &str) {
 async fn index_spike() {
     for (label, memtable_rows) in [("all in the memtable", 50_000), ("flushed generations (memtable 2,000)", 2_000)] {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows, wal_flush: Duration::from_millis(200), embedding_model: None };
+        let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows, wal_flush: Duration::from_millis(200), embedding_model: None, cold: None };
         let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
         let mut off = 0u64;
         for chunk in 0..100 {

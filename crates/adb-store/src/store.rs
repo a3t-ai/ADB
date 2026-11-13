@@ -38,6 +38,9 @@ use crate::{StoreError, StoreResult};
 
 #[path = "store_fold.rs"]
 mod fold;
+#[path = "tier.rs"]
+mod tier;
+pub use tier::{ArchiveStats, COLD_BASE_ID};
 
 /// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
 /// deployment (D3 S5); a table of another dimension is rewritten at open.
@@ -57,6 +60,11 @@ pub struct StoreConfig {
     /// came from another model has them cleared at open (the backfill re-embeds).
     /// `None`: not checked.
     pub embedding_model: Option<String>,
+    /// Object storage behind the local table (S3 option B): a URI such as
+    /// `s3://adb-1/adb-dev/cluster-a` (credentials from the `AWS_*` variables) or
+    /// `file:///…`. Tables made with it get a cold base there and are archived to a
+    /// mirror there ([`PartitionStore::archive`]). `None`: local only, as before.
+    pub cold: Option<String>,
 }
 
 /// The model of tables whose `_meta` names none (written before W9.10).
@@ -64,7 +72,7 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "bge-small-en-v1.5";
 
 impl StoreConfig {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), embedding_dim: DEFAULT_EMBEDDING_DIM, memtable_rows: 10_000, wal_flush: Duration::from_secs(1), embedding_model: None }
+        Self { root: root.into(), embedding_dim: DEFAULT_EMBEDDING_DIM, memtable_rows: 10_000, wal_flush: Duration::from_secs(1), embedding_model: None, cold: None }
     }
 }
 
@@ -160,6 +168,10 @@ pub struct PartitionStore {
     apply_seq: std::sync::atomic::AtomicU64,
     /// The schema version `_meta` gets (`schema_version`).
     layout: std::sync::atomic::AtomicU32,
+    /// One archive at a time ([`Self::archive`]).
+    archiving: tokio::sync::Mutex<()>,
+    /// What the object-storage mirror holds (`tier`).
+    archive_state: std::sync::Mutex<tier::ArchiveState>,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -371,6 +383,8 @@ impl PartitionStore {
             if let Some(found) = embedding_dim_of(&ds) {
                 if found != cfg.embedding_dim {
                     drop(ds);
+                    // The old lineage is complete on the mirror before the rewrite replaces it.
+                    tier::archive_dir(cfg, partition, &dir).await?;
                     Box::pin(Self::rewrite_dim(cfg, partition, found)).await?;
                 }
             }
@@ -687,9 +701,14 @@ impl PartitionStore {
                 kept += buf.len();
                 let batch = encode(&buf, &self.schema, self.dim)?;
                 buf.clear();
-                let mode = if ds.is_some() { lance::dataset::WriteMode::Append } else { lance::dataset::WriteMode::Create };
-                let params = WriteParams { mode, ..Default::default() };
+                // The first chunk creates the table: its cold base and lineage too (`tier`).
+                let (params, lineage) = if ds.is_some() {
+                    (WriteParams { mode: lance::dataset::WriteMode::Append, ..Default::default() }, None)
+                } else {
+                    tier::new_table_params(&self.cfg, self.partition)
+                };
                 ds = Some(Dataset::write(RecordBatchIterator::new([Ok(batch)], self.schema.clone()), &uri, Some(params)).await.map_err(lance)?);
+                tier::record_lineage(std::path::Path::new(&uri), lineage.as_deref())?;
             }
             if done {
                 break;
@@ -697,7 +716,7 @@ impl PartitionStore {
         }
         let Some(mut ds) = ds else {
             // Nothing at all, not even `_meta` (not expected): an empty table.
-            Self::create(&uri, &self.schema, self.dim).await?;
+            Self::create(&uri, &self.schema, self.dim, &self.cfg, self.partition).await?;
             return Ok((total, kept));
         };
         table_indexes(&mut ds).await?;
@@ -714,6 +733,9 @@ impl PartitionStore {
         let trash = dir.with_file_name("memory.compacted.trash");
         let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
         let _one = self.folding.lock().await;
+        // The old lineage is complete on the mirror before its table is replaced
+        // and deleted locally (`tier`; a no-op without object storage).
+        self.archive().await?;
         let mut g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
         let bytes_before = dir_size(&dir);
         // The new table, complete and closed, beside the old one.
@@ -729,7 +751,7 @@ impl PartitionStore {
             let total = all.len();
             let mut rows: Vec<StoredRow> = all.into_iter().filter_map(keep).collect();
             rows.extend(extra.iter().cloned());
-            Self::create(&staged.to_string_lossy(), &self.schema, self.dim).await?;
+            Self::create(&staged.to_string_lossy(), &self.schema, self.dim, &self.cfg, self.partition).await?;
             let new = Self::open_inner(&self.cfg, self.partition, &staged).await?;
             for chunk in rows.chunks(REWRITE_CHUNK) {
                 new.writer.put(vec![encode(chunk, &self.schema, self.dim)?]).await.map_err(lance)?;
@@ -758,6 +780,8 @@ impl PartitionStore {
         let inner = Self::open_inner(&self.cfg, self.partition, &dir).await?;
         Self::reset_ledger(&inner, self.applied.load(std::sync::atomic::Ordering::SeqCst)).await?;
         *g = Some(inner);
+        // A new lineage: its own archive, empty so far.
+        *self.archive_state.lock().unwrap() = tier::load_archive_state(&dir);
         // Compaction may drop or rewrite rows: cached ones read again.
         self.rows.clear();
         // A migration's rows bypassed the applies: the field indexes rebuild on use.
@@ -859,7 +883,7 @@ impl PartitionStore {
         if staged.exists() {
             std::fs::remove_dir_all(&staged).map_err(err)?;
         }
-        Self::create(&staged.to_string_lossy(), &memory_schema(cfg.embedding_dim), cfg.embedding_dim).await?;
+        Self::create(&staged.to_string_lossy(), &memory_schema(cfg.embedding_dim), cfg.embedding_dim, cfg, partition).await?;
         let new = Self::open_at(cfg, partition, &staged).await?;
         new.put_rows(&rows).await?;
         new.close().await?;
@@ -911,6 +935,8 @@ impl PartitionStore {
             yield_compaction: std::sync::atomic::AtomicBool::new(false),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
             layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
+            archiving: tokio::sync::Mutex::new(()),
+            archive_state: std::sync::Mutex::new(tier::load_archive_state(dir)),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -946,7 +972,7 @@ impl PartitionStore {
         let schema = memory_schema(cfg.embedding_dim);
         let uri = dir.to_string_lossy().to_string();
         if !dir.exists() {
-            Self::create(&uri, &schema, cfg.embedding_dim).await?;
+            Self::create(&uri, &schema, cfg.embedding_dim, cfg, partition).await?;
         }
         let base = Arc::new(Dataset::open(&uri).await.map_err(lance)?);
         // Schema v1 kept `value` as JSON text; v2 needs JSONB (D3.6). No in-place
@@ -1020,12 +1046,15 @@ impl PartitionStore {
     }
 
     /// Base table with the `_meta` row, a BTree on `id`, and a MemWAL maintaining it.
-    async fn create(uri: &str, schema: &SchemaRef, dim: i32) -> StoreResult<()> {
+    /// With [`StoreConfig::cold`], the table gets its cold base and a new lineage (`tier`).
+    async fn create(uri: &str, schema: &SchemaRef, dim: i32, cfg: &StoreConfig, partition: PartitionId) -> StoreResult<()> {
         let meta = StoredRow::meta(0, CommitTs(0), 0, serde_json::json!({ "embedding_dim": dim }));
         let batch = encode(&[meta], schema, dim)?;
-        let mut ds = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema.clone()), uri, Some(WriteParams::default()))
+        let (params, lineage) = tier::new_table_params(cfg, partition);
+        let mut ds = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema.clone()), uri, Some(params))
             .await
             .map_err(lance)?;
+        tier::record_lineage(std::path::Path::new(uri), lineage.as_deref())?;
         table_indexes(&mut ds).await?;
         Ok(())
     }

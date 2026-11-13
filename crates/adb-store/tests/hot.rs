@@ -130,7 +130,7 @@ async fn check(store: &PartitionStore, step: usize) {
 #[tokio::test]
 async fn cache_follows_the_table() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 7, wal_flush: Duration::from_millis(20), embedding_model: None };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 7, wal_flush: Duration::from_millis(20), embedding_model: None, cold: None };
     let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
     store.set_cache(Some(HotCache::new(rules(), false))).await.unwrap();
     let mut rng = Rng(7);

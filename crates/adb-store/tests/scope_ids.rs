@@ -44,7 +44,7 @@ fn rec(offset: u64, effects: Vec<Effect>) -> LogRecord {
 #[tokio::test(flavor = "multi_thread")]
 async fn named_scope_rows_get_scoped_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 1000, wal_flush: Duration::from_millis(50), embedding_model: None };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 1000, wal_flush: Duration::from_millis(50), embedding_model: None, cold: None };
     let now = CommitTs(T0 + 1_000_000);
     {
         let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();

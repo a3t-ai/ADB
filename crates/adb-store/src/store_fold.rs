@@ -50,7 +50,7 @@ fn in_list(ids: &[String]) -> Expr {
 
 /// A plain Lance scan returns JSONB columns (`value`) as Arrow JSON text; the rows
 /// codec reads Lance's binary form (as the LSM scanner returns it).
-fn jsonb(b: &arrow_array::RecordBatch) -> StoreResult<arrow_array::RecordBatch> {
+pub(super) fn jsonb(b: &arrow_array::RecordBatch) -> StoreResult<arrow_array::RecordBatch> {
     lance_arrow_14::json::convert_json_columns(b).map_err(lance)
 }
 
@@ -119,7 +119,7 @@ struct FoldCounts {
 }
 
 impl PartitionStore {
-    fn table_dir(&self) -> std::path::PathBuf {
+    pub(super) fn table_dir(&self) -> std::path::PathBuf {
         self.root.join(format!("p{}", self.partition.0)).join("memory.lance")
     }
 
@@ -136,6 +136,9 @@ impl PartitionStore {
             return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
         }
         let started = std::time::Instant::now();
+        // The mirror catches up first, so the cleanup in step 5 may remove the
+        // versions it now holds (`tier`; a no-op without object storage).
+        self.archive().await?;
         let dir = self.table_dir();
         let bytes_before = dir_size(&dir);
         let mut n = FoldCounts::default();
@@ -280,7 +283,8 @@ impl PartitionStore {
             })
             .await
             .map_err(lance)?;
-        let removed = inner.base.cleanup_old_versions(chrono::TimeDelta::zero(), Some(true), Some(false)).await.map_err(lance)?;
+        // Without object storage every old version; with it, only those the mirror holds.
+        let removed = self.cleanup_local_versions(&inner.base).await?;
         let shard_dir = dir.join("_mem_wal").join(shard.as_hyphenated().to_string());
         let listed: HashSet<u64> = m.sstables.iter().map(|t| t.generation).collect();
         // SSTable directories: the folded ones, and any a crash left unlisted below them.

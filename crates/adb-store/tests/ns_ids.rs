@@ -53,7 +53,7 @@ fn fact(ns: &str, subject: &str, predicate: &str, value: &str) -> NewRow {
 #[tokio::test(flavor = "multi_thread")]
 async fn namespaced_rows_get_namespaced_ids_and_shared_stubs_split() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 1000, wal_flush: Duration::from_millis(50), embedding_model: None };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 1000, wal_flush: Duration::from_millis(50), embedding_model: None, cold: None };
     let now = CommitTs(T0 + 1_000_000);
     {
         let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();

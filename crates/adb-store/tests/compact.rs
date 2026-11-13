@@ -60,7 +60,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 async fn spike(n: usize) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 2_000, wal_flush: Duration::from_millis(50), embedding_model: None };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 2_000, wal_flush: Duration::from_millis(50), embedding_model: None, cold: None };
     let now = CommitTs(T0 + 200 * DAY);
     let mut off = 0u64;
     {
@@ -131,7 +131,7 @@ async fn compaction_100k() {
 #[tokio::test]
 async fn a_branch_pin_keeps_the_versions_current_at_its_point() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 2_000, wal_flush: Duration::from_millis(50), embedding_model: None };
+    let cfg = StoreConfig { root: dir.path().to_path_buf(), embedding_dim: 4, memtable_rows: 2_000, wal_flush: Duration::from_millis(50), embedding_model: None, cold: None };
     let now = CommitTs(T0 + 200 * DAY);
     let store = PartitionStore::open(&cfg, PartitionId(0)).await.unwrap();
     let mut off = 0u64;
