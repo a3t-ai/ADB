@@ -334,6 +334,76 @@ async fn log_is_purged_below_lances_durable_offset() {
 
 /// Stage D3.7: Lance is written by a background task, and a read served from Lance
 /// still sees every write that returned before it.
+/// S3 option B: with object storage behind the table, the log keeps every record
+/// it can't yet rebuild from there — nothing above the archive watermark is purged —
+/// and the archive tick (archive, fold when too much is held back, archive) moves
+/// the watermark on, after which the log is trimmed again.
+#[tokio::test(flavor = "multi_thread")]
+async fn log_is_kept_until_object_storage_holds_it() {
+    use adb_core::log::{Epoch, LogOffset, PartitionId};
+    use adb_executor::{DurableWrites, Writes};
+    use adb_log::{Log, LocalWal, WalConfig};
+    use adb_sequencer::Sequencer;
+    use adb_store::{PartitionStore, StoreConfig};
+    use std::sync::Arc;
+
+    // Only this test reads it (`archive_tick`).
+    std::env::set_var("ADB_ARCHIVE_FOLD_RECORDS", "100");
+    let dir = tempfile::tempdir().unwrap();
+    let cold = tempfile::tempdir().unwrap();
+    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };
+    let store_cfg = StoreConfig {
+        root: dir.path().join("store"),
+        embedding_dim: 4,
+        memtable_rows: 100,
+        wal_flush: std::time::Duration::from_millis(20),
+        embedding_model: None,
+        cold: Some(format!("file://{}", cold.path().display())),
+    };
+    let seq = Sequencer::new(LocalWal::open(PartitionId(0), wal_cfg.clone()).unwrap(), Epoch(1));
+    let store = Arc::new(PartitionStore::open(&store_cfg, PartitionId(0)).await.unwrap());
+    let (w, _) = DurableWrites::open(seq, store.clone()).await.unwrap();
+    let write = |i: u64| {
+        let w = &w;
+        async move {
+            Writes::store(w, adb_core::MemoryType::Episodic, &format!("e{i}"), serde_json::json!({"bid_id": format!("e{i}"), "i": i}), adb_core::Scope::Private, None, None, None)
+                .await
+                .unwrap();
+        }
+    };
+    let n = 700u64;
+    for i in 1..=n {
+        write(i).await;
+        if i % 50 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        }
+    }
+    // Nothing archived yet: the log still holds offset 1 although Lance has it.
+    let first_kept = |dir: &std::path::Path| {
+        let wal = LocalWal::open(PartitionId(0), WalConfig { dir: dir.join("p0"), segment_bytes: 4096 }).unwrap();
+        (1..=n + 400).find(|o| futures::executor::block_on(wal.read(LogOffset(*o), 1)).is_ok()).unwrap_or(0)
+    };
+    assert_eq!(store.log_floor(), Some(LogOffset(1)));
+
+    // The archive tick: archive, fold (too much held back), archive.
+    w.archive_tick().await.unwrap();
+    let (version, watermark) = store.archive_watermark();
+    eprintln!("after the archive tick: version {version}, watermark {}", watermark.0);
+    assert_eq!(watermark, LogOffset(n), "the archived table holds every record");
+    let current: serde_json::Value = serde_json::from_slice(&std::fs::read(cold.path().join("p0/CURRENT")).unwrap()).unwrap();
+    assert_eq!(current["watermark"], n);
+
+    // More writes trigger the purge again: now everything up to the watermark may go.
+    for i in n + 1..=n + 300 {
+        write(i).await;
+    }
+    drop(w);
+    let kept = first_kept(dir.path());
+    eprintln!("first record still in the log: {kept}");
+    assert!(kept > 1, "the log was trimmed below the watermark");
+    assert!(kept <= n + 1, "nothing above the watermark was trimmed (first kept {kept})");
+}
+
 #[tokio::test]
 async fn reads_see_their_own_writes_with_the_background_applier() {
     let dir = tempfile::tempdir().unwrap();

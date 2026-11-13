@@ -421,7 +421,10 @@ pub(crate) async fn open_store(dir: &std::path::Path) -> Result<(Arc<PartitionSt
     let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
     // The replica set's other nodes may embed on this node's model (C-17b).
     adb_embed::peers::serve_with(embedder.clone());
-    let store_cfg = StoreConfig { embedding_dim, embedding_model, ..StoreConfig::new(dir.join("store")) };
+    // S3 option B (`.ai/S3_OPTION_B_PLAN.md`): object storage behind the table, from
+    // `ADB_COLD_URI` (e.g. s3://adb-1/prod/cluster-a; credentials from AWS_*).
+    let cold = std::env::var("ADB_COLD_URI").ok().filter(|v| !v.trim().is_empty());
+    let store_cfg = StoreConfig { embedding_dim, embedding_model, cold, ..StoreConfig::new(dir.join("store")) };
     let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
     Ok((store, embedder))
 }
@@ -459,6 +462,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
         let mut last_nightly = None;
         // How often (ticks of 1 s) compaction thresholds are checked (`ADB_COMPACT_CHECK_SECS`, default 10).
         let check = std::env::var("ADB_COMPACT_CHECK_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(10);
+        let archive_every = std::env::var("ADB_ARCHIVE_EVERY_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(30);
         loop {
             tick.tick().await;
             ticks += 1;
@@ -475,6 +479,12 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 }
                 if let Err(e) = w.compact().await {
                     tracing::warn!(error = %e, "compaction failed; retrying later");
+                }
+            }
+            // S3 option B: archive to object storage every `ADB_ARCHIVE_EVERY_SECS` (default 30).
+            if ticks % archive_every == 0 {
+                if let Err(e) = w.archive_tick().await {
+                    tracing::warn!(error = %e, "archive to object storage failed; the log keeps the records; retrying");
                 }
             }
             // W5-L4: the platform tables, nightly and on their version count.

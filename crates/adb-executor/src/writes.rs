@@ -1875,6 +1875,27 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     /// Whether compaction is due on size: more than 16 MemWAL generations (W5), or
     /// many writes since the last one (W7).
+    /// Object storage (S3 option B): archive the table, then fold when the log held
+    /// back for it passes `ADB_ARCHIVE_FOLD_RECORDS` (default 100 000), so the next
+    /// archive moves the watermark on. A no-op without object storage.
+    pub async fn archive_tick(&self) -> AdbResult<()> {
+        let Some(store) = &self.store else { return Ok(()) };
+        if store.log_floor().is_none() {
+            return Ok(());
+        }
+        let stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+        let tip = seq_lock!(self).log().last_offset().0;
+        let held = tip.saturating_sub(stats.watermark);
+        if stats.files > 0 {
+            tracing::info!(files = stats.files, bytes = stats.bytes, version = stats.version, watermark = stats.watermark, held, "archived to object storage");
+        }
+        if held >= archive_fold_records() {
+            self.compact().await?;
+            store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+        }
+        Ok(())
+    }
+
     pub async fn compaction_due(&self) -> bool {
         let erase = self.forgotten_since.lock().unwrap().is_some_and(|t| t.elapsed() >= ERASE_WITHIN);
         match &self.store {
@@ -2680,6 +2701,10 @@ impl<L: Log + 'static> DurableWrites<L> {
                     // Keep what subscribers haven't acked, up to `retain_max` behind the
                     // tip (E3); never above Lance's durable offset.
                     let mut floor = d.next();
+                    // With object storage: never above what it can rebuild (the archive watermark).
+                    if let Some(cap) = s.log_floor() {
+                        floor = LogOffset(floor.0.min(cap.0));
+                    }
                     // Platform tables apply synchronously; the log keeps a platform
                     // record only if its apply failed (they catch up on the next open).
                     if let Some(p) = self.platform_floor().await {
@@ -2714,6 +2739,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
         }
     }
+}
+
+/// Log records held back for object storage before a fold is forced (`archive_tick`).
+fn archive_fold_records() -> u64 {
+    std::env::var("ADB_ARCHIVE_FOLD_RECORDS").ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(100_000)
 }
 
 /// How often (in log records) the log is trimmed below Lance's durable offset.

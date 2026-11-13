@@ -229,6 +229,10 @@ pub(crate) async fn archive_table(cfg: &StoreConfig, partition: PartitionId, dir
     st.version = st.version.max(version);
     st.watermark = st.watermark.max(watermark);
     save_archive_state(dir, &lineage, &st)?;
+    // The partition's active lineage, for a node that takes it over from object storage.
+    let (pstore, ppath) = lance::io::ObjectStore::from_uri(&format!("{}/p{}", cold.trim_end_matches('/'), partition.0)).await.map_err(lance)?;
+    let current = serde_json::json!({ "lineage": lineage, "version": st.version, "watermark": st.watermark });
+    pstore.put(&ppath.child("CURRENT"), current.to_string().as_bytes()).await.map_err(lance)?;
     stats.version = st.version;
     stats.watermark = st.watermark;
     Ok((stats, st))
@@ -302,6 +306,13 @@ impl PartitionStore {
         let mut g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
         g.as_mut().expect("the partition store is open").base = Arc::new(ds);
         Ok(stats)
+    }
+
+    /// The lowest log offset the log must keep while object storage is on: one past
+    /// the archive watermark (everything above it can't yet be rebuilt from object
+    /// storage alone). `None` without [`StoreConfig::cold`]: the log is trimmed as before.
+    pub fn log_floor(&self) -> Option<LogOffset> {
+        self.cfg.cold.as_ref().map(|_| LogOffset(self.archive_state.lock().unwrap().watermark + 1))
     }
 
     /// The newest archived version and its offset (0 without object storage).
