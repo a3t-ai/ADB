@@ -25,8 +25,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use lance::dataset::optimize::{compact_files_with_planner, CompactionOptions, CompactionPlan, CompactionPlanner, TaskData};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
-use lance::table::format::BasePath;
+use lance::table::format::{BasePath, Fragment};
 
 use super::*;
 
@@ -83,6 +84,35 @@ pub struct ArchiveState {
     pub version: u64,
     /// That version's `_meta` offset: the log may be trimmed to it.
     pub watermark: u64,
+}
+
+/// What one [`PartitionStore::tier`] moved to the cold base.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TierStats {
+    pub fragments: usize,
+    pub rows: usize,
+    /// Local bytes those fragments held (they leave the disk at the next guarded cleanup).
+    pub bytes: u64,
+    /// Local bytes of the fragments that stay.
+    pub local_after: u64,
+}
+
+/// Compacts the given fragments into the cold base.
+struct ToCold {
+    fragments: Vec<Fragment>,
+}
+
+#[async_trait::async_trait]
+impl CompactionPlanner for ToCold {
+    async fn plan(&self, ds: &Dataset) -> lance::Result<CompactionPlan> {
+        let options = CompactionOptions {
+            target_bases: Some(vec![COLD_BASE_ID]),
+            materialize_deletions_threshold: 0.0,
+            num_threads: Some(1),
+            ..Default::default()
+        };
+        Ok(CompactionPlan { tasks: vec![TaskData { fragments: self.fragments.clone() }], read_version: ds.version().version, options })
+    }
 }
 
 /// What one [`PartitionStore::archive`] did.
@@ -228,6 +258,49 @@ impl PartitionStore {
         let st = self.archive_state.lock().unwrap().clone();
         let (stats, st) = archive_table(&self.cfg, self.partition, &self.table_dir(), &base, st).await?;
         *self.archive_state.lock().unwrap() = st;
+        Ok(stats)
+    }
+
+    /// Move the oldest local fragments into the cold base until the local ones hold
+    /// at most `keep_local_bytes` (the newest fragment always stays local). Their
+    /// local files leave the disk at the next guarded cleanup, once archived. A no-op
+    /// without [`StoreConfig::cold`].
+    pub async fn tier(&self, keep_local_bytes: u64) -> StoreResult<TierStats> {
+        if self.cfg.cold.is_none() {
+            return Ok(TierStats::default());
+        }
+        let _t = adb_core::steps::timer("store.tier");
+        // The base table changes only under this lock (fold, rewrite, tier).
+        let _one = self.folding.lock().await;
+        let dir = self.table_dir();
+        let base = { let g = self.state.read().await; open_state(&g).base.clone() };
+        let size = |f: &Fragment| -> u64 {
+            f.files.iter().map(|d| std::fs::metadata(dir.join("data").join(&d.path)).map(|m| m.len()).unwrap_or(0)).sum()
+        };
+        // Local fragments, oldest first (fragment ids grow with time).
+        let mut local: Vec<(Fragment, u64)> =
+            base.manifest.fragments.iter().filter(|f| f.files.iter().all(|d| d.base_id.is_none())).map(|f| (f.clone(), size(f))).collect();
+        local.sort_by_key(|(f, _)| f.id);
+        let total: u64 = local.iter().map(|(_, b)| b).sum();
+        let mut stats = TierStats { local_after: total, ..Default::default() };
+        let mut chosen = Vec::new();
+        for (f, b) in local.iter().take(local.len().saturating_sub(1)) {
+            if stats.local_after <= keep_local_bytes {
+                break;
+            }
+            chosen.push(f.clone());
+            stats.fragments += 1;
+            stats.rows += f.physical_rows.unwrap_or(0);
+            stats.bytes += b;
+            stats.local_after -= b;
+        }
+        if chosen.is_empty() {
+            return Ok(stats);
+        }
+        let mut ds = (*base).clone();
+        compact_files_with_planner(&mut ds, None, &ToCold { fragments: chosen }).await.map_err(lance)?;
+        let mut g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
+        g.as_mut().expect("the partition store is open").base = Arc::new(ds);
         Ok(stats)
     }
 

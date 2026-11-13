@@ -40,7 +40,7 @@ use crate::{StoreError, StoreResult};
 mod fold;
 #[path = "tier.rs"]
 mod tier;
-pub use tier::{ArchiveStats, COLD_BASE_ID};
+pub use tier::{ArchiveStats, TierStats, COLD_BASE_ID};
 
 /// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
 /// deployment (D3 S5); a table of another dimension is rewritten at open.

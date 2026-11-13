@@ -75,6 +75,13 @@ async fn mirror_manifests(mirror: &str) -> usize {
     list.iter().filter(|o| o.location.as_ref().ends_with(".manifest")).count()
 }
 
+async fn cold_files(cold: &str) -> usize {
+    use futures::TryStreamExt;
+    let (store, base) = lance::io::ObjectStore::from_uri(cold).await.unwrap();
+    let list: Vec<_> = store.read_dir_all(&base.child("data"), None).try_collect().await.unwrap();
+    list.len()
+}
+
 fn local_manifests(root: &std::path::Path) -> usize {
     std::fs::read_dir(root.join("p0/memory.lance/_versions")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".manifest")).count()
 }
@@ -124,14 +131,36 @@ async fn tiered(cold: String) {
     assert!(on_mirror > on_disk, "local cleanup removed old versions; the mirror kept them ({on_mirror} vs {on_disk})");
     assert_eq!(rows(&mirror).await, 60 * 100 + 1);
 
+    // 3b. Tier: move every local fragment but the newest to the cold base; after the
+    //     next fold (archive first, then the guarded cleanup) the local data shrinks
+    //     and every row still reads, locally and from the mirror.
+    let local_data = |root: &std::path::Path| -> u64 {
+        std::fs::read_dir(root.join("p0/memory.lance/data")).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum()
+    };
+    let before = local_data(root.path());
+    let t = store.tier(0).await.unwrap();
+    eprintln!("tier: {t:?}");
+    assert!(t.fragments > 0, "{t:?}");
+    off = apply(&store, off, 5).await;
+    store.compact(history, now).await.unwrap();
+    let d = store.archive().await.unwrap();
+    eprintln!("archive after tiering: {d:?}");
+    let after = local_data(root.path());
+    eprintln!("local data: {before} → {after} bytes");
+    assert!(after < before, "tiered fragments left the local disk ({before} → {after})");
+    assert!(cold_files(&format!("{base_uri}/cold")).await > 0, "the cold base holds the tiered data");
+    assert_eq!(rows(&local).await, 65 * 100 + 1);
+    assert_eq!(rows(&mirror).await, 65 * 100 + 1);
+    assert_eq!(d.watermark, off);
+
     // 4. A full rewrite (here: clearing vectors) is a new lineage; the old one stays.
     store.clear_vectors().await.unwrap();
     let l2 = lineage(root.path());
     assert_ne!(l1, l2, "a rewrite starts a new lineage");
     let c = store.archive().await.unwrap();
     eprintln!("archive 3 (new lineage): {c:?}");
-    assert_eq!(rows(&format!("{}/p0/{l2}/mirror", cold.trim_end_matches('/'))).await, 60 * 100 + 1);
-    assert_eq!(rows(&mirror).await, 60 * 100 + 1, "the old lineage's archive is kept");
+    assert_eq!(rows(&format!("{}/p0/{l2}/mirror", cold.trim_end_matches('/'))).await, 65 * 100 + 1);
+    assert_eq!(rows(&mirror).await, 65 * 100 + 1, "the old lineage's archive is kept");
     store.close().await.unwrap();
 }
 
