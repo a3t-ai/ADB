@@ -1072,6 +1072,10 @@ impl<L: Log + 'static> DurableWrites<L> {
         let now = CommitTs::from_datetime(time::now());
         // PF-16: in place, without the sequencer; only the swap holds readers, briefly.
         let stats = store.compact_with_windows(HISTORY, now, &pins, windows).await.map_err(store_err)?;
+        // With object storage the archive holds every payload before the log loses any.
+        if store.log_floor().is_some() {
+            store.archive().await.map_err(store_err)?;
+        }
         let mut redacted = 0;
         if !rows.is_empty() {
             let mut seq = seq_lock!(self);

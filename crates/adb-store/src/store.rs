@@ -444,6 +444,14 @@ impl PartitionStore {
         // superseded before it are the candidates `keep` decides.
         let shortest = windows.iter().map(|(_, w)| *w).fold(history, Duration::min);
         let horizon = CommitTs(now.0 - shortest.as_micros() as i64);
+        // With object storage, nothing is physically removed (only a manual purge does
+        // that, `.ai/S3_OPTION_B_PLAN.md` §1): the fold merges the MemWAL into the base
+        // and keeps every row as it is — tombstoned rows with their payloads (no read
+        // returns them), superseded versions — so all of it reaches the archive. The
+        // tier job bounds the local disk instead.
+        if self.cfg.cold.is_some() {
+            return self.fold(&Some, now, horizon).await;
+        }
         let keep = compaction_row_windows(history, now, pins.clone(), windows);
         self.fold(&keep, now, horizon).await
     }

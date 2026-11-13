@@ -88,6 +88,10 @@ async fn every_forget_and_expiry_is_logged_and_kept() {
     // Compaction, tiering and a full rewrite keep it.
     store.compact(history, now).await.unwrap();
     check(&store.tombstone_log(0, 100).await.unwrap());
+    // With object storage nothing is physically removed by compaction: the forgotten
+    // fact keeps its payload (no read returns it), so the archive holds it.
+    let k2 = store.scan(Some("tombstone = true AND lineage_id = 'semantic:k2'")).await.unwrap();
+    assert!(k2.iter().any(|r| r.data.text.as_deref() == Some("fact k2")), "forgotten payload kept: {k2:?}");
     store.archive().await.unwrap();
     store.tier(0).await.unwrap();
     store.compact(history, now).await.unwrap();
@@ -102,5 +106,6 @@ async fn every_forget_and_expiry_is_logged_and_kept() {
     let mirror = format!("file://{}/p0/{}/mirror", cold.path().display(), lineage.trim());
     let ds = adb_store::lance::Dataset::open(&mirror).await.unwrap();
     assert_eq!(ds.count_rows(Some("kind = 'tomb_log'".to_string())).await.unwrap(), 4);
+    assert_eq!(ds.count_rows(Some("tombstone = true AND text = 'fact k2'".to_string())).await.unwrap(), 1, "the archive holds the forgotten payload");
     store.close().await.unwrap();
 }

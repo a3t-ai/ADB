@@ -338,10 +338,6 @@ impl Replica {
         }
         self.store.sync_to_disk().await.map_err(s("store"))?;
         let mut floor = durable.0 + 1;
-        // With object storage: never above what it can rebuild (the archive watermark).
-        if let Some(cap) = self.store.log_floor() {
-            floor = floor.min(cap.0);
-        }
         // Below what the platform tables hold in Lance, not in memory (PF-5).
         floor = floor.min(self.platform.applied_offset().await + 1);
         if let Some(f) = self.engine.floor().await {
