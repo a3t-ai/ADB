@@ -232,7 +232,7 @@ pub(crate) async fn archive_table(cfg: &StoreConfig, partition: PartitionId, dir
     // The partition's active lineage, for a node that takes it over from object storage.
     let (pstore, ppath) = lance::io::ObjectStore::from_uri(&format!("{}/p{}", cold.trim_end_matches('/'), partition.0)).await.map_err(lance)?;
     let current = serde_json::json!({ "lineage": lineage, "version": st.version, "watermark": st.watermark });
-    pstore.put(&ppath.child("CURRENT"), current.to_string().as_bytes()).await.map_err(lance)?;
+    pstore.put(&ppath.clone().join("CURRENT"), current.to_string().as_bytes()).await.map_err(lance)?;
     stats.version = st.version;
     stats.watermark = st.watermark;
     Ok((stats, st))
@@ -246,6 +246,82 @@ pub(crate) async fn archive_dir(cfg: &StoreConfig, partition: PartitionId, dir: 
     }
     let base = Dataset::open(&dir.to_string_lossy()).await.map_err(lance)?;
     archive_table(cfg, partition, dir, &base, load_archive_state(dir)).await.map(|_| ())
+}
+
+/// What [`archive_tree`] has copied, kept in the tree (`_adb_archived`).
+const TREE_STATE: &str = "_adb_archived";
+
+/// Archive a directory tree that is not a partition table — the platform tables,
+/// the engine's spaces — under `{cold}/{kind}/{lineage}/`: every file not copied yet
+/// (data and side files, then manifests), then `last`, the contents captured by the
+/// caller of files rewritten in place (`_applied.json`, `snapshot.json`), so the
+/// archive matches the offsets they name. `skip` leaves out working state the log
+/// rebuilds (a MemWAL). The lineage is the tree's own (`_adb_lineage`, made on first
+/// use): another node's tree never shares its prefix. Nothing is deleted.
+pub async fn archive_tree(cold: &str, kind: &str, dir: &Path, skip: &(dyn Fn(&str) -> bool + Sync), last: &[(String, Vec<u8>)]) -> StoreResult<(String, ArchiveStats)> {
+    let lineage = match lineage_of(dir) {
+        Some(l) => l,
+        None => {
+            let l = uuid::Uuid::new_v4().simple().to_string();
+            std::fs::create_dir_all(dir).map_err(|e| StoreError::Decode(format!("archive tree: {e}")))?;
+            record_lineage(dir, Some(&l))?;
+            l
+        }
+    };
+    let state_path = dir.join(TREE_STATE);
+    let mut done: HashSet<String> = std::fs::read_to_string(&state_path).map(|t| t.lines().map(String::from).collect()).unwrap_or_default();
+    let last_names: HashSet<&str> = last.iter().map(|(n, _)| n.as_str()).collect();
+    let mut todo: Vec<String> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(dir).map(|r| r.to_string_lossy().to_string()).unwrap_or_default();
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if rel.is_empty() || skip(&rel) || rel == LINEAGE_FILE || rel == TREE_STATE || name == "LOCK" || name.ends_with(".tmp") || last_names.contains(rel.as_str()) {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else if !done.contains(&rel) || rel.ends_with("latest_version_hint.json") {
+                todo.push(rel);
+            }
+        }
+    }
+    todo.sort_by_key(|f| (archive_rank(f.rsplit_once(".lance/").map(|(_, r)| r).unwrap_or(f)), f.clone()));
+    let uri = format!("{}/{}/{}", cold.trim_end_matches('/'), kind, lineage);
+    let (store, base) = lance::io::ObjectStore::from_uri(&uri).await.map_err(lance)?;
+    let dest = |rel: &str| rel.split('/').fold(base.clone(), |p, part| p.join(part));
+    let mut stats = ArchiveStats::default();
+    for rel in todo {
+        let bytes = match std::fs::read(dir.join(&rel)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(StoreError::Decode(format!("reading {rel} to archive: {e}"))),
+        };
+        store.put(&dest(&rel), &bytes).await.map_err(lance)?;
+        stats.files += 1;
+        stats.bytes += bytes.len() as u64;
+        done.insert(rel);
+    }
+    for (rel, bytes) in last {
+        store.put(&dest(rel), bytes).await.map_err(lance)?;
+        stats.files += 1;
+        stats.bytes += bytes.len() as u64;
+    }
+    let mut lines: Vec<&str> = done.iter().map(String::as_str).collect();
+    lines.sort_unstable();
+    std::fs::write(&state_path, lines.join("\n")).map_err(|e| StoreError::Decode(format!("saving the archive state: {e}")))?;
+    Ok((lineage, stats))
+}
+
+/// The `_meta` offset of the partition table in `table_dir` (0 when there is none).
+pub async fn table_meta_offset(table_dir: &Path) -> StoreResult<u64> {
+    match Dataset::open(&table_dir.to_string_lossy()).await {
+        Ok(ds) => meta_offset(&ds).await,
+        Err(_) => Ok(0),
+    }
 }
 
 impl PartitionStore {
@@ -313,6 +389,11 @@ impl PartitionStore {
     /// storage alone). `None` without [`StoreConfig::cold`]: the log is trimmed as before.
     pub fn log_floor(&self) -> Option<LogOffset> {
         self.cfg.cold.as_ref().map(|_| LogOffset(self.archive_state.lock().unwrap().watermark + 1))
+    }
+
+    /// The object storage behind the table, if any ([`StoreConfig::cold`]).
+    pub fn cold_uri(&self) -> Option<&str> {
+        self.cfg.cold.as_deref()
     }
 
     /// The newest archived version and its offset (0 without object storage).

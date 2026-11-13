@@ -213,6 +213,10 @@ Table `_tombstones`: one row per FORGET.
 | T1 tier job (local → cold within a byte budget) | done; local data 742 KB → 315 KB in the test | `b683759` |
 | T2 tombstone log (`Kind::TombLog`, `tombstone_log()`) | done; one row per FORGET/expiry in the same put, never in memory views, kept by compaction, archived | (this commit) |
 | P2 cleanup guard | done as part of T1 (`cleanup_local_versions`: only versions older than the archived one) | `2f9cae0` |
+| Phase 1 step 1: log retention at the archive watermark, archive timer (`ADB_ARCHIVE_EVERY_SECS`, default 30 s), `CURRENT` pointer | done; leader only (followers keep their own purge) | `8b072a5` |
+| No erasure with object storage: the fold keeps forgotten payloads (archived), archive runs before log redaction | done | `912f95d` |
+| Phase 1 step 2a: the whole node archived — platform tables and engine store beside the memory table (`{cold}/platform/{lineage}`, `{cold}/engine/{lineage}`, `{cold}/NODE`); log floor = the lowest point any of them still needs | done; test `cold_node.rs` (log trimmed to 394 with watermark 400) | (this commit) |
+| Phase 1 step 2b: rebuild a lagging or new node from object storage (Raft snapshot at the archived point, restore by shallow clone + WAL from W+1) | next | |
 
 Measured on Hetzner `nbg1` from the code-server pod (curl, a TLS handshake per request, so pessimistic): PUT 4 KB 42 ms, 1 MB 98 ms, 16 MB 911 ms (~18 MB/s per stream); GET 1 MB 98 ms, 16 MB 347 ms (~46 MB/s); 64 KB range 35 ms; 32 parallel range reads 187 req/s, no 429s.
 
@@ -221,7 +225,6 @@ Measured on Hetzner `nbg1` from the code-server pod (curl, a TLS handshake per r
 - **Who asked (tombstone log `actor`, `reason`).** ADB has no caller identity on the write path today (`Provenance::default()`; one shared service token). FlowR would send the caller (e.g. `x-adb-actor`), ADB carry it in the log record. Needs approval (touches FlowR and ADB).
 - **The fold rewrites cold fragments back into the root** when they hold tombstoned rows or fall in a size tier; the tier job moves them out again and the old cold file stays (never deleted). Correct, but it costs object-storage space; restrict the fold to local fragments, or give it a target base.
 - **Tier policy** is "oldest fragments by id"; per-memory-type priority (keep `WORKING`/`SEMANTIC`/`PROCEDURAL` local, tier `EPISODIC` first) needs fragments split by memory type, or by time, to mean anything.
-- **Archive scheduling**: today it runs at each fold and rewrite and on demand; Phase 1 runs it on a timer (5–30 s) to bound log retention.
 - **Lance clone test** `test_deep_clone_repairs_legacy_schema_without_activation` fails in our copy because the crates.io package ships no fixture data; not ours.
 
 - **Hetzner request limits:** 750 req/s per bucket. Archiving and tiering batch files;

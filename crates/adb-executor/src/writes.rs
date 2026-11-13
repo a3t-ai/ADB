@@ -630,6 +630,10 @@ pub struct DurableWrites<L: Log> {
     /// Offset of the last record with platform-table effects (stage G). The log
     /// must keep it until the platform tables have applied it.
     platform_last: std::sync::atomic::AtomicU64,
+    /// With object storage: the lowest log offset the log must keep — one past the
+    /// lowest of the memory table's, the platform tables' and the engine's archived
+    /// offsets ([`Self::archive_tick`]). 1 until the first archive.
+    archive_floor: std::sync::atomic::AtomicU64,
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
@@ -1887,17 +1891,64 @@ impl<L: Log + 'static> DurableWrites<L> {
         if store.log_floor().is_none() {
             return Ok(());
         }
-        let stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+        let mut stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
         let tip = seq_lock!(self).log().last_offset().0;
-        let held = tip.saturating_sub(stats.watermark);
-        if stats.files > 0 {
-            tracing::info!(files = stats.files, bytes = stats.bytes, version = stats.version, watermark = stats.watermark, held, "archived to object storage");
-        }
-        if held >= archive_fold_records() {
+        if tip.saturating_sub(stats.watermark) >= archive_fold_records() {
             self.compact().await?;
-            store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+            stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
         }
+        let floor = stats.watermark.min(self.archive_trees(store.cold_uri().unwrap_or_default()).await?);
+        self.archive_floor.store(floor + 1, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(files = stats.files, version = stats.version, memory = stats.watermark, floor, held = tip.saturating_sub(floor), "archived to object storage");
         Ok(())
+    }
+
+    /// Archive the platform tables and the engine's spaces beside the memory table;
+    /// returns the lowest offset they can be rebuilt to (`u64::MAX`: neither exists).
+    async fn archive_trees(&self, cold: &str) -> AdbResult<u64> {
+        let err = |e: adb_store::StoreError| AdbError::Internal(format!("archive: {e}"));
+        let mut floor = u64::MAX;
+        let mut lineages = serde_json::Map::new();
+        if let Some(p) = &self.platform {
+            // `_applied.json` as it is before the copy: the archive holds at least that.
+            // Past the last platform record, the platform needs nothing from the log.
+            let platform_last = self.platform_last.load(std::sync::atomic::Ordering::SeqCst);
+            let root = p.root().to_path_buf();
+            let applied = std::fs::read(root.join("_applied.json")).ok();
+            let offset = applied.as_ref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok()).and_then(|v| v.get("offset").and_then(|o| o.as_u64())).unwrap_or(0);
+            let last: Vec<(String, Vec<u8>)> = applied.map(|b| vec![("_applied.json".to_string(), b)]).unwrap_or_default();
+            let (lineage, _) = adb_store::archive_tree(cold, "platform", &root, &|_| false, &last).await.map_err(err)?;
+            lineages.insert("platform".into(), serde_json::json!({ "lineage": lineage, "watermark": offset }));
+            if offset < platform_last {
+                floor = floor.min(offset);
+            }
+        }
+        if let Some(e) = &self.engine {
+            let (dir, points) = e.lock().await.archive_points();
+            let mut engine_floor = u64::MAX;
+            let mut last = Vec::new();
+            for pt in points {
+                let journal = adb_store::table_meta_offset(&pt.journal).await.map_err(err)?;
+                // A space whose snapshot and journal hold all its changes needs nothing.
+                if pt.snapshot_offset < pt.last_offset || journal < pt.last_offset {
+                    engine_floor = engine_floor.min(pt.snapshot_offset.min(journal));
+                }
+                last.extend(pt.snapshot);
+            }
+            if engine_floor != u64::MAX || dir.exists() {
+                let (lineage, _) = adb_store::archive_tree(cold, "engine", &dir, &|rel: &str| rel.contains("_mem_wal"), &last).await.map_err(err)?;
+                let w = if engine_floor == u64::MAX { 0 } else { engine_floor };
+                lineages.insert("engine".into(), serde_json::json!({ "lineage": lineage, "watermark": w }));
+                if engine_floor != u64::MAX {
+                    floor = floor.min(engine_floor);
+                }
+            }
+        }
+        if !lineages.is_empty() {
+            let (store, base) = adb_store::lance::io::ObjectStore::from_uri(cold).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+            store.put(&base.clone().join("NODE"), serde_json::Value::Object(lineages).to_string().as_bytes()).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+        }
+        Ok(floor)
     }
 
     pub async fn compaction_due(&self) -> bool {
@@ -2090,7 +2141,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2705,9 +2756,10 @@ impl<L: Log + 'static> DurableWrites<L> {
                     // Keep what subscribers haven't acked, up to `retain_max` behind the
                     // tip (E3); never above Lance's durable offset.
                     let mut floor = d.next();
-                    // With object storage: never above what it can rebuild (the archive watermark).
-                    if let Some(cap) = s.log_floor() {
-                        floor = LogOffset(floor.0.min(cap.0));
+                    // With object storage: never above what it can rebuild (the lowest of the
+                    // memory table's, platform tables' and engine's archived offsets).
+                    if s.log_floor().is_some() {
+                        floor = LogOffset(floor.0.min(self.archive_floor.load(std::sync::atomic::Ordering::SeqCst)));
                     }
                     // Platform tables apply synchronously; the log keeps a platform
                     // record only if its apply failed (they catch up on the next open).

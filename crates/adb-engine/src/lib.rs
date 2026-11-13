@@ -136,6 +136,17 @@ pub fn subscribe_on(subs: &Subs, space: &str, topic: &str) -> UnboundedReceiver<
     rx
 }
 
+/// One space, as archiving sees it ([`EngineHost::archive_points`]).
+pub struct ArchivePoint {
+    /// `{space}/snapshot.json` and its contents, if there is one.
+    pub snapshot: Option<(String, Vec<u8>)>,
+    pub snapshot_offset: u64,
+    /// The last log offset with this space's changes.
+    pub last_offset: u64,
+    /// The journal's table directory.
+    pub journal: PathBuf,
+}
+
 pub struct EngineHost {
     dir: PathBuf,
     spaces: HashMap<String, Space>,
@@ -272,6 +283,26 @@ pub fn episode(space: &str, namespace: &str, run: RunId, e: &JournalEntry) -> Ne
 impl EngineHost {
     /// Open the spaces under `dir` (`<dir>/<space>/`), from their snapshots.
     /// Call [`Self::replay`] with the log above [`Self::replay_from`] next.
+    /// What archiving the engine needs (S3 option B): its directory, each space's
+    /// `snapshot.json` as it is now, with the offset it includes, and its journal
+    /// table's directory. Read under the host's lock; the copy runs without it.
+    pub fn archive_points(&self) -> (PathBuf, Vec<ArchivePoint>) {
+        let points = self
+            .spaces
+            .keys()
+            .map(|name| {
+                let dir = self.dir.join(name);
+                ArchivePoint {
+                    snapshot: std::fs::read(dir.join("snapshot.json")).ok().map(|b| (format!("{name}/snapshot.json"), b)),
+                    snapshot_offset: self.spaces[name].snapshot_offset,
+                    last_offset: self.spaces[name].last_offset,
+                    journal: dir.join("journal").join(format!("p{}", JOURNAL_PARTITION.0)).join("memory.lance"),
+                }
+            })
+            .collect();
+        (self.dir.clone(), points)
+    }
+
     pub async fn open(dir: impl Into<PathBuf>) -> EngineResult<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(store_err)?;

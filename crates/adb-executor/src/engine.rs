@@ -695,6 +695,16 @@ impl LocalEngine {
     }
 
     /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
+    /// Archive to object storage now (S3 option B, `ADB_COLD_URI`): the memory table,
+    /// the platform tables and the engine, and the log's floor with them. The
+    /// maintenance timer does this every `ADB_ARCHIVE_EVERY_SECS`.
+    pub async fn archive_now(&self) -> Result<(), String> {
+        match &self.durable {
+            Some(w) => w.archive_tick().await.map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
     }
