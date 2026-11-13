@@ -13670,6 +13670,12 @@ mod tests {
         assert_eq!(reopened.count_rows(Some("id < 20".to_string())).await.unwrap(), 10);
     }
 
+    fn walk_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|d| d.map(|e| e.unwrap().path()).map(|p| if p.is_dir() { walk_count(&p) } else { 1 }).sum())
+            .unwrap_or(0)
+    }
+
     /// Against real object storage (Hetzner, S3): run with
     /// `ADB_S3_TEST_URI=s3://bucket/prefix` and the `AWS_*` variables set, and
     /// `cargo test --lib -- --ignored --nocapture test_s3_tiering`. A local root
@@ -13775,6 +13781,43 @@ mod tests {
         assert_eq!(mirror.count_rows(None).await.unwrap(), (n - 100) as usize);
         assert_eq!(mirror.count_rows(Some("id < 200".to_string())).await.unwrap(), 100);
         println!("read the mirror (manifest on S3, data in the cold base): {} ms", ms(t));
+
+        // S2: takeover. A new owner shallow-clones the archived version into
+        // its own local root (no data copied), appends there, and reads across
+        // the local root, the mirror and the cold base.
+        let takeover = TempDir::default();
+        let t = Instant::now();
+        let mut mirror = mirror;
+        let version = mirror.version().version;
+        let mut clone = mirror
+            .shallow_clone(&takeover.path_str(), version, None)
+            .await
+            .unwrap();
+        println!("shallow-clone the archived version into a new local root: {} ms", ms(t));
+        let bases: Vec<String> = clone.manifest.base_paths.values().map(|b| b.path.clone()).collect();
+        println!("  the clone's bases: {bases:?}");
+        assert_eq!(clone.count_rows(None).await.unwrap(), (n - 100) as usize);
+        let more_ids: ArrayRef = Arc::new(Int32Array::from((n..n + 1000).collect::<Vec<i32>>()));
+        let more_texts: ArrayRef = Arc::new(arrow_array::StringArray::from(
+            (n..n + 1000).map(|i| format!("memory {i}: written after the takeover")).collect::<Vec<_>>(),
+        ));
+        let more = RecordBatch::try_new(schema.clone(), vec![more_ids, more_texts]).unwrap();
+        let t = Instant::now();
+        clone.append(RecordBatchIterator::new(vec![Ok(more)], schema.clone()), None).await.unwrap();
+        println!("append 1000 rows on the new owner (local): {} ms", ms(t));
+        assert!(clone.get_fragments().iter().any(|f| f.metadata().files.iter().all(|d| d.base_id.is_none())),
+            "the appended fragment is in the clone's own root");
+        let t = Instant::now();
+        assert_eq!(clone.count_rows(None).await.unwrap(), (n - 100 + 1000) as usize);
+        assert_eq!(clone.count_rows(Some(format!("id >= {}", n - 5))).await.unwrap(), 5 + 1000);
+        assert_eq!(clone.count_rows(Some("id < 200".to_string())).await.unwrap(), 100);
+        println!("read across local root + mirror + cold: {} ms", ms(t));
+        let t = Instant::now();
+        let reopened = Dataset::open(&takeover.path_str()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), (n - 100 + 1000) as usize);
+        println!("reopen the clone and count: {} ms", ms(t));
+        let local_files = walk_count(takeover.std_path());
+        println!("  files in the clone's local root: {local_files}");
         println!("objects are under {run}");
     }
 

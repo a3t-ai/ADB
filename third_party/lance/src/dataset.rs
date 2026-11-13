@@ -513,6 +513,14 @@ impl From<Schema> for ProjectionRequest {
     }
 }
 
+/// The scheme of a dataset URI (`s3`, `gs`, `az`, `memory`…); a plain path is `file`.
+fn uri_scheme(uri: &str) -> &str {
+    match uri.split_once("://") {
+        Some((scheme, _)) if !scheme.is_empty() && !scheme.contains('/') => scheme,
+        _ => "file",
+    }
+}
+
 impl Dataset {
     /// Open an existing dataset.
     ///
@@ -3472,13 +3480,21 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+        let mut builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
-            .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            // The source manifest is read through the source's store, whatever the target.
+            .with_source_store(Arc::new(self.object_store.as_ref().clone()));
+        // Into another kind of store (object storage → local disk, say), the target's
+        // own store and commit handler are resolved from `target_path`: reusing the
+        // source's wrote the "local" clone into the source's bucket.
+        if uri_scheme(target_path) == uri_scheme(&self.uri) {
+            builder = builder
+                .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+                .with_commit_handler(self.commit_handler.clone());
+        }
         builder.execute(transaction).await
     }
 
