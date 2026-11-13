@@ -634,6 +634,8 @@ pub struct DurableWrites<L: Log> {
     /// lowest of the memory table's, the platform tables' and the engine's archived
     /// offsets ([`Self::archive_tick`]). 1 until the first archive.
     archive_floor: std::sync::atomic::AtomicU64,
+    /// The floor the last `Effect::Archived` record announced.
+    archive_marked: std::sync::atomic::AtomicU64,
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
@@ -1897,15 +1899,31 @@ impl<L: Log + 'static> DurableWrites<L> {
             self.compact().await?;
             stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
         }
-        let floor = stats.watermark.min(self.archive_trees(store.cold_uri().unwrap_or_default()).await?);
+        let cold = store.cold_uri().unwrap_or_default().to_string();
+        let (trees_floor, mut node) = self.archive_trees(&cold).await?;
+        let floor = stats.watermark.min(trees_floor);
         self.archive_floor.store(floor + 1, std::sync::atomic::Ordering::SeqCst);
         tracing::info!(files = stats.files, version = stats.version, memory = stats.watermark, floor, held = tip.saturating_sub(floor), "archived to object storage");
+        // Tell every replica where the node now restores from (only when that moved: an
+        // idle node writes nothing). Raft snapshots are taken at this point.
+        if floor > self.archive_marked.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(current) = store.archived_current() {
+                node.insert("memory".into(), current);
+            }
+            let mut seq = seq_lock!(self);
+            let effects = vec![Effect::Archived { cold, floor: LogOffset(floor), node: serde_json::Value::Object(node) }];
+            let ts = seq.begin();
+            let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+            self.to_store(&record, seq.log()).await;
+            self.archive_marked.store(floor, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
 
     /// Archive the platform tables and the engine's spaces beside the memory table;
-    /// returns the lowest offset they can be rebuilt to (`u64::MAX`: neither exists).
-    async fn archive_trees(&self, cold: &str) -> AdbResult<u64> {
+    /// returns the lowest offset they can be rebuilt to (`u64::MAX`: neither exists),
+    /// and where each is (`NODE`).
+    async fn archive_trees(&self, cold: &str) -> AdbResult<(u64, serde_json::Map<String, serde_json::Value>)> {
         let err = |e: adb_store::StoreError| AdbError::Internal(format!("archive: {e}"));
         let mut floor = u64::MAX;
         let mut lineages = serde_json::Map::new();
@@ -1946,9 +1964,9 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         if !lineages.is_empty() {
             let (store, base) = adb_store::lance::io::ObjectStore::from_uri(cold).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
-            store.put(&base.clone().join("NODE"), serde_json::Value::Object(lineages).to_string().as_bytes()).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+            store.put(&base.clone().join("NODE"), serde_json::Value::Object(lineages.clone()).to_string().as_bytes()).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
         }
-        Ok(floor)
+        Ok((floor, lineages))
     }
 
     pub async fn compaction_due(&self) -> bool {
@@ -2141,7 +2159,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

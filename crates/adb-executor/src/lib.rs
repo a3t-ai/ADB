@@ -22,6 +22,7 @@ pub mod follower;
 pub mod branches;
 pub mod branch_engine;
 pub mod merge;
+pub mod restore;
 
 pub use error::{ExecutorError, ExecutorResult};
 pub use executor::{Executor, MAX_DEPTH, MAX_REACHED};

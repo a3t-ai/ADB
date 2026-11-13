@@ -321,6 +321,11 @@ pub enum Effect {
     /// operation made in engine space `space` (`flowr_storage::engine_core::Change`
     /// as JSON, applied in order by `adb-engine`; opaque here).
     Engine { space: String, changes: serde_json::Value },
+    /// S3 option B (`.ai/S3_OPTION_B_PLAN.md` §3.3): the node's state up to `floor` is
+    /// in object storage at `cold` (`node`: the memory table's `CURRENT`, the platform
+    /// and engine lineages). Changes no data; every replica learns from it where a
+    /// node that is behind the log restores from, and Raft snapshots are taken there.
+    Archived { cold: String, floor: LogOffset, node: serde_json::Value },
 }
 
 /// One committed transaction on one partition.

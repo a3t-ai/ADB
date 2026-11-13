@@ -155,6 +155,18 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ()> {
 }
 
 impl LocalWal {
+    /// Create an empty log in `dir` (which must hold none) whose first record will be
+    /// `first`: a node restored from object storage up to `first - 1` (S3 option B).
+    pub fn create_at(dir: &Path, first: LogOffset) -> LogResult<()> {
+        fs::create_dir_all(dir).map_err(io)?;
+        let existing = fs::read_dir(dir).map_err(io)?.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".wal"));
+        if existing {
+            return Err(io(format!("{} already holds a log", dir.display())));
+        }
+        File::create(segment_path(dir, first.0.max(1))).map_err(io)?;
+        sync_dir(dir)
+    }
+
     /// Open (or create) the log in `config.dir`, recovering from a crash if needed.
     pub fn open(partition: PartitionId, config: WalConfig) -> LogResult<Self> {
         fs::create_dir_all(&config.dir).map_err(io)?;

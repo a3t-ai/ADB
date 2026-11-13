@@ -341,6 +341,14 @@ impl PartitionStore {
         Ok(stats)
     }
 
+    /// The archived point, as written to `CURRENT`: `{lineage, version, watermark}`
+    /// (`None` before the first archive).
+    pub fn archived_current(&self) -> Option<serde_json::Value> {
+        let st = self.archive_state.lock().unwrap().clone();
+        let lineage = lineage_of(&self.table_dir())?;
+        (st.version > 0).then(|| serde_json::json!({ "lineage": lineage, "version": st.version, "watermark": st.watermark }))
+    }
+
     /// Move the oldest local fragments into the cold base until the local ones hold
     /// at most `keep_local_bytes` (the newest fragment always stays local). Their
     /// local files leave the disk at the next guarded cleanup, once archived. A no-op
@@ -418,4 +426,46 @@ impl PartitionStore {
         };
         lance::dataset::cleanup::cleanup_old_versions(base, policy).await.map_err(lance)
     }
+}
+
+/// Rebuild partition `partition`'s table under `root` from object storage: the
+/// archived `version` of `lineage`, shallow-cloned (no data copied: the clone's
+/// manifest points at the mirror and the cold base). The restored table starts a
+/// new lineage, so its archive never writes into the one it came from, which is
+/// kept as it is. `root/p{n}/memory.lance` must not exist.
+pub async fn restore_table(cold: &str, root: &Path, partition: PartitionId, lineage: &str, version: u64) -> StoreResult<String> {
+    let dir = root.join(format!("p{}", partition.0)).join("memory.lance");
+    if dir.exists() {
+        return Err(StoreError::Decode(format!("restoring into {}: it exists", dir.display())));
+    }
+    std::fs::create_dir_all(dir.parent().unwrap_or(root)).map_err(|e| StoreError::Decode(format!("restore: {e}")))?;
+    let mirror = format!("{}/mirror", lineage_uri(cold, partition, lineage));
+    let mut ds = Dataset::open(&mirror).await.map_err(lance)?;
+    ds.shallow_clone(&dir.to_string_lossy(), version, None).await.map_err(lance)?;
+    let fresh = uuid::Uuid::new_v4().simple().to_string();
+    record_lineage(&dir, Some(&fresh))?;
+    Ok(fresh)
+}
+
+/// Copy a tree archived by [`archive_tree`] (`{cold}/{kind}/{lineage}`) into `dir`,
+/// which must not exist. Returns the number of files.
+pub async fn restore_tree(cold: &str, kind: &str, lineage: &str, dir: &Path) -> StoreResult<usize> {
+    use futures::TryStreamExt;
+    if dir.exists() {
+        return Err(StoreError::Decode(format!("restoring into {}: it exists", dir.display())));
+    }
+    let uri = format!("{}/{}/{}", cold.trim_end_matches('/'), kind, lineage);
+    let (store, base) = lance::io::ObjectStore::from_uri(&uri).await.map_err(lance)?;
+    let objects: Vec<_> = store.read_dir_all(&base, None).try_collect().await.map_err(lance)?;
+    let prefix = format!("{}/", base.as_ref().trim_end_matches('/'));
+    let io = |e: std::io::Error| StoreError::Decode(format!("restore {kind}: {e}"));
+    std::fs::create_dir_all(dir).map_err(io)?;
+    for o in &objects {
+        let path = o.location.as_ref();
+        let rel = path.strip_prefix(&prefix).unwrap_or(path);
+        let to = dir.join(rel);
+        std::fs::create_dir_all(to.parent().unwrap_or(dir)).map_err(io)?;
+        std::fs::write(&to, store.read_one_all(&o.location).await.map_err(lance)?).map_err(io)?;
+    }
+    Ok(objects.len())
 }

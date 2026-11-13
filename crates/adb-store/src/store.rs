@@ -40,7 +40,7 @@ use crate::{StoreError, StoreResult};
 mod fold;
 #[path = "tier.rs"]
 mod tier;
-pub use tier::{archive_tree, table_meta_offset, ArchiveStats, TierStats, COLD_BASE_ID};
+pub use tier::{archive_tree, restore_table, restore_tree, table_meta_offset, ArchiveStats, TierStats, COLD_BASE_ID};
 
 /// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
 /// deployment (D3 S5); a table of another dimension is rewritten at open.
@@ -1777,7 +1777,7 @@ impl PartitionStore {
                 // memory table only moves its applied offset past them.
                 Effect::TableCreate { .. } | Effect::TableInsert { .. } | Effect::TableUpdate { .. } | Effect::TableDelete { .. } | Effect::TableUpsert { .. } | Effect::TableReplace { .. } | Effect::TableAddColumns { .. } | Effect::TableAppendOnly { .. } | Effect::TablePurge { .. } => {}
                 // FlowR's engine (stage H) keeps its own state and journal partition.
-                Effect::Engine { .. } => {}
+                Effect::Engine { .. } | Effect::Archived { .. } => {}
             }
         }
         Ok(())

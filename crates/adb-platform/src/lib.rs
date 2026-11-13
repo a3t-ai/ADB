@@ -277,6 +277,39 @@ impl PlatformStore {
         Ok(store)
     }
 
+    /// Settle platform tables copied back from object storage (S3 option B, a node
+    /// restored from its archive) before [`Self::open`]: the copy may hold commits made
+    /// after the `_applied.json` it came with. Each table goes back to the version that
+    /// file records (a new version with that content), a table it does not know is
+    /// removed, and a flush or compaction it marks is dropped: the replay from its
+    /// offset applies everything after it once.
+    pub async fn settle_restored(root: &Path) -> PlatformResult<()> {
+        let io = |e: std::io::Error| PlatformError::Io(e.to_string());
+        let mut applied: Applied = match std::fs::read(root.join("_applied.json")) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| PlatformError::Io(format!("_applied.json: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Applied::default(),
+            Err(e) => return Err(io(e)),
+        };
+        applied.flush = None;
+        applied.compacting = None;
+        for entry in std::fs::read_dir(root).map_err(io)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(table) = name.strip_suffix(".lance") else { continue };
+            let Some(&want) = applied.versions.get(table) else {
+                std::fs::remove_dir_all(entry.path()).map_err(io)?;
+                continue;
+            };
+            let ds = Dataset::open(&entry.path().to_string_lossy()).await.map_err(|e| PlatformError::Lance(e.to_string()))?;
+            if ds.version().version > want {
+                let mut at = ds.checkout_version(want).await.map_err(|e| PlatformError::Lance(format!("{table} at version {want}: {e}")))?;
+                at.restore().await.map_err(|e| PlatformError::Lance(format!("{table}: {e}")))?;
+                applied.versions.insert(table.to_string(), at.version().version);
+            }
+        }
+        let store = Self { root: root.to_path_buf(), applied: Mutex::new(Applied::default()), tables: RwLock::new(HashMap::new()), files: RwLock::new(()), mem: Default::default() };
+        store.save(&applied)
+    }
+
     fn uri(&self, table: &str) -> String {
         self.root.join(format!("{table}.lance")).to_string_lossy().to_string()
     }

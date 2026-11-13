@@ -164,10 +164,42 @@ async fn tiered(cold: String) {
     store.close().await.unwrap();
 }
 
+/// Objects under a local "bucket", by area (`p0/<lineage>/mirror/_versions`, …) and
+/// extension: what one partition costs in object count.
+fn object_census(cold: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![cold.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(cold).unwrap().to_string_lossy().to_string();
+            let parts: Vec<&str> = rel.split('/').collect();
+            // p0/<lineage>/<mirror|cold>/<area>/… → "<mirror|cold>/<area> .<ext>"
+            let area = match parts.as_slice() {
+                [_, _, tier, area, ..] => format!("{tier}/{area}"),
+                [_, _, tier] => tier.to_string(),
+                _ => rel.clone(),
+            };
+            let ext = p.extension().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+            *out.entry(format!("{area} .{ext}")).or_default() += 1;
+        }
+    }
+    out
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tiered_store_on_a_local_object_store() {
     let cold = tempfile::tempdir().unwrap();
     tiered(format!("file://{}", cold.path().display())).await;
+    let census = object_census(cold.path());
+    eprintln!("objects: {} in all", census.values().sum::<usize>());
+    for (k, n) in &census {
+        eprintln!("  {n:5}  {k}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
