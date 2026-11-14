@@ -114,6 +114,24 @@ write ─▶ gateway ─▶ owner of p (lease, epoch)
 - **WAL segments after a checkpoint** are pure duplicates (every row, tombstone and
   tombstone-log entry is in the Lance files) and are deleted, so a partition holds
   about one checkpoint interval of segments (confirmed by the user, 14 Nov).
+- **Reads on every node (user, 14 Nov):** the gateway sends reads to any node, round
+  robin or least loaded; writes go to the partition's owner. Every node runs a
+  **reader** for each partition it serves:
+  - its table is a shallow clone of the partition's last checkpoint (large files read
+    from object storage through the fixed cache), plus the records after it applied
+    locally (at most one checkpoint interval of small local files);
+  - the owner streams committed records to every reader node **asynchronously**
+    (batched, off the ack path; the replica's copy stays the only one the ack waits for);
+  - a fresh read asks the owner for its commit offset (batched, as PF-46's read index)
+    and waits until the reader has applied it; `ADB_READ_STALE_MS` lets a read skip
+    that and accept a bounded lag;
+  - at each checkpoint a reader re-bases on the new checkpoint and drops its tail below
+    the floor; a reader that fell behind catches up from the WAL segments in object
+    storage instead of the owner;
+  - the owner and the replica are readers too.
+- **Partitions (Phase 2) are built with this, not after (user, 14 Nov):** partitions by
+  hash of tenant/namespace; owners and replicas spread across the nodes; the platform
+  tables in one system partition.
 - Tuning variables: `ADB_WAL_SEGMENT_MS` (1000), `ADB_WAL_SEGMENT_BYTES` (8 MB),
   `ADB_REPLICA_MEM_BYTES` (100 MB), `ADB_REPLICA_SPILL_MAX_BYTES`, `ADB_WAL_REPLICAS` (1).
 
