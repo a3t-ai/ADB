@@ -42,6 +42,20 @@ dependencies = [
 [[package]]
 name = "adb-cluster"
 version = "0.1.0"
+dependencies = [
+ "axum 0.7.9",
+ "futures",
+ "openraft",
+ "reqwest 0.12.28",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "adb-core"
