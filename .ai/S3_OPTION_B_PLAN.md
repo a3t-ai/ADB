@@ -1,4 +1,6 @@
-# S3 option B: one copy on object storage, Raft as the WAL (plan, 13 Nov 2026)
+# S3 option B: one copy on object storage (plan, 13 Nov 2026; data path revised 14 Nov)
+
+> **14 Nov revision (user decision):** Raft no longer carries the data. Each partition has an **owner** and **one in-memory WAL replica**; the log goes to object storage as small **WAL segments** every second; a small Raft group holds only the ownership map. See §3.0. §3.2–§3.4 below describe the 13 Nov design and are kept for history where §3.0 does not replace them.
 
 Branch: `s3-option-b` (from `m0-k5-deps` at `7e240b4`).
 
@@ -55,6 +57,65 @@ three storage decisions made on 13 Nov:
 - Every node applies every write (`replica.rs`).
 
 ## 3. Target
+
+### 3.0 Data path (14 Nov): owner + in-memory replica, WAL segments in S3, Raft for ownership only
+
+Why: per-partition Raft groups mean heartbeats and elections per partition and three
+copies of every write; the user wants the least replication traffic and the fastest
+ack. Consensus is needed only for *who owns what*; the data itself is replicated
+primary–backup (as PacificA, Kafka ISR + controller).
+
+```
+write ─▶ gateway ─▶ owner of p (lease, epoch)
+                      │ memory + local WAL (restart cache only)
+                      ├──────────▶ replica of p: memory only (spill to NVMe past 100 MB)
+                      │                 │ ack
+                      ◀─────────────────┘
+                      ack to client
+                      │
+                      ├─ every ADB_WAL_SEGMENT_MS (1 s) or ADB_WAL_SEGMENT_BYTES (8 MB):
+                      │     WAL segment ─▶ {cold}/p{n}/wal/{first offset}   (immutable)
+                      │     then tell the replica: drop up to that offset
+                      │
+                      └─ checkpoint (B: ADB_ARCHIVE_MIN_BYTES / ADB_ARCHIVE_MAX_AGE_SECS):
+                            large Lance files ─▶ S3; then delete the WAL segments it covers
+```
+
+- **Ack:** after the replica holds the write in memory. No fsync and no S3 call on the
+  ack path: one network round trip.
+- **The replica holds only what object storage lacks** (about a second of writes).
+  It never needs the older log: everything older is in S3.
+- **Back-pressure (user, 14 Nov):** past `ADB_REPLICA_MEM_BYTES` (100 MB) the replica
+  spills to local NVMe (append-only spill files, group fsync) instead of blocking; the
+  ack still waits only for the replica's write (memory, or the spill file once
+  spilling). Past `ADB_REPLICA_SPILL_MAX_BYTES` (disk cap) writes wait. When S3
+  recovers the backlog is uploaded oldest first and the spill files are removed.
+- **Why S3 can't take the small chunks into the large file:** no append on S3 or
+  Hetzner; a server-side copy-merge (UploadPartCopy) rewrites the whole object per
+  chunk and needs 5 MB parts; parts of an unfinished multipart upload can't be read;
+  and a Lance file's footer is at its end. Hence two kinds of objects: small WAL
+  segments (short-lived) and large Lance files (kept).
+- **Owner failure:** the control plane sees the owner's node lease lapse, raises the
+  partition's epoch and promotes the replica. The new owner first uploads its memory
+  and spill tail as a WAL segment (now S3 holds every acked write), then
+  shallow-clones the last checkpoint and replays the WAL segments after its
+  watermark (steps 2a–2c), and serves. A new replica is picked; it starts empty.
+- **Fencing:** every write needs the replica's ack, and a replica refuses an older
+  epoch; an owner cut off by the network cannot complete a write.
+- **Loss window:** writes not yet in a WAL segment (~1 s, or the spill backlog) if the
+  owner and the replica die together. `ADB_WAL_REPLICAS` (default 1) can be raised to
+  2 for a third copy (same mechanism, one more ack).
+- **Control plane:** one small Raft group on the same nodes (the existing openraft
+  code) holding `partition → (owner, replica, epoch)` and node leases. Its traffic is
+  node heartbeats every few seconds and a few entries per failover; writes never
+  pass through it.
+- **Nodes are S3 + memory:** the owner's local WAL is only a restart cache; adding or
+  replacing a node copies no log.
+- **WAL segments after a checkpoint** are pure duplicates (every row, tombstone and
+  tombstone-log entry is in the Lance files) and are deleted, so a partition holds
+  about one checkpoint interval of segments. *Pending the user's confirmation.*
+- Tuning variables: `ADB_WAL_SEGMENT_MS` (1000), `ADB_WAL_SEGMENT_BYTES` (8 MB),
+  `ADB_REPLICA_MEM_BYTES` (100 MB), `ADB_REPLICA_SPILL_MAX_BYTES`, `ADB_WAL_REPLICAS` (1).
 
 ```
 client ─▶ gateway ─▶ partition owner (lease + epoch claim)
@@ -183,6 +244,20 @@ Table `_tombstones`: one row per FORGET.
 - **T2. Tombstone log table** (§3.5).
 
 ### Phase 1: ADB cluster on option B (3 nodes, one replica set)
+
+**Revised 14 Nov (§3.0)** — the order now:
+1. Done: archive the node (2a), restore a node from S3 (2b, local), large-file
+   checkpoints (2c).
+2. WAL segments to object storage (owner side), replay from segments on restore,
+   segment deletion after a checkpoint.
+3. Control plane: the ownership map and node leases on openraft (metadata only).
+4. Owner → replica shipping: in-memory replica, epoch checks, ack from memory, spill
+   to NVMe past 100 MB, drop on segment upload.
+5. Failover: promote the replica (upload tail, restore, serve), pick a new replica.
+6. Tests: kill the owner under load; S3 outage (spill and catch-up); Hetzner end to end.
+
+The 13 Nov list below (Raft as the WAL) is superseded; the Raft data-path work in
+progress is parked on branch `raft-datapath-wip`.
 
 - **One log** (§3.4).
 - **Owner-only apply:** followers hold the log and do not apply. Ownership comes from
