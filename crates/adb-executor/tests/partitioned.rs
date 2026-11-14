@@ -152,3 +152,73 @@ async fn a_shared_partition_never_leaks_across_the_scope() {
     let mine = node.query_in(r#"RECALL FROM SEMANTIC ALL"#, None, &scope).await.unwrap();
     assert!(!mine.to_string().contains("secret"), "{mine}");
 }
+
+fn values(answer: &Value, field: &str) -> Vec<String> {
+    let recs = answer.pointer("/data/records").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    let mut v: Vec<String> = recs.iter().filter_map(|r| r.pointer(&format!("/data/{field}")).and_then(|x| x.as_str()).map(String::from)).collect();
+    v.sort();
+    v
+}
+
+/// B7 memory layers across partitions: a space reads another space that lives in a
+/// different partition (as agents read a3t-docs), pinned or mounted, sealed, ranked
+/// by LIKE, reached by FORGET; a pinned tag can't be dropped while another
+/// partition's space reads it; layers survive a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_layers_reach_across_partitions() {
+    use adb_core::MemoryType;
+    use adb_executor::branches::{Layer, LayerMode};
+    std::env::set_var("ADB_S3", "off");
+    let dir = tempfile::tempdir().unwrap();
+    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
+    let (src, dst) = ("compliance", (0..1000).map(|i| format!("trading{i}")).find(|n| node.partition_of(n) != node.partition_of("compliance")).unwrap());
+    assert_ne!(node.partition_of(src), node.partition_of(&dst));
+    let dst: &str = Box::leak(dst.into_boxed_str());
+    let q = |aql: String| {
+        let node = std::sync::Arc::clone(&node);
+        async move { node.query(&aql, None).await }
+    };
+    let fact = |ns: &'static str| {
+        let node = std::sync::Arc::clone(&node);
+        async move { values(&node.query(&format!(r#"RECALL FROM SEMANTIC WHERE fact != "" NAMESPACE "{ns}" LIMIT 100"#), None).await.unwrap(), "fact") }
+    };
+    q(format!(r#"STORE INTO SEMANTIC (key = "rule:max-trade", fact = "limit 1M") NAMESPACE "{src}""#)).await.unwrap();
+    q(format!(r#"STORE INTO PROCEDURAL (key = "check_trade", pattern = "check a trade", steps = "limits") NAMESPACE "{src}""#)).await.unwrap();
+    q(format!(r#"STORE INTO EPISODIC (key = "audit-1", event = "reviewed desk 4") NAMESPACE "{src}""#)).await.unwrap();
+    node.tag_create(src, "v1", None).await.unwrap();
+    q(format!(r#"UPDATE INTO SEMANTIC WHERE key = "rule:max-trade" (fact = "limit 2M", content = "trade limit is 2M") NAMESPACE "{src}""#)).await.unwrap();
+    q(format!(r#"STORE INTO SEMANTIC (key = "desk", fact = "desk 4", content = "desk 4 trades bonds") NAMESPACE "{dst}""#)).await.unwrap();
+
+    let layer = |mode: LayerMode| Layer {
+        space: src.into(),
+        mode,
+        tag: (mode == LayerMode::Pin).then(|| "v1".into()),
+        memories: vec![MemoryType::Semantic, MemoryType::Procedural],
+        sealed: true,
+    };
+    assert!(node.layers_set(dst, vec![Layer { tag: Some("nope".into()), ..layer(LayerMode::Pin) }]).await.is_err(), "the tag is checked in the layer's partition");
+    node.layers_set(dst, vec![layer(LayerMode::Pin)]).await.unwrap();
+
+    assert_eq!(fact(dst).await, ["desk 4", "limit 1M"], "pinned at v1, read from the other partition");
+    let procs = q(format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{dst}""#)).await.unwrap();
+    assert_eq!(procs.pointer("/data/count").and_then(|c| c.as_u64()), Some(1), "the inherited procedure: {procs}");
+    assert!(q(format!(r#"STORE INTO SEMANTIC (key = "rule:max-trade", fact = "limit 9M") NAMESPACE "{dst}""#)).await.is_err(), "sealed: can't shadow");
+    let refused = node.tag_drop(src, "v1").await.unwrap_err();
+    assert!(refused.contains("pinned"), "a pin in another partition holds the tag: {refused}");
+
+    node.layers_set(dst, vec![layer(LayerMode::Mount)]).await.unwrap();
+    assert_eq!(fact(dst).await, ["desk 4", "limit 2M"], "mounted: current");
+    let vars: std::collections::HashMap<String, Value> = [("q".to_string(), serde_json::json!("trade limit"))].into();
+    let like = node.query(&format!(r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "{dst}" LIMIT 5"#), Some(&vars)).await.unwrap();
+    let found = values(&like, "fact");
+    assert!(found.contains(&"limit 2M".to_string()) && found.contains(&"desk 4".to_string()), "the layer's and its own: {like}");
+    q(format!(r#"FORGET FROM SEMANTIC WHERE key = "rule:max-trade" NAMESPACE "{src}""#)).await.unwrap();
+    assert_eq!(fact(dst).await, ["desk 4"], "FORGET on the layer reaches the mount");
+
+    drop(node);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
+    assert_eq!(node.layers_get(dst).await.unwrap().len(), 1, "layers survive a restart");
+    let procs = node.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{dst}""#), None).await.unwrap();
+    assert_eq!(procs.pointer("/data/count").and_then(|c| c.as_u64()), Some(1), "and are read again: {procs}");
+}

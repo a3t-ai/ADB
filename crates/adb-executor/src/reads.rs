@@ -121,6 +121,8 @@ pub struct LanceReads {
     parent: Option<crate::branch_engine::ParentView>,
     /// B7: the org's tags and layers (a read in a namespace with layers sees them).
     registry: Option<Arc<crate::branches::Branches>>,
+    /// Where a layer space's rows and tags are read (its own partition in a cluster).
+    spaces: Option<crate::spaces::SpaceView>,
 }
 
 /// `IN SCOPE` (named scopes, AQL v0.6) is served on the long-term memory types.
@@ -195,7 +197,7 @@ pub fn lance_owned(memory: MemoryType) -> bool {
 
 impl LanceReads {
     pub fn new(store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { store, barrier, embedder: None, parent: None, registry: None }
+        Self { store, barrier, embedder: None, parent: None, registry: None, spaces: None }
     }
 
     pub fn with_parent(mut self, parent: Option<crate::branch_engine::ParentView>) -> Self {
@@ -206,6 +208,12 @@ impl LanceReads {
     /// B7: reads in a namespace with layers see them.
     pub fn with_layers(mut self, registry: Option<Arc<crate::branches::Branches>>) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// Where layer spaces are read (default: this table and registry).
+    pub fn with_spaces(mut self, spaces: Option<crate::spaces::SpaceView>) -> Self {
+        self.spaces = spaces;
         self
     }
 
@@ -224,27 +232,29 @@ impl LanceReads {
     async fn layer_rows(&self, memory: MemoryType, ns: &str, layers: &[crate::branches::Layer], in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<StoredRow>> {
         let reg = self.registry.as_ref().expect("layers come from the registry");
         let m: adb_core::log::Memory = memory.into();
-        let rows_at = |space: String, at: CommitTs| {
-            let store = Arc::clone(&self.store);
-            async move {
-                let rows = store.versions(m, Some(&format!("namespace = {}", adb_store::sql_str(&space)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-                AdbResult::Ok(rows.into_iter().filter(|r| r.is_current_at(at, now) && in_scope.is_none_or(|s| r.data.scope == s)).collect::<Vec<_>>())
-            }
-        };
-        let point = |l: &crate::branches::Layer| match l.mode {
-            crate::branches::LayerMode::Mount => Some(now),
-            crate::branches::LayerMode::Pin | crate::branches::LayerMode::History => l.tag.as_ref().and_then(|t| reg.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
-        };
+        let local = crate::spaces::SpaceView::new(crate::spaces::LocalSpaces { store: Some(Arc::clone(&self.store)), barrier: None, registry: Arc::clone(reg) });
+        let view = self.spaces.as_ref().unwrap_or(&local);
+        // A layer space from wherever it lives; the space's own rows from this table.
+        let current = |rows: Vec<StoredRow>, at: CommitTs| rows.into_iter().filter(|r| r.is_current_at(at, now) && in_scope.is_none_or(|s| r.data.scope == s)).collect::<Vec<_>>();
+        // A mount reads now; a pin or history at its tag (a pin whose tag is gone: skipped).
+        let mut points = Vec::new();
+        for l in layers {
+            points.push(match l.mode {
+                crate::branches::LayerMode::Mount => Some(now),
+                _ => view.layer_point(l).await?,
+            });
+        }
         let mut sources = Vec::new();
-        for l in layers.iter().filter(|l| l.sealed) {
-            if let Some(at) = point(l) {
-                sources.push((rows_at(l.space.clone(), at).await?, false));
+        for (l, at) in layers.iter().zip(&points).filter(|(l, _)| l.sealed) {
+            if let Some(at) = at {
+                sources.push((current(view.versions(m, &l.space).await?, *at), false));
             }
         }
-        sources.push((rows_at(ns.to_string(), now).await?, true));
-        for l in layers.iter().filter(|l| !l.sealed) {
-            if let Some(at) = point(l) {
-                sources.push((rows_at(l.space.clone(), at).await?, false));
+        let own = self.store.versions(m, Some(&format!("namespace = {}", adb_store::sql_str(ns)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        sources.push((current(own, now), true));
+        for (l, at) in layers.iter().zip(&points).filter(|(l, _)| !l.sealed) {
+            if let Some(at) = at {
+                sources.push((current(view.versions(m, &l.space).await?, *at), false));
             }
         }
         let mut seen = std::collections::HashSet::new();

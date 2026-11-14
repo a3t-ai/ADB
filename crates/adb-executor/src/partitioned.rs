@@ -66,6 +66,48 @@ pub struct PartitionedEngine {
     system: Arc<LocalEngine>,
     /// Namespace → partition, as recorded in [`CATALOG`].
     catalog: std::sync::RwLock<BTreeMap<String, Partition>>,
+    /// Other spaces read from their own partitions (memory layers); each partition
+    /// engine holds it weakly.
+    spaces: Arc<dyn crate::spaces::Spaces>,
+}
+
+/// Each space read from its own partition (`crate::spaces`).
+struct RouterSpaces {
+    node: std::sync::Weak<PartitionedEngine>,
+}
+
+impl RouterSpaces {
+    async fn local(&self, space: &str) -> AdbResult<crate::spaces::LocalSpaces> {
+        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
+        let e = node.engine_of(space).await.map_err(AdbError::Internal)?;
+        e.local_spaces().ok_or_else(|| AdbError::Internal(format!("partition of {space:?} has no table")))
+    }
+}
+
+#[async_trait]
+impl crate::spaces::Spaces for RouterSpaces {
+    async fn versions(&self, memory: adb_core::log::Memory, space: &str) -> AdbResult<Vec<adb_store::StoredRow>> {
+        self.local(space).await?.versions(memory, space).await
+    }
+
+    async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<crate::branches::Tag>> {
+        self.local(space).await?.tag(space, name).await
+    }
+
+    async fn layers_of(&self, space: &str) -> AdbResult<Vec<crate::branches::Layer>> {
+        self.local(space).await?.layers_of(space).await
+    }
+
+    async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {
+        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
+        let mut out = Vec::new();
+        for e in node.data_parts().await.map_err(AdbError::Internal)? {
+            if let Some(l) = e.local_spaces() {
+                out.extend(l.layered_by(space).await?);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl PartitionedEngine {
@@ -91,7 +133,14 @@ impl PartitionedEngine {
                 }
             }
         }
-        Ok(Arc::new(Self { dir, map: std::sync::RwLock::new(map), parts: Default::default(), system: Arc::new(system), catalog: std::sync::RwLock::new(catalog) }))
+        Ok(Arc::new_cyclic(|me| Self {
+            dir,
+            map: std::sync::RwLock::new(map),
+            parts: Default::default(),
+            system: Arc::new(system),
+            catalog: std::sync::RwLock::new(catalog),
+            spaces: Arc::new(RouterSpaces { node: me.clone() }),
+        }))
     }
 
     /// The system partition's engine.
@@ -111,6 +160,8 @@ impl PartitionedEngine {
             return Ok(Arc::clone(e));
         }
         let (e, _) = LocalEngine::durable_partition(self.dir.join("parts").join(format!("p{p}")), PartitionRole::memory(p)).await?;
+        // Layer spaces in other partitions are read from there.
+        e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
         parts.insert(p, Arc::clone(&e));
         Ok(e)
@@ -685,9 +736,8 @@ impl Engine for Arc<PartitionedEngine> {
     }
 
     async fn layers_set(&self, namespace: &str, layers: Vec<crate::branches::Layer>) -> Result<crate::branches::Layers, String> {
-        for l in &layers {
-            self.engine_of_both("a memory layer", &l.space, namespace).await?;
-        }
+        // Layer spaces are read from their own partitions (RouterSpaces).
+        self.note(namespace).await?;
         self.engine_of(namespace).await?.layers_set(namespace, layers).await
     }
 

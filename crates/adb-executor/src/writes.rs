@@ -655,6 +655,8 @@ pub struct DurableWrites<L: Log> {
     shipped: tokio::sync::Mutex<Option<u64>>,
     /// The owner epoch object keys are written under (`segments`; 0 on a single node).
     epoch: std::sync::atomic::AtomicU64,
+    /// Where other spaces (layers) are read: set at open (`crate::spaces`).
+    spaces: std::sync::OnceLock<crate::spaces::SpaceView>,
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
@@ -1416,8 +1418,9 @@ impl<L: Log + 'static> DurableWrites<L> {
         if self.branches.tag(namespace, name).is_none() {
             return Ok(false);
         }
-        for space in self.branches.layered_by(namespace) {
-            if self.branches.layers_of(&space).iter().any(|l| l.space == namespace && l.tag.as_deref() == Some(name)) {
+        let view = self.space_view();
+        for space in view.layered_by(namespace).await? {
+            if view.layers_of(&space).await?.iter().any(|l| l.space == namespace && l.tag.as_deref() == Some(name)) {
                 return Err(AdbError::QueryError(format!("tag {name:?} of {namespace:?} is pinned by {space:?}: change its layers first")));
             }
         }
@@ -1438,6 +1441,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         if self.parent.is_some() {
             return Err(AdbError::QueryError("layers are set on the org's engine".into()));
         }
+        let view = self.space_view();
         for l in &layers {
             if l.space == namespace {
                 return Err(AdbError::QueryError(format!("{namespace:?} can't be a layer of itself")));
@@ -1448,7 +1452,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             // D1: a promoted agent's history reaches back through its predecessors, so a
             // history layer may name a space that has layers.
             let history = l.mode == LayerMode::History;
-            if !history && !self.branches.layers_of(&l.space).is_empty() {
+            if !history && !view.layers_of(&l.space).await?.is_empty() {
                 return Err(AdbError::QueryError(format!("{:?} has layers of its own: layers are one level deep (B7)", l.space)));
             }
             if history && (l.sealed || l.memories != [MemoryType::Episodic]) {
@@ -1459,14 +1463,19 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
             match (l.mode, &l.tag) {
                 (LayerMode::Pin, None) | (LayerMode::History, None) => return Err(AdbError::QueryError(format!("pinning {:?} needs a tag", l.space))),
-                (LayerMode::Pin, Some(t)) | (LayerMode::History, Some(t)) if self.branches.tag(&l.space, t).is_none() => {
-                    return Err(AdbError::QueryError(format!("{:?} has no tag {t:?}", l.space)));
+                (LayerMode::Pin, Some(t)) | (LayerMode::History, Some(t)) => {
+                    if view.tag(&l.space, t).await?.is_none() {
+                        return Err(AdbError::QueryError(format!("{:?} has no tag {t:?}", l.space)));
+                    }
                 }
                 _ => {}
             }
         }
         // A layer space stays flat, history layers aside (they name predecessors).
-        let layered = self.branches.layered_by(namespace).iter().any(|by| self.branches.layers_of(by).iter().any(|l| l.space == namespace && l.mode != LayerMode::History));
+        let mut layered = false;
+        for by in view.layered_by(namespace).await? {
+            layered |= view.layers_of(&by).await?.iter().any(|l| l.space == namespace && l.mode != LayerMode::History);
+        }
         if layered && layers.iter().any(|l| l.mode != LayerMode::History) {
             return Err(AdbError::QueryError(format!("{namespace:?} is a layer of another space: layers are one level deep (B7)")));
         }
@@ -1481,9 +1490,11 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// a fact with the same subject and predicate.
     async fn check_sealed(&self, memory: MemoryType, namespace: Option<&str>, key: &str, fact: Option<(&str, &str)>, now: CommitTs) -> AdbResult<()> {
         let (Some(ns), Some(store)) = (namespace, &self.store) else { return Ok(()) };
+        let _ = store;
+        let view = self.space_view();
         for l in self.branches.layers_of(ns).iter().filter(|l| l.sealed && l.memories.contains(&memory)) {
-            let at = self.layer_point(l).unwrap_or(now);
-            let rows = store.versions(memory.into(), Some(&format!("namespace = {}", adb_store::sql_str(&l.space)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+            let at = view.layer_point(l).await?.unwrap_or(now);
+            let rows = view.versions(memory.into(), &l.space).await?;
             let shadows = rows.iter().filter(|r| r.is_current_at(at, now)).any(|r| {
                 let bare = adb_store::without_namespace(adb_store::key_of(&r.lineage_id));
                 bare == key
@@ -1500,11 +1511,16 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(())
     }
 
-    /// The commit time a layer is read at: its tag's point for a pin, `None` (now) for a mount.
-    pub fn layer_point(&self, l: &crate::branches::Layer) -> Option<CommitTs> {
-        match l.mode {
-            crate::branches::LayerMode::Mount => None,
-            crate::branches::LayerMode::Pin | crate::branches::LayerMode::History => l.tag.as_ref().and_then(|t| self.branches.tag(&l.space, t)).map(|t| CommitTs(t.point_ts)),
+    /// Read other spaces (layers) through `view` (set once, at open).
+    pub fn set_spaces(&self, view: crate::spaces::SpaceView) {
+        let _ = self.spaces.set(view);
+    }
+
+    /// Where other spaces are read: the view set at open, else this table and registry.
+    pub fn space_view(&self) -> crate::spaces::SpaceView {
+        match self.spaces.get() {
+            Some(v) => v.clone(),
+            None => crate::spaces::SpaceView::new(crate::spaces::LocalSpaces { store: self.store.clone(), barrier: None, registry: Arc::clone(&self.branches) }),
         }
     }
 
@@ -2228,7 +2244,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

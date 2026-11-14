@@ -342,6 +342,9 @@ pub struct LocalEngine {
     branch_host: Option<Arc<crate::branch_engine::BranchHost>>,
     /// A branch engine's parent (B2); `None` on the org engine.
     parent: Option<crate::branch_engine::ParentView>,
+    /// Where other spaces (memory layers) are read: this partition, or (cluster) the
+    /// router's source, set by [`crate::partitioned::PartitionedEngine`].
+    spaces: Option<crate::spaces::SpaceView>,
     /// DB-14: recent space stats, as each is a scan: key → (when, stats).
     stats_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
     /// A temporary engine's directory, removed with it (dropped last).
@@ -695,6 +698,21 @@ impl LocalEngine {
         Box::pin(Self::durable_with(dir, wal, None, Some(parent), PartitionRole::SINGLE)).await
     }
 
+    /// This partition's own table and registry, for a router reading other partitions'
+    /// spaces (`crate::spaces`).
+    pub fn local_spaces(&self) -> Option<crate::spaces::LocalSpaces> {
+        let (store, barrier) = self.store.as_ref()?;
+        let registry = Arc::clone(self.durable.as_ref()?.branches());
+        Some(crate::spaces::LocalSpaces { store: Some(Arc::clone(store)), barrier: barrier.clone(), registry })
+    }
+
+    /// Read other spaces through `spaces` (a cluster's router, step 3).
+    pub fn set_spaces(&self, spaces: std::sync::Weak<dyn crate::spaces::Spaces>) {
+        if let Some(v) = &self.spaces {
+            v.set_remote(spaces);
+        }
+    }
+
     /// The engine's writes and reads, as its executor uses them (the partition router
     /// runs statements spanning partitions over them, step 3).
     pub fn io(&self) -> (Arc<dyn Writes>, Arc<dyn crate::reads::Reads>) {
@@ -914,7 +932,15 @@ impl LocalEngine {
             let registry = Arc::clone(writes.branches());
             writes.set_pins(Arc::new(move || registry.pins(None)));
         }
-        let reads: Arc<dyn Reads> = Arc::new(LanceReads::new(Arc::clone(&store), barrier.clone()).with_embedder(embedder.clone()).with_parent(parent.clone()).with_layers(parent.is_none().then(|| Arc::clone(writes.branches()))));
+        let spaces = crate::spaces::SpaceView::new(crate::spaces::LocalSpaces { store: Some(Arc::clone(&store)), barrier: barrier.clone(), registry: Arc::clone(writes.branches()) });
+        writes.set_spaces(spaces.clone());
+        let reads: Arc<dyn Reads> = Arc::new(
+            LanceReads::new(Arc::clone(&store), barrier.clone())
+                .with_embedder(embedder.clone())
+                .with_parent(parent.clone())
+                .with_layers(parent.is_none().then(|| Arc::clone(writes.branches())))
+                .with_spaces(Some(spaces.clone())),
+        );
         let durable = Arc::new(writes);
         let expiry = Some(spawn_expiry(Arc::downgrade(&durable)));
         let durable_handle = Arc::clone(&durable);
@@ -960,6 +986,7 @@ impl LocalEngine {
                 embedder,
                 branch_host,
                 parent,
+                spaces: Some(spaces),
             },
             stats,
         ))

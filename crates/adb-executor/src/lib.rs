@@ -24,6 +24,7 @@ pub mod branch_engine;
 pub mod merge;
 pub mod restore;
 pub mod partitioned;
+pub mod spaces;
 
 pub use error::{ExecutorError, ExecutorResult};
 pub use executor::{Executor, MAX_DEPTH, MAX_REACHED};
