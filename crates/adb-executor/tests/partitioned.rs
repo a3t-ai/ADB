@@ -155,7 +155,9 @@ async fn a_shared_partition_never_leaks_across_the_scope() {
 
 fn values(answer: &Value, field: &str) -> Vec<String> {
     let recs = answer.pointer("/data/records").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-    let mut v: Vec<String> = recs.iter().filter_map(|r| r.pointer(&format!("/data/{field}")).and_then(|x| x.as_str()).map(String::from)).collect();
+    // PROCEDURAL keeps `steps` as a list: its first step stands for the record here.
+    let text = |x: &Value| x.as_str().map(String::from).or_else(|| x.get(0).and_then(|y| y.as_str()).map(String::from));
+    let mut v: Vec<String> = recs.iter().filter_map(|r| r.pointer(&format!("/data/{field}")).and_then(text)).collect();
     v.sort();
     v
 }
@@ -221,4 +223,72 @@ async fn memory_layers_reach_across_partitions() {
     assert_eq!(node.layers_get(dst).await.unwrap().len(), 1, "layers survive a restart");
     let procs = node.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{dst}""#), None).await.unwrap();
     assert_eq!(procs.pointer("/data/count").and_then(|c| c.as_u64()), Some(1), "and are read again: {procs}");
+}
+
+/// Copies between namespaces in different partitions: clone (now and at a tag),
+/// procedures only, and promoting a branch — read out of the source's partition,
+/// materialised in the target's, with the promoted agent's history layer reading
+/// the old agent's episodes from the old partition.
+#[tokio::test(flavor = "multi_thread")]
+async fn copies_cross_partitions() {
+    use adb_executor::branches::PointRef;
+    std::env::set_var("ADB_S3", "off");
+    let dir = tempfile::tempdir().unwrap();
+    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
+    let elsewhere = |prefix: &str| -> &'static str {
+        let n = (0..1000).map(|i| format!("{prefix}{i}")).find(|n| node.partition_of(n) != node.partition_of("bot")).unwrap();
+        Box::leak(n.into_boxed_str())
+    };
+    let (v2, clone, at, procs) = (elsewhere("bot-v2-"), elsewhere("bot-clone-"), elsewhere("bot-at-"), elsewhere("bot-procs-"));
+    let q = |aql: String| {
+        let node = std::sync::Arc::clone(&node);
+        async move { node.query(&aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
+    };
+    let steps = |ns: &'static str, branch: Option<&'static str>| {
+        let node = std::sync::Arc::clone(&node);
+        async move {
+            let b = branch.map(|b| format!(r#" BRANCH "{b}""#)).unwrap_or_default();
+            values(&node.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{ns}"{b} LIMIT 100"#), None).await.unwrap(), "steps")
+        }
+    };
+    for k in ["p1", "p2"] {
+        q(format!(r#"STORE INTO PROCEDURAL (key = "{k}", steps = "{k}-v1") NAMESPACE "bot""#)).await;
+    }
+    q(r#"STORE INTO SEMANTIC (key = "fact1", fact = "likes tea") NAMESPACE "bot""#.into()).await;
+    q(r#"STORE INTO EPISODIC (event = "said hello") NAMESPACE "bot""#.into()).await;
+    node.tag_create("bot", "v1", None).await.unwrap();
+    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p1" (steps = "p1-v2") NAMESPACE "bot""#.into()).await;
+
+    // Clone now: SEMANTIC, PROCEDURAL, TOOLS — no episodes.
+    let c = node.space_clone("bot", clone).await.unwrap();
+    assert_eq!(c["records"], 3, "{c}");
+    assert_eq!(steps(clone, None).await, ["p1-v2", "p2-v1"]);
+    let eps = q(format!(r#"RECALL FROM EPISODIC ALL NAMESPACE "{clone}""#)).await;
+    assert_eq!(eps["data"]["count"], 0);
+    // Clone at the tag: the older procedure.
+    let c = node.space_clone_at("bot", at, &PointRef { tag: Some("v1".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(steps(at, None).await, ["p1-v1", "p2-v1"], "{c}");
+    // Procedures only.
+    let c = node.space_copy_procedures("bot", procs, false).await.unwrap();
+    assert_eq!(c["records"], 2, "{c}");
+    let sem = q(format!(r#"RECALL FROM SEMANTIC ALL NAMESPACE "{procs}""#)).await;
+    assert_eq!(sem["data"]["count"], 0, "no facts travel");
+
+    // Promote a branch into another partition.
+    node.branch_create("bot", "try", None, None).await.unwrap();
+    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-branch") NAMESPACE "bot" BRANCH "try""#.into()).await;
+    assert_eq!(steps("bot", Some("try")).await, ["p1-v2", "p2-branch"]);
+    let p = node.branch_promote("bot", "try", v2, false).await.unwrap();
+    assert_eq!(p["records"], 3, "{p}");
+    assert_eq!(steps(v2, None).await, ["p1-v2", "p2-branch"]);
+    assert_eq!(steps("bot", None).await, ["p1-v2", "p2-v1"], "the old agent is untouched");
+    q(r#"STORE INTO EPISODIC (event = "old agent later") NAMESPACE "bot""#.into()).await;
+    q(format!(r#"STORE INTO EPISODIC (event = "new agent said hi") NAMESPACE "{v2}""#)).await;
+    let eps = values(&q(format!(r#"RECALL FROM EPISODIC ALL NAMESPACE "{v2}" LIMIT 100"#)).await, "event");
+    assert_eq!(eps, ["new agent said hi", "promoted_from", "said hello"], "own, origin, and the old agent's (from its partition) as of the promote");
+    // Behind main: refused unless allow_stale, as on one engine.
+    node.branch_create("bot", "behind", None, None).await.unwrap();
+    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-main") NAMESPACE "bot""#.into()).await;
+    let err = node.branch_promote("bot", "behind", elsewhere("bot-v3-"), false).await.unwrap_err();
+    assert!(err.starts_with("merge_stale:"), "{err}");
 }

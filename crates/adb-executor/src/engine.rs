@@ -810,6 +810,46 @@ impl LocalEngine {
         d.materialise(into, rows).await.map_err(|e| e.to_string())
     }
 
+    /// B5 / DB-11: branch `name` of `namespace`, if it may be promoted: a copy of a
+    /// branch behind main would drop main's newer memory (unless `allow_stale`).
+    pub async fn promote_check(&self, namespace: &str, name: &str, allow_stale: bool) -> Result<crate::branches::Branch, String> {
+        let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
+        let branch = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
+        if !allow_stale && branch.parent == crate::branches::MAIN {
+            let w = self.three_way(namespace, name, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools]).await?;
+            if !w.conflicts.is_empty() {
+                return Err(format!("merge_conflicts: {} records changed on both main and the branch: {}: rebase first", w.conflicts.len(), w.conflicts.iter().map(|c| c.lineage.as_str()).collect::<Vec<_>>().join(", ")));
+            }
+            if w.behind > 0 {
+                return Err(format!("merge_stale: main changed {} records since the branch point: rebase first (allow_stale promotes without them)", w.behind));
+            }
+        }
+        Ok(branch)
+    }
+
+    /// Step 3, a copy between partitions — out: `namespace`'s rows of `memories` as
+    /// main (or `branch`) saw them at `at`.
+    pub async fn copy_out(&self, namespace: &str, branch: Option<&str>, memories: &[MemoryType], at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {
+        let source = self.space_source(namespace, branch).await?;
+        let mut rows = Vec::new();
+        for m in memories {
+            rows.extend(source.rows_as_of(*m, namespace, at).await.map_err(|e| e.to_string())?);
+        }
+        Ok(rows)
+    }
+
+    /// Step 3, a copy between partitions — in: `rows` materialised in `into`.
+    pub async fn copy_in(&self, into: &str, rows: Vec<adb_store::StoredRow>) -> Result<u64, String> {
+        let d = self.durable.as_ref().ok_or("copying needs a durable engine (start ADB with --data-dir)")?;
+        d.materialise(into, rows).await.map_err(|e| e.to_string())
+    }
+
+    /// The log point a `PointRef` names in `namespace` (offset, commit time).
+    pub async fn resolve_point(&self, namespace: &str, at: &crate::branches::PointRef) -> Result<(u64, adb_core::log::CommitTs), String> {
+        let d = self.durable.as_ref().ok_or("points need a durable engine (start ADB with --data-dir)")?;
+        d.resolve_point(namespace, at).await.map_err(|e| e.to_string())
+    }
+
     /// B6: how this org reaches branches in their own pods (the server's Flight client).
     pub fn set_branch_remote(&self, remote: Arc<dyn crate::branch_engine::BranchRemote>) {
         if let Some(host) = &self.branch_host {
@@ -1365,17 +1405,7 @@ impl Engine for LocalEngine {
     async fn branch_promote(&self, namespace: &str, name: &str, into: &str, allow_stale: bool) -> Result<Value, String> {
         let host = self.branch_host.as_ref().ok_or("branches are promoted on the org's engine")?;
         let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
-        let branch = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
-        // DB-11: a copy of a branch that is behind main would drop main's newer memory.
-        if !allow_stale && branch.parent == crate::branches::MAIN {
-            let w = self.three_way(namespace, name, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools]).await?;
-            if !w.conflicts.is_empty() {
-                return Err(format!("merge_conflicts: {} records changed on both main and the branch: {}: rebase first", w.conflicts.len(), w.conflicts.iter().map(|c| c.lineage.as_str()).collect::<Vec<_>>().join(", ")));
-            }
-            if w.behind > 0 {
-                return Err(format!("merge_stale: main changed {} records since the branch point: rebase first (allow_stale promotes without them)", w.behind));
-            }
-        }
+        let branch = self.promote_check(namespace, name, allow_stale).await?;
         let source = host.source(namespace, name).await?;
         let n = self.materialise_from(source, namespace, into).await?;
         // D1: the new agent carries the old one's layers, reads its episodes as of now,

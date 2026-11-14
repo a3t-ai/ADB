@@ -225,16 +225,6 @@ impl PartitionedEngine {
         self.part(self.partition_of(namespace)).await
     }
 
-    /// The engine both namespaces live in; an operation spanning two partitions isn't
-    /// built yet and is refused rather than run on one of them.
-    async fn engine_of_both(&self, what: &str, a: &str, b: &str) -> Result<Arc<LocalEngine>, String> {
-        let (pa, pb) = (self.partition_of(a), self.partition_of(b));
-        if pa != pb {
-            return Err(format!("{what} from {a:?} (partition {pa}) into {b:?} (partition {pb}): across partitions is not built yet"));
-        }
-        self.part(pa).await
-    }
-
     /// The memory partitions holding data (the catalog's), opened.
     async fn data_parts(&self) -> Result<Vec<Arc<LocalEngine>>, String> {
         let ps: BTreeSet<Partition> = self.catalog.read().unwrap().values().copied().collect();
@@ -302,6 +292,10 @@ fn touches(aql: &str) -> Vec<(Option<String>, bool)> {
         S::Pipeline(p) => p.stages.iter().map(of).collect(),
         other => vec![of(other)],
     }
+}
+
+fn now() -> adb_core::log::CommitTs {
+    adb_core::log::CommitTs::from_datetime(adb_core::time::now())
 }
 
 fn out_of_reach(namespace: &str) -> AdbError {
@@ -709,30 +703,69 @@ impl Engine for Arc<PartitionedEngine> {
         }
     }
 
-    // ---- two namespaces: one partition only, for now
+    // ---- two namespaces: in one partition as before; across partitions read out of
+    // the source's, materialised in the target's (not one transaction: a copy that
+    // fails half way is repeated into a fresh namespace)
 
     async fn branch_promote(&self, namespace: &str, name: &str, into: &str, allow_stale: bool) -> Result<Value, String> {
-        let e = self.engine_of_both("branch_promote", namespace, into).await?;
         self.note(into).await?;
-        e.branch_promote(namespace, name, into, allow_stale).await
+        if self.partition_of(namespace) == self.partition_of(into) {
+            return self.engine_of(namespace).await?.branch_promote(namespace, name, into, allow_stale).await;
+        }
+        let (src, dst) = (self.engine_of(namespace).await?, self.engine_of(into).await?);
+        let branch = src.promote_check(namespace, name, allow_stale).await?;
+        let rows = src.copy_out(namespace, Some(name), &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools], now()).await?;
+        let n = dst.copy_in(into, rows).await?;
+        // D1, as on one engine: the new agent carries the old one's layers, reads its
+        // episodes as of now (a history layer, read from the old one's partition), and
+        // its first record says where it came from.
+        let old_layers = src.layers_get(namespace).await?;
+        let safe: String = into.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).take(55).collect();
+        let tag = format!("promoted-{safe}");
+        src.tag_create(namespace, &tag, None).await?;
+        let mut layers = vec![crate::branches::Layer { space: namespace.to_string(), mode: crate::branches::LayerMode::History, tag: Some(tag), memories: vec![MemoryType::Episodic], sealed: false }];
+        layers.extend(old_layers);
+        dst.layers_set(into, layers).await?;
+        let s = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
+        let aql = format!(
+            "STORE INTO EPISODIC (event = \"promoted_from\", from_namespace = {}, from_branch = {}, point_offset = \"{}\", point_ts = \"{}\") NAMESPACE {}",
+            s(namespace), s(name), branch.point_offset, branch.point_ts, s(into)
+        );
+        dst.query(&aql, None).await?;
+        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
     }
 
     async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {
-        let e = self.engine_of_both("space_clone", namespace, into).await?;
         self.note(into).await?;
-        e.space_clone(namespace, into).await
+        if self.partition_of(namespace) == self.partition_of(into) {
+            return self.engine_of(namespace).await?.space_clone(namespace, into).await;
+        }
+        let rows = self.engine_of(namespace).await?.copy_out(namespace, None, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools], now()).await?;
+        let n = self.engine_of(into).await?.copy_in(into, rows).await?;
+        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
     }
 
     async fn space_clone_at(&self, namespace: &str, into: &str, at: &crate::branches::PointRef) -> Result<Value, String> {
-        let e = self.engine_of_both("space_clone_at", namespace, into).await?;
         self.note(into).await?;
-        e.space_clone_at(namespace, into, at).await
+        if self.partition_of(namespace) == self.partition_of(into) {
+            return self.engine_of(namespace).await?.space_clone_at(namespace, into, at).await;
+        }
+        let src = self.engine_of(namespace).await?;
+        let (offset, ts) = src.resolve_point(namespace, at).await?;
+        let rows = src.copy_out(namespace, None, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools], ts).await?;
+        let n = self.engine_of(into).await?.copy_in(into, rows).await?;
+        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
     }
 
     async fn space_copy_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<Value, String> {
-        let e = self.engine_of_both("space_copy_procedures", namespace, into).await?;
         self.note(into).await?;
-        e.space_copy_procedures(namespace, into, tools).await
+        if self.partition_of(namespace) == self.partition_of(into) {
+            return self.engine_of(namespace).await?.space_copy_procedures(namespace, into, tools).await;
+        }
+        let memories: &[MemoryType] = if tools { &[MemoryType::Procedural, MemoryType::Tools] } else { &[MemoryType::Procedural] };
+        let rows = self.engine_of(namespace).await?.copy_out(namespace, None, memories, now()).await?;
+        let n = self.engine_of(into).await?.copy_in(into, rows).await?;
+        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN }, "procedures_only": true }))
     }
 
     async fn layers_set(&self, namespace: &str, layers: Vec<crate::branches::Layer>) -> Result<crate::branches::Layers, String> {
