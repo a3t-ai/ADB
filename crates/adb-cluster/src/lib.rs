@@ -7,11 +7,14 @@
 //! - [`leases`]: who is live, from heartbeats (the control leader's memory only).
 //! - [`raft`]: the group's log, state machine and RPCs (openraft).
 //! - [`control`]: the voters' service and the client every node runs.
+//! - [`routing`]: namespace → partition (hash, pins), and which partitions a
+//!   statement runs on for the scope a call carries.
 
 pub mod control;
 pub mod leases;
 pub mod map;
 pub mod raft;
+pub mod routing;
 
 pub use control::{ControlClient, ControlNode};
 pub use map::{Assignment, ControlCmd, NodeId, Partition, PartitionMap};

@@ -25,7 +25,7 @@ async fn wait_for(what: &str, within: Duration, mut ok: impl FnMut() -> bool) {
 
 fn whole(m: &PartitionMap, live: &[NodeId]) -> bool {
     m.partitions > 0
-        && m.assignments.len() == m.partitions as usize
+        && m.assignments.len() == m.partitions as usize + 1
         && m.assignments.values().all(|a| live.contains(&a.owner) && a.replica.is_some_and(|r| r != a.owner && live.contains(&r)))
 }
 
@@ -34,7 +34,8 @@ async fn the_map_is_kept_and_repaired_across_a_leader_loss() {
     let _ = tracing_subscriber::fmt().with_env_filter("adb_cluster=debug,openraft=warn").with_test_writer().try_init();
     std::env::set_var("ADB_LEASE_MS", "1500");
     std::env::set_var("ADB_HEARTBEAT_MS", "200");
-    const PARTITIONS: u32 = 6;
+    // 5 memory partitions + the system partition: 2 owners per node.
+    const PARTITIONS: u32 = 5;
     let mut listeners = Vec::new();
     let mut voters_at = BTreeMap::new();
     for id in 1..=3u64 {

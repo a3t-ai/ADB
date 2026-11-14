@@ -53,6 +53,12 @@ pub enum ControlCmd {
     /// Set where a partition lives. Refused unless `epoch` is the partition's current
     /// epoch (replica change) or the next one (owner change).
     Assign { partition: Partition, assignment: Assignment },
+    /// Place the namespaces matching `pattern` (exact, or a prefix `…*`) in
+    /// `partition` instead of by hash ([`crate::routing`]). Moves no rows: set it
+    /// before a matching namespace holds data (the caller checks the catalog).
+    Pin { pattern: String, partition: Partition },
+    /// Remove a pin (same caveat).
+    Unpin { pattern: String },
 }
 
 /// The map every control-plane member builds by applying [`ControlCmd`]s.
@@ -61,6 +67,9 @@ pub struct PartitionMap {
     pub partitions: Partition,
     pub members: BTreeMap<NodeId, Member>,
     pub assignments: BTreeMap<Partition, Assignment>,
+    /// Namespace placement overrides: pattern → memory partition.
+    #[serde(default)]
+    pub pins: BTreeMap<String, Partition>,
     /// Raised by every applied command: who holds the map can tell it is behind.
     pub version: u64,
 }
@@ -80,6 +89,10 @@ pub enum Refused {
     OwnerWithoutEpoch { partition: Partition, current: u64 },
     #[error("partition {0}: owner and replica are the same node")]
     SameNode(Partition),
+    #[error("pin {0:?}: a pattern is a namespace or a prefix ending in `*`")]
+    BadPattern(String),
+    #[error("no pin {0:?}")]
+    NoPin(String),
 }
 
 impl PartitionMap {
@@ -101,8 +114,22 @@ impl PartitionMap {
                     return Err(Refused::NotMember(*node));
                 }
             }
-            ControlCmd::Assign { partition, assignment } => {
+            ControlCmd::Pin { pattern, partition } => {
+                if pattern.is_empty() || pattern[..pattern.len() - 1].contains('*') {
+                    return Err(Refused::BadPattern(pattern.clone()));
+                }
                 if *partition >= self.partitions {
+                    return Err(Refused::NoPartition(*partition));
+                }
+                self.pins.insert(pattern.clone(), *partition);
+            }
+            ControlCmd::Unpin { pattern } => {
+                if self.pins.remove(pattern).is_none() {
+                    return Err(Refused::NoPin(pattern.clone()));
+                }
+            }
+            ControlCmd::Assign { partition, assignment } => {
+                if *partition > self.partitions {
                     return Err(Refused::NoPartition(*partition));
                 }
                 for n in std::iter::once(assignment.owner).chain(assignment.replica) {
@@ -138,6 +165,12 @@ impl PartitionMap {
     /// The partitions `node` is the replica of.
     pub fn replicated_by(&self, node: NodeId) -> impl Iterator<Item = (Partition, &Assignment)> {
         self.assignments.iter().filter(move |(_, a)| a.replica == Some(node)).map(|(p, a)| (*p, a))
+    }
+
+    /// Every partition that needs an owner: the memory partitions `0..partitions`, then
+    /// the system partition (`partitions`).
+    pub fn all_partitions(&self) -> std::ops::RangeInclusive<Partition> {
+        0..=self.partitions
     }
 }
 
@@ -180,7 +213,10 @@ pub fn plan(map: &PartitionMap, live: &BTreeSet<NodeId>, reported: &BTreeMap<Nod
             .map(|(n, _)| *n)
     };
     let mut out = Vec::new();
-    for p in 0..map.partitions {
+    if map.partitions == 0 {
+        return out;
+    }
+    for p in map.all_partitions() {
         let cur = map.assignments.get(&p);
         let place_replica = |count: &mut BTreeMap<NodeId, (u64, u64)>, owner: NodeId| {
             let r = pick(count, false, Some(owner));
@@ -255,7 +291,8 @@ mod tests {
 
     #[test]
     fn new_partitions_spread_with_a_replica_elsewhere() {
-        let mut m = map_with(&[1, 2, 3], 6);
+        // 5 memory partitions + the system partition: 6 to place.
+        let mut m = map_with(&[1, 2, 3], 5);
         let changes = plan(&m, &live(&[1, 2, 3]), &BTreeMap::new());
         assert_eq!(changes.len(), 6);
         apply_all(&mut m, &changes);
@@ -295,12 +332,15 @@ mod tests {
     #[test]
     fn both_lost_any_live_node_takes_over_and_says_what_is_lost() {
         let mut m = map_with(&[1, 2, 3], 1);
-        m.apply(&ControlCmd::Assign { partition: 0, assignment: Assignment { owner: 1, replica: Some(2), epoch: 1 } }).unwrap();
+        for p in m.all_partitions() {
+            m.apply(&ControlCmd::Assign { partition: p, assignment: Assignment { owner: 1, replica: Some(2), epoch: 1 } }).unwrap();
+        }
         let changes = plan(&m, &live(&[3]), &BTreeMap::new());
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].reason.contains("lost"));
+        assert_eq!(changes.len(), 2, "the memory partition and the system partition");
+        assert!(changes.iter().all(|c| c.reason.contains("lost")));
         apply_all(&mut m, &changes);
         assert_eq!(m.assignments[&0], Assignment { owner: 3, replica: None, epoch: 2 });
+        assert_eq!(m.assignments[&1], Assignment { owner: 3, replica: None, epoch: 2 });
     }
 
     #[test]
@@ -313,6 +353,10 @@ mod tests {
         assert!(matches!(m.apply(&ControlCmd::Assign { partition: 0, assignment: Assignment { owner: 2, replica: Some(2), epoch: 2 } }), Err(Refused::SameNode(0))));
         assert!(matches!(m.apply(&ControlCmd::Assign { partition: 0, assignment: Assignment { owner: 9, replica: None, epoch: 2 } }), Err(Refused::NotMember(9))));
         assert!(matches!(m.apply(&ControlCmd::Init { partitions: 4 }), Err(Refused::PartitionCount { .. })));
+        assert!(matches!(m.apply(&ControlCmd::Assign { partition: 2, assignment: Assignment { owner: 1, replica: None, epoch: 1 } }), Err(Refused::NoPartition(2))), "1 memory partition + system (1)");
+        assert!(matches!(m.apply(&ControlCmd::Pin { pattern: "a*b*".into(), partition: 0 }), Err(Refused::BadPattern(_))));
+        assert!(matches!(m.apply(&ControlCmd::Pin { pattern: "acme--*".into(), partition: 1 }), Err(Refused::NoPartition(1))), "pins go to memory partitions only");
+        assert!(matches!(m.apply(&ControlCmd::Unpin { pattern: "x".into() }), Err(Refused::NoPin(_))));
         let v = m.version;
         m.apply(&ControlCmd::Assign { partition: 0, assignment: Assignment { owner: 2, replica: Some(1), epoch: 2 } }).unwrap();
         assert_eq!(m.version, v + 1);
