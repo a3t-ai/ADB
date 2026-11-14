@@ -395,8 +395,7 @@ async fn log_is_kept_until_object_storage_holds_it() {
     let (version, watermark) = store.archive_watermark();
     eprintln!("after the archive tick: version {version}, watermark {}", watermark.0);
     assert_eq!(watermark, LogOffset(n), "the archived table holds every record");
-    let current: serde_json::Value = serde_json::from_slice(&std::fs::read(cold.path().join("p0/CURRENT")).unwrap()).unwrap();
-    assert_eq!(current["watermark"], n);
+    assert_eq!(last_point(cold.path())["node"]["memory"]["watermark"], n);
 
     // More writes trigger the purge again: now everything up to the watermark may go.
     for i in n + 1..=n + 300 {
@@ -766,4 +765,12 @@ async fn concurrent_platform_writes_commit_in_groups() {
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let rows = adb_platform::batches_to_json(&engine.platform().unwrap().query("state", None, 1000).await.unwrap());
     assert_eq!(read(rows), want, "the same after a reopen");
+}
+
+/// The newest checkpoint point under `{cold}/p0/points` (S3 option B §3.0).
+fn last_point(cold: &std::path::Path) -> serde_json::Value {
+    let dir = cold.join("p0/points");
+    let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    names.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().split_once('-').map(|(_, f)| f.to_string()).unwrap_or_default());
+    serde_json::from_slice(&std::fs::read(names.last().expect("a checkpoint point")).unwrap()).unwrap()
 }

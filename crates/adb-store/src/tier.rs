@@ -336,10 +336,6 @@ pub(crate) async fn archive_table(cfg: &StoreConfig, partition: PartitionId, dir
     st.watermark = st.watermark.max(watermark);
     st.at = chrono::Utc::now().timestamp();
     save_archive_state(dir, &lineage, &st)?;
-    // The partition's active lineage, for a node that takes it over from object storage.
-    let (pstore, ppath) = lance::io::ObjectStore::from_uri(&format!("{}/p{}", cold.trim_end_matches('/'), partition.0)).await.map_err(lance)?;
-    let current = serde_json::json!({ "lineage": lineage, "version": st.version, "watermark": st.watermark });
-    pstore.put(&ppath.clone().join("CURRENT"), current.to_string().as_bytes()).await.map_err(lance)?;
     stats.version = st.version;
     stats.watermark = st.watermark;
     Ok((stats, st))
@@ -523,7 +519,7 @@ impl PartitionStore {
         ArchivePending { bytes, changed: base.version().version > st.version, since_last: std::time::Duration::from_secs(since.max(0) as u64) }
     }
 
-    /// The archived point, as written to `CURRENT`: `{lineage, version, watermark}`
+    /// The archived point, as the checkpoint point records it: `{lineage, version, watermark}`
     /// (`None` before the first archive).
     pub fn archived_current(&self) -> Option<serde_json::Value> {
         let st = self.archive_state.lock().unwrap().clone();

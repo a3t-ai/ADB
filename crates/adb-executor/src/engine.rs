@@ -416,14 +416,37 @@ pub struct Warm {
     pub(crate) engine_next: adb_core::log::LogOffset,
 }
 
+/// Object storage behind the node (S3 option B, `.ai/S3_OPTION_B_PLAN.md`): on by
+/// default (`ADB_S3=on`), at `ADB_COLD_URI` (e.g. `s3://adb-1/prod/cluster-a`,
+/// credentials from `AWS_*`; any Lance URI, a local path too). `ADB_S3=off`, or no
+/// `ADB_COLD_URI`, leaves it out: Lance writes to local disk only, the log is the
+/// only other copy, and no archive, checkpoint or WAL segment is made.
+pub fn object_storage() -> Option<String> {
+    let on = std::env::var("ADB_S3").map_or(true, |v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"));
+    let uri = std::env::var("ADB_COLD_URI").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    static SAID: std::sync::Once = std::sync::Once::new();
+    match (on, uri) {
+        (true, Some(uri)) => {
+            SAID.call_once(|| tracing::info!(%uri, "object storage on"));
+            Some(uri)
+        }
+        (true, None) => {
+            SAID.call_once(|| tracing::warn!("object storage is on (ADB_S3) but ADB_COLD_URI is not set: writing to local disk only"));
+            None
+        }
+        (false, _) => {
+            SAID.call_once(|| tracing::info!("object storage off (ADB_S3=off): writing to local disk only"));
+            None
+        }
+    }
+}
+
 pub(crate) async fn open_store(dir: &std::path::Path) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
     let settings = adb_embed::EmbedConfig::load(dir)?;
     let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
     // The replica set's other nodes may embed on this node's model (C-17b).
     adb_embed::peers::serve_with(embedder.clone());
-    // S3 option B (`.ai/S3_OPTION_B_PLAN.md`): object storage behind the table, from
-    // `ADB_COLD_URI` (e.g. s3://adb-1/prod/cluster-a; credentials from AWS_*).
-    let cold = std::env::var("ADB_COLD_URI").ok().filter(|v| !v.trim().is_empty());
+    let cold = object_storage();
     let store_cfg = StoreConfig { embedding_dim, embedding_model, cold, ..StoreConfig::new(dir.join("store")) };
     let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
     Ok((store, embedder))
@@ -736,6 +759,15 @@ impl LocalEngine {
         match &self.durable {
             Some(w) => w.ship_segments().await.map(|s| s.shipped).map_err(|e| e.to_string()),
             None => Ok(0),
+        }
+    }
+
+    /// Take the partition over at owner epoch `epoch` (`segments`): record where this
+    /// owner starts on object storage before it takes writes.
+    pub async fn begin_epoch(&self, epoch: u64) -> Result<(), String> {
+        match &self.durable {
+            Some(w) => w.begin_epoch(epoch).await.map_err(|e| e.to_string()),
+            None => Ok(()),
         }
     }
 

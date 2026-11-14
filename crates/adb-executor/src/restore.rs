@@ -13,7 +13,8 @@
 //! A restore cut short is started again from scratch.
 //!
 //! [`restore_from_object_storage`] needs nothing but object storage (§3.0): the last
-//! checkpoint's `POINT`, the checkpoint, and the WAL segments above its floor.
+//! checkpoint point the epoch fence allows, the checkpoint, and the WAL segments
+//! above its floor.
 
 use std::path::Path;
 
@@ -100,17 +101,24 @@ pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreSta
 }
 
 /// Rebuild the data directory `dir` (empty, or a node to replace) from object storage
-/// alone: the last checkpoint (`{cold}/p0/POINT`, [`restore_node`]), then every WAL
-/// segment above its floor appended to the fresh log. Opening the engine on `dir`
-/// afterwards replays those records. With no checkpoint yet, the log is rebuilt from
-/// the segments alone.
-pub async fn restore_from_object_storage(dir: &Path, cold: &str) -> Result<RestoreStats, String> {
+/// alone: the best checkpoint point the epoch [`Fence`] allows ([`restore_node`]),
+/// then every allowed WAL record above its floor appended to the fresh log. Opening
+/// the engine on `dir` afterwards replays those records. With no checkpoint yet, the
+/// log is rebuilt from the segments alone.
+///
+/// `before_epoch`: a new owner taking the partition over at epoch E passes `Some(E)`
+/// and reads only what epochs below E wrote; `None` reads everything.
+///
+/// [`Fence`]: crate::writes::segments::Fence
+pub async fn restore_from_object_storage(dir: &Path, cold: &str, before_epoch: Option<u64>) -> Result<RestoreStats, String> {
+    use crate::writes::segments as seg;
     use adb_log::Log;
     let at = |what: &str| format!("restore from object storage ({what})");
     let partition = PartitionId(0);
-    let point = crate::writes::segments::read_point(cold, partition).await.map_err(|e| format!("{}: {e}", at("point")))?;
+    let fence = seg::Fence::load(cold, partition, before_epoch).await.map_err(|e| format!("{}: {e}", at("epochs")))?;
+    let point = seg::read_point(cold, partition, &fence).await.map_err(|e| format!("{}: {e}", at("point")))?;
     let mut stats = match &point {
-        Some(p) => restore_node(dir, p).await?,
+        Some((_, p)) => restore_node(dir, p).await?,
         None => {
             if dir.join("p0").exists() {
                 return Err(at("no checkpoint yet, and the directory holds a log: restore into an empty one"));
@@ -119,15 +127,22 @@ pub async fn restore_from_object_storage(dir: &Path, cold: &str) -> Result<Resto
             RestoreStats { log_starts_at: 1, ..Default::default() }
         }
     };
-    let floor = point.as_ref().map(|p| p.floor).unwrap_or(0);
+    let floor = point.as_ref().map(|(_, p)| p.floor).unwrap_or(0);
     let wal = adb_log::LocalWal::open(partition, adb_log::WalConfig::new(dir.join("p0"))).map_err(|e| format!("{}: {e}", at("log")))?;
-    for seg in crate::writes::segments::list_segments(cold, partition).await.map_err(|e| format!("{}: {e}", at("segments")))?.into_iter().filter(|s| s.last > floor) {
-        let records = crate::writes::segments::read_segment(cold, partition, seg).await.map_err(|e| format!("{}: {e}", at("segment")))?;
+    // By first offset: each record is taken once, from the first allowed segment
+    // holding it (every allowed copy of an offset is the same acked record).
+    let segments = seg::list_segments(cold, partition).await.map_err(|e| format!("{}: {e}", at("segments")))?;
+    for s in segments.into_iter().filter(|s| fence.admits(s.epoch) && s.last > floor && s.first <= fence.limit(s.epoch)) {
+        let records = seg::read_segment(cold, partition, s).await.map_err(|e| format!("{}: {e}", at("segment")))?;
         stats.segments += 1;
         for r in records {
-            // A segment straddling the floor: what the checkpoint holds is skipped.
-            if r.offset.0 <= wal.last_offset().0 || r.offset.0 <= floor {
+            // Held by the checkpoint or an earlier segment; or written after this
+            // epoch lost the partition (never acked).
+            if r.offset.0 <= wal.last_offset().0 || r.offset.0 <= floor || !fence.allows(s.epoch, r.offset.0) {
                 continue;
+            }
+            if r.offset.0 != wal.last_offset().0 + 1 {
+                return Err(at(&format!("gap in the WAL segments: offset {} follows {}", r.offset.0, wal.last_offset().0)));
             }
             wal.append(r).await.map_err(|e| format!("{}: {e}", at("appending a record")))?;
             stats.segment_records += 1;

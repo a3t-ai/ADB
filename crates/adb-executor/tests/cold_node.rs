@@ -24,11 +24,11 @@ async fn a_node_archives_everything_and_trims_its_log_to_it() {
     // Archive: the table is folded (more than 10 records held back) and archived,
     // the platform and engine trees beside it.
     engine.archive_now().await.unwrap();
-    let current: serde_json::Value = serde_json::from_slice(&std::fs::read(cold.path().join("p0/CURRENT")).unwrap()).unwrap();
-    eprintln!("CURRENT {current}");
+    let point = last_point(cold.path());
+    eprintln!("point {point}");
+    let current = &point["node"]["memory"];
     assert_eq!(current["watermark"], 50, "{current}");
-    let node: serde_json::Value = serde_json::from_slice(&std::fs::read(cold.path().join("NODE")).unwrap()).unwrap();
-    eprintln!("NODE {node}");
+    let node = &point["node"];
     assert!(node.get("platform").is_some() && node.get("engine").is_some(), "{node}");
     let lineage = current["lineage"].as_str().unwrap();
     assert!(cold.path().join(format!("p0/{lineage}/mirror/_versions")).exists());
@@ -41,7 +41,7 @@ async fn a_node_archives_everything_and_trims_its_log_to_it() {
     for i in 400..700 {
         engine.query(&format!(r#"STORE INTO EPISODIC (bid_id = "b{i}", n = {i})"#), None).await.unwrap();
     }
-    let watermark = serde_json::from_slice::<serde_json::Value>(&std::fs::read(cold.path().join("p0/CURRENT")).unwrap()).unwrap()["watermark"].as_u64().unwrap();
+    let watermark = last_point(cold.path())["node"]["memory"]["watermark"].as_u64().unwrap();
     drop(engine);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let wal = LocalWal::open(PartitionId(0), wal_cfg).unwrap();
@@ -49,4 +49,12 @@ async fn a_node_archives_everything_and_trims_its_log_to_it() {
     eprintln!("watermark {watermark}; the log now starts at {first}");
     assert!(first > 1, "the log was trimmed (an idle platform and engine don't hold it)");
     assert!(first <= watermark + 1, "nothing the archive can't rebuild was trimmed");
+}
+
+/// The newest checkpoint point under `{cold}/p0/points` (S3 option B §3.0).
+fn last_point(cold: &std::path::Path) -> serde_json::Value {
+    let dir = cold.join("p0/points");
+    let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+    names.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().split_once('-').map(|(_, f)| f.to_string()).unwrap_or_default());
+    serde_json::from_slice(&std::fs::read(names.last().expect("a checkpoint point")).unwrap()).unwrap()
 }

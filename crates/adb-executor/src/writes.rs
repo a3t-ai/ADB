@@ -645,6 +645,8 @@ pub struct DurableWrites<L: Log> {
     /// Object storage holds every record up to this offset (WAL segments above the
     /// checkpoint); `None` until the first ship looks. Serialises shipping.
     shipped: tokio::sync::Mutex<Option<u64>>,
+    /// The owner epoch object keys are written under (`segments`; 0 on a single node).
+    epoch: std::sync::atomic::AtomicU64,
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
@@ -1952,7 +1954,15 @@ impl<L: Log + 'static> DurableWrites<L> {
             self.archive_marked.store(floor, std::sync::atomic::Ordering::SeqCst);
             self.archive_record.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
             // Where a node restores from, then the WAL segments the checkpoint covers go.
-            let deleted = self.checkpoint_segments(&point, store.partition()).await?;
+            let deleted = match self.checkpoint_segments(&point, store.partition()).await? {
+                segments::Checkpointed::Done { deleted } => deleted,
+                segments::Checkpointed::Fenced { newer } => {
+                    // A newer owner has the partition: take no more writes (the engine restarts).
+                    tracing::error!(epoch = self.epoch(), newer, "this owner has been fenced off; no more writes");
+                    self.poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(AdbError::Internal(format!("fenced: epoch {newer} has taken this partition over from epoch {}", self.epoch())));
+                }
+            };
             tracing::info!(floor, deleted, "checkpoint point written; covered WAL segments deleted");
         }
         Ok(())
@@ -2016,10 +2026,6 @@ impl<L: Log + 'static> DurableWrites<L> {
                     floor = floor.min(engine_floor);
                 }
             }
-        }
-        if !lineages.is_empty() {
-            let (store, base) = adb_store::lance::io::ObjectStore::from_uri(cold).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
-            store.put(&base.clone().join("NODE"), serde_json::Value::Object(lineages.clone()).to_string().as_bytes()).await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
         }
         Ok((floor, lineages))
     }
@@ -2214,7 +2220,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
