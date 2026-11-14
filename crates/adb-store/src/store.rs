@@ -40,7 +40,7 @@ use crate::{StoreError, StoreResult};
 mod fold;
 #[path = "tier.rs"]
 mod tier;
-pub use tier::{archive_tree, restore_table, restore_tree, table_meta_offset, ArchiveStats, TierStats, COLD_BASE_ID};
+pub use tier::{archive_tree, restore_table, restore_tree, table_meta_offset, tree_archived, ArchivePending, ArchivePolicy, ArchiveStats, TierStats, COLD_BASE_ID};
 
 /// The embedding dimension of ADB's model (bge-small-en-v1.5, MVP W4). One per
 /// deployment (D3 S5); a table of another dimension is rewritten at open.
@@ -172,6 +172,8 @@ pub struct PartitionStore {
     archiving: tokio::sync::Mutex<()>,
     /// What the object-storage mirror holds (`tier`).
     archive_state: std::sync::Mutex<tier::ArchiveState>,
+    /// When this store opened: the archive age before the first archive.
+    opened_at: std::time::Instant,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -743,7 +745,7 @@ impl PartitionStore {
         let _one = self.folding.lock().await;
         // The old lineage is complete on the mirror before its table is replaced
         // and deleted locally (`tier`; a no-op without object storage).
-        self.archive().await?;
+        self.archive_locked(tier::ArchivePolicy::from_env()).await?;
         let mut g = { let _w = adb_core::steps::timer("store.state WRITE-lock wait"); self.state.write().await };
         let bytes_before = dir_size(&dir);
         // The new table, complete and closed, beside the old one.
@@ -945,6 +947,7 @@ impl PartitionStore {
             layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
             archiving: tokio::sync::Mutex::new(()),
             archive_state: std::sync::Mutex::new(tier::load_archive_state(dir)),
+            opened_at: std::time::Instant::now(),
         };
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);

@@ -86,6 +86,14 @@ fn local_manifests(root: &std::path::Path) -> usize {
     std::fs::read_dir(root.join("p0/memory.lance/_versions")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".manifest")).count()
 }
 
+/// Data files on the mirror (the root's data, as archived).
+async fn mirror_data_files(mirror: &str) -> usize {
+    use futures::TryStreamExt;
+    let (store, base) = lance::io::ObjectStore::from_uri(mirror).await.unwrap();
+    let list: Vec<_> = store.read_dir_all(&base.child("data"), None).try_collect().await.unwrap();
+    list.len()
+}
+
 async fn tiered(cold: String) {
     let root = tempfile::tempdir().unwrap();
     let cfg = StoreConfig {
@@ -117,18 +125,30 @@ async fn tiered(cold: String) {
     assert_eq!(rows(&mirror).await, rows(&local).await);
     assert_eq!(rows(&mirror).await, 20 * 100 + 1, "facts and _meta");
 
-    // 3. More writes and folds: local cleanup keeps every unarchived version, and the
-    //    mirror keeps every manifest ever written.
-    off = apply(&store, off, 20).await;
-    store.compact(history, now).await.unwrap();
-    off = apply(&store, off, 20).await;
-    store.compact(history, now).await.unwrap();
+    // 3. More writes and folds between two archives (option B: checkpoints of large
+    //    files): the folds' small fragments are merged into one file before the
+    //    archive, and only the checkpoint's version reaches the mirror — one manifest
+    //    per archive, never the versions in between.
+    let data_1 = mirror_data_files(&mirror).await;
+    let mut folds = 0;
+    for _ in 0..4 {
+        off = apply(&store, off, 10).await;
+        store.compact(history, now).await.unwrap();
+        folds += 1;
+    }
+    let pending = store.archive_pending().await;
+    eprintln!("pending after {folds} folds: {pending:?}");
+    assert!(pending.bytes > 0 && pending.changed);
     let b = store.archive().await.unwrap();
     eprintln!("archive 2: {b:?}");
     assert_eq!(b.watermark, off);
     let (on_mirror, on_disk) = (mirror_manifests(&mirror).await, local_manifests(root.path()));
-    eprintln!("manifests: {on_mirror} on the mirror, {on_disk} local");
-    assert!(on_mirror > on_disk, "local cleanup removed old versions; the mirror kept them ({on_mirror} vs {on_disk})");
+    let data_2 = mirror_data_files(&mirror).await;
+    eprintln!("manifests: {on_mirror} on the mirror, {on_disk} local; mirror data files {data_1} → {data_2}");
+    assert_eq!(on_mirror, 2, "one manifest per archive");
+    assert_eq!(data_2, data_1 + 1, "{folds} folds' fragments reached object storage as one file");
+    assert_eq!(on_disk, 1, "local versions before the checkpoint are gone");
+    assert_eq!(store.archive_pending().await.bytes, 0);
     assert_eq!(rows(&mirror).await, 60 * 100 + 1);
 
     // 3b. Tier: move every local fragment but the newest to the cold base; after the
@@ -144,6 +164,7 @@ async fn tiered(cold: String) {
     off = apply(&store, off, 5).await;
     store.compact(history, now).await.unwrap();
     let d = store.archive().await.unwrap();
+    assert_eq!(mirror_manifests(&mirror).await, 3, "one manifest per archive");
     eprintln!("archive after tiering: {d:?}");
     let after = local_data(root.path());
     eprintln!("local data: {before} → {after} bytes");

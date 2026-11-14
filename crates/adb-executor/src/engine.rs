@@ -481,7 +481,8 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                     tracing::warn!(error = %e, "compaction failed; retrying later");
                 }
             }
-            // S3 option B: archive to object storage every `ADB_ARCHIVE_EVERY_SECS` (default 30).
+            // S3 option B: every `ADB_ARCHIVE_EVERY_SECS` (default 30), archive a
+            // checkpoint to object storage if `ArchivePolicy` says it is due.
             if ticks % archive_every == 0 {
                 if let Err(e) = w.archive_tick().await {
                     tracing::warn!(error = %e, "archive to object storage failed; the log keeps the records; retrying");
@@ -694,17 +695,18 @@ impl LocalEngine {
         }
     }
 
-    /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
     /// Archive to object storage now (S3 option B, `ADB_COLD_URI`): the memory table,
     /// the platform tables and the engine, and the log's floor with them. The
-    /// maintenance timer does this every `ADB_ARCHIVE_EVERY_SECS`.
+    /// maintenance timer does this when due (`ADB_ARCHIVE_MIN_BYTES`,
+    /// `ADB_ARCHIVE_MAX_AGE_SECS`), checking every `ADB_ARCHIVE_EVERY_SECS`.
     pub async fn archive_now(&self) -> Result<(), String> {
         match &self.durable {
-            Some(w) => w.archive_tick().await.map_err(|e| e.to_string()),
+            Some(w) => w.archive_now().await.map_err(|e| e.to_string()),
             None => Ok(()),
         }
     }
 
+    /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
     pub(crate) fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
     }

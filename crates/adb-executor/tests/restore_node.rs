@@ -47,7 +47,6 @@ async fn a_node_is_rebuilt_from_object_storage_and_the_log_after_it() {
     let cold = tempfile::tempdir().unwrap();
     std::env::set_var("ADB_COLD_URI", format!("file://{}", cold.path().display()));
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
-    std::env::set_var("ADB_ARCHIVE_FOLD_RECORDS", "10");
 
     let wal_cfg = |dir: &std::path::Path| WalConfig { dir: dir.join("p0"), segment_bytes: 4096 };
     let wal: adb_executor::EngineLog = std::sync::Arc::new(LocalWal::open(PartitionId(0), wal_cfg(a_dir.path())).unwrap());

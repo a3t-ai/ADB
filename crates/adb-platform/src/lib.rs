@@ -138,6 +138,31 @@ pub struct PlatformCompactStats {
     pub took: std::time::Duration,
 }
 
+/// Compacts exactly the given fragments, one file per `max_bytes`
+/// ([`PlatformStore::merge_unarchived`]).
+struct MergeFragments {
+    fragments: Vec<lance::table::format::Fragment>,
+    max_bytes: u64,
+}
+
+#[async_trait::async_trait]
+impl lance::dataset::optimize::CompactionPlanner for MergeFragments {
+    async fn plan(&self, ds: &Dataset) -> lance::Result<lance::dataset::optimize::CompactionPlan> {
+        let options = lance::dataset::optimize::CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            num_threads: Some(1),
+            target_rows_per_fragment: usize::MAX / 2,
+            max_bytes_per_file: Some(self.max_bytes as usize),
+            ..Default::default()
+        };
+        Ok(lance::dataset::optimize::CompactionPlan {
+            tasks: vec![lance::dataset::optimize::TaskData { fragments: self.fragments.clone() }],
+            read_version: ds.version().version,
+            options,
+        })
+    }
+}
+
 /// Versions a table may gain before it is compacted outside the nightly run.
 pub const COMPACT_AFTER_VERSIONS: u64 = 256;
 
@@ -813,6 +838,43 @@ impl PlatformStore {
         }
         stats.took = started.elapsed();
         Ok(stats)
+    }
+
+    /// Before an archive to object storage (S3 option B): in every table, merge the
+    /// fragments whose files object storage doesn't hold yet (`archived`: paths
+    /// under the platform root, as `archive_tree` records them) into large files
+    /// (`max_bytes` each), so the archive copies those instead of every small one.
+    /// Rows stay as they are; old versions stay until the next compaction. Writes
+    /// wait for it, as for [`Self::compact`]. Returns the tables merged.
+    pub async fn merge_unarchived(&self, archived: &std::collections::HashSet<String>, max_bytes: u64) -> PlatformResult<usize> {
+        let mut applied = self.applied.lock().await;
+        Box::pin(self.flush_locked(&mut applied)).await?;
+        let mut merged = 0;
+        for table in self.list_tables()? {
+            let Some(ds) = self.dataset(&table).await else { continue };
+            let fresh: Vec<lance::table::format::Fragment> = ds
+                .manifest
+                .fragments
+                .iter()
+                .filter(|f| f.files.iter().all(|d| d.base_id.is_none() && !archived.contains(&format!("{table}.lance/data/{}", d.path))))
+                .cloned()
+                .collect();
+            if fresh.len() < 2 {
+                continue;
+            }
+            let mut ds = (*ds).clone();
+            applied.compacting = Some(table.clone());
+            self.save(&applied)?;
+            let done = lance::dataset::optimize::compact_files_with_planner(&mut ds, None, &MergeFragments { fragments: fresh, max_bytes }).await;
+            ds.checkout_latest().await.map_err(lance)?;
+            applied.versions.insert(table.clone(), ds.version().version);
+            applied.compacting = None;
+            self.save(&applied)?;
+            self.tables.write().await.insert(table.clone(), Arc::new(ds));
+            done.map_err(lance)?;
+            merged += 1;
+        }
+        Ok(merged)
     }
 
     /// Rewrite `_applied.json` atomically (temp file, fsync, rename).

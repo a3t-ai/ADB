@@ -14,6 +14,7 @@ lance-datafusion-14 = { package = "lance-datafusion", version = "=14.0.2" }
 datafusion.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
 serde.workspace = true

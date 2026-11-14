@@ -13,7 +13,6 @@ async fn a_node_archives_everything_and_trims_its_log_to_it() {
     let cold = tempfile::tempdir().unwrap();
     std::env::set_var("ADB_COLD_URI", format!("file://{}", cold.path().display()));
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
-    std::env::set_var("ADB_ARCHIVE_FOLD_RECORDS", "10");
 
     // Small log segments, so the purge can drop whole segments in a short test.
     let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };

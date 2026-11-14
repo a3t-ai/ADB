@@ -215,8 +215,24 @@ Table `_tombstones`: one row per FORGET.
 | P2 cleanup guard | done as part of T1 (`cleanup_local_versions`: only versions older than the archived one) | `2f9cae0` |
 | Phase 1 step 1: log retention at the archive watermark, archive timer (`ADB_ARCHIVE_EVERY_SECS`, default 30 s), `CURRENT` pointer | done; leader only (followers keep their own purge) | `8b072a5` |
 | No erasure with object storage: the fold keeps forgotten payloads (archived), archive runs before log redaction | done | `912f95d` |
-| Phase 1 step 2a: the whole node archived — platform tables and engine store beside the memory table (`{cold}/platform/{lineage}`, `{cold}/engine/{lineage}`, `{cold}/NODE`); log floor = the lowest point any of them still needs | done; test `cold_node.rs` (log trimmed to 394 with watermark 400) | (this commit) |
-| Phase 1 step 2b: rebuild a lagging or new node from object storage (Raft snapshot at the archived point, restore by shallow clone + WAL from W+1) | next | |
+| Phase 1 step 2a: the whole node archived — platform tables and engine store beside the memory table (`{cold}/platform/{lineage}`, `{cold}/engine/{lineage}`, `{cold}/NODE`); log floor = the lowest point any of them still needs | done; test `cold_node.rs` (log trimmed to 394 with watermark 400) | `746f27f` |
+| Phase 1 step 2b: rebuild a lagging or new node from object storage | done in code; restore tested locally (`restore_node.rs`), 3-node test `tests/cluster-restore.mjs` | `d5688c1` + (this commit) |
+| Phase 1 step 2c: large files only — archive = checkpoint (14 Nov, user decision "B") | done; tests `tier.rs` (4 folds → 1 data file + 1 manifest on the mirror; 77 → 34 objects for the same run), `durable.rs` (policy not due → nothing archived) | (this commit) |
+
+How step 2b works:
+- After an archive tick whose floor moved, the leader logs `Effect::Archived {cold, floor, node}` (`node`: the memory table's `CURRENT`, the platform and engine lineages). Every replica sees it.
+- Each node's Raft state machine takes its snapshot at the entry holding `floor` (found by binary search in openraft's log) and carries the point as the snapshot data, so openraft trims its log only to what the archive holds. A membership change after the point waits for the next point.
+- A node behind the trimmed log gets that snapshot: it writes `raft/restore`, moves `applied` to the snapshot, stops applying, and exits 76. On the next start, before opening anything, `restore::restore_node` shallow-clones the memory table at the archived version (new lineage), copies the platform tables (each set back to the version `_applied.json` records) and the engine, and starts an empty WAL at `floor + 1`. Raft then sends every entry after the point; each store skips what it holds.
+- Limits: an empty node 1 (lowest id) initialises a new group at start (existing rule, not new); `branches/` is not archived.
+
+How step 2c works (why: per-fold archiving made ~11 objects per fold, up to ~95k per busy dataset per day, against Hetzner's 50 M objects per bucket):
+- S3 objects can't be appended to, so new data starts as small local files and reaches object storage only in large ones. The log (three copies) holds what object storage lacks meanwhile.
+- **When** (`ArchivePolicy`, tuning variables): `ADB_ARCHIVE_MIN_BYTES` (default 512 MiB) of folded data not yet archived, or `ADB_ARCHIVE_MAX_AGE_SECS` (default 1800) since the last archive with anything new in the log. `ADB_ARCHIVE_EVERY_SECS` (default 30) is only how often that is checked. An idle node archives nothing (its own `Archived` record doesn't count as new).
+- **Merge first**: the fragments object storage holds no file of are compacted into one file per `min_bytes` (memory table: `PartitionStore::archive`; platform tables: `PlatformStore::merge_unarchived`, under its write lock like its compaction).
+- **Checkpoint only**: an archive copies the files the current version uses (data, deletions, indexes, its transaction and its manifest, then the hint); versions between two archives never reach object storage. Platform tables are archived at the versions `_applied.json` names, under the platform's file lock.
+- After the checkpoint, local versions older than it are removed (with the small fragments the merge replaced). Folds no longer archive.
+- Expected per dataset: about `data ÷ min_bytes` data files plus one manifest (and its index files) per checkpoint; at most 48 checkpoints a day with the defaults.
+- Open: the fold can still rewrite archived fragments (size tiers) into new ones, which are archived again; indexes are archived at every checkpoint (4 files each in the test).
 
 Measured on Hetzner `nbg1` from the code-server pod (curl, a TLS handshake per request, so pessimistic): PUT 4 KB 42 ms, 1 MB 98 ms, 16 MB 911 ms (~18 MB/s per stream); GET 1 MB 98 ms, 16 MB 347 ms (~46 MB/s); 64 KB range 35 ms; 32 parallel range reads 187 req/s, no 429s.
 

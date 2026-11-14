@@ -136,9 +136,9 @@ impl PartitionStore {
             return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
         }
         let started = std::time::Instant::now();
-        // The mirror catches up first, so the cleanup in step 5 may remove the
-        // versions it now holds (`tier`; a no-op without object storage).
-        self.archive().await?;
+        // No archive here (S3 option B): object storage gets large files at the
+        // archive timer's checkpoints; the cleanup in step 5 keeps every version since
+        // the last one (`cleanup_local_versions`).
         let dir = self.table_dir();
         let bytes_before = dir_size(&dir);
         let mut n = FoldCounts::default();

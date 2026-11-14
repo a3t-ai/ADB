@@ -636,6 +636,9 @@ pub struct DurableWrites<L: Log> {
     archive_floor: std::sync::atomic::AtomicU64,
     /// The floor the last `Effect::Archived` record announced.
     archive_marked: std::sync::atomic::AtomicU64,
+    /// The offset of the last `Archived` record: records up to it are nothing new
+    /// to archive (an idle node archives nothing).
+    archive_record: std::sync::atomic::AtomicU64,
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
@@ -1885,22 +1888,38 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     /// Whether compaction is due on size: more than 16 MemWAL generations (W5), or
     /// many writes since the last one (W7).
-    /// Object storage (S3 option B): archive the table, then fold when the log held
-    /// back for it passes `ADB_ARCHIVE_FOLD_RECORDS` (default 100 000), so the next
-    /// archive moves the watermark on. A no-op without object storage.
+    /// Object storage (S3 option B): archive a checkpoint of the node when
+    /// [`adb_store::ArchivePolicy`] says so — the new folded data reached
+    /// `ADB_ARCHIVE_MIN_BYTES`, or `ADB_ARCHIVE_MAX_AGE_SECS` passed with anything
+    /// new in the log — folding first so the checkpoint covers the log's tip. Until
+    /// then the log holds what object storage lacks. A no-op without object storage.
     pub async fn archive_tick(&self) -> AdbResult<()> {
+        Box::pin(self.archive_checkpoint(false)).await
+    }
+
+    /// Archive a checkpoint now, whatever the policy (on request, tests).
+    pub async fn archive_now(&self) -> AdbResult<()> {
+        Box::pin(self.archive_checkpoint(true)).await
+    }
+
+    async fn archive_checkpoint(&self, force: bool) -> AdbResult<()> {
         let Some(store) = &self.store else { return Ok(()) };
         if store.log_floor().is_none() {
             return Ok(());
         }
-        let mut stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+        let policy = adb_store::ArchivePolicy::from_env();
         let tip = seq_lock!(self).log().last_offset().0;
-        if tip.saturating_sub(stats.watermark) >= archive_fold_records() {
-            self.compact().await?;
-            stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
+        let seen = store.archive_watermark().1 .0.max(self.archive_record.load(std::sync::atomic::Ordering::SeqCst));
+        let pending = store.archive_pending().await;
+        if !force && !policy.due(pending.bytes, tip > seen, pending.since_last) {
+            return Ok(());
         }
+        if tip > store.archive_watermark().1 .0 {
+            self.compact().await?;
+        }
+        let stats = store.archive().await.map_err(|e| AdbError::Internal(format!("archive: {e}")))?;
         let cold = store.cold_uri().unwrap_or_default().to_string();
-        let (trees_floor, mut node) = self.archive_trees(&cold).await?;
+        let (trees_floor, mut node) = Box::pin(self.archive_trees(&cold, policy)).await?;
         let floor = stats.watermark.min(trees_floor);
         self.archive_floor.store(floor + 1, std::sync::atomic::Ordering::SeqCst);
         tracing::info!(files = stats.files, version = stats.version, memory = stats.watermark, floor, held = tip.saturating_sub(floor), "archived to object storage");
@@ -1916,6 +1935,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
             self.to_store(&record, seq.log()).await;
             self.archive_marked.store(floor, std::sync::atomic::Ordering::SeqCst);
+            self.archive_record.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(())
     }
@@ -1923,7 +1943,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Archive the platform tables and the engine's spaces beside the memory table;
     /// returns the lowest offset they can be rebuilt to (`u64::MAX`: neither exists),
     /// and where each is (`NODE`).
-    async fn archive_trees(&self, cold: &str) -> AdbResult<(u64, serde_json::Map<String, serde_json::Value>)> {
+    async fn archive_trees(&self, cold: &str, policy: adb_store::ArchivePolicy) -> AdbResult<(u64, serde_json::Map<String, serde_json::Value>)> {
         let err = |e: adb_store::StoreError| AdbError::Internal(format!("archive: {e}"));
         let mut floor = u64::MAX;
         let mut lineages = serde_json::Map::new();
@@ -1932,10 +1952,27 @@ impl<L: Log + 'static> DurableWrites<L> {
             // Past the last platform record, the platform needs nothing from the log.
             let platform_last = self.platform_last.load(std::sync::atomic::Ordering::SeqCst);
             let root = p.root().to_path_buf();
-            let applied = std::fs::read(root.join("_applied.json")).ok();
-            let offset = applied.as_ref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok()).and_then(|v| v.get("offset").and_then(|o| o.as_u64())).unwrap_or(0);
-            let last: Vec<(String, Vec<u8>)> = applied.map(|b| vec![("_applied.json".to_string(), b)]).unwrap_or_default();
-            let (lineage, _) = adb_store::archive_tree(cold, "platform", &root, &|_| false, &last).await.map_err(err)?;
+            // Each table's new small fragments into large files first.
+            p.merge_unarchived(&adb_store::tree_archived(&root), policy.min_bytes).await.map_err(|e| AdbError::Internal(format!("archive: platform merge: {e}")))?;
+            // Under the platform's file lock (no compaction deletes a version meanwhile):
+            // `_applied.json`, and each table at the version it names.
+            let (lineage, offset) = p
+                .with_tables(|_| async {
+                    let applied = std::fs::read(root.join("_applied.json")).ok();
+                    let parsed = applied.as_ref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+                    let offset = parsed.as_ref().and_then(|v| v.get("offset").and_then(|o| o.as_u64())).unwrap_or(0);
+                    let pins: std::collections::HashMap<String, u64> = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("versions").and_then(|m| m.as_object()).cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(t, v)| v.as_u64().map(|v| (format!("{t}.lance"), v)))
+                        .collect();
+                    let last: Vec<(String, Vec<u8>)> = applied.map(|b| vec![("_applied.json".to_string(), b)]).unwrap_or_default();
+                    Box::pin(adb_store::archive_tree(cold, "platform", &root, &|_| false, &last, &pins)).await.map(|(l, _)| (l, offset))
+                })
+                .await
+                .map_err(err)?;
             lineages.insert("platform".into(), serde_json::json!({ "lineage": lineage, "watermark": offset }));
             if offset < platform_last {
                 floor = floor.min(offset);
@@ -1954,7 +1991,7 @@ impl<L: Log + 'static> DurableWrites<L> {
                 last.extend(pt.snapshot);
             }
             if engine_floor != u64::MAX || dir.exists() {
-                let (lineage, _) = adb_store::archive_tree(cold, "engine", &dir, &|rel: &str| rel.contains("_mem_wal"), &last).await.map_err(err)?;
+                let (lineage, _) = Box::pin(adb_store::archive_tree(cold, "engine", &dir, &|rel: &str| rel.contains("_mem_wal"), &last, &Default::default())).await.map_err(err)?;
                 let w = if engine_floor == u64::MAX { 0 } else { engine_floor };
                 lineages.insert("engine".into(), serde_json::json!({ "lineage": lineage, "watermark": w }));
                 if engine_floor != u64::MAX {
@@ -2159,7 +2196,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2813,11 +2850,6 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
         }
     }
-}
-
-/// Log records held back for object storage before a fold is forced (`archive_tick`).
-fn archive_fold_records() -> u64 {
-    std::env::var("ADB_ARCHIVE_FOLD_RECORDS").ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(100_000)
 }
 
 /// How often (in log records) the log is trimmed below Lance's durable offset.

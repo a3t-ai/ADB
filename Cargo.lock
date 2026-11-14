@@ -199,6 +199,7 @@ dependencies = [
  "adb-core",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "chrono",
  "datafusion",
  "futures",

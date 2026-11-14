@@ -347,8 +347,8 @@ async fn log_is_kept_until_object_storage_holds_it() {
     use adb_store::{PartitionStore, StoreConfig};
     use std::sync::Arc;
 
-    // Only this test reads it (`archive_tick`).
-    std::env::set_var("ADB_ARCHIVE_FOLD_RECORDS", "100");
+    // Only this test archives (`archive_tick`): first a policy that isn't due.
+    std::env::set_var("ADB_ARCHIVE_MAX_AGE_SECS", "3600");
     let dir = tempfile::tempdir().unwrap();
     let cold = tempfile::tempdir().unwrap();
     let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };
@@ -385,7 +385,12 @@ async fn log_is_kept_until_object_storage_holds_it() {
     };
     assert_eq!(store.log_floor(), Some(LogOffset(1)));
 
-    // The archive tick: archive, fold (too much held back), archive.
+    // Not due (little data, the age not reached): the tick archives nothing.
+    w.archive_tick().await.unwrap();
+    assert_eq!(store.archive_watermark().1, LogOffset(0), "not due: nothing archived");
+
+    // Due (any age): the tick folds what the log holds back, then archives a checkpoint.
+    std::env::set_var("ADB_ARCHIVE_MAX_AGE_SECS", "0");
     w.archive_tick().await.unwrap();
     let (version, watermark) = store.archive_watermark();
     eprintln!("after the archive tick: version {version}, watermark {}", watermark.0);
