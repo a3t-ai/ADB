@@ -27,6 +27,9 @@ use adb_sequencer::Sequencer;
 use adb_store::PartitionStore;
 
 use crate::apply::{Applier, ApplyBarrier};
+
+#[path = "segments.rs"]
+pub mod segments;
 use crate::reads::check_scope;
 use adb_gateway::{sub_value, Registry, SubSpec};
 use async_trait::async_trait;
@@ -639,6 +642,9 @@ pub struct DurableWrites<L: Log> {
     /// The offset of the last `Archived` record: records up to it are nothing new
     /// to archive (an idle node archives nothing).
     archive_record: std::sync::atomic::AtomicU64,
+    /// Object storage holds every record up to this offset (WAL segments above the
+    /// checkpoint); `None` until the first ship looks. Serialises shipping.
+    shipped: tokio::sync::Mutex<Option<u64>>,
     /// Platform writes waiting for the sequencer: the next holder commits them as one
     /// group (one record, one Lance commit per table), see [`Self::platform_many`].
     platform_queue: std::sync::Mutex<Vec<PlatformPending>>,
@@ -1888,6 +1894,11 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     /// Whether compaction is due on size: more than 16 MemWAL generations (W5), or
     /// many writes since the last one (W7).
+    /// Whether object storage is on (`ADB_COLD_URI`): the log is kept for it.
+    pub fn log_floor_on(&self) -> bool {
+        self.store.as_ref().is_some_and(|s| s.log_floor().is_some())
+    }
+
     /// Object storage (S3 option B): archive a checkpoint of the node when
     /// [`adb_store::ArchivePolicy`] says so — the new folded data reached
     /// `ADB_ARCHIVE_MIN_BYTES`, or `ADB_ARCHIVE_MAX_AGE_SECS` passed with anything
@@ -1929,13 +1940,20 @@ impl<L: Log + 'static> DurableWrites<L> {
             if let Some(current) = store.archived_current() {
                 node.insert("memory".into(), current);
             }
-            let mut seq = seq_lock!(self);
-            let effects = vec![Effect::Archived { cold, floor: LogOffset(floor), node: serde_json::Value::Object(node) }];
-            let ts = seq.begin();
-            let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-            self.to_store(&record, seq.log()).await;
+            let point = crate::restore::ArchivePoint { cold: cold.clone(), floor, node: serde_json::Value::Object(node) };
+            let record = {
+                let mut seq = seq_lock!(self);
+                let effects = vec![Effect::Archived { cold, floor: LogOffset(floor), node: point.node.clone() }];
+                let ts = seq.begin();
+                let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
+                self.to_store(&record, seq.log()).await;
+                record
+            };
             self.archive_marked.store(floor, std::sync::atomic::Ordering::SeqCst);
             self.archive_record.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
+            // Where a node restores from, then the WAL segments the checkpoint covers go.
+            let deleted = self.checkpoint_segments(&point, store.partition()).await?;
+            tracing::info!(floor, deleted, "checkpoint point written; covered WAL segments deleted");
         }
         Ok(())
     }
@@ -2196,7 +2214,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

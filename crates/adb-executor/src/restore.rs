@@ -11,6 +11,9 @@
 //! The restore is built in `dir/.restoring` and swapped in at the end; the old
 //! directories are removed only then (their contents are behind the archive anyway).
 //! A restore cut short is started again from scratch.
+//!
+//! [`restore_from_object_storage`] needs nothing but object storage (§3.0): the last
+//! checkpoint's `POINT`, the checkpoint, and the WAL segments above its floor.
 
 use std::path::Path;
 
@@ -36,6 +39,11 @@ pub struct RestoreStats {
     pub engine_files: usize,
     /// The log's first offset now (`floor + 1`).
     pub log_starts_at: u64,
+    /// WAL segments read from object storage, and the records they added to the log.
+    pub segments: usize,
+    pub segment_records: usize,
+    /// The log's last offset after the restore.
+    pub log_ends_at: u64,
 }
 
 /// The directories a restore replaces.
@@ -88,5 +96,45 @@ pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreSta
     std::fs::remove_dir_all(&old).map_err(|e| format!("{}: {e}", at("removing the old parts")))?;
     std::fs::remove_dir_all(&work).map_err(|e| format!("{}: {e}", at("done")))?;
     tracing::info!(floor = point.floor, ?stats, "node restored from object storage");
+    Ok(stats)
+}
+
+/// Rebuild the data directory `dir` (empty, or a node to replace) from object storage
+/// alone: the last checkpoint (`{cold}/p0/POINT`, [`restore_node`]), then every WAL
+/// segment above its floor appended to the fresh log. Opening the engine on `dir`
+/// afterwards replays those records. With no checkpoint yet, the log is rebuilt from
+/// the segments alone.
+pub async fn restore_from_object_storage(dir: &Path, cold: &str) -> Result<RestoreStats, String> {
+    use adb_log::Log;
+    let at = |what: &str| format!("restore from object storage ({what})");
+    let partition = PartitionId(0);
+    let point = crate::writes::segments::read_point(cold, partition).await.map_err(|e| format!("{}: {e}", at("point")))?;
+    let mut stats = match &point {
+        Some(p) => restore_node(dir, p).await?,
+        None => {
+            if dir.join("p0").exists() {
+                return Err(at("no checkpoint yet, and the directory holds a log: restore into an empty one"));
+            }
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", at("start")))?;
+            RestoreStats { log_starts_at: 1, ..Default::default() }
+        }
+    };
+    let floor = point.as_ref().map(|p| p.floor).unwrap_or(0);
+    let wal = adb_log::LocalWal::open(partition, adb_log::WalConfig::new(dir.join("p0"))).map_err(|e| format!("{}: {e}", at("log")))?;
+    for seg in crate::writes::segments::list_segments(cold, partition).await.map_err(|e| format!("{}: {e}", at("segments")))?.into_iter().filter(|s| s.last > floor) {
+        let records = crate::writes::segments::read_segment(cold, partition, seg).await.map_err(|e| format!("{}: {e}", at("segment")))?;
+        stats.segments += 1;
+        for r in records {
+            // A segment straddling the floor: what the checkpoint holds is skipped.
+            if r.offset.0 <= wal.last_offset().0 || r.offset.0 <= floor {
+                continue;
+            }
+            wal.append(r).await.map_err(|e| format!("{}: {e}", at("appending a record")))?;
+            stats.segment_records += 1;
+        }
+    }
+    stats.log_ends_at = wal.last_offset().0;
+    drop(wal);
+    tracing::info!(floor, ?stats, "node restored from object storage alone");
     Ok(stats)
 }

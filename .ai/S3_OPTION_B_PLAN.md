@@ -113,7 +113,7 @@ write ─▶ gateway ─▶ owner of p (lease, epoch)
   replacing a node copies no log.
 - **WAL segments after a checkpoint** are pure duplicates (every row, tombstone and
   tombstone-log entry is in the Lance files) and are deleted, so a partition holds
-  about one checkpoint interval of segments. *Pending the user's confirmation.*
+  about one checkpoint interval of segments (confirmed by the user, 14 Nov).
 - Tuning variables: `ADB_WAL_SEGMENT_MS` (1000), `ADB_WAL_SEGMENT_BYTES` (8 MB),
   `ADB_REPLICA_MEM_BYTES` (100 MB), `ADB_REPLICA_SPILL_MAX_BYTES`, `ADB_WAL_REPLICAS` (1).
 
@@ -293,6 +293,7 @@ progress is parked on branch `raft-datapath-wip`.
 | Phase 1 step 2a: the whole node archived — platform tables and engine store beside the memory table (`{cold}/platform/{lineage}`, `{cold}/engine/{lineage}`, `{cold}/NODE`); log floor = the lowest point any of them still needs | done; test `cold_node.rs` (log trimmed to 394 with watermark 400) | `746f27f` |
 | Phase 1 step 2b: rebuild a lagging or new node from object storage | done in code; restore tested locally (`restore_node.rs`), 3-node test `tests/cluster-restore.mjs` | `d5688c1` + (this commit) |
 | Phase 1 step 2c: large files only — archive = checkpoint (14 Nov, user decision "B") | done; tests `tier.rs` (4 folds → 1 data file + 1 manifest on the mirror; 77 → 34 objects for the same run), `durable.rs` (policy not due → nothing archived) | (this commit) |
+| §3.0 step 2: WAL segments to object storage (`{cold}/p0/wal/{first}-{last}.seg`, every `ADB_WAL_SEGMENT_MS`, ≤ `ADB_WAL_SEGMENT_BYTES`), `POINT` at each checkpoint, covered segments deleted, restore from object storage alone (`restore_from_object_storage`) | done; test `restore_s3.rs` local + Hetzner `adb-1` (restore 41 ms local, 1.3 s from `adb-1`; every read matches) | (this commit) |
 
 How step 2b works:
 - After an archive tick whose floor moved, the leader logs `Effect::Archived {cold, floor, node}` (`node`: the memory table's `CURRENT`, the platform and engine lineages). Every replica sees it.

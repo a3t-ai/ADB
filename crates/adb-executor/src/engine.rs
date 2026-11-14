@@ -447,11 +447,45 @@ const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 const BACKFILL_BATCH: usize = 256;
 const BACKFILL_IDLE_TICKS: u32 = 60;
 
+/// Aborts a task when dropped (a timer's companion task stops with it).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// S3 option B: every `ADB_WAL_SEGMENT_MS` (default 1000), ship the log records object
+/// storage lacks as WAL segments (`writes::segments`). Ends at once without object
+/// storage. Holds only a weak reference.
+fn spawn_shipper<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match writes.upgrade() {
+            Some(w) if w.log_floor_on() => {}
+            _ => return,
+        }
+        let every = crate::writes::segments::segment_interval();
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(w) = writes.upgrade() else { return };
+            if let Err(e) = w.ship_segments().await {
+                tracing::warn!(error = %e, "shipping WAL segments to object storage failed; the log keeps the records; retrying");
+            }
+        }
+    })
+}
+
 /// The maintenance timer: every tick, `expire_due`, and the embedding backfill
 /// while it finds work (then once a minute), on `writes` while it exists. Holds
 /// only a weak reference, so it never keeps the log (and its directory lock) open.
 fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
+    let shipper = spawn_shipper(writes.clone());
     tokio::spawn(async move {
+        // S3 option B: the WAL segment shipper lives as long as this timer.
+        let _shipper = AbortOnDrop(shipper);
         // The first tick after one interval, not at once: a just-opened engine is
         // often closed again right away (tests, `adb import`).
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + EXPIRE_TICK, EXPIRE_TICK);
@@ -692,6 +726,16 @@ impl LocalEngine {
     pub fn set_branch_remote(&self, remote: Arc<dyn crate::branch_engine::BranchRemote>) {
         if let Some(host) = &self.branch_host {
             host.set_remote(remote);
+        }
+    }
+
+    /// Ship the log records object storage lacks as WAL segments now (the shipper
+    /// does this every `ADB_WAL_SEGMENT_MS`). Returns the offset object storage
+    /// then holds every record up to.
+    pub async fn ship_now(&self) -> Result<u64, String> {
+        match &self.durable {
+            Some(w) => w.ship_segments().await.map(|s| s.shipped).map_err(|e| e.to_string()),
+            None => Ok(0),
         }
     }
 

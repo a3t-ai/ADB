@@ -132,6 +132,7 @@ dependencies = [
  "flowr-storage",
  "futures",
  "half",
+ "rmp-serde",
  "rust-stemmers",
  "serde",
  "serde_json",
