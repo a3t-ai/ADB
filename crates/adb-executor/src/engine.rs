@@ -827,6 +827,13 @@ impl LocalEngine {
         Ok(branch)
     }
 
+    /// DB-4: (records, payload bytes) of this partition's namespaces `quota` covers.
+    pub async fn usage_covered(&self, quota: &crate::branches::Quota) -> Result<(u64, u64), String> {
+        let Some(d) = &self.durable else { return Ok((0, 0)) };
+        let usage = d.usage().await.map_err(|e| e.to_string())?;
+        Ok(usage.iter().filter(|(n, _)| quota.covers(n)).fold((0, 0), |a, (_, u)| (a.0 + u.0, a.1 + u.1)))
+    }
+
     /// Step 3, a copy between partitions — out: `namespace`'s rows of `memories` as
     /// main (or `branch`) saw them at `at`.
     pub async fn copy_out(&self, namespace: &str, branch: Option<&str>, memories: &[MemoryType], at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {

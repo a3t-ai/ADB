@@ -98,6 +98,23 @@ impl crate::spaces::Spaces for RouterSpaces {
         self.local(space).await?.layers_of(space).await
     }
 
+    async fn quotas(&self) -> AdbResult<Vec<crate::branches::Quota>> {
+        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
+        let sys = node.system.local_spaces().ok_or_else(|| AdbError::Internal("the system partition has no table".into()))?;
+        sys.quotas().await
+    }
+
+    async fn usage_elsewhere(&self, quota: &crate::branches::Quota, except: adb_core::log::PartitionId) -> AdbResult<(u64, u64)> {
+        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
+        let mut total = (0, 0);
+        let parts: BTreeSet<Partition> = node.catalog.read().unwrap().iter().filter(|(ns, _)| quota.covers(ns)).map(|(_, p)| *p).collect();
+        for p in parts.into_iter().filter(|p| *p != except.0) {
+            let (r, b) = node.part(p).await.map_err(AdbError::Internal)?.usage_covered(quota).await.map_err(AdbError::Internal)?;
+            total = (total.0 + r, total.1 + b);
+        }
+        Ok(total)
+    }
+
     async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {
         let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
         let mut out = Vec::new();
@@ -143,6 +160,12 @@ impl PartitionedEngine {
         }))
     }
 
+    /// The system partition's data directory.
+    fn system_dir(&self) -> PathBuf {
+        let sys = routing::system_partition(&self.map.read().unwrap());
+        self.dir.join("parts").join(format!("p{sys}"))
+    }
+
     /// The system partition's engine.
     pub fn system(&self) -> &Arc<LocalEngine> {
         &self.system
@@ -159,7 +182,18 @@ impl PartitionedEngine {
         if let Some(e) = parts.get(&p) {
             return Ok(Arc::clone(e));
         }
-        let (e, _) = LocalEngine::durable_partition(self.dir.join("parts").join(format!("p{p}")), PartitionRole::memory(p)).await?;
+        let pdir = self.dir.join("parts").join(format!("p{p}"));
+        // Cluster-wide settings (one embedding model, one set of cache rules): the
+        // system partition's, copied before a partition opens.
+        std::fs::create_dir_all(&pdir).map_err(|e| format!("partition data dir {}: {e}", pdir.display()))?;
+        let sys_dir = self.system_dir();
+        if let Some(c) = adb_embed::EmbedConfig::load(&sys_dir)? {
+            c.save(&pdir)?;
+        }
+        if let Some(c) = adb_store::CacheConfig::load(&sys_dir)? {
+            c.save(&pdir)?;
+        }
+        let (e, _) = LocalEngine::durable_partition(&pdir, PartitionRole::memory(p)).await?;
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
@@ -782,6 +816,53 @@ impl Engine for Arc<PartitionedEngine> {
             n += e.forget_lineages(memory, lineages).await?;
         }
         Ok(n)
+    }
+
+    // ---- quotas: kept once, in the system partition (every partition reads them)
+
+    async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>, history_days: Option<u64>) -> Result<crate::branches::Quota, String> {
+        self.system.quota_set(pattern, max_bytes, max_records, history_days).await
+    }
+
+    async fn quota_drop(&self, pattern: &str) -> Result<bool, String> {
+        self.system.quota_drop(pattern).await
+    }
+
+    async fn quota_list(&self) -> Result<Vec<crate::branches::Quota>, String> {
+        self.system.quota_list().await
+    }
+
+    // ---- settings: cluster-wide
+
+    async fn embedding(&self) -> Result<Value, String> {
+        self.system.embedding().await
+    }
+
+    /// Checked and saved by the system partition (which restarts ADB to apply them),
+    /// and saved for every other partition, so all embed with one model.
+    async fn set_embedding(&self, settings: Value) -> Result<Value, String> {
+        let c: adb_embed::EmbedConfig = serde_json::from_value(settings.clone()).map_err(|e| format!("embedding settings: {e}"))?;
+        let r = self.system.set_embedding(settings).await?;
+        if let Ok(dirs) = std::fs::read_dir(self.dir.join("parts")) {
+            for d in dirs.flatten().filter(|d| d.path().is_dir()) {
+                c.save(&d.path())?;
+            }
+        }
+        Ok(r)
+    }
+
+    async fn cache(&self) -> Result<Value, String> {
+        self.system.cache().await
+    }
+
+    /// Applied to the system partition and every open one (saved by each); a partition
+    /// opened later copies the system partition's.
+    async fn set_cache(&self, settings: Value) -> Result<Value, String> {
+        let r = self.system.set_cache(settings.clone()).await?;
+        for e in self.parts.lock().await.values() {
+            e.set_cache(settings.clone()).await?;
+        }
+        Ok(r)
     }
 
     async fn compact(&self) -> Result<Value, String> {

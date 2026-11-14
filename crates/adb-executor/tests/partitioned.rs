@@ -292,3 +292,48 @@ async fn copies_cross_partitions() {
     let err = node.branch_promote("bot", "behind", elsewhere("bot-v3-"), false).await.unwrap_err();
     assert!(err.starts_with("merge_stale:"), "{err}");
 }
+
+/// Quotas in a cluster (option A, user 14 Nov): kept once in the system partition and
+/// read by every partition. A pattern quota counts its namespaces in every partition;
+/// one namespace's quota is exact. Cache rules are cluster-wide: a partition opened
+/// later gets them too.
+#[tokio::test(flavor = "multi_thread")]
+async fn quotas_and_settings_span_partitions() {
+    std::env::set_var("ADB_S3", "off");
+    let dir = tempfile::tempdir().unwrap();
+    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
+    let a = "acme--a";
+    let b: &'static str = Box::leak((0..1000).map(|i| format!("acme--b{i}")).find(|n| node.partition_of(n) != node.partition_of(a)).unwrap().into_boxed_str());
+    let q = |aql: String| {
+        let node = std::sync::Arc::clone(&node);
+        async move { node.query(&aql, None).await }
+    };
+    node.quota_set("acme--*", None, Some(5), None).await.unwrap();
+    node.quota_set(a, None, Some(3), None).await.unwrap();
+    assert_eq!(node.quota_list().await.unwrap().len(), 2, "kept once, in the system partition");
+
+    for i in 0..3 {
+        q(format!(r#"STORE INTO SEMANTIC (key = "k{i}") NAMESPACE "{a}""#)).await.unwrap();
+    }
+    let e = q(format!(r#"STORE INTO SEMANTIC (key = "k3") NAMESPACE "{a}""#)).await.unwrap_err();
+    assert!(e.contains("quota_exceeded") && e.contains(a), "the namespace's own quota, exact: {e}");
+    q(format!(r#"STORE INTO SEMANTIC (key = "k0") NAMESPACE "{b}""#)).await.unwrap();
+    q(format!(r#"STORE INTO SEMANTIC (key = "k1") NAMESPACE "{b}""#)).await.unwrap();
+    // 3 in a's partition + 2 in b's = the pattern's 5: the next one in b is refused.
+    let e = q(format!(r#"STORE INTO SEMANTIC (key = "k2") NAMESPACE "{b}""#)).await.unwrap_err();
+    assert!(e.contains("quota_exceeded") && e.contains("acme--*"), "the pattern counts the other partition: {e}");
+    q(r#"STORE INTO SEMANTIC (key = "free") NAMESPACE "other--x""#.into()).await.unwrap();
+    assert!(node.quota_drop("acme--*").await.unwrap());
+    q(format!(r#"STORE INTO SEMANTIC (key = "k2") NAMESPACE "{b}""#)).await.unwrap();
+
+    // Cache rules: applied to the open partitions, copied into one opened later.
+    node.set_cache(serde_json::json!({ "max_bytes": "16MB", "rules": [{ "memory": "semantic", "keep": "all" }] })).await.unwrap();
+    let late: &'static str = Box::leak((0..1000).map(|i| format!("late{i}")).find(|n| {
+        let p = node.partition_of(n);
+        ![node.partition_of(a), node.partition_of(b), node.partition_of("other--x")].contains(&p)
+    }).unwrap().into_boxed_str());
+    q(format!(r#"STORE INTO SEMANTIC (key = "x") NAMESPACE "{late}""#)).await.unwrap();
+    let late_dir = dir.path().join("parts").join(format!("p{}", node.partition_of(late)));
+    let rules = adb_store::CacheConfig::load(&late_dir).unwrap().expect("the late partition has the cache rules");
+    assert_eq!(rules.rules.len(), 1);
+}

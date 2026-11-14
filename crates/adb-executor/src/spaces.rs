@@ -18,7 +18,7 @@ use adb_store::{PartitionStore, StoredRow};
 use async_trait::async_trait;
 
 use crate::apply::ApplyBarrier;
-use crate::branches::{Branches, Layer, Tag};
+use crate::branches::{Branches, Layer, Quota, Tag};
 
 /// Other spaces, wherever they live.
 #[async_trait]
@@ -30,6 +30,12 @@ pub trait Spaces: Send + Sync {
     async fn layers_of(&self, space: &str) -> AdbResult<Vec<Layer>>;
     /// Every space (in any partition) reading `space` as a layer.
     async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>>;
+    /// The org's quotas (DB-4): in a cluster, kept once in the system partition.
+    async fn quotas(&self) -> AdbResult<Vec<Quota>>;
+    /// (records, payload bytes) of the namespaces `quota` covers in every partition
+    /// but `except` — current usage, not reserved: parallel writes on other
+    /// partitions can pass a pattern quota by about one write each (user, 14 Nov).
+    async fn usage_elsewhere(&self, quota: &Quota, except: adb_core::log::PartitionId) -> AdbResult<(u64, u64)>;
 }
 
 /// One partition's own table and registry as a [`Spaces`] (also what a router asks
@@ -61,6 +67,15 @@ impl Spaces for LocalSpaces {
 
     async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {
         Ok(self.registry.layered_by(space))
+    }
+
+    async fn quotas(&self) -> AdbResult<Vec<Quota>> {
+        Ok(self.registry.quotas())
+    }
+
+    /// One partition: there is nowhere else.
+    async fn usage_elsewhere(&self, _quota: &Quota, _except: adb_core::log::PartitionId) -> AdbResult<(u64, u64)> {
+        Ok((0, 0))
     }
 }
 
@@ -103,6 +118,14 @@ impl SpaceView {
 
     pub async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {
         self.source().layered_by(space).await
+    }
+
+    pub async fn quotas(&self) -> AdbResult<Vec<Quota>> {
+        self.source().quotas().await
+    }
+
+    pub async fn usage_elsewhere(&self, quota: &Quota, except: adb_core::log::PartitionId) -> AdbResult<(u64, u64)> {
+        self.source().usage_elsewhere(quota, except).await
     }
 
     /// The commit time a layer is read at: its tag's point for a pin or history, `None`

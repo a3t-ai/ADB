@@ -1093,7 +1093,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let rows = forgotten_rows(store, forgotten.clone()).await.map_err(store_err)?;
         let pins = self.pins.get().map(|f| f()).unwrap_or_default();
         // DB-8: a namespace's own history window, where a quota row sets one.
-        let windows: Vec<(String, Duration)> = self.branches.quotas().into_iter()
+        let windows: Vec<(String, Duration)> = self.space_view().quotas().await?.into_iter()
             .filter_map(|q| q.history_days.map(|d| (q.pattern, Duration::from_secs(d * 86_400))))
             .collect();
         let now = CommitTs::from_datetime(time::now());
@@ -1362,13 +1362,23 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// have none: their writes aren't the org's storage.
     async fn check_quota(&self, namespace: Option<&str>, bytes: u64) -> AdbResult<()> {
         let Some(ns) = namespace.filter(|_| self.parent.is_none()) else { return Ok(()) };
-        let quotas: Vec<_> = self.branches.quotas().into_iter().filter(|q| q.covers(ns)).collect();
+        let view = self.space_view();
+        let quotas: Vec<_> = view.quotas().await?.into_iter().filter(|q| q.covers(ns)).collect();
         if quotas.is_empty() {
             return Ok(());
         }
         let usage = self.usage().await?;
         for q in quotas {
-            let (records, used) = usage.iter().filter(|(n, _)| q.covers(n)).fold((0u64, 0u64), |a, (_, u)| (a.0 + u.0, a.1 + u.1));
+            let (mut records, mut used) = usage.iter().filter(|(n, _)| q.covers(n)).fold((0u64, 0u64), |a, (_, u)| (a.0 + u.0, a.1 + u.1));
+            // A pattern can cover namespaces in other partitions (option A, 14 Nov):
+            // their current usage counts too. One namespace lives here only.
+            if q.pattern.ends_with('*') {
+                if let Some(store) = &self.store {
+                    let (r, b) = view.usage_elsewhere(&q, store.partition()).await?;
+                    records += r;
+                    used += b;
+                }
+            }
             if q.max_records.is_some_and(|m| records + 1 > m) {
                 return Err(AdbError::QueryError(format!("quota_exceeded: {:?} holds {records} records, its limit is {}", q.pattern, q.max_records.unwrap_or(0))));
             }
