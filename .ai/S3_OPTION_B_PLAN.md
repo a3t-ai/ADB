@@ -4,6 +4,8 @@
 
 Branch: `s3-option-b` (from `m0-k5-deps` at `7e240b4`).
 
+Shared architecture doc with the implementation steps and their status (14 Nov): https://claude.ai/artifact/AByc6eirpKsnRjLjNbSF24
+
 ## 1. Decision
 
 ADB is a simple self-hosted agent database with small, fixed-size disks. Object
