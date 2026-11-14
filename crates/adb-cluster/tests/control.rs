@@ -35,7 +35,7 @@ async fn the_map_is_kept_and_repaired_across_a_leader_loss() {
     std::env::set_var("ADB_LEASE_MS", "1500");
     std::env::set_var("ADB_HEARTBEAT_MS", "200");
     // 5 memory partitions + the system partition: 2 owners per node.
-    const PARTITIONS: u32 = 5;
+    const PARTITIONS: u16 = 5;
     let mut listeners = Vec::new();
     let mut voters_at = BTreeMap::new();
     for id in 1..=3u64 {

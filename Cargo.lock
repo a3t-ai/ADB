@@ -129,6 +129,7 @@ dependencies = [
 name = "adb-executor"
 version = "0.1.0"
 dependencies = [
+ "adb-cluster",
  "adb-core",
  "adb-cq",
  "adb-embed",

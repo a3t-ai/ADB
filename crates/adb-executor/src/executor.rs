@@ -40,6 +40,11 @@ pub struct Executor {
 
 impl Executor {
     /// An executor over its write and read paths (log + Lance).
+    /// Its writes and reads.
+    pub fn io(&self) -> (Arc<dyn Writes>, Arc<dyn Reads>) {
+        (Arc::clone(&self.writes), Arc::clone(&self.reads))
+    }
+
     pub fn with_io(writes: Arc<dyn Writes>, reads: Arc<dyn Reads>) -> Self {
         Self {
             writes,

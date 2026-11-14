@@ -21,6 +21,7 @@ rmp-serde.workspace = true
 adb-cq = { path = "../adb-cq" }
 adb-gateway = { path = "../adb-gateway" }
 adb-platform = { path = "../adb-platform" }
+adb-cluster = { path = "../adb-cluster" }
 datafusion.workspace = true
 aql-parser.workspace = true
 tokio.workspace = true

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 pub type NodeId = u64;
-pub type Partition = u32;
+pub type Partition = u16;
 
 /// Where a partition lives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

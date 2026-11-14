@@ -12,7 +12,7 @@ use adb_core::{MemoryRecord, MemoryType};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
-use adb_core::log::Epoch;
+use adb_core::log::{Epoch, PartitionId};
 use adb_log::{LocalWal, WalConfig};
 
 /// The log a durable engine runs on: the local WAL, or (cluster) the Raft log.
@@ -387,14 +387,45 @@ fn watch_statement(aql: &str) -> Option<aql_parser::ast::Statement> {
     aql_parser::parse(aql).ok()
 }
 
-/// Open the partition log in `dir/p0`. A log this process just closed can still be
+/// What one engine holds (S3 option B step 3). A single node holds everything in
+/// partition 0, as before. In a cluster each memory partition `n` holds its memory
+/// table, log, branches and watches; the system partition holds the platform tables
+/// and FlowR's engine store (and an empty memory table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionRole {
+    pub id: PartitionId,
+    pub platform: bool,
+    pub engine: bool,
+}
+
+impl PartitionRole {
+    /// One node, one partition, everything in it (today's layout).
+    pub const SINGLE: Self = Self { id: SINGLE_PARTITION, platform: true, engine: true };
+
+    /// Memory partition `n`: the memory table only.
+    pub fn memory(n: u16) -> Self {
+        Self { id: PartitionId(n), platform: false, engine: false }
+    }
+
+    /// The system partition (id `n`): platform tables and FlowR's engine store.
+    pub fn system(n: u16) -> Self {
+        Self { id: PartitionId(n), platform: true, engine: true }
+    }
+
+    /// The log's directory in an engine's data directory: `p{n}`.
+    pub fn log_dir(&self, dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(format!("p{}", self.id.0))
+    }
+}
+
+/// Open the partition log in `dir/p{n}`. A log this process just closed can still be
 /// held for a moment by a background task finishing its step (the maintenance
 /// timer is aborted, but stops only when the runtime next polls it): retry for up
 /// to 10 s, yielding to the runtime between tries.
-async fn open_wal(dir: &std::path::Path) -> Result<LocalWal, String> {
+async fn open_wal(dir: &std::path::Path, role: PartitionRole) -> Result<LocalWal, String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match LocalWal::open(SINGLE_PARTITION, WalConfig::new(dir.join("p0"))) {
+        match LocalWal::open(role.id, WalConfig::new(role.log_dir(dir))) {
             Err(adb_log::LogError::Locked(_)) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -441,14 +472,14 @@ pub fn object_storage() -> Option<String> {
     }
 }
 
-pub(crate) async fn open_store(dir: &std::path::Path) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
+pub(crate) async fn open_store(dir: &std::path::Path, partition: PartitionId) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
     let settings = adb_embed::EmbedConfig::load(dir)?;
     let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
     // The replica set's other nodes may embed on this node's model (C-17b).
     adb_embed::peers::serve_with(embedder.clone());
     let cold = object_storage();
     let store_cfg = StoreConfig { embedding_dim, embedding_model, cold, ..StoreConfig::new(dir.join("store")) };
-    let store = Arc::new(PartitionStore::open(&store_cfg, SINGLE_PARTITION).await.map_err(|e| e.to_string())?);
+    let store = Arc::new(PartitionStore::open(&store_cfg, partition).await.map_err(|e| e.to_string())?);
     Ok((store, embedder))
 }
 
@@ -621,13 +652,23 @@ impl LocalEngine {
     /// table (stage D3). Returns what the replay found.
     pub async fn durable(dir: impl Into<std::path::PathBuf>) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
-        let wal: EngineLog = Arc::new(open_wal(&dir).await?);
+        let wal: EngineLog = Arc::new(open_wal(&dir, PartitionRole::SINGLE).await?);
         Self::durable_on(dir, wal).await
+    }
+
+    /// A durable engine for one partition of a cluster node (step 3): its log in
+    /// `dir/p{n}`, its table in `dir/store/p{n}`, object storage under `{cold}/p{n}`;
+    /// platform tables and the engine store only if `role` has them.
+    pub async fn durable_partition(dir: impl Into<std::path::PathBuf>, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
+        let wal: EngineLog = Arc::new(open_wal(&dir, role).await?);
+        Box::pin(Self::durable_with(dir, wal, None, None, role)).await
     }
 
     /// The local WAL in `dir/p0`, opened (a cluster node's state machine holds it).
     pub async fn open_local_wal(dir: &std::path::Path) -> Result<Arc<LocalWal>, String> {
-        Ok(Arc::new(open_wal(dir).await?))
+        Ok(Arc::new(open_wal(dir, PartitionRole::SINGLE).await?))
     }
 
     /// A durable engine over `wal`: the local WAL, or (cluster, M3) the Raft log,
@@ -635,14 +676,14 @@ impl LocalEngine {
     /// node's local WAL. Everything else is as [`Self::durable`].
     pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
         // Boxed: keeps the callers' future types shallow (the compiler's query depth).
-        Box::pin(Self::durable_with(dir.into(), wal, None, None)).await
+        Box::pin(Self::durable_with(dir.into(), wal, None, None, PartitionRole::SINGLE)).await
     }
 
     /// As [`Self::durable_on`], taking over a follower's already-open table,
     /// platform tables and engine spaces (CA-34: a new leader does not reopen
     /// what its replica kept applied).
     pub async fn durable_warm(dir: impl Into<std::path::PathBuf>, wal: EngineLog, warm: Warm) -> Result<(Self, ReplayStats), String> {
-        Box::pin(Self::durable_with(dir.into(), wal, Some(warm), None)).await
+        Box::pin(Self::durable_with(dir.into(), wal, Some(warm), None, PartitionRole::SINGLE)).await
     }
 
     /// A branch engine (B2): its own WAL, sequencer and delta table in `dir`, reading
@@ -650,8 +691,14 @@ impl LocalEngine {
     pub async fn durable_branch(dir: impl Into<std::path::PathBuf>, parent: crate::branch_engine::ParentView) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("branch data dir {}: {e}", dir.display()))?;
-        let wal: EngineLog = Arc::new(open_wal(&dir).await?);
-        Box::pin(Self::durable_with(dir, wal, None, Some(parent))).await
+        let wal: EngineLog = Arc::new(open_wal(&dir, PartitionRole::SINGLE).await?);
+        Box::pin(Self::durable_with(dir, wal, None, Some(parent), PartitionRole::SINGLE)).await
+    }
+
+    /// The engine's writes and reads, as its executor uses them (the partition router
+    /// runs statements spanning partitions over them, step 3).
+    pub fn io(&self) -> (Arc<dyn Writes>, Arc<dyn crate::reads::Reads>) {
+        self.executor.io()
     }
 
     /// The last record in this engine's log (offset, commit time).
@@ -787,7 +834,7 @@ impl LocalEngine {
         self.durable.as_ref()
     }
 
-    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, warm: Option<Warm>, parent: Option<crate::branch_engine::ParentView>) -> Result<(Self, ReplayStats), String> {
+    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, warm: Option<Warm>, parent: Option<crate::branch_engine::ParentView>, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
         let warm_cache = warm.is_some();
@@ -798,7 +845,7 @@ impl LocalEngine {
                 (w.store, w.embedder, Some(w.platform), Some((w.engine, Some(w.engine_next))))
             }
             None => {
-                let (store, embedder) = open_store(&dir).await?;
+                let (store, embedder) = open_store(&dir, role.id).await?;
                 // The field indexes it had, in the background (PF-40).
                 store.warm(false);
                 (store, embedder, None, None)
@@ -813,18 +860,25 @@ impl LocalEngine {
         }
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
-        let platform = match platform_open {
-            Some(p) => p,
-            None => Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?),
+        let platform = match (platform_open, role.platform) {
+            (Some(p), _) => Some(p),
+            (None, true) => Some(Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?)),
+            (None, false) => None,
         };
-        writes.attach_platform(Arc::clone(&platform)).await.map_err(|e| e.to_string())?;
+        if let Some(p) = &platform {
+            writes.attach_platform(Arc::clone(p)).await.map_err(|e| e.to_string())?;
+        }
         // FlowR's engine store (stage H): its spaces under `<dir>/engine`.
-        let (engine, engine_next) = match engine_open {
-            Some(e) => e,
-            None => (adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?, None),
+        let engine = match (engine_open, role.engine) {
+            (Some(e), _) => Some(e),
+            (None, true) => Some((adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?, None)),
+            (None, false) => None,
         };
         let t_engine = std::time::Instant::now();
-        let replayed = writes.attach_engine(engine, engine_next).await.map_err(|e| e.to_string())?;
+        let replayed = match engine {
+            Some((engine, engine_next)) => writes.attach_engine(engine, engine_next).await.map_err(|e| e.to_string())?,
+            None => 0,
+        };
         tracing::info!(write_path = ?(t_engine - opened), engine_spaces = ?t_engine.elapsed(), "engine open steps");
         store.yield_compaction(false);
         if replayed > 0 {
@@ -896,7 +950,7 @@ impl LocalEngine {
                 executor,
                 store: Some((store, barrier)),
                 gateway,
-                platform: Some((platform, writes)),
+                platform: platform.map(|p| (p, writes)),
                 expiry,
                 durable: Some(durable_handle),
                 watcher,

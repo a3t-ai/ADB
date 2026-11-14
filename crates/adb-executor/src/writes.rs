@@ -131,6 +131,14 @@ pub trait Writes: Send + Sync {
         weight: Option<f32>,
     ) -> AdbResult<Link>;
 
+    /// `LINK` whose target is in another partition (S3 option B step 3): as
+    /// [`Self::link`], but only the source is checked here; the router checked the
+    /// target in its own partition (a later FORGET of it leaves the link pointing at
+    /// nothing, which following it skips).
+    async fn link_remote(&self, _from_type: MemoryType, _from_id: &str, _to_type: MemoryType, _to_id: &str, _link_type: &str, _weight: Option<f32>) -> AdbResult<Link> {
+        Err(AdbError::UnsupportedOperation("links across partitions need a durable engine".into()))
+    }
+
     /// AQL v0.7 UPDATE LINK: set the weight and/or type of the links from any of
     /// `from_ids` to any of `to_ids` (of `link_type`, if given). Returns how many.
     #[allow(clippy::too_many_arguments)]
@@ -3417,59 +3425,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         link_type: &str,
         weight: Option<f32>,
     ) -> AdbResult<Link> {
-        let mut seq = seq_lock!(self);
-        let ts = seq.begin();
-        // Both ends must exist when the link commits (L4, W9): checked under the
-        // sequencer, after every earlier write is applied, so a FORGET racing this
-        // LINK can't leave it pointing at nothing.
-        if let Some(store) = &self.store {
-            if let Some(b) = self.barrier() {
-                b.wait_for_committed().await;
-            }
-            for (end, memory, id) in [("source", from_type, from_id), ("target", to_type, to_id)] {
-                let key = adb_core::Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.to_string()) };
-                if crate::query::read(store, memory, &key, &Default::default(), ts).await?.is_empty() {
-                    return Err(AdbError::QueryError(format!("LINK: the {end} record {memory:?} {id:?} doesn't exist (any more)")));
-                }
-            }
-        }
-        // AQL v0.7: the same link again (same ends, same type) sets its weight —
-        // a new version of that edge, not a parallel one.
-        if let Some(store) = &self.store {
-            let existing = self
-                .edges_between(store, from_type, &[from_id.to_string()], to_type, &[to_id.to_string()], Some(link_type), ts)
-                .await?;
-            if let Some(cur) = existing.into_iter().next() {
-                if weight.is_none() {
-                    // Nothing to change.
-                    return crate::reads::to_link(&cur).ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
-                }
-                let new = edge_version(&cur, None, weight, seq.new_id(ts));
-                let effect = Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: new.clone() };
-                let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-                self.to_store(&record, seq.log()).await;
-                return crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0))
-                    .ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
-            }
-        }
-        let id = seq.new_id(ts);
-        let to: Memory = to_type.into();
-        let mut data = row(from_type, Kind::Edge, serde_json::json!({ "to_memory": to }));
-        data.key = None;
-        data.text = None;
-        data.subject_id = Some(from_id.into());
-        data.predicate = Some("link".into());
-        data.object_id = Some(to_id.into());
-        data.link_type = Some(link_type.into());
-        data.weight = Some(weight.unwrap_or(1.0));
-        let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
-        let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
-        // Links are read from the table's edge rows (D4.1).
-        let Effect::PutEdge(n) = &effect else { unreachable!() };
-        let link = crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(n), ts, 0, 0))
-            .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?;
-        self.to_store(&record, seq.log()).await;
-        Ok(link)
+        self.link_with(from_type, from_id, to_type, to_id, link_type, weight, true).await
+    }
+
+    async fn link_remote(&self, from_type: MemoryType, from_id: &str, to_type: MemoryType, to_id: &str, link_type: &str, weight: Option<f32>) -> AdbResult<Link> {
+        self.link_with(from_type, from_id, to_type, to_id, link_type, weight, false).await
     }
 
     async fn update_links(
@@ -3800,3 +3760,73 @@ fn next_version(cur: &adb_store::StoredRow, fields: &serde_json::Map<String, ser
     NewRow { id, lineage_id: RecordId(cur.key().to_string()), version: cur.version + 1, data }
 }
 
+
+impl<L: Log + 'static> DurableWrites<L> {
+    /// `LINK`: both ends checked under the sequencer (`check_target`), or only the
+    /// source (a target in another partition, [`Writes::link_remote`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn link_with(
+        &self,
+        from_type: MemoryType,
+        from_id: &str,
+        to_type: MemoryType,
+        to_id: &str,
+        link_type: &str,
+        weight: Option<f32>,
+        check_target: bool,
+    ) -> AdbResult<Link> {
+        let mut seq = seq_lock!(self);
+        let ts = seq.begin();
+        // Both ends must exist when the link commits (L4, W9): checked under the
+        // sequencer, after every earlier write is applied, so a FORGET racing this
+        // LINK can't leave it pointing at nothing.
+        if let Some(store) = &self.store {
+            if let Some(b) = self.barrier() {
+                b.wait_for_committed().await;
+            }
+            for (end, memory, id) in [("source", from_type, from_id), ("target", to_type, to_id)].into_iter().filter(|(end, _, _)| check_target || *end == "source") {
+                let key = adb_core::Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.to_string()) };
+                if crate::query::read(store, memory, &key, &Default::default(), ts).await?.is_empty() {
+                    return Err(AdbError::QueryError(format!("LINK: the {end} record {memory:?} {id:?} doesn't exist (any more)")));
+                }
+            }
+        }
+        // AQL v0.7: the same link again (same ends, same type) sets its weight —
+        // a new version of that edge, not a parallel one.
+        if let Some(store) = &self.store {
+            let existing = self
+                .edges_between(store, from_type, &[from_id.to_string()], to_type, &[to_id.to_string()], Some(link_type), ts)
+                .await?;
+            if let Some(cur) = existing.into_iter().next() {
+                if weight.is_none() {
+                    // Nothing to change.
+                    return crate::reads::to_link(&cur).ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
+                }
+                let new = edge_version(&cur, None, weight, seq.new_id(ts));
+                let effect = Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: new.clone() };
+                let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+                self.to_store(&record, seq.log()).await;
+                return crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0))
+                    .ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
+            }
+        }
+        let id = seq.new_id(ts);
+        let to: Memory = to_type.into();
+        let mut data = row(from_type, Kind::Edge, serde_json::json!({ "to_memory": to }));
+        data.key = None;
+        data.text = None;
+        data.subject_id = Some(from_id.into());
+        data.predicate = Some("link".into());
+        data.object_id = Some(to_id.into());
+        data.link_type = Some(link_type.into());
+        data.weight = Some(weight.unwrap_or(1.0));
+        let effect = Effect::PutEdge(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
+        let record = seq.append_record(ts, None, vec![effect.clone()]).await.map_err(log_err)?;
+        // Links are read from the table's edge rows (D4.1).
+        let Effect::PutEdge(n) = &effect else { unreachable!() };
+        let link = crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(n), ts, 0, 0))
+            .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?;
+        self.to_store(&record, seq.log()).await;
+        Ok(link)
+    }
+}

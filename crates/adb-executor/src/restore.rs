@@ -47,12 +47,20 @@ pub struct RestoreStats {
     pub log_ends_at: u64,
 }
 
-/// The directories a restore replaces.
-const PARTS: [&str; 4] = ["p0", "store", "platform", "engine"];
+/// The directories a restore replaces: the partition's log, then the stores.
+fn parts(partition: PartitionId) -> [String; 4] {
+    [format!("p{}", partition.0), "store".into(), "platform".into(), "engine".into()]
+}
 
 /// Rebuild the data directory `dir` from `point` (see the module docs). `dir/raft`
 /// and anything else in `dir` are left as they are.
 pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreStats, String> {
+    restore_partition(dir, point, PartitionId(0)).await
+}
+
+/// [`restore_node`] for partition `partition` of a cluster node (step 3): its log in
+/// `dir/p{n}`, its table in `dir/store/p{n}`.
+pub async fn restore_partition(dir: &Path, point: &ArchivePoint, partition: PartitionId) -> Result<RestoreStats, String> {
     let at = |what: &str| format!("restore ({what})");
     let work = dir.join(".restoring");
     if work.exists() {
@@ -65,7 +73,7 @@ pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreSta
     if let Some(m) = part("memory") {
         let lineage = m["lineage"].as_str().ok_or_else(|| at("memory: no lineage"))?;
         let version = m["version"].as_u64().ok_or_else(|| at("memory: no version"))?;
-        adb_store::restore_table(&point.cold, &work.join("store"), PartitionId(0), lineage, version).await.map_err(|e| format!("{}: {e}", at("memory")))?;
+        adb_store::restore_table(&point.cold, &work.join("store"), partition, lineage, version).await.map_err(|e| format!("{}: {e}", at("memory")))?;
         stats.memory_version = version;
     }
     if let Some(p) = part("platform") {
@@ -78,7 +86,7 @@ pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreSta
         let lineage = e["lineage"].as_str().ok_or_else(|| at("engine: no lineage"))?;
         stats.engine_files = adb_store::restore_tree(&point.cold, "engine", lineage, &work.join("engine")).await.map_err(|e| format!("{}: {e}", at("engine")))?;
     }
-    adb_log::LocalWal::create_at(&work.join("p0"), LogOffset(point.floor + 1)).map_err(|e| format!("{}: {e}", at("log")))?;
+    adb_log::LocalWal::create_at(&work.join(format!("p{}", partition.0)), LogOffset(point.floor + 1)).map_err(|e| format!("{}: {e}", at("log")))?;
 
     // Swap in: the old parts aside, the new ones in place, then the old ones removed.
     let old = dir.join(".before-restore");
@@ -86,7 +94,8 @@ pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreSta
         std::fs::remove_dir_all(&old).map_err(|e| format!("{}: {e}", at("swap")))?;
     }
     std::fs::create_dir_all(&old).map_err(|e| format!("{}: {e}", at("swap")))?;
-    for name in PARTS {
+    for name in parts(partition) {
+        let name = name.as_str();
         if dir.join(name).exists() {
             std::fs::rename(dir.join(name), old.join(name)).map_err(|e| format!("{}: {e}", at("swap")))?;
         }
@@ -111,16 +120,21 @@ pub async fn restore_node(dir: &Path, point: &ArchivePoint) -> Result<RestoreSta
 ///
 /// [`Fence`]: crate::writes::segments::Fence
 pub async fn restore_from_object_storage(dir: &Path, cold: &str, before_epoch: Option<u64>) -> Result<RestoreStats, String> {
+    restore_partition_from_object_storage(dir, cold, PartitionId(0), before_epoch).await
+}
+
+/// [`restore_from_object_storage`] for partition `partition` of a cluster node.
+pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, partition: PartitionId, before_epoch: Option<u64>) -> Result<RestoreStats, String> {
     use crate::writes::segments as seg;
     use adb_log::Log;
     let at = |what: &str| format!("restore from object storage ({what})");
-    let partition = PartitionId(0);
+    let log_dir = format!("p{}", partition.0);
     let fence = seg::Fence::load(cold, partition, before_epoch).await.map_err(|e| format!("{}: {e}", at("epochs")))?;
     let point = seg::read_point(cold, partition, &fence).await.map_err(|e| format!("{}: {e}", at("point")))?;
     let mut stats = match &point {
-        Some((_, p)) => restore_node(dir, p).await?,
+        Some((_, p)) => restore_partition(dir, p, partition).await?,
         None => {
-            if dir.join("p0").exists() {
+            if dir.join(&log_dir).exists() {
                 return Err(at("no checkpoint yet, and the directory holds a log: restore into an empty one"));
             }
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", at("start")))?;
@@ -128,7 +142,7 @@ pub async fn restore_from_object_storage(dir: &Path, cold: &str, before_epoch: O
         }
     };
     let floor = point.as_ref().map(|(_, p)| p.floor).unwrap_or(0);
-    let wal = adb_log::LocalWal::open(partition, adb_log::WalConfig::new(dir.join("p0"))).map_err(|e| format!("{}: {e}", at("log")))?;
+    let wal = adb_log::LocalWal::open(partition, adb_log::WalConfig::new(dir.join(&log_dir))).map_err(|e| format!("{}: {e}", at("log")))?;
     // By first offset: each record is taken once, from the first allowed segment
     // holding it (every allowed copy of an offset is the same acked record).
     let segments = seg::list_segments(cold, partition).await.map_err(|e| format!("{}: {e}", at("segments")))?;

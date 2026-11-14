@@ -61,7 +61,7 @@ impl Replica {
     /// Open `dir`'s table, platform tables and engine spaces, and catch up with `log`.
     pub async fn open(dir: impl AsRef<std::path::Path>, log: EngineLog) -> Result<Self, String> {
         let dir = dir.as_ref();
-        let (store, embedder) = crate::engine::open_store(dir).await?;
+        let (store, embedder) = crate::engine::open_store(dir, crate::writes::SINGLE_PARTITION).await?;
         // The hot cache, kept by every apply, so a takeover doesn't refill it (C-19).
         store.set_cache(crate::engine::hot_cache(crate::engine::cache_config(dir)?)).await.map_err(s("store"))?;
         // The live keys a takeover hands over, and the field indexes (PF-38, PF-40).
