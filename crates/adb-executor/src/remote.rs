@@ -32,6 +32,11 @@ use crate::writes::Writes;
 pub trait Placement: Send + Sync {
     fn me(&self) -> NodeId;
     fn map(&self) -> Arc<PartitionMap>;
+    /// Whether this node holds its lease (it heard the control plane within one): a
+    /// node that doesn't may have lost its partitions, and stops serving them (step 7).
+    fn leased(&self) -> bool {
+        true
+    }
 }
 
 /// The calls between nodes.

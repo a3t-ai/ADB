@@ -398,6 +398,13 @@ impl ReplicaBuffers {
         Ok((b.epoch, out))
     }
 
+    /// Forget partition `p`'s buffer (this node took the partition over: its tail is in
+    /// the new owner's log now).
+    pub fn clear(&self, p: Partition) {
+        self.parts.lock().unwrap().remove(&p);
+        let _ = std::fs::remove_file(self.spill_path(p));
+    }
+
     /// (records in memory, bytes in memory, bytes spilled) for partition `p`.
     pub fn usage(&self, p: Partition) -> (usize, u64, u64) {
         let parts = self.parts.lock().unwrap();

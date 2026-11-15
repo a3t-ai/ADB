@@ -278,6 +278,26 @@ impl PartitionedEngine {
         if node.owns(node.sys()) {
             Box::pin(node.handle(node.sys())).await?;
         }
+        // Step 7: partitions given to this node are taken over at once, not at their
+        // first request — until then the replica's memory is the only copy of their
+        // writes not yet on object storage.
+        let weak = Arc::downgrade(&node);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let Some(node) = weak.upgrade() else { return };
+                let map = node.map();
+                let me = node.cluster.as_ref().map(|c| c.placement.me());
+                let opened: BTreeSet<Partition> = node.parts.lock().await.keys().copied().collect();
+                for (p, a) in map.assignments.iter() {
+                    if Some(a.owner) == me && !opened.contains(p) && node.leased() {
+                        if let Err(e) = Box::pin(node.handle(*p)).await {
+                            tracing::warn!(partition = p, error = %e, "taking the partition over failed; retrying");
+                        }
+                    }
+                }
+            }
+        });
         Ok(node)
     }
 
@@ -323,16 +343,62 @@ impl PartitionedEngine {
         routing::partition_of(&self.map(), namespace)
     }
 
+    /// Whether this node holds its lease (one node: always).
+    fn leased(&self) -> bool {
+        self.cluster.as_ref().is_none_or(|c| c.placement.leased())
+    }
+
     /// Partition `p`: its engine if this node owns it, else its owner.
     pub async fn handle(&self, p: Partition) -> Result<Handle, String> {
         let Some(c) = &self.cluster else { return Ok(Handle::Local(Box::pin(self.part(p)).await?)) };
         let map = self.map();
         let a = map.assignments.get(&p).ok_or_else(|| not_owner(p, &map))?;
         if a.owner == c.placement.me() {
+            // Without a lease this node may have lost the partition already (step 7).
+            if !c.placement.leased() {
+                return Err(format!("no_lease: node {} hasn't heard the control plane within a lease; it doesn't serve partition {p}", a.owner));
+            }
             return Ok(Handle::Local(Box::pin(self.part(p)).await?));
         }
         let addr = map.members.get(&a.owner).map(|m| m.addr.clone()).ok_or_else(|| not_owner(p, &map))?;
         Ok(Handle::Remote(Arc::new(RemotePartition { partition: p, addr, peers: Arc::clone(&c.peers) })))
+    }
+
+    /// Take partition `p` over at `epoch` (step 7): its directory rebuilt from object
+    /// storage — only what epochs below `epoch` wrote — then the records this node holds
+    /// as its replica appended (the acknowledged writes not yet on object storage). A
+    /// gap between the two is refused: serving would lose acknowledged writes.
+    async fn take_over(&self, p: Partition, epoch: u64, pdir: &std::path::Path) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        if pdir.exists() {
+            std::fs::remove_dir_all(pdir).map_err(|e| format!("taking over partition {p}: {e}"))?;
+        }
+        let cold = crate::engine::object_storage();
+        let mut ends_at = 0;
+        if let Some(cold) = &cold {
+            let st = crate::restore::restore_partition_from_object_storage(pdir, cold, adb_core::log::PartitionId(p), Some(epoch)).await?;
+            ends_at = st.log_ends_at;
+        }
+        let (tail_epoch, tail) = self.replicas.tail(p)?;
+        let role = if p == self.sys() { PartitionRole::system(p) } else { PartitionRole::memory(p) };
+        let mut appended = 0;
+        if !tail.is_empty() && tail_epoch < epoch {
+            let wal = LocalEngine::open_partition_wal(pdir, role).await?;
+            for r in tail {
+                let last = adb_log::Log::last_offset(&*wal).0;
+                if r.offset.0 <= last {
+                    continue;
+                }
+                if r.offset.0 != last + 1 {
+                    return Err(format!("taking over partition {p}: object storage ends at {last}, this replica's tail starts at {}: acknowledged writes would be lost", r.offset.0));
+                }
+                adb_log::Log::append(&*wal, r).await.map_err(|e| format!("taking over partition {p}: {e}"))?;
+                appended += 1;
+            }
+            ends_at = adb_log::Log::last_offset(&*wal).0;
+        }
+        tracing::info!(partition = p, epoch, from_object_storage = cold.is_some(), tail_records = appended, log_ends_at = ends_at, took_ms = t0.elapsed().as_millis() as u64, "partition taken over");
+        Ok(())
     }
 
     /// The reader of memory partition `p`, if this node reads it rather than owns it
@@ -382,6 +448,16 @@ impl PartitionedEngine {
         }
         let sys = self.sys();
         let pdir = self.dir.join("parts").join(format!("p{p}"));
+        // Step 7: owned at an epoch this directory doesn't hold — taken over from another
+        // node, or held at an older epoch — rebuilt from object storage and this node's
+        // replica tail before anything opens it.
+        let epoch = self.map().assignments.get(&p).map(|a| a.epoch);
+        if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
+            let held = std::fs::read_to_string(pdir.join("owner.epoch")).ok().and_then(|s| s.trim().parse::<u64>().ok());
+            if held != Some(epoch) {
+                Box::pin(self.take_over(p, epoch, &pdir)).await?;
+            }
+        }
         std::fs::create_dir_all(&pdir).map_err(|e| format!("partition data dir {}: {e}", pdir.display()))?;
         if p != sys {
             // Cluster-wide settings (one embedding model, one set of cache rules): the
@@ -414,11 +490,12 @@ impl PartitionedEngine {
             }
             _ => Box::pin(LocalEngine::durable_partition(&pdir, role)).await?,
         };
-        // A cluster owner records its epoch on object storage before taking writes.
-        if self.cluster.is_some() {
-            if let Some(a) = self.map().assignments.get(&p) {
-                e.begin_epoch(a.epoch).await?;
-            }
+        // A cluster owner records its epoch on object storage before taking writes, then
+        // here (a restart at the same epoch opens what it has).
+        if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
+            e.begin_epoch(epoch).await?;
+            std::fs::write(pdir.join("owner.epoch"), epoch.to_string()).map_err(|e| format!("owner epoch: {e}"))?;
+            self.replicas.clear(p);
         }
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
