@@ -83,6 +83,10 @@ pub trait Log: Send + Sync {
     /// W5: a forgotten record's payload leaves the log without disturbing anyone's
     /// position in it. Returns how many records changed.
     async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize>;
+
+    /// Object storage now holds every record up to `offset` (WAL segments, S3 option B):
+    /// a replicated log tells its replica, which may drop them. Default: nothing.
+    fn note_shipped(&self, _offset: LogOffset) {}
 }
 
 /// A shared log: the sequencer appends while readers (stage E subscribers) read the
@@ -91,6 +95,10 @@ pub trait Log: Send + Sync {
 impl<L: Log + ?Sized> Log for std::sync::Arc<L> {
     fn partition(&self) -> PartitionId {
         (**self).partition()
+    }
+
+    fn note_shipped(&self, offset: LogOffset) {
+        (**self).note_shipped(offset)
     }
 
     async fn append(&self, record: LogRecord) -> LogResult<LogOffset> {

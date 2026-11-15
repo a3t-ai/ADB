@@ -41,6 +41,8 @@ pub trait Peers: Send + Sync {
     async fn query(&self, addr: &str, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String>;
     /// Run one call on partition `partition` of the node at `addr`.
     async fn part(&self, addr: &str, partition: Partition, call: PartCall) -> Result<PartReply, String>;
+    /// Send an owner's records to partition `partition`'s replica at `addr` (step 5).
+    async fn replicate(&self, addr: &str, partition: Partition, req: crate::replication::ReplicateReq) -> Result<crate::replication::ReplicateAck, String>;
 }
 
 /// The answer of a node that doesn't own the partition asked of it.
@@ -371,6 +373,12 @@ impl Peers for LocalPeers {
         let node = self.node(addr)?;
         let r = node.serve_part(partition, wire(&call)?).await?;
         wire(&r)
+    }
+
+    async fn replicate(&self, addr: &str, partition: Partition, req: crate::replication::ReplicateReq) -> Result<crate::replication::ReplicateAck, String> {
+        let node = self.node(addr)?;
+        let req: crate::replication::ReplicateReq = rmp_serde::from_slice(&rmp_serde::to_vec_named(&req).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        node.serve_replicate(partition, req)
     }
 }
 

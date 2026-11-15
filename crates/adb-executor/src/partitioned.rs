@@ -122,6 +122,32 @@ pub struct PartitionedEngine {
     /// Other spaces read from their own partitions (memory layers); each partition
     /// engine holds it weakly.
     spaces: Arc<dyn crate::spaces::Spaces>,
+    /// What this node holds as the replica of other nodes' partitions (step 5).
+    replicas: Arc<crate::replication::ReplicaBuffers>,
+    me: std::sync::Weak<PartitionedEngine>,
+}
+
+/// Where an owned partition's records go: its replica in the current map.
+struct PartTarget {
+    partition: Partition,
+    node: std::sync::Weak<PartitionedEngine>,
+}
+
+#[async_trait]
+impl crate::replication::ReplicaTarget for PartTarget {
+    fn target(&self) -> Option<(String, u64)> {
+        let node = self.node.upgrade()?;
+        let map = node.map();
+        let a = map.assignments.get(&self.partition)?;
+        let addr = map.members.get(&a.replica?)?.addr.clone();
+        Some((addr, a.epoch))
+    }
+
+    async fn replicate(&self, addr: &str, req: crate::replication::ReplicateReq) -> Result<crate::replication::ReplicateAck, String> {
+        let node = self.node.upgrade().ok_or("the partition router has stopped")?;
+        let c = node.cluster.as_ref().ok_or("replication needs a cluster")?;
+        c.peers.replicate(addr, self.partition, req).await
+    }
 }
 
 /// Each space read from its own partition, here or on its owner (`crate::spaces`).
@@ -230,8 +256,9 @@ impl PartitionedEngine {
     }
 
     fn new(dir: PathBuf, map: PartitionMap, cluster: Option<Cluster>) -> Arc<Self> {
+        let _ = std::fs::create_dir_all(dir.join("parts"));
         Arc::new_cyclic(|me| Self {
-            dir,
+            dir: dir.clone(),
             map: std::sync::RwLock::new(Arc::new(map)),
             cluster,
             parts: Default::default(),
@@ -239,6 +266,8 @@ impl PartitionedEngine {
             catalog: Default::default(),
             catalog_at: Default::default(),
             spaces: Arc::new(RouterSpaces { node: me.clone() }),
+            replicas: Arc::new(crate::replication::ReplicaBuffers::new(dir.join("parts"))),
+            me: me.clone(),
         })
     }
 
@@ -318,7 +347,22 @@ impl PartitionedEngine {
             }
         }
         let role = if p == sys { PartitionRole::system(p) } else { PartitionRole::memory(p) };
-        let (e, _) = Box::pin(LocalEngine::durable_partition(&pdir, role)).await?;
+        let (e, _) = match (&self.cluster, crate::replication::replicas()) {
+            // A cluster owner: every record also on the partition's replica (step 5).
+            (Some(_), n) if n > 0 => {
+                let wal = LocalEngine::open_partition_wal(&pdir, role).await?;
+                let target = Arc::new(PartTarget { partition: p, node: self.me.clone() });
+                let log = crate::replication::ReplicatedLog::new(wal as Arc<dyn adb_log::Log>, target);
+                Box::pin(LocalEngine::durable_partition_on(&pdir, role, log as crate::engine::EngineLog)).await?
+            }
+            _ => Box::pin(LocalEngine::durable_partition(&pdir, role)).await?,
+        };
+        // A cluster owner records its epoch on object storage before taking writes.
+        if self.cluster.is_some() {
+            if let Some(a) = self.map().assignments.get(&p) {
+                e.begin_epoch(a.epoch).await?;
+            }
+        }
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
@@ -479,6 +523,32 @@ impl PartitionedEngine {
             }
             None => Box::pin(self.across(aql, variables, reach)).await,
         }
+    }
+
+    /// An owner's records for partition `p`, of which this node is the replica (step 5):
+    /// `not_replica` if it isn't in this node's map, `fenced` for an older epoch.
+    pub fn serve_replicate(&self, p: Partition, req: crate::replication::ReplicateReq) -> Result<crate::replication::ReplicateAck, String> {
+        let map = self.map();
+        let me = self.cluster.as_ref().map(|c| c.placement.me()).ok_or("replication needs a cluster")?;
+        let a = map.assignments.get(&p).ok_or_else(|| format!("not_replica: partition {p} has no assignment here"))?;
+        // A newer epoch here: the sender no longer owns the partition.
+        if a.epoch > req.epoch {
+            return Err(format!("fenced: partition {p} is at epoch {} (owner {}); epoch {} is stale", a.epoch, a.owner, req.epoch));
+        }
+        if a.replica != Some(me) {
+            return Err(format!("not_replica: node {me} is not partition {p}'s replica (epoch {})", a.epoch));
+        }
+        self.replicas.append(p, a.epoch, req)
+    }
+
+    /// What this node holds as partition `p`'s replica: (epoch, records above object storage).
+    pub fn replica_tail(&self, p: Partition) -> Result<(u64, Vec<adb_core::log::LogRecord>), String> {
+        self.replicas.tail(p)
+    }
+
+    /// (records in memory, bytes in memory, bytes spilled) of partition `p`'s replica here.
+    pub fn replica_usage(&self, p: Partition) -> (usize, u64, u64) {
+        self.replicas.usage(p)
     }
 
     /// A partition call another node sent here: run on the partition if this node

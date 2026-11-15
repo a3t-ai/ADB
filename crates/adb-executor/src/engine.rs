@@ -683,6 +683,17 @@ impl LocalEngine {
         Box::pin(Self::durable_with(dir, wal, None, None, role)).await
     }
 
+    /// [`Self::durable_partition`] over `log` (a cluster owner's replicated log, step 5).
+    pub async fn durable_partition_on(dir: impl Into<std::path::PathBuf>, role: PartitionRole, log: EngineLog) -> Result<(Self, ReplayStats), String> {
+        Box::pin(Self::durable_with(dir.into(), log, None, None, role)).await
+    }
+
+    /// The partition's local WAL in `dir/p{n}`, opened.
+    pub async fn open_partition_wal(dir: &std::path::Path, role: PartitionRole) -> Result<Arc<LocalWal>, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
+        Ok(Arc::new(open_wal(dir, role).await?))
+    }
+
     /// The local WAL in `dir/p0`, opened (a cluster node's state machine holds it).
     pub async fn open_local_wal(dir: &std::path::Path) -> Result<Arc<LocalWal>, String> {
         Ok(Arc::new(open_wal(dir, PartitionRole::SINGLE).await?))
@@ -914,7 +925,7 @@ impl LocalEngine {
     }
 
     /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
-    pub(crate) fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
+    pub fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
     }
 

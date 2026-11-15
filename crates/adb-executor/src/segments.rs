@@ -320,6 +320,8 @@ impl<L: Log> DurableWrites<L> {
             stats = ShipStats { segments: stats.segments + 1, records: stats.records + n, bytes: stats.bytes + b, shipped: l };
         }
         *shipped = Some(stats.shipped);
+        // The replica may drop what object storage now holds (step 5).
+        seq_timed(&self.seq, "seq.wait @ship", "seq.held @ship").await.log().note_shipped(LogOffset(stats.shipped));
         Ok(stats)
     }
 

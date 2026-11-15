@@ -285,6 +285,7 @@ dependencies = [
  "flowr-storage",
  "futures",
  "reqwest 0.12.28",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
