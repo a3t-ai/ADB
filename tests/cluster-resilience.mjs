@@ -77,7 +77,7 @@ for (let b = 0; b < acked.length; b += batch) {
       try {
         const d = await q(node, `LOOKUP FROM SEMANTIC KEY id = "${run}k${i}" NAMESPACE "${ns(i)}"`);
         checked++;
-        if ((d?.count ?? d?.records?.length ?? 0) < 1) { missing++; if (lost.length < 10) lost.push(i); }
+        if ((d?.data?.count ?? d?.data?.records?.length ?? d?.count ?? d?.records?.length ?? 0) < 1) { missing++; if (lost.length < 10) lost.push(i); }
         return;
       } catch {}
     }
