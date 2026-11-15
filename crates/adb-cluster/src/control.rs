@@ -90,6 +90,11 @@ pub struct ControlNode {
 
 /// `ADB_REBALANCE_SECS`: at most one rebalancing step this often (default 10). A node
 /// taking a partition over needs that long or less (S3 option B, 15 Nov).
+fn start_grace() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("ADB_START_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30))
+}
+
+/// `ADB_REBALANCE_SECS` (see [`rebalance_every`]).
 fn rebalance_every() -> std::time::Duration {
     std::time::Duration::from_secs(std::env::var("ADB_REBALANCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10))
 }
@@ -149,12 +154,14 @@ impl ControlNode {
         let mut leading = false;
         // A new leader waits a full interval before its first rebalance step.
         let mut rebalanced = std::time::Instant::now();
+        let mut led_since = std::time::Instant::now();
         loop {
             tick.tick().await;
             let now = self.is_leader();
             if now && !leading {
                 // A new leader: every member gets a full lease before anything moves.
                 *self.leases.lock().unwrap() = Some(Leases::new(leases::lease()));
+                led_since = std::time::Instant::now();
                 tracing::info!(node = self.id, "leading the control group");
             } else if !now && leading {
                 *self.leases.lock().unwrap() = None;
@@ -196,6 +203,18 @@ impl ControlNode {
                 let Some(l) = l.as_ref() else { continue };
                 (l.live(map.members.keys().copied()), l.reported())
             };
+            // The first placement waits for every voter of the control group (or
+            // `ADB_START_GRACE_SECS`): placing on whoever was up first left a node empty
+            // and the rebalancer moving partitions under load for minutes (Hetzner,
+            // round 4).
+            if map.assignments.is_empty() {
+                let voters: std::collections::BTreeSet<NodeId> = self.raft.metrics().borrow_watched().membership_config.membership().voter_ids().collect();
+                let missing: Vec<NodeId> = voters.iter().copied().filter(|v| !live.contains(v)).collect();
+                if !missing.is_empty() && led_since.elapsed() < start_grace() {
+                    tracing::debug!(?missing, "control: first placement waits for every node");
+                    continue;
+                }
+            }
             let mut changes = plan(&map, &live, &reported);
             // The map whole: one step toward an even spread, every `ADB_REBALANCE_SECS`.
             if changes.is_empty() && rebalanced.elapsed() >= rebalance_every() {

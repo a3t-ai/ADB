@@ -56,7 +56,7 @@ fn ostore_err(what: &'static str) -> impl Fn(adb_store::lance::Error) -> AdbErro
 macro_rules! at {
     ($cold:expr, $partition:expr, $dir:expr, $name:expr) => {{
         let uri = format!("{}/p{}", $cold.trim_end_matches('/'), $partition.0);
-        let (store, base) = adb_store::lance::io::ObjectStore::from_uri(&uri).await.map_err(ostore_err("object storage"))?;
+        let (store, base) = adb_store::ostore::located(&uri).await.map_err(ostore_err("object storage"))?;
         let path = base.clone().join($dir);
         let path = if $name.is_empty() { path } else { path.join($name) };
         (store, path)

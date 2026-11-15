@@ -316,7 +316,7 @@ pub(crate) async fn archive_table(cfg: &StoreConfig, partition: PartitionId, dir
     let mut todo: Vec<String> = version_files(dir, base).await?.into_iter().filter(|f| !st.done.contains(f) || f.ends_with("latest_version_hint.json")).collect();
     todo.sort_by_key(|f| (archive_rank(f), f.clone()));
     let mirror = format!("{}/mirror", lineage_uri(cold, partition, &lineage));
-    let (store, base_path) = lance::io::ObjectStore::from_uri(&mirror).await.map_err(lance)?;
+    let (store, base_path) = crate::ostore::located(&mirror).await.map_err(lance)?;
     let mut stats = ArchiveStats::default();
     for rel in todo {
         let bytes = match std::fs::read(dir.join(&rel)) {
@@ -426,7 +426,7 @@ pub async fn archive_tree(
     }
     todo.sort_by_key(|f| (archive_rank(f.rsplit_once(".lance/").map(|(_, r)| r).unwrap_or(f)), f.clone()));
     let uri = format!("{}/{}/{}", cold.trim_end_matches('/'), kind, lineage);
-    let (store, base) = lance::io::ObjectStore::from_uri(&uri).await.map_err(lance)?;
+    let (store, base) = crate::ostore::located(&uri).await.map_err(lance)?;
     let dest = |rel: &str| rel.split('/').fold(base.clone(), |p, part| p.join(part));
     let mut stats = ArchiveStats::default();
     for rel in todo {
@@ -633,7 +633,7 @@ pub async fn restore_tree(cold: &str, kind: &str, lineage: &str, dir: &Path) -> 
         return Err(StoreError::Decode(format!("restoring into {}: it exists", dir.display())));
     }
     let uri = format!("{}/{}/{}", cold.trim_end_matches('/'), kind, lineage);
-    let (store, base) = lance::io::ObjectStore::from_uri(&uri).await.map_err(lance)?;
+    let (store, base) = crate::ostore::located(&uri).await.map_err(lance)?;
     let objects: Vec<_> = store.read_dir_all(&base, None).try_collect().await.map_err(lance)?;
     let prefix = format!("{}/", base.as_ref().trim_end_matches('/'));
     let io = |e: std::io::Error| StoreError::Decode(format!("restore {kind}: {e}"));

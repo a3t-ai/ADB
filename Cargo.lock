@@ -291,6 +291,7 @@ dependencies = [
  "lance-arrow 14.0.2",
  "lance-datafusion 12.0.0",
  "lance-index",
+ "object_store 0.14.2",
  "serde",
  "serde_json",
  "tempfile",
