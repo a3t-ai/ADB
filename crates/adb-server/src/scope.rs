@@ -90,6 +90,41 @@ impl Scope {
         Ok(())
     }
 
+    /// Step 4b, on an engine that runs statements within a scope (the partition
+    /// router): the namespaces this token reaches for `aql` — its write patterns if
+    /// any stage writes, else its read and write patterns. A stage naming a namespace
+    /// must be open to it as before; a stage naming none runs inside the patterns.
+    /// Kinds that belong to no namespace (topics, subscriptions, MERGE ENTITY, WATCH
+    /// without NAMESPACE) stay closed to a scoped token.
+    pub fn reach_for(&self, aql: &str) -> Result<adb_cluster::routing::Reach, String> {
+        use aql_parser::Statement as S;
+        let stmt = aql_parser::parse(aql).map_err(|_| format!("a statement that doesn't parse is not open to the {} token", self.name))?;
+        let stages: Vec<&S> = match &stmt {
+            S::Pipeline(p) => p.stages.iter().collect(),
+            other => vec![other],
+        };
+        let mut writes = false;
+        for s in stages {
+            let (ns, w) = match s {
+                S::Recall(x) => (x.modifiers.namespace.as_deref(), false),
+                S::Lookup(x) => (x.modifiers.namespace.as_deref(), false),
+                S::Load(x) => (x.modifiers.namespace.as_deref(), false),
+                S::Scan(x) => (x.modifiers.namespace.as_deref(), false),
+                S::Store(x) => (x.modifiers.namespace.as_deref(), true),
+                S::Update(x) => (x.modifiers.namespace.as_deref(), true),
+                S::Forget(x) => (x.modifiers.namespace.as_deref(), true),
+                S::Link(_) | S::UpdateLink(_) | S::Unlink(_) => (None, true),
+                _ => return Err(format!("this kind of statement is not open to the {} token", self.name)),
+            };
+            if let Some(ns) = ns {
+                self.check(ns, w)?;
+            }
+            writes |= w;
+        }
+        let patterns: Vec<String> = if writes { self.write.clone() } else { self.write.iter().chain(&self.read).cloned().collect() };
+        Ok(adb_cluster::routing::Reach::Only(patterns))
+    }
+
     /// A Flight action, by its body.
     pub fn check_action(&self, action: &str, body: &Value) -> Result<(), String> {
         if action == "aql" {

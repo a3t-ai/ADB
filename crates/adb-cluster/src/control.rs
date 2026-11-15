@@ -10,7 +10,7 @@
 //! HTTP, on each voter's control endpoint:
 //!
 //! ```text
-//! POST /control/heartbeat   {node, addr, load} → {map}       (leader; else 421 {leader})
+//! POST /control/heartbeat   {node, addr, flight, load} → {map}   (leader; else 421 {leader})
 //! GET  /control/map         the map as applied on this voter
 //! POST /control/raft/*      the group's Raft RPCs
 //! ```
@@ -59,6 +59,9 @@ pub struct Heartbeat {
     pub node: NodeId,
     /// The node's data-plane base URL.
     pub addr: String,
+    /// Its Arrow Flight endpoint.
+    #[serde(default)]
+    pub flight: Option<String>,
     /// Its own load report (higher = busier).
     pub load: f64,
 }
@@ -206,8 +209,8 @@ async fn heartbeat(State(node): State<Arc<ControlNode>>, Json(hb): Json<Heartbea
         return (StatusCode::MISDIRECTED_REQUEST, Json(NotLeader { leader })).into_response();
     }
     let map = node.map();
-    if map.members.get(&hb.node).map(|m| &m.addr) != Some(&hb.addr) {
-        if let Err(e) = node.propose(ControlCmd::Join { node: hb.node, addr: hb.addr.clone() }).await {
+    if map.members.get(&hb.node).map(|m| (&m.addr, &m.flight)) != Some((&hb.addr, &hb.flight)) {
+        if let Err(e) = node.propose(ControlCmd::Join { node: hb.node, addr: hb.addr.clone(), flight: hb.flight.clone() }).await {
             return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
         }
         tracing::info!(node = hb.node, addr = %hb.addr, "node joined");
@@ -240,9 +243,9 @@ impl Drop for AbortOnDrop {
 }
 
 impl ControlClient {
-    /// Start heartbeating as `node` (data plane at `addr`) to the voters' control
-    /// endpoints; `load` gives the load to report each time.
-    pub fn start(node: NodeId, addr: String, voters: BTreeMap<NodeId, String>, load: impl Fn() -> f64 + Send + 'static) -> Self {
+    /// Start heartbeating as `node` (data plane at `addr`, Flight at `flight`) to the
+    /// voters' control endpoints; `load` gives the load to report each time.
+    pub fn start(node: NodeId, addr: String, flight: Option<String>, voters: BTreeMap<NodeId, String>, load: impl Fn() -> f64 + Send + 'static) -> Self {
         let (tx, rx) = watch::channel(PartitionMap::default());
         let last_ok: Arc<Mutex<Option<std::time::Instant>>> = Default::default();
         let ok = Arc::clone(&last_ok);
@@ -255,7 +258,7 @@ impl ControlClient {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let hb = Heartbeat { node, addr: addr.clone(), load: load() };
+                let hb = Heartbeat { node, addr: addr.clone(), flight: flight.clone(), load: load() };
                 match http.post(format!("{target}/control/heartbeat")).json(&hb).send().await {
                     Ok(r) if r.status().is_success() => match r.json::<PartitionMap>().await {
                         Ok(map) => {

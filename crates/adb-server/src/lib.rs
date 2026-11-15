@@ -21,6 +21,8 @@
 pub mod auth;
 pub mod branch_remote;
 pub mod flight;
+pub mod forward;
+pub mod internal;
 pub mod non_prod;
 pub mod scope;
 pub use flight::{serve_flight, serve_flight_until, serve_flight_with_token, serve_flight_with_tokens};
@@ -67,7 +69,18 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
 
 /// The full router; with `token`, every endpoint but `/health` requires it.
 pub fn router_with_token(engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> Router {
-    let mut r = routes(engine);
+    guarded(routes(engine), token)
+}
+
+/// A cluster node's router (step 4): the full router plus the calls between nodes
+/// (`/internal/*`), behind the same token.
+pub fn cluster_router(node: Arc<adb_executor::partitioned::PartitionedEngine>, token: Option<Arc<str>>) -> Router {
+    let engine: Arc<dyn Engine> = Arc::new(Arc::clone(&node));
+    guarded(routes(engine).merge(internal::routes(node)), token)
+}
+
+fn guarded(routes: Router, token: Option<Arc<str>>) -> Router {
+    let mut r = routes;
     let scopes = Arc::new(scope::scopes_from_env());
     if token.is_some() || !scopes.is_empty() {
         r = r.layer(axum::middleware::from_fn(move |req, next| auth::require_token(token.clone(), Arc::clone(&scopes), req, next)));
@@ -278,16 +291,42 @@ async fn query(State(s): State<AppState>, headers: axum::http::HeaderMap, scope:
     adb_core::read_opts::scope(opts, query_inner(s, scope, req)).await
 }
 
-async fn query_inner(s: AppState, scope: Option<axum::Extension<Arc<scope::Scope>>>, req: QueryRequest) -> (StatusCode, Json<QueryResponse>) {
-    if let Some(axum::Extension(scope)) = scope {
-        if let Err(e) = scope.check_aql(&req.query) {
-            return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }));
+/// Run `aql` as the caller may: with a scoped token, within its namespaces — on an
+/// engine that can (the partition router, step 4b), statements naming no namespace run
+/// inside the token's patterns; elsewhere every stage must name one (DB-3). `Err` with
+/// `forbidden` before anything ran: the token doesn't open it.
+pub(crate) async fn scoped_query(engine: &dyn Engine, scope: Option<&scope::Scope>, aql: &str, variables: Option<&std::collections::HashMap<String, Value>>) -> Result<Result<Value, String>, String> {
+    let Some(scope) = scope else { return Ok(engine.query(aql, variables).await) };
+    let reach = scope.reach_for(aql)?;
+    match engine.query_reach(aql, variables, &reach).await {
+        Some(r) => Ok(r),
+        None => {
+            scope.check_aql(aql)?;
+            Ok(engine.query(aql, variables).await)
         }
     }
+}
+
+async fn query_inner(s: AppState, scope: Option<axum::Extension<Arc<scope::Scope>>>, req: QueryRequest) -> (StatusCode, Json<QueryResponse>) {
     let start = Instant::now();
     static IN_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     adb_core::steps::value("http.query in flight", IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
-    let result = s.engine.query(&req.query, req.variables.as_ref()).await;
+    let scope = scope.map(|axum::Extension(s)| s);
+    let result = scoped_query(s.engine.as_ref(), scope.as_deref(), &req.query, req.variables.as_ref()).await;
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }));
+        }
+    };
+    // A scope the router refused once running (a named namespace outside it).
+    if let (Some(_), Err(e)) = (&scope, &result) {
+        if adb_core::codes::code_of(e) == "forbidden" {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some("forbidden"), error: Some(e.clone()), execution_time_ms: None }));
+        }
+    }
     IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     adb_core::steps::add("http.query handler", start.elapsed());
     let ms = Some(start.elapsed().as_millis() as u64);

@@ -834,6 +834,20 @@ impl Engine for Arc<PartitionedEngine> {
         Box::pin(self.query_in(aql, variables, &Reach::All)).await
     }
 
+    async fn query_reach(&self, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Option<Result<Value, String>> {
+        Some(Box::pin(self.query_in(aql, variables, reach)).await)
+    }
+
+    fn system_flight(&self) -> Option<String> {
+        let sys = self.sys();
+        if self.owns(sys) {
+            return None;
+        }
+        let map = self.map();
+        let owner = map.assignments.get(&sys)?.owner;
+        map.members.get(&owner)?.flight.clone()
+    }
+
     async fn stats(&self) -> Result<Value, String> {
         let parts: Vec<Partition> = self.parts.lock().await.keys().copied().collect();
         Ok(json!({ "partitions_open": parts, "namespaces": self.catalog.read().unwrap().len() }))

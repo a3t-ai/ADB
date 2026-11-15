@@ -264,6 +264,7 @@ dependencies = [
 name = "adb-server"
 version = "0.1.0"
 dependencies = [
+ "adb-cluster",
  "adb-core",
  "adb-embed",
  "adb-executor",
@@ -271,6 +272,7 @@ dependencies = [
  "adb-mcp",
  "adb-platform",
  "adb-store",
+ "aql-parser",
  "arrow-array",
  "arrow-cast",
  "arrow-flight",

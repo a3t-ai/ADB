@@ -39,6 +39,10 @@ pub struct Assignment {
 pub struct Member {
     /// Base URL of its data plane (owner → replica appends, gateway forwarding).
     pub addr: String,
+    /// Its Arrow Flight endpoint (`grpc://host:port`), where the transports send calls
+    /// for partitions it owns (step 4b).
+    #[serde(default)]
+    pub flight: Option<String>,
 }
 
 /// What the control plane's Raft log holds.
@@ -47,7 +51,12 @@ pub enum ControlCmd {
     /// Fix the partition count (once; later ones must match).
     Init { partitions: Partition },
     /// A node joins (or rejoins, perhaps at a new address).
-    Join { node: NodeId, addr: String },
+    Join {
+        node: NodeId,
+        addr: String,
+        #[serde(default)]
+        flight: Option<String>,
+    },
     /// A node is removed for good.
     Leave { node: NodeId },
     /// Set where a partition lives. Refused unless `epoch` is the partition's current
@@ -106,8 +115,8 @@ impl PartitionMap {
                 }
                 self.partitions = *partitions;
             }
-            ControlCmd::Join { node, addr } => {
-                self.members.insert(*node, Member { addr: addr.clone() });
+            ControlCmd::Join { node, addr, flight } => {
+                self.members.insert(*node, Member { addr: addr.clone(), flight: flight.clone() });
             }
             ControlCmd::Leave { node } => {
                 if self.members.remove(node).is_none() {
@@ -274,7 +283,7 @@ mod tests {
         let mut m = PartitionMap::default();
         m.apply(&ControlCmd::Init { partitions }).unwrap();
         for n in nodes {
-            m.apply(&ControlCmd::Join { node: *n, addr: format!("http://n{n}") }).unwrap();
+            m.apply(&ControlCmd::Join { node: *n, addr: format!("http://n{n}"), flight: None }).unwrap();
         }
         m
     }

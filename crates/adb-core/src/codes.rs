@@ -62,7 +62,7 @@ pub fn code_of(message: &str) -> &'static str {
     // Order matters: the more specific patterns first.
     if has("unauthorized") {
         "unauthorized"
-    } else if has(" pool's token") || has(" is the console's (the engine token)") || has(" is not open to the ") {
+    } else if has(" pool's token") || has(" is the console's (the engine token)") || has(" is not open to the ") || m.starts_with("forbidden:") || has("Query execution error: forbidden:") {
         "forbidden"
     } else if has("quota_exceeded:") {
         "quota_exceeded"

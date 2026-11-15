@@ -37,7 +37,7 @@ fn map3() -> PartitionMap {
     let mut m = PartitionMap::default();
     m.apply(&ControlCmd::Init { partitions: PARTITIONS }).unwrap();
     for n in 1..=3u64 {
-        m.apply(&ControlCmd::Join { node: n, addr: format!("node{n}") }).unwrap();
+        m.apply(&ControlCmd::Join { node: n, addr: format!("node{n}"), flight: None }).unwrap();
     }
     for p in m.all_partitions() {
         let owner = u64::from(p) % 3 + 1;

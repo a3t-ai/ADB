@@ -54,7 +54,7 @@ async fn the_map_is_kept_and_repaired_across_a_leader_loss() {
         let run = tokio::spawn(Arc::clone(&node).run(PARTITIONS));
         voters.insert(id, Voter { node, tasks: vec![serve, run], _dir: dir });
     }
-    let mut clients: BTreeMap<NodeId, ControlClient> = (1..=3u64).map(|id| (id, ControlClient::start(id, format!("http://data-{id}"), voters_at.clone(), move || id as f64 * 0.1))).collect();
+    let mut clients: BTreeMap<NodeId, ControlClient> = (1..=3u64).map(|id| (id, ControlClient::start(id, format!("http://data-{id}"), None, voters_at.clone(), move || id as f64 * 0.1))).collect();
 
     // Every partition placed, every node a member, owners spread evenly.
     let c1 = clients[&1].clone();

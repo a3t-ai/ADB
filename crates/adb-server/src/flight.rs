@@ -77,7 +77,7 @@ pub async fn serve_flight_until(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<()> {
     tracing::info!(auth = token.is_some(), engine_auth = engine_token.is_some(), "ADB Flight on grpc://{addr}");
-    let svc = FlightServiceServer::new(AdbFlight { engine })
+    let svc = FlightServiceServer::new(AdbFlight { engine, forward: Default::default() })
         .max_decoding_message_size(MAX_MESSAGE)
         .max_encoding_message_size(MAX_MESSAGE);
     let pools = crate::auth::pool_tokens_from_env();
@@ -110,6 +110,8 @@ pub async fn serve_flight_until(
 
 pub struct AdbFlight {
     engine: Arc<dyn Engine>,
+    /// Step 4b: calls for the system partition, sent on to its owner.
+    forward: Arc<crate::forward::Forwarder>,
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -722,6 +724,19 @@ impl AdbFlight {
             return Err(Status::permission_denied("the engine token opens only FlowR's engine store"));
         }
         let b = body(&a.body)?;
+        // AQL with a scoped token: within its namespaces (step 4b: on the partition
+        // router, statements naming none run inside them).
+        if a.r#type == "aql" {
+            let query = str_field(&b, "query")?;
+            let vars: Option<HashMap<String, Value>> = b.get("variables").and_then(|v| v.as_object()).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+            let answer = match crate::scoped_query(self.engine.as_ref(), scope.as_deref(), query, vars.as_ref()).await.map_err(Status::permission_denied)? {
+                Ok(data) => json!({ "success": true, "data": data }),
+                Err(e) if scope.is_some() && adb_core::codes::code_of(&e) == "forbidden" => return Err(Status::permission_denied(e)),
+                Err(e) => json!({ "success": false, "code": adb_core::codes::code_of(&e), "error": e }),
+            };
+            let r = arrow_flight::Result { body: answer.to_string().into() };
+            return Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(r)]))));
+        }
         if let Some(scope) = &scope {
             scope.check_action(&a.r#type, &b).map_err(Status::permission_denied)?;
         }
@@ -828,6 +843,10 @@ impl FlightService for AdbFlight {
     type DoExchangeStream = BoxStream<FlightData>;
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
+        // Platform-table reads and SQL: on the system partition's node.
+        if let Some(url) = self.engine.system_flight() {
+            return self.forward.do_get(&url, req).await;
+        }
         let f = adb_core::metrics::InFlight::start("flight", "get");
         let _t = adb_core::steps::timer("flight.do_get");
         let opts = adb_core::read_opts::ReadOpts::from_lookup(|k| req.metadata().get(k).and_then(|v| v.to_str().ok()));
@@ -837,6 +856,9 @@ impl FlightService for AdbFlight {
     }
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
+        if let Some(url) = self.engine.system_flight() {
+            return self.forward.do_put(&url, req).await;
+        }
         let f = adb_core::metrics::InFlight::start("flight", "put");
         let _t = adb_core::steps::timer("flight.do_put");
         let r = self.do_put_inner(req).await;
@@ -845,6 +867,12 @@ impl FlightService for AdbFlight {
     }
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        // Platform tables and FlowR's engine store: on the system partition's node.
+        if crate::forward::SYSTEM_ACTIONS.contains(&req.get_ref().r#type.as_str()) {
+            if let Some(url) = self.engine.system_flight() {
+                return self.forward.do_action(&url, req).await;
+            }
+        }
         let f = adb_core::metrics::InFlight::start("flight", action_op(&req.get_ref().r#type));
         let _t = adb_core::steps::timer("flight.do_action");
         let opts = adb_core::read_opts::ReadOpts::from_lookup(|k| req.metadata().get(k).and_then(|v| v.to_str().ok()));
@@ -902,6 +930,9 @@ impl FlightService for AdbFlight {
         Err(Status::unimplemented("not supported"))
     }
     async fn get_schema(&self, req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
+        if let Some(url) = self.engine.system_flight() {
+            return self.forward.get_schema(&url, req).await;
+        }
         not_scoped(&req)?;
         let table = req.into_inner().path.first().cloned().ok_or_else(|| Status::invalid_argument("descriptor path [table]"))?;
         let schema = self.platform()?.schema(&table).await.map_err(platform_err)?;

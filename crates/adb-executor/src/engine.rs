@@ -242,6 +242,20 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// Step 4b: the Flight endpoint of the node owning the system partition (platform
+    /// tables, the engine store), when that isn't this node; the transports send those
+    /// calls there. `None`: this node serves them.
+    fn system_flight(&self) -> Option<String> {
+        None
+    }
+
+    /// Step 4b: run `aql` within `reach` (a scoped token's namespaces: statements naming
+    /// none run inside them). `None`: this engine can't — a scoped statement must then
+    /// name its namespace (DB-3).
+    async fn query_reach(&self, _aql: &str, _variables: Option<&HashMap<String, Value>>, _reach: &adb_cluster::routing::Reach) -> Option<Result<Value, String>> {
+        None
+    }
+
     /// Load another store's state into engine space `space` (H-5, `adb
     /// import-flowr-engine`): `changes` are `engine_core::Change`s, logged like
     /// any operation's. `first`: refuse a space that already holds runs.
