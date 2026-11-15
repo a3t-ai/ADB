@@ -45,7 +45,7 @@ pub type Applied = tokio::sync::watch::Receiver<u64>;
 pub struct FollowerReads {
     executor: Executor,
     store: Arc<PartitionStore>,
-    platform: Arc<adb_platform::PlatformStore>,
+    platform: Option<Arc<adb_platform::PlatformStore>>,
     log: EngineLog,
     applied: Applied,
     /// Asks the replica to apply now instead of at its next tick.
@@ -56,7 +56,7 @@ impl FollowerReads {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         store: Arc<PartitionStore>,
-        platform: Arc<adb_platform::PlatformStore>,
+        platform: Option<Arc<adb_platform::PlatformStore>>,
         embedder: Option<Arc<adb_embed::Embedder>>,
         registry: Arc<crate::branches::Branches>,
         aliases: Aliases,
@@ -73,8 +73,14 @@ impl FollowerReads {
         &self.store
     }
 
-    pub fn platform(&self) -> &Arc<adb_platform::PlatformStore> {
-        &self.platform
+    /// The reads its executor runs on (a cluster router's reads of this partition, step 6).
+    pub fn reads(&self) -> Arc<dyn Reads> {
+        self.executor.io().1
+    }
+
+    /// `None` on a memory partition's reader (step 6).
+    pub fn platform(&self) -> Option<&Arc<adb_platform::PlatformStore>> {
+        self.platform.as_ref()
     }
 
     /// The WAL's last offset: after this node's state machine applied the leader's
@@ -133,7 +139,7 @@ impl FollowerReads {
     /// Read-only SQL over the follower's tables (Flight `{"sql"}` tickets).
     pub async fn sql(&self, sql: &str, limit: Option<usize>, upto: LogOffset) -> Result<crate::sql::SqlResult, String> {
         self.caught_up(upto, Duration::from_secs(10)).await?;
-        crate::sql::run(Some(Arc::clone(&self.store)), Some(Arc::clone(&self.platform)), sql, limit).await
+        crate::sql::run(Some(Arc::clone(&self.store)), self.platform.clone(), sql, limit).await
     }
 }
 

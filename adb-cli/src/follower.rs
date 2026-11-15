@@ -74,7 +74,7 @@ impl Engine for FollowerEngine {
     }
 
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
-        Some(Arc::clone(self.reads.platform()))
+        self.reads.platform().cloned()
     }
 
     fn read_only(&self) -> bool {

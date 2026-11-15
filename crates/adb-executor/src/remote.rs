@@ -206,6 +206,9 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "quota_set" => val(e.quota_set(&s("pattern")?, arg(&a, "max_bytes")?, arg(&a, "max_records")?, arg(&a, "history_days")?).await?),
         "quota_drop" => val(e.quota_drop(&s("pattern")?).await?),
         "usage_covered" => val(e.usage_covered(&arg(&a, "quota")?).await?),
+        // Readers on other nodes (step 6).
+        "log_tail" => val(e.log_tail(arg(&a, "from")?, arg(&a, "max")?).await?),
+        "commit_offset" => val(e.commit_offset()),
         // The system partition.
         "platform_write" => val(e.platform_write(arg(&a, "effect")?).await?),
         "platform_write_many" => val(e.platform_write_many(arg(&a, "effects")?).await?),

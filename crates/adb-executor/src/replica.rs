@@ -21,8 +21,9 @@ pub struct Replica {
     log: EngineLog,
     store: Arc<PartitionStore>,
     embedder: Option<Arc<adb_embed::Embedder>>,
-    platform: Arc<adb_platform::PlatformStore>,
-    engine: adb_engine::EngineHost,
+    /// `None`: a memory partition's reader (step 6: no platform tables, no engine store).
+    platform: Option<Arc<adb_platform::PlatformStore>>,
+    engine: Option<adb_engine::EngineHost>,
     platform_next: LogOffset,
     engine_next: LogOffset,
     retain_max: u64,
@@ -60,16 +61,33 @@ fn s<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
 impl Replica {
     /// Open `dir`'s table, platform tables and engine spaces, and catch up with `log`.
     pub async fn open(dir: impl AsRef<std::path::Path>, log: EngineLog) -> Result<Self, String> {
+        Self::open_role(dir, crate::engine::PartitionRole::SINGLE, log).await
+    }
+
+    /// As [`Self::open`], for one partition of a cluster node: a memory partition's
+    /// reader (step 6) holds its table only.
+    pub async fn open_role(dir: impl AsRef<std::path::Path>, role: crate::engine::PartitionRole, log: EngineLog) -> Result<Self, String> {
         let dir = dir.as_ref();
-        let (store, embedder) = crate::engine::open_store(dir, crate::writes::SINGLE_PARTITION).await?;
+        let (store, embedder) = crate::engine::open_store(dir, role.id).await?;
         // The hot cache, kept by every apply, so a takeover doesn't refill it (C-19).
         store.set_cache(crate::engine::hot_cache(crate::engine::cache_config(dir)?)).await.map_err(s("store"))?;
         // The live keys a takeover hands over, and the field indexes (PF-38, PF-40).
         store.warm(true);
-        let platform = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(s("platform"))?);
-        let platform_next = LogOffset(platform.applied_offset().await + 1);
-        let engine = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;
-        let engine_next = engine.replay_from().await.map_err(s("engine"))?;
+        let (platform, platform_next) = if role.platform {
+            let p = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(s("platform"))?);
+            let next = LogOffset(p.applied_offset().await + 1);
+            (Some(p), next)
+        } else {
+            // Records are still read from here for branches, tags, layers and FORGETs.
+            (None, LogOffset(store.applied_offset().await.map_err(s("store"))?.0 + 1))
+        };
+        let (engine, engine_next) = if role.engine {
+            let e = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;
+            let next = e.replay_from().await.map_err(s("engine"))?;
+            (Some(e), next)
+        } else {
+            (None, LogOffset(u64::MAX))
+        };
         let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
         let branches = Arc::new(crate::branches::Branches::load(&store, now).await?);
         let aliases = Arc::new(std::sync::RwLock::new(crate::writes::load_aliases(&store).await.map_err(s("store"))?));
@@ -112,7 +130,7 @@ impl Replica {
     pub fn reader(&self, log: EngineLog) -> crate::follower::FollowerReads {
         crate::follower::FollowerReads::new(
             Arc::clone(&self.store),
-            Arc::clone(&self.platform),
+            self.platform.clone(),
             self.embedder.clone(),
             Arc::clone(&self.branches),
             Arc::clone(&self.aliases),
@@ -135,7 +153,13 @@ impl Replica {
     /// Hand what this replica keeps open to the leader's engine
     /// ([`crate::LocalEngine::durable_warm`]); call after a last [`Self::step`].
     pub fn into_warm(self) -> crate::engine::Warm {
-        crate::engine::Warm { store: self.store, embedder: self.embedder, platform: self.platform, engine: self.engine, engine_next: self.engine_next }
+        crate::engine::Warm {
+            store: self.store,
+            embedder: self.embedder,
+            platform: self.platform.expect("a replica set member's replica has platform tables"),
+            engine: self.engine.expect("a replica set member's replica has engine spaces"),
+            engine_next: self.engine_next,
+        }
     }
 
     /// Records from `from` on, skipping a purged stretch (its records were
@@ -166,8 +190,10 @@ impl Replica {
             // One Lance commit for a run of upserts into one table (PF-4), as the leader.
             // Boxed (once per 1,024 records): its future, a Lance write inside, would nest in
             // every caller's — open's grew past rustc's layout depth limit.
-            for r in Box::pin(self.platform.apply_batch(&batch)).await {
-                r.map_err(s("platform"))?;
+            if let Some(p) = &self.platform {
+                for r in Box::pin(p.apply_batch(&batch)).await {
+                    r.map_err(s("platform"))?;
+                }
             }
             for r in &batch {
                 self.note_forgets(r);
@@ -195,21 +221,32 @@ impl Replica {
         });
         crate::steps::lap("follower.2 platform + aliases", &mut ft);
         // PF-5: the memtable to Lance when due (the log is purged only below that).
-        self.platform.flush_due().await.map_err(s("platform"))?;
+        if let Some(p) = &self.platform {
+            p.flush_due().await.map_err(s("platform"))?;
+        }
         crate::steps::lap("follower.3 platform flush", &mut ft);
-        loop {
-            let mut from = self.engine_next;
-            let batch = self.read(&mut from).await?;
-            let Some(last) = batch.last().map(|r| r.offset) else { break };
-            for r in &batch {
-                if r.effects.iter().any(|e| matches!(e, Effect::Engine { .. })) {
-                    self.engine.replay(r).await.map_err(s("engine"))?;
+        // Taken out for the step (its calls need it alone), put back however it ends.
+        if let Some(mut engine) = self.engine.take() {
+            let r = async {
+                loop {
+                    let mut from = self.engine_next;
+                    let batch = self.read(&mut from).await?;
+                    let Some(last) = batch.last().map(|r| r.offset) else { break };
+                    for r in &batch {
+                        if r.effects.iter().any(|e| matches!(e, Effect::Engine { .. })) {
+                            engine.replay(r).await.map_err(s("engine"))?;
+                        }
+                    }
+                    self.engine_next = last.next();
                 }
+                engine.snapshot_due(false).await.map_err(s("engine"))?;
+                Ok::<(), String>(())
             }
-            self.engine_next = last.next();
+            .await;
+            self.engine = Some(engine);
+            r?;
         }
         crate::steps::lap("follower.4 engine replay", &mut ft);
-        self.engine.snapshot_due(false).await.map_err(s("engine"))?;
         crate::steps::lap("follower.5 engine snapshot", &mut ft);
         if self.erase_due {
             self.erase_due = false;
@@ -264,8 +301,11 @@ impl Replica {
         if self.compacting.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let jobs = self.engine.journals_to_compact().await;
-        let (store, platform, compacting) = (Arc::clone(&self.store), Arc::clone(&self.platform), Arc::clone(&self.compacting));
+        let jobs = match &self.engine {
+            Some(e) => e.journals_to_compact().await,
+            None => Vec::new(),
+        };
+        let (store, platform, compacting) = (Arc::clone(&self.store), self.platform.clone(), Arc::clone(&self.compacting));
         tokio::spawn(async move {
             let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
             if crate::writes::compaction_due_for(&store).await {
@@ -279,9 +319,11 @@ impl Replica {
                     tracing::warn!(space = %j.space, error = %e, "follower journal compaction failed");
                 }
             }
-            if platform.compaction_due().await {
-                if let Err(e) = platform.compact().await {
-                    tracing::warn!(error = %e, "follower platform compaction failed");
+            if let Some(platform) = platform {
+                if platform.compaction_due().await {
+                    if let Err(e) = platform.compact().await {
+                        tracing::warn!(error = %e, "follower platform compaction failed");
+                    }
                 }
             }
             compacting.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -339,9 +381,13 @@ impl Replica {
         self.store.sync_to_disk().await.map_err(s("store"))?;
         let mut floor = durable.0 + 1;
         // Below what the platform tables hold in Lance, not in memory (PF-5).
-        floor = floor.min(self.platform.applied_offset().await + 1);
-        if let Some(f) = self.engine.floor().await {
-            floor = floor.min(f.0);
+        if let Some(p) = &self.platform {
+            floor = floor.min(p.applied_offset().await + 1);
+        }
+        if let Some(e) = &self.engine {
+            if let Some(f) = e.floor().await {
+                floor = floor.min(f.0);
+            }
         }
         floor = floor.min(tip.saturating_sub(self.retain_max) + 1);
         if floor > 1 {

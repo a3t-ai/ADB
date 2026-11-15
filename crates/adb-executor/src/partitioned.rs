@@ -124,7 +124,33 @@ pub struct PartitionedEngine {
     spaces: Arc<dyn crate::spaces::Spaces>,
     /// What this node holds as the replica of other nodes' partitions (step 5).
     replicas: Arc<crate::replication::ReplicaBuffers>,
+    /// Readers of partitions other nodes own (step 6), opened on first read.
+    readers: tokio::sync::Mutex<HashMap<Partition, Arc<crate::readers::Reader>>>,
     me: std::sync::Weak<PartitionedEngine>,
+}
+
+/// A reader's owner: whoever owns the partition in the current map.
+struct OwnerSource {
+    partition: Partition,
+    node: std::sync::Weak<PartitionedEngine>,
+}
+
+#[async_trait]
+impl crate::readers::ReaderSource for OwnerSource {
+    async fn tail(&self, from: u64, max: usize) -> Result<Vec<adb_core::log::LogRecord>, String> {
+        let node = self.node.upgrade().ok_or("the partition router has stopped")?;
+        node.handle(self.partition).await?.op_as("log_tail", json!({ "from": from, "max": max })).await
+    }
+
+    async fn commit_offset(&self) -> Result<u64, String> {
+        let node = self.node.upgrade().ok_or("the partition router has stopped")?;
+        node.handle(self.partition).await?.op_as("commit_offset", json!({})).await
+    }
+}
+
+/// `ADB_READERS`: readers on (default) or off (`0`: reads go to the owner).
+fn readers_on() -> bool {
+    std::env::var("ADB_READERS").map_or(true, |v| v != "0" && v != "off")
 }
 
 /// Where an owned partition's records go: its replica in the current map.
@@ -267,6 +293,7 @@ impl PartitionedEngine {
             catalog_at: Default::default(),
             spaces: Arc::new(RouterSpaces { node: me.clone() }),
             replicas: Arc::new(crate::replication::ReplicaBuffers::new(dir.join("parts"))),
+            readers: Default::default(),
             me: me.clone(),
         })
     }
@@ -306,6 +333,36 @@ impl PartitionedEngine {
         }
         let addr = map.members.get(&a.owner).map(|m| m.addr.clone()).ok_or_else(|| not_owner(p, &map))?;
         Ok(Handle::Remote(Arc::new(RemotePartition { partition: p, addr, peers: Arc::clone(&c.peers) })))
+    }
+
+    /// The reader of memory partition `p`, if this node reads it rather than owns it
+    /// (a cluster, object storage, `ADB_READERS` on): opened on first use; `None` falls
+    /// back to asking the owner.
+    pub async fn reader(&self, p: Partition) -> Option<Arc<crate::readers::Reader>> {
+        if self.cluster.is_none() || !readers_on() || p == self.sys() {
+            return None;
+        }
+        let mut readers = self.readers.lock().await;
+        if self.owns(p) {
+            // Owned now (a takeover): its reader is of no more use.
+            readers.remove(&p);
+            return None;
+        }
+        if let Some(r) = readers.get(&p) {
+            return Some(Arc::clone(r));
+        }
+        let cold = crate::engine::object_storage()?;
+        let source = Arc::new(OwnerSource { partition: p, node: self.me.clone() });
+        match Box::pin(crate::readers::Reader::open(self.dir.join("parts").join(format!("reader-p{p}")), p, Some(cold), source)).await {
+            Ok(r) => {
+                readers.insert(p, Arc::clone(&r));
+                Some(r)
+            }
+            Err(e) => {
+                tracing::warn!(partition = p, error = %e, "reader not opened; reads go to the owner");
+                None
+            }
+        }
     }
 
     async fn system_handle(&self) -> Result<Handle, String> {
@@ -417,6 +474,23 @@ impl PartitionedEngine {
         Ok(())
     }
 
+    /// A target on partition `p`: its own reads and writes here; for a partition another
+    /// node owns, its writes go to the owner and its reads to this node's reader, once
+    /// that holds everything committed now (else to the owner too).
+    async fn target(&self, p: Partition, namespace: Option<String>) -> Result<Target, String> {
+        let h = self.handle(p).await?;
+        let mut t = Target::of(p, namespace, &h);
+        if matches!(h, Handle::Remote(_)) {
+            if let Some(r) = self.reader(p).await {
+                match r.fresh_reads().await {
+                    Ok(reads) => t.reads = reads,
+                    Err(e) => tracing::debug!(partition = p, error = %e, "reader behind; this read goes to the owner"),
+                }
+            }
+        }
+        Ok(t)
+    }
+
     /// Where a statement without one namespace reads and writes: for a full-access
     /// call each partition holding data, else each catalog namespace in scope.
     async fn targets(&self, reach: &Reach) -> Result<Vec<Target>, String> {
@@ -426,12 +500,12 @@ impl PartitionedEngine {
             Reach::All => {
                 let partitions: BTreeSet<Partition> = catalog.values().copied().collect();
                 for p in partitions {
-                    out.push(Target::of(p, None, &self.handle(p).await?));
+                    out.push(self.target(p, None).await?);
                 }
             }
             Reach::Only(_) => {
                 for (ns, p) in catalog.iter().filter(|(ns, _)| reach.allows(ns)) {
-                    out.push(Target::of(*p, Some(ns.clone()), &self.handle(*p).await?));
+                    out.push(self.target(*p, Some(ns.clone())).await?);
                 }
             }
         }
@@ -444,8 +518,7 @@ impl PartitionedEngine {
             return Err(out_of_reach(namespace));
         }
         let p = self.partition_of(namespace);
-        let h = self.handle(p).await.map_err(AdbError::QueryError)?;
-        Ok(Target::of(p, Some(namespace.to_string()), &h))
+        self.target(p, Some(namespace.to_string())).await.map_err(AdbError::QueryError)
     }
 
     /// The partitions holding data (the catalog's), here or remote.
@@ -475,6 +548,12 @@ impl PartitionedEngine {
     /// at the owner it names or the map now names).
     async fn on_owner(self: &Arc<Self>, ns: &str, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
         let p = self.partition_of(ns);
+        // A read of a partition another node owns: answered here, by its reader (step 6).
+        if !self.owns(p) && crate::follower::follower_reads(aql) {
+            if let Some(r) = self.reader(p).await {
+                return Box::pin(r.query(aql, variables)).await;
+            }
+        }
         let mut last: Option<String> = None;
         for attempt in 0..2 {
             let addr = match self.handle(p).await? {

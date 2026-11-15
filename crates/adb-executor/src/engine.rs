@@ -359,6 +359,8 @@ pub struct LocalEngine {
     /// Where other spaces (memory layers) are read: this partition, or (cluster) the
     /// router's source, set by [`crate::partitioned::PartitionedEngine`].
     spaces: Option<crate::spaces::SpaceView>,
+    /// The log the sequencer appends to (readers on other nodes follow it, step 6).
+    log: Option<EngineLog>,
     /// DB-14: recent space stats, as each is a scan: key → (when, stats).
     stats_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>,
     /// A temporary engine's directory, removed with it (dropped last).
@@ -686,6 +688,24 @@ impl LocalEngine {
     /// [`Self::durable_partition`] over `log` (a cluster owner's replicated log, step 5).
     pub async fn durable_partition_on(dir: impl Into<std::path::PathBuf>, role: PartitionRole, log: EngineLog) -> Result<(Self, ReplayStats), String> {
         Box::pin(Self::durable_with(dir.into(), log, None, None, role)).await
+    }
+
+    /// Step 6, for readers on other nodes: committed records from `from` (at most `max`,
+    /// none past the commit offset — what a failover could drop is never shown).
+    pub async fn log_tail(&self, from: u64, max: usize) -> Result<Vec<adb_core::log::LogRecord>, String> {
+        let log = self.log.as_ref().ok_or("no log")?;
+        let committed = log.durable_offset().0;
+        if from > committed {
+            return Ok(Vec::new());
+        }
+        let mut recs = log.read(adb_core::log::LogOffset(from.max(1)), max.min((committed - from + 1) as usize)).await.map_err(|e| e.to_string())?;
+        recs.retain(|r| r.offset.0 <= committed);
+        Ok(recs)
+    }
+
+    /// Step 6: the offset every acknowledged write is at or below.
+    pub fn commit_offset(&self) -> u64 {
+        self.log.as_ref().map(|l| l.durable_offset().0).unwrap_or(0)
     }
 
     /// The partition's local WAL in `dir/p{n}`, opened.
@@ -1064,6 +1084,7 @@ impl LocalEngine {
                 branch_host,
                 parent,
                 spaces: Some(spaces),
+                log: Some(Arc::clone(&wal)),
             },
             stats,
         ))
