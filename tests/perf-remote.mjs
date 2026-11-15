@@ -116,12 +116,19 @@ async function adb() {
   // C-16: reads (RECALL / LOOKUP / SCAN) go to every node in turn — followers answer
   // them — and writes to the leader; `--spread 0` sends everything to the leader.
   const spread = nodes.length > 1 && args.spread !== '0';
+  // --gateway: any node takes any statement (S3 option B): writes are spread too.
+  const gateway = spread && !!args.gateway;
   let turn = 0;
   const isRead = aql => /^\s*(RECALL|LOOKUP|SCAN)\b/i.test(aql);
-  if (spread) console.log(`reads spread over ${nodes.length} nodes; writes to the leader`);
+  if (spread) console.log(`reads spread over ${nodes.length} nodes; writes ${gateway ? 'spread too (gateway)' : 'to the leader'}`);
+  // --namespaces N: every statement names one of N namespaces (as agents' do), so the
+  // load spreads over a partitioned cluster; a key's namespace follows its index.
+  const NSN = Number(args.namespaces ?? 0);
+  if (NSN) console.log(`statements over ${NSN} namespaces`);
+  const ns = k => (NSN ? ` NAMESPACE "perf-${run}-${k % NSN}"` : '');
   const q = async aql => {
     let r;
-    const target = spread && isRead(aql) ? nodes[turn++ % nodes.length] : url;
+    const target = spread && (gateway || isRead(aql)) ? nodes[turn++ % nodes.length] : url;
     try {
       r = await fetch(`${target}/query`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify({ query: aql }), signal: AbortSignal.timeout(30000) });
     } catch (e) { if (nodes.length > 1) await findLeader(); throw e; }
@@ -142,52 +149,52 @@ async function adb() {
   for (const c of CS) {
     await phase('STORE SEMANTIC', c, async i => {
       const key = c === CS[0] ? `${run}f${i}` : `${run}s${c}_${i}`;
-      await q(`STORE INTO SEMANTIC (key = "${key}", topic = "t${i % 20}", n = ${i % 997}, v = 1, content = "fact number ${i} about topic t${i % 20}")`);
+      await q(`STORE INTO SEMANTIC (key = "${key}", topic = "t${i % 20}", n = ${i % 997}, v = 1, content = "fact number ${i} about topic t${i % 20}")${ns(i)}`);
       if (c === CS[0]) keys = Math.max(keys, i + 1);
     });
   }
   for (const c of CS) {
     await phase('STORE EPISODIC', c, async i => {
       const key = c === CS[0] ? `${run}e${i}` : `${run}e${c}_${i}`;
-      await q(`STORE INTO EPISODIC (key = "${key}", kind = "event", n = ${i}, content = "event ${i} happened")`);
-      episodic.push(key);
+      await q(`STORE INTO EPISODIC (key = "${key}", kind = "event", n = ${i}, content = "event ${i} happened")${ns(i)}`);
+      episodic.push([key, i]);
       if (c === CS[0]) ekeys = Math.max(ekeys, i + 1);
     });
   }
   for (const c of CS) {
     await phase('STORE WORKING', c, async i => {
       const key = c === CS[0] ? `${run}w${i}` : `${run}w${c}_${i}`;
-      await q(`STORE INTO WORKING (key = "${key}", step = 1, priority = ${i % 10})`);
+      await q(`STORE INTO WORKING (key = "${key}", step = 1, priority = ${i % 10})${ns(i)}`);
       if (c === CS[0]) wkeys = Math.max(wkeys, i + 1);
     });
   }
   keys = Math.max(1, Math.min(keys, ROWS)); ekeys = Math.max(1, ekeys); wkeys = Math.max(1, wkeys);
   const reads = [
-    ['LOOKUP KEY (SEMANTIC)', i => `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 37) % keys}"`],
-    ['RECALL WHERE topic LIMIT 10', i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10`],
-    ['RECALL ALL ORDER BY n LIMIT 10', () => `RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 10`],
-    ['AGGREGATE COUNT by topic', i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" AGGREGATE COUNT(*) AS c`],
-    ['RECALL EPISODIC newest 10', () => `RECALL FROM EPISODIC ALL LIMIT 10`],
-    ['RECALL EPISODIC KEY', i => `RECALL FROM EPISODIC KEY id = "${run}e${(i * 7) % ekeys}"`],
-    ['RECALL WORKING KEY', i => `RECALL FROM WORKING KEY id = "${run}w${(i * 7) % wkeys}"`],
+    ['LOOKUP KEY (SEMANTIC)', i => `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 37) % keys}"${ns((i * 37) % keys)}`],
+    ['RECALL WHERE topic LIMIT 10', i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10${ns(i)}`],
+    ['RECALL ALL ORDER BY n LIMIT 10', i => `RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 10${ns(i)}`],
+    ['AGGREGATE COUNT by topic', i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" AGGREGATE COUNT(*) AS c${ns(i)}`],
+    ['RECALL EPISODIC newest 10', i => `RECALL FROM EPISODIC ALL LIMIT 10${ns(i)}`],
+    ['RECALL EPISODIC KEY', i => `RECALL FROM EPISODIC KEY id = "${run}e${(i * 7) % ekeys}"${ns((i * 7) % ekeys)}`],
+    ['RECALL WORKING KEY', i => `RECALL FROM WORKING KEY id = "${run}w${(i * 7) % wkeys}"${ns((i * 7) % wkeys)}`],
   ];
   for (const [name, f] of reads) for (const c of CS) await phase(name, c, i => q(f(i)));
-  for (const c of CS) await phase('UPDATE SEMANTIC (existing key)', c, i => q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 53) % keys}" (v = 2, content = "fact ${i} updated")`));
-  for (const c of CS) await phase('UPDATE WORKING', c, i => q(`UPDATE INTO WORKING WHERE id = "${run}w${(i * 11) % wkeys}" (step = 2)`));
+  for (const c of CS) await phase('UPDATE SEMANTIC (existing key)', c, i => q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 53) % keys}" (v = 2, content = "fact ${i} updated")${ns((i * 53) % keys)}`));
+  for (const c of CS) await phase('UPDATE WORKING', c, i => q(`UPDATE INTO WORKING WHERE id = "${run}w${(i * 11) % wkeys}" (step = 2)${ns((i * 11) % wkeys)}`));
   // FORGET each key once: the c-th phase takes its own slice of the episodic keys.
   // FORGET each stored EPISODIC key once (from the newest; the reads above used the first
   // phase's); a phase that runs out of keys stops counting.
   for (const c of CS) await phase('FORGET EPISODIC (one key each)', c, async () => {
-    const k = episodic.pop();
-    if (!k) throw new Error('out of keys');
-    await q(`FORGET FROM EPISODIC WHERE id = "${k}"`);
+    const e = episodic.pop();
+    if (!e) throw new Error('out of keys');
+    await q(`FORGET FROM EPISODIC WHERE id = "${e[0]}"${ns(e[1])}`);
   });
   for (const c of CS) {
     await phase('mixed 70% read / 25% STORE / 5% UPDATE', c, i => {
       const k = i % 20;
-      if (k < 14) return q(k % 2 ? `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 97) % keys}"` : `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10`);
-      if (k < 19) return q(`STORE INTO SEMANTIC (key = "${run}m${c}x${i}", topic = "t${i % 20}", n = 1, content = "mixed ${i}")`);
-      return q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 31) % keys}" (v = 3)`);
+      if (k < 14) return q(k % 2 ? `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 97) % keys}"${ns((i * 97) % keys)}` : `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10${ns(i)}`);
+      if (k < 19) return q(`STORE INTO SEMANTIC (key = "${run}m${c}x${i}", topic = "t${i % 20}", n = 1, content = "mixed ${i}")${ns(i)}`);
+      return q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 31) % keys}" (v = 3)${ns((i * 31) % keys)}`);
     });
   }
 }
