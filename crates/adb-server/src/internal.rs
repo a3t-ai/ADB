@@ -93,7 +93,11 @@ impl HttpPeers {
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
-        let r = req.send().await.map_err(|e| format!("{url}: {e}"))?;
+        // Never sent (refused, or no connection in time): marked so it may be sent again.
+        let r = req.send().await.map_err(|e| match e.is_connect() {
+            true => format!("{}{url}: {e}", adb_executor::remote::UNREACHABLE),
+            false => format!("{url}: {e}"),
+        })?;
         let status = r.status();
         let v: Value = r.json().await.map_err(|e| format!("{url}: {status}: {e}"))?;
         match (v.get("ok"), v.get("err").and_then(|e| e.as_str())) {

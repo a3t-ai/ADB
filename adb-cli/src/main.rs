@@ -134,6 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(log_filter(std::env::var("RUST_LOG").ok()))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_ansi(false))
         .init();
+    match adb_core::disk::raise_open_files() {
+        Ok(n) => tracing::info!(limit = n, "open files"),
+        Err(e) => tracing::warn!(error = %e, "could not raise the open-file limit"),
+    }
     alloc::report_every(alloc::report_interval());
     adb_core::steps::spawn_lag_probe();
     if let Commands::ServeEmbed { host, port } = &command {

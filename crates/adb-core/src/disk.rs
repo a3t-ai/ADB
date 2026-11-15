@@ -19,3 +19,25 @@ pub async fn sync_fs_async(path: &Path) -> std::io::Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || sync_fs(&path)).await.map_err(std::io::Error::other)?
 }
+
+/// Raise this process's open-file limit to its hard limit (a database server holds a
+/// socket per client connection plus its data files; container defaults are a soft
+/// 1024, which 2,048 client connections ran out of on Hetzner, 15 Nov). Returns the
+/// limit now in force.
+pub fn raise_open_files() -> std::io::Result<u64> {
+    let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `l` is a valid rlimit for the duration of each call.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if l.rlim_cur < l.rlim_max {
+            let want = libc::rlimit { rlim_cur: l.rlim_max, rlim_max: l.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            l.rlim_cur = l.rlim_max;
+        }
+    }
+    Ok(l.rlim_cur as u64)
+}

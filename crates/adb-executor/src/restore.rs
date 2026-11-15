@@ -146,8 +146,17 @@ pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, parti
     // By first offset: each record is taken once, from the first allowed segment
     // holding it (every allowed copy of an offset is the same acked record).
     let segments = seg::list_segments(cold, partition).await.map_err(|e| format!("{}: {e}", at("segments")))?;
-    for s in segments.into_iter().filter(|s| fence.admits(s.epoch) && s.last > floor && s.first <= fence.limit(s.epoch)) {
-        let records = seg::read_segment(cold, partition, s).await.map_err(|e| format!("{}: {e}", at("segment")))?;
+    // Fetched `ADB_RESTORE_FETCHES` at a time (default 16), applied in order: one GET
+    // after another made a takeover take seconds (Hetzner, 15 Nov).
+    use futures::StreamExt;
+    let fetches = std::env::var("ADB_RESTORE_FETCHES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(16);
+    let wanted: Vec<_> = segments.into_iter().filter(|s| fence.admits(s.epoch) && s.last > floor && s.first <= fence.limit(s.epoch)).collect();
+    let mut fetched = futures::stream::iter(wanted.into_iter().map(|s| async move { seg::read_segment(cold, partition, s).await.map(|r| (s, r)) })).buffered(fetches);
+    // Queued, not waited on one by one: a group sync covers each batch; the last is
+    // waited on below.
+    let mut last_wait = None;
+    while let Some(next) = fetched.next().await {
+        let (s, records) = next.map_err(|e| format!("{}: {e}", at("segment")))?;
         stats.segments += 1;
         for r in records {
             // Held by the checkpoint or an earlier segment; or written after this
@@ -158,9 +167,12 @@ pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, parti
             if r.offset.0 != wal.last_offset().0 + 1 {
                 return Err(at(&format!("gap in the WAL segments: offset {} follows {}", r.offset.0, wal.last_offset().0)));
             }
-            wal.append(r).await.map_err(|e| format!("{}: {e}", at("appending a record")))?;
+            last_wait = Some(wal.enqueue(r, false).map_err(|e| format!("{}: {e}", at("appending a record")))?);
             stats.segment_records += 1;
         }
+    }
+    if let Some(w) = last_wait {
+        w.await.map_err(|e| format!("{}: {e}", at("appending a record")))?;
     }
     stats.log_ends_at = wal.last_offset().0;
     drop(wal);

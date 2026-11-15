@@ -88,6 +88,12 @@ pub struct ControlNode {
     proposing: tokio::sync::Mutex<()>,
 }
 
+/// `ADB_REBALANCE_SECS`: at most one rebalancing step this often (default 10). A node
+/// taking a partition over needs that long or less (S3 option B, 15 Nov).
+fn rebalance_every() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("ADB_REBALANCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10))
+}
+
 impl ControlNode {
     /// Open the group's log and map in `dir/control`, start Raft, and, on the lowest
     /// voter id with an empty log, initialise the group. Serve [`Self::router`] on the
@@ -141,6 +147,8 @@ impl ControlNode {
         let mut tick = tokio::time::interval(leases::heartbeat());
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut leading = false;
+        // A new leader waits a full interval before its first rebalance step.
+        let mut rebalanced = std::time::Instant::now();
         loop {
             tick.tick().await;
             let now = self.is_leader();
@@ -188,7 +196,14 @@ impl ControlNode {
                 let Some(l) = l.as_ref() else { continue };
                 (l.live(map.members.keys().copied()), l.reported())
             };
-            let changes = plan(&map, &live, &reported);
+            let mut changes = plan(&map, &live, &reported);
+            // The map whole: one step toward an even spread, every `ADB_REBALANCE_SECS`.
+            if changes.is_empty() && rebalanced.elapsed() >= rebalance_every() {
+                if let Some(c) = crate::map::rebalance(&map, &live) {
+                    rebalanced = std::time::Instant::now();
+                    changes.push(c);
+                }
+            }
             tracing::debug!(?live, changes = changes.len(), "control: planned");
             for change in changes {
                 tracing::info!(cmd = %change.cmd, reason = change.reason, "control: reassigning");

@@ -96,6 +96,17 @@ async fn killing_an_owner_loses_no_acknowledged_write() {
     for place in &places[1..] {
         *place.map.write().unwrap() = Arc::new(map(2, 3, 2));
     }
+    // Many requests at once while node 2 takes its partitions over: each partition is
+    // still taken over exactly once (one opener per partition).
+    let burst: Vec<_> = (0..50)
+        .map(|_| {
+            let (n, q) = (Arc::clone(&nodes[1]), q.clone());
+            tokio::spawn(async move { n.query(&q, None).await })
+        })
+        .collect();
+    for b in burst {
+        let _ = b.await.unwrap();
+    }
     // Node 2 takes the partition over by itself; reads through node 3 see every write.
     let mut got = Vec::new();
     for _ in 0..100 {
@@ -109,6 +120,14 @@ async fn killing_an_owner_loses_no_acknowledged_write() {
     }
     assert_eq!(got, (0..30).collect::<Vec<_>>(), "no acknowledged write lost");
     assert_eq!(std::fs::read_to_string(dirs[1].path().join(format!("parts/p{p}/owner.epoch"))).unwrap(), "2");
+    for _ in 0..100 {
+        if nodes[1].takeovers_started() >= PARTITIONS as u64 + 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(nodes[1].takeovers_started(), PARTITIONS as u64 + 1, "each partition (and the system partition) taken over once");
 
     // The new owner takes writes; its replica (node 3) holds them.
     nodes[2].query(&format!(r#"STORE INTO SEMANTIC (key = "after", n = 99) NAMESPACE "{ns}""#), None).await.unwrap();

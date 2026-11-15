@@ -51,6 +51,10 @@ pub trait Peers: Send + Sync {
 }
 
 /// The answer of a node that doesn't own the partition asked of it.
+/// The prefix of a peer call's error when the call was never sent (connection refused
+/// or timed out): safe to send again, elsewhere.
+pub const UNREACHABLE: &str = "unreachable:";
+
 pub fn not_owner(partition: Partition, map: &PartitionMap) -> String {
     match map.assignments.get(&partition) {
         Some(a) => format!("not_owner:{}:{}: partition {partition} is owned by node {} (epoch {})", a.owner, map.members.get(&a.owner).map(|m| m.addr.as_str()).unwrap_or(""), a.owner, a.epoch),
@@ -360,7 +364,7 @@ impl LocalPeers {
     }
 
     fn node(&self, addr: &str) -> Result<Arc<crate::partitioned::PartitionedEngine>, String> {
-        self.nodes.read().unwrap().get(addr).and_then(|w| w.upgrade()).ok_or_else(|| format!("node {addr} is unreachable"))
+        self.nodes.read().unwrap().get(addr).and_then(|w| w.upgrade()).ok_or_else(|| format!("{UNREACHABLE}node {addr} is unreachable"))
     }
 }
 

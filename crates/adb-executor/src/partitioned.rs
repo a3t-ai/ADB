@@ -111,7 +111,15 @@ pub struct PartitionedEngine {
     /// The map on one node (in a cluster: the placement's, current).
     map: std::sync::RwLock<Arc<PartitionMap>>,
     cluster: Option<Cluster>,
-    parts: tokio::sync::Mutex<HashMap<Partition, Arc<LocalEngine>>>,
+    /// Each partition's engine, opened once: concurrent callers share the one open, and
+    /// partitions open (or are taken over) side by side — no node-wide lock (a takeover
+    /// of one partition held up every request, and a second opener raced the first).
+    parts: std::sync::Mutex<HashMap<Partition, PartSlot>>,
+    /// Partitions being taken over by the background task, and how many at once.
+    opening: std::sync::Mutex<BTreeSet<Partition>>,
+    /// Takeovers done here (tests, metrics).
+    taken_over: std::sync::atomic::AtomicU64,
+    takeovers: Arc<tokio::sync::Semaphore>,
     /// The system partition's engine, once this node has opened it (it owns it).
     system: OnceLock<Arc<LocalEngine>>,
     /// Namespace → partition, as recorded in [`CATALOG`] (refreshed before every
@@ -163,6 +171,20 @@ impl crate::readers::ReaderSource for PartSource {
         }
         node.handle(self.partition).await?.op_as("commit_offset", json!({})).await
     }
+}
+
+/// A partition's engine on this node, once opened.
+type PartSlot = Arc<tokio::sync::OnceCell<Arc<LocalEngine>>>;
+
+/// `ADB_FORWARD_WAIT_MS`: how long a statement waits for an unreachable owner's
+/// partition to move to another node (default 10000: a lease plus a takeover).
+fn forward_wait() -> Duration {
+    Duration::from_millis(std::env::var("ADB_FORWARD_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000))
+}
+
+/// `ADB_TAKEOVERS`: partitions taken over at once by a node (default 8).
+fn takeovers() -> usize {
+    std::env::var("ADB_TAKEOVERS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(8)
 }
 
 /// A reader's state on this node.
@@ -330,12 +352,19 @@ impl PartitionedEngine {
                 let Some(node) = weak.upgrade() else { return };
                 let map = node.map();
                 let me = node.cluster.as_ref().map(|c| c.placement.me());
-                let opened: BTreeSet<Partition> = node.parts.lock().await.keys().copied().collect();
+                let opened: BTreeSet<Partition> = node.opened().into_iter().map(|(p, _)| p).collect();
                 for (p, a) in map.assignments.iter() {
-                    if Some(a.owner) == me && !opened.contains(p) && node.leased() {
-                        if let Err(e) = Box::pin(node.handle(*p)).await {
-                            tracing::warn!(partition = p, error = %e, "taking the partition over failed; retrying");
-                        }
+                    // Taken over side by side (`ADB_TAKEOVERS` at once), each once.
+                    if Some(a.owner) == me && !opened.contains(p) && node.leased() && node.opening.lock().unwrap().insert(*p) {
+                        let (n, p) = (Arc::clone(&node), *p);
+                        let permits = Arc::clone(&node.takeovers);
+                        tokio::spawn(async move {
+                            let _permit = permits.acquire_owned().await;
+                            if let Err(e) = Box::pin(n.handle(p)).await {
+                                tracing::warn!(partition = p, error = %e, "taking the partition over failed; retrying");
+                            }
+                            n.opening.lock().unwrap().remove(&p);
+                        });
                     }
                     // The replica's reader, built ahead of the first read.
                     if Some(a.owner) != me && a.replica == me && *p != node.sys() {
@@ -355,6 +384,9 @@ impl PartitionedEngine {
             map: std::sync::RwLock::new(Arc::new(map)),
             cluster,
             parts: Default::default(),
+            opening: Default::default(),
+            taken_over: Default::default(),
+            takeovers: Arc::new(tokio::sync::Semaphore::new(takeovers())),
             system: OnceLock::new(),
             catalog: Default::default(),
             catalog_at: Default::default(),
@@ -437,6 +469,11 @@ impl PartitionedEngine {
         }
     }
 
+    /// How many partition takeovers this node has started (tests, metrics).
+    pub fn takeovers_started(&self) -> u64 {
+        self.taken_over.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Whether this node has a reader of `p` ready (tests, metrics).
     pub fn has_reader(&self, p: Partition) -> bool {
         self.ready_reader(p).is_some()
@@ -490,6 +527,7 @@ impl PartitionedEngine {
     /// gap between the two is refused: serving would lose acknowledged writes.
     async fn take_over(&self, p: Partition, epoch: u64, pdir: &std::path::Path) -> Result<(), String> {
         let t0 = std::time::Instant::now();
+        self.taken_over.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if pdir.exists() {
             std::fs::remove_dir_all(pdir).map_err(|e| format!("taking over partition {p}: {e}"))?;
         }
@@ -583,11 +621,33 @@ impl PartitionedEngine {
     }
 
     /// The engine of partition `p` on this node, opened on first use.
-    pub async fn part(&self, p: Partition) -> Result<Arc<LocalEngine>, String> {
-        let mut parts = self.parts.lock().await;
-        if let Some(e) = parts.get(&p) {
-            return Ok(Arc::clone(e));
-        }
+    /// Boxed with an explicit `Send`: opening a partition reaches the system
+    /// partition's, through here again.
+    pub fn part(&self, p: Partition) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<LocalEngine>, String>> + Send + '_>> {
+        Box::pin(async move {
+            let slot = Arc::clone(self.parts.lock().unwrap().entry(p).or_default());
+            if let Some(e) = slot.get() {
+                return Ok(Arc::clone(e));
+            }
+            let t0 = std::time::Instant::now();
+            let me = self.me.upgrade().ok_or("the partition router has stopped")?;
+            // The open in a task of its own: a request given up (a client timeout) mustn't
+            // leave a takeover half done; whoever asks next waits for the same open.
+            let e = slot
+                .get_or_try_init(|| async move {
+                    tokio::spawn(async move { Box::pin(me.open_part(p)).await })
+                        .await
+                        .map_err(|e| format!("opening partition {p}: {e}"))?
+                })
+                .await?;
+            crate::steps::add("partition open wait", t0.elapsed());
+            Ok(Arc::clone(e))
+        })
+    }
+
+    /// Open partition `p` (taking it over first when this node holds an older epoch):
+    /// called once per partition, through its slot.
+    async fn open_part(&self, p: Partition) -> Result<Arc<LocalEngine>, String> {
         let sys = self.sys();
         let pdir = self.dir.join("parts").join(format!("p{p}"));
         // Step 7: owned at an epoch this directory doesn't hold — taken over from another
@@ -604,7 +664,6 @@ impl PartitionedEngine {
         if p != sys {
             // Cluster-wide settings (one embedding model, one set of cache rules): the
             // system partition's, copied before a partition opens.
-            drop(parts);
             let settings: Value = match self.system.get() {
                 Some(s) => dispatch_op(s, "settings", json!({})).await?,
                 // Boxed: opening a partition may reach the system partition's handle.
@@ -615,10 +674,6 @@ impl PartitionedEngine {
             }
             if let Some(c) = settings.get("cache").cloned().filter(|v| !v.is_null()) {
                 serde_json::from_value::<adb_store::CacheConfig>(c).map_err(|e| e.to_string())?.save(&pdir)?;
-            }
-            parts = self.parts.lock().await;
-            if let Some(e) = parts.get(&p) {
-                return Ok(Arc::clone(e));
             }
         }
         let role = if p == sys { PartitionRole::system(p) } else { PartitionRole::memory(p) };
@@ -642,11 +697,15 @@ impl PartitionedEngine {
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
-        parts.insert(p, Arc::clone(&e));
         if p == sys {
             let _ = self.system.set(Arc::clone(&e));
         }
         Ok(e)
+    }
+
+    /// The partitions open here, with their engines.
+    fn opened(&self) -> Vec<(Partition, Arc<LocalEngine>)> {
+        self.parts.lock().unwrap().iter().filter_map(|(p, c)| c.get().map(|e| (*p, Arc::clone(e)))).collect()
     }
 
     /// Every namespace written so far, with its partition (as last read).
@@ -782,7 +841,10 @@ impl PartitionedEngine {
             if let Some(addr) = self.replica_addr(p) {
                 if self.spread.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0 {
                     let peers = &self.cluster.as_ref().expect("a replica means a cluster").peers;
-                    match peers.query(&addr, aql, variables, reach).await {
+                    let t = std::time::Instant::now();
+                    let r = peers.query(&addr, aql, variables, reach).await;
+                    crate::steps::add("router.forward to replica (round trip)", t.elapsed());
+                    match r {
                         Ok(v) => return Ok(v),
                         Err(e) => tracing::debug!(partition = p, error = %e, "the replica didn't answer; asking the owner"),
                     }
@@ -790,7 +852,13 @@ impl PartitionedEngine {
             }
         }
         let mut last: Option<String> = None;
-        for attempt in 0..2 {
+        let mut attempt = 0;
+        // An owner that can't be reached (the call was never sent: it died, the map
+        // hasn't moved yet): asked again, through the map as it is then, until another
+        // node owns the partition or `ADB_FORWARD_WAIT_MS` passes — the write waits for
+        // the failover instead of failing.
+        let deadline = std::time::Instant::now() + forward_wait();
+        loop {
             let addr = match self.handle(p).await? {
                 Handle::Local(e) => return Box::pin(e.query(aql, variables)).await,
                 Handle::Remote(r) => match (&last, attempt) {
@@ -799,12 +867,24 @@ impl PartitionedEngine {
                 },
             };
             let peers = &self.cluster.as_ref().expect("a remote partition means a cluster").peers;
-            match peers.query(&addr, aql, variables, reach).await {
-                Err(e) if e.starts_with("not_owner:") && attempt == 0 => last = Some(e),
+            let t = std::time::Instant::now();
+            let r = peers.query(&addr, aql, variables, reach).await;
+            crate::steps::add("router.forward to owner (round trip)", t.elapsed());
+            match r {
+                Err(e) if e.starts_with("not_owner:") && attempt == 0 => {
+                    last = Some(e);
+                    attempt = 1;
+                }
+                Err(e) if e.starts_with(crate::remote::UNREACHABLE) && std::time::Instant::now() < deadline => {
+                    tracing::debug!(partition = p, error = %e, "owner unreachable; waiting for the map to move");
+                    last = None;
+                    attempt = 0;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) if e.starts_with("not_owner:") => return Err(e),
                 other => return other,
             }
         }
-        Err(last.unwrap_or_else(|| "not_owner".into()))
     }
 
     /// A statement spanning partitions: the router's executor over their reads and writes.
@@ -829,6 +909,7 @@ impl PartitionedEngine {
     /// A statement another node forwarded here (it was on one namespace, which this
     /// node owned in that node's map): run here, or `not_owner` — never forwarded on.
     pub async fn serve_query(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        let _t = crate::steps::timer("router.serve forwarded query");
         let (single, _) = single_namespace(aql, reach)?;
         match single {
             Some(ns) => {
@@ -1258,7 +1339,7 @@ impl Engine for Arc<PartitionedEngine> {
     }
 
     async fn stats(&self) -> Result<Value, String> {
-        let parts: Vec<Partition> = self.parts.lock().await.keys().copied().collect();
+        let parts: Vec<Partition> = self.opened().into_iter().map(|(p, _)| p).collect();
         Ok(json!({ "partitions_open": parts, "namespaces": self.catalog.read().unwrap().len() }))
     }
 
@@ -1510,8 +1591,7 @@ impl Engine for Arc<PartitionedEngine> {
     async fn set_cache(&self, settings: Value) -> Result<Value, String> {
         let r = self.system_handle().await?.op("set_cache", json!({ "settings": settings })).await?;
         let sys = self.sys();
-        for (p, e) in self.parts.lock().await.iter().filter(|(p, _)| **p != sys) {
-            let _ = p;
+        for (_, e) in self.opened().into_iter().filter(|(p, _)| *p != sys) {
             e.set_cache(settings.clone()).await?;
         }
         for h in self.data_handles().await? {

@@ -295,6 +295,64 @@ pub fn plan(map: &PartitionMap, live: &BTreeSet<NodeId>, reported: &BTreeMap<Nod
     out
 }
 
+/// One step toward an even spread once the map is whole (a node joined or came back
+/// with nothing): `None` when every live node owns and replicates within one partition
+/// of every other. The caller paces the steps (one at a time).
+///
+/// - **Replicas first:** a partition replicated by the node replicating most moves its
+///   replica to the node replicating fewest (not its owner). Same epoch: the owner
+///   sends the new replica its tail.
+/// - **Then owners:** a partition owned by the node owning most whose replica is the
+///   node owning fewest changes hands at the next epoch — the replica holds every
+///   acknowledged record not yet on object storage, so nothing is lost, and the old
+///   owner is fenced. Its writes wait while the new owner opens it.
+pub fn rebalance(map: &PartitionMap, live: &BTreeSet<NodeId>) -> Option<Change> {
+    let live: Vec<NodeId> = live.iter().copied().filter(|n| map.members.contains_key(n)).collect();
+    if live.len() < 2 || map.assignments.values().any(|a| !live.contains(&a.owner) || a.replica.is_some_and(|r| !live.contains(&r)) || a.replica.is_none()) {
+        return None;
+    }
+    let mut owned: BTreeMap<NodeId, usize> = live.iter().map(|n| (*n, 0)).collect();
+    let mut replicated = owned.clone();
+    for a in map.assignments.values() {
+        *owned.get_mut(&a.owner).unwrap() += 1;
+        if let Some(r) = a.replica {
+            *replicated.get_mut(&r).unwrap() += 1;
+        }
+    }
+    // (most, fewest) by count, ties by node id.
+    let ends = |c: &BTreeMap<NodeId, usize>| {
+        let most = c.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).map(|(n, k)| (*n, *k)).unwrap();
+        let fewest = c.iter().min_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0))).map(|(n, k)| (*n, *k)).unwrap();
+        (most, fewest)
+    };
+    let ((rmax, rk), (rmin, rj)) = ends(&replicated);
+    if rk >= rj + 2 {
+        if let Some((p, a)) = map.assignments.iter().find(|(_, a)| a.replica == Some(rmax) && a.owner != rmin) {
+            return Some(Change {
+                cmd: ControlCmd::Assign { partition: *p, assignment: Assignment { owner: a.owner, replica: Some(rmin), epoch: a.epoch } },
+                reason: "rebalance: a replica to the node replicating fewest",
+            });
+        }
+    }
+    let ((omax, ok), (omin, oj)) = ends(&owned);
+    if ok >= oj + 2 {
+        if let Some((p, a)) = map.assignments.iter().find(|(_, a)| a.owner == omax && a.replica == Some(omin)) {
+            return Some(Change {
+                cmd: ControlCmd::Assign { partition: *p, assignment: Assignment { owner: omin, replica: Some(omax), epoch: a.epoch + 1 } },
+                reason: "rebalance: a partition to its replica on the node owning fewest",
+            });
+        }
+        // None replicated there yet: give it one of the busiest owner's replicas first.
+        if let Some((p, a)) = map.assignments.iter().find(|(_, a)| a.owner == omax && a.replica != Some(omin)) {
+            return Some(Change {
+                cmd: ControlCmd::Assign { partition: *p, assignment: Assignment { owner: a.owner, replica: Some(omin), epoch: a.epoch } },
+                reason: "rebalance: a replica on the node owning fewest, before it takes the partition",
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +447,39 @@ mod tests {
         let v = m.version;
         m.apply(&ControlCmd::Assign { partition: 0, assignment: Assignment { owner: 2, replica: Some(1), epoch: 2 } }).unwrap();
         assert_eq!(m.version, v + 1);
+    }
+
+    #[test]
+    fn a_node_back_with_nothing_gets_its_share_one_step_at_a_time() {
+        // Node 2 was lost: nodes 1 and 3 own and replicate everything between them.
+        let mut m = map_with(&[1, 2, 3], 11);
+        for p in m.all_partitions() {
+            let (o, r) = if p % 2 == 0 { (1, 3) } else { (3, 1) };
+            m.apply(&ControlCmd::Assign { partition: p, assignment: Assignment { owner: o, replica: Some(r), epoch: 1 } }).unwrap();
+        }
+        assert!(rebalance(&m, &live(&[1, 3])).is_none(), "even between the two");
+        let mut steps = 0;
+        while let Some(c) = rebalance(&m, &live(&[1, 2, 3])) {
+            let before = m.assignments.clone();
+            apply_all(&mut m, std::slice::from_ref(&c));
+            let ControlCmd::Assign { partition, assignment } = &c.cmd else { panic!("{c:?}") };
+            let was = &before[partition];
+            if assignment.owner != was.owner {
+                // An owner moves only to the partition's replica, at the next epoch.
+                assert_eq!(Some(assignment.owner), was.replica, "{c:?}");
+                assert_eq!(assignment.epoch, was.epoch + 1);
+            } else {
+                assert_eq!(assignment.epoch, was.epoch, "a replica move keeps the epoch");
+            }
+            steps += 1;
+            assert!(steps < 50, "converges");
+        }
+        for n in [1, 2, 3] {
+            assert!((3..=5).contains(&m.owned_by(n).count()), "owners spread: {m:?}");
+            let r = m.assignments.values().filter(|a| a.replica == Some(n)).count();
+            assert!((3..=5).contains(&r), "replicas spread: {m:?}");
+        }
+        assert!(plan(&m, &live(&[1, 2, 3]), &BTreeMap::new()).is_empty(), "still whole");
     }
 
     #[test]
