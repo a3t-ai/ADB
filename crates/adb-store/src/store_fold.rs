@@ -131,11 +131,14 @@ impl PartitionStore {
     pub(super) async fn fold(&self, keep: &(dyn Fn(StoredRow) -> Option<StoredRow> + Sync), now: CommitTs, horizon: CommitTs) -> StoreResult<CompactStats> {
         let _t = adb_core::steps::timer("store.fold compaction (all)");
         let _one = self.folding.lock().await;
+        // The node's compaction budget: a few folds at once, owners first.
+        let _budget = crate::budget::acquire(self.replica_copy.load(std::sync::atomic::Ordering::SeqCst)).await;
         // Only before step 3: from there on the base table is being rewritten.
         if self.compaction_yields() {
             return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
         }
         let started = std::time::Instant::now();
+        let mut ft = std::time::Instant::now();
         // No archive here (S3 option B): object storage gets large files at the
         // archive timer's checkpoints; the cleanup in step 5 keeps every version since
         // the last one (`cleanup_local_versions`).
@@ -149,6 +152,7 @@ impl PartitionStore {
             open_state(&g).writer.force_freeze_active().await.map_err(lance)?
         };
         fence.wait().await.map_err(lance)?;
+        adb_core::steps::lap("fold.1 freeze + flush memtable", &mut ft);
 
         // 2. The delta (newest version per id, generation order), and the base snapshot.
         let (base, shard, sstables) = {
@@ -173,6 +177,7 @@ impl PartitionStore {
             }
         }
         n.delta = delta.len();
+        adb_core::steps::lap("fold.2 read sstables (delta)", &mut ft);
         if self.compaction_yields() {
             return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
         }
@@ -217,6 +222,7 @@ impl PartitionStore {
             }
         }
 
+        adb_core::steps::lap("fold.3 scan base for expired rows", &mut ft);
         if self.compaction_yields() {
             return Err(StoreError::Decode("compaction gave way to a takeover; it runs again later".into()));
         }
@@ -237,6 +243,7 @@ impl PartitionStore {
             ds.delete(&format!("id IN ({list})")).await.map_err(lance)?;
         }
         n.deleted = deletes.len();
+        adb_core::steps::lap("fold.4 find erased fragments + deletes", &mut ft);
         if !upserts.is_empty() {
             n.upserted = upserts.len();
             let batches = upserts.chunks(REWRITE_CHUNK).map(|c| encode(c, &self.schema, self.dim)).collect::<StoreResult<Vec<_>>>()?;
@@ -250,6 +257,7 @@ impl PartitionStore {
                 .map_err(lance)?;
             ds = (*merged).clone();
         }
+        adb_core::steps::lap("fold.5 merge_insert", &mut ft);
         // New fragments into the indexes first: Lance rewrites no group that mixes
         // indexed and unindexed fragments (its remap would lose rows).
         if n.upserted > 0 {
@@ -259,11 +267,14 @@ impl PartitionStore {
         }
         let tasks = plan_rewrites(ds.fragments(), &erase_frags);
         n.rewritten = tasks.iter().map(|t| t.len()).sum();
+        adb_core::steps::lap("fold.6 optimize indexes", &mut ft);
         if !tasks.is_empty() {
             compact_files_with_planner(&mut ds, None, &Planner { tasks }).await.map_err(lance)?;
         }
+        adb_core::steps::lap("fold.7 rewrite fragments", &mut ft);
         let err = |e: std::io::Error| StoreError::Decode(format!("compaction: {e}"));
         adb_core::disk::sync_fs_async(&dir).await.map_err(err)?;
+        adb_core::steps::lap("fold.8 syncfs", &mut ft);
 
         // 4. The swap and the clean-up, with readers and the applier held.
         let folded: HashSet<u64> = sstables.iter().map(|t| t.generation).collect();
@@ -307,9 +318,12 @@ impl PartitionStore {
                 }
             }
         }
+        adb_core::steps::lap("fold.9 swap + cleanup (write lock)", &mut ft);
         let total = inner.base.count_rows(None).await.map_err(lance)?;
         drop(g);
+        adb_core::steps::lap("fold.10 count rows (write lock)", &mut ft);
         adb_core::disk::sync_fs_async(&dir).await.map_err(err)?;
+        adb_core::steps::lap("fold.11 final syncfs", &mut ft);
         tracing::info!(
             sstables = n.sstables, delta = n.delta, expired = n.expired, upserted = n.upserted, deleted = n.deleted,
             fragments_rewritten = n.rewritten, wal_entries_removed = n.wal_entries, old_versions = removed.old_versions,

@@ -148,6 +148,9 @@ pub struct PartitionStore {
     rows_at_compaction: std::sync::atomic::AtomicU64,
     /// One fold (compaction, PF-16) or table rewrite at a time.
     folding: tokio::sync::Mutex<()>,
+    /// A replica's read copy (a cache of the owner's table): its folds wait behind
+    /// owners' for the node's compaction budget (`budget`).
+    replica_copy: std::sync::atomic::AtomicBool,
     /// Rows the write path read for a record it then submitted (PF-48), by the
     /// record's offset: the applier uses them instead of reading the table again.
     hints: std::sync::Mutex<std::collections::HashMap<u64, Vec<StoredRow>>>,
@@ -936,6 +939,7 @@ impl PartitionStore {
             puts_since_compaction: std::sync::atomic::AtomicU64::new(0),
             rows_at_compaction: std::sync::atomic::AtomicU64::new(0),
             folding: tokio::sync::Mutex::new(()),
+            replica_copy: Default::default(),
             hints: Default::default(),
             model_changed: std::sync::atomic::AtomicBool::new(false),
             hot: std::sync::RwLock::new(None),
@@ -1404,6 +1408,11 @@ impl PartitionStore {
     }
 
     /// [`get`](Self::get) through the row cache (exact: see `row_cache`).
+    /// Mark this table a replica's read copy (see `replica_copy`).
+    pub fn mark_replica_copy(&self) {
+        self.replica_copy.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub async fn get_cached(&self, id: &str) -> StoreResult<Option<StoredRow>> {
         let _t = adb_core::steps::timer("store.get_cached");
         match self.rows.begin(id) {
@@ -1655,7 +1664,11 @@ impl PartitionStore {
         if let (Ok(_), Some(h)) = (&put, self.hot()) {
             h.apply(&rows);
         }
-        self.rows.drop_rows(&rows);
+        // The row cache too: written through, or dropped if the put failed.
+        match &put {
+            Ok(_) => self.rows.wrote(&rows),
+            Err(_) => self.rows.drop_rows(&rows),
+        }
         if put.is_ok() {
             self.fields.apply(&rows);
             self.live.apply(&rows);

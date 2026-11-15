@@ -49,6 +49,14 @@ pub struct Replica {
     cache_only: bool,
 }
 
+/// A reader's table is folded only past `ADB_REPLICA_COMPACT_GENERATIONS` unmerged
+/// layers (default 12): it is a cache of the owner's, moved to newer checkpoints; folding
+/// it on every 500 writes doubled the node's compaction work (Hetzner round 5).
+async fn replica_compaction_due(store: &adb_store::PartitionStore) -> bool {
+    let max = std::env::var("ADB_REPLICA_COMPACT_GENERATIONS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(12);
+    store.generation_count().await.is_ok_and(|n| n > max)
+}
+
 /// How often a follower checks whether its tables need compacting.
 const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -170,6 +178,7 @@ impl Replica {
     /// Mark this as a reader's copy (see `cache_only`).
     pub fn cache_only(&mut self) {
         self.cache_only = true;
+        self.store.mark_replica_copy();
     }
 
     /// Apply what the WAL gained since the last step; trim it. Returns the
@@ -303,10 +312,18 @@ impl Replica {
             None => Vec::new(),
         };
         let (store, platform, compacting) = (Arc::clone(&self.store), self.platform.clone(), Arc::clone(&self.compacting));
+        let cache_only = self.cache_only;
         tokio::spawn(async move {
             let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-            if crate::writes::compaction_due_for(&store).await {
-                match store.compact(FOLLOWER_HISTORY, now).await {
+            // A reader (a cache of the owner, rebuilt from newer checkpoints) folds only
+            // when its layers would slow its reads; owners fold on their writes.
+            let due = match cache_only {
+                true => replica_compaction_due(&store).await,
+                false => crate::writes::compaction_due_for(&store).await,
+            };
+            if due {
+                let st = Arc::clone(&store);
+                match adb_store::budget::run(async move { st.compact(FOLLOWER_HISTORY, now).await }).await {
                     Ok(st) => tracing::info!(kept = st.kept, of = st.total, took = ?st.took, "follower table compacted"),
                     Err(e) => tracing::warn!(error = %e, "follower compaction failed; retrying later"),
                 }
@@ -359,7 +376,8 @@ impl Replica {
         catch_up(&self.store, &self.log).await.map_err(s("store"))?;
         let rows = forgotten_rows(&self.store, forgotten.clone()).await.map_err(s("store"))?;
         let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let st = self.store.compact(FOLLOWER_HISTORY, now).await.map_err(s("compaction"))?;
+        let store = Arc::clone(&self.store);
+        let st = adb_store::budget::run(async move { store.compact(FOLLOWER_HISTORY, now).await }).await.map_err(s("compaction"))?;
         let redact = |r: &mut adb_core::log::LogRecord| redact_record(r, &rows);
         let n = self.log.rewrite_closed(&redact).await.map_err(s("log redaction"))?;
         tracing::info!(lineages = forgotten.len(), kept = st.kept, of = st.total, log_records_redacted = n, "follower erased forgotten records");

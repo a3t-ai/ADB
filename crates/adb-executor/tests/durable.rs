@@ -308,6 +308,7 @@ async fn log_is_purged_below_lances_durable_offset() {
                 .unwrap();
             if i % 50 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await; // let the MemWAL flush
+                w.purge_log().await.unwrap(); // the maintenance tick's trim
             }
         }
         segments_at_most = std::fs::read_dir(dir.path().join("p0")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".wal")).count();
@@ -397,10 +398,12 @@ async fn log_is_kept_until_object_storage_holds_it() {
     assert_eq!(watermark, LogOffset(n), "the archived table holds every record");
     assert_eq!(last_point(cold.path())["node"]["memory"]["watermark"], n);
 
-    // More writes trigger the purge again: now everything up to the watermark may go.
+    // More writes, then the maintenance tick's trim: now everything up to the
+    // watermark may go.
     for i in n + 1..=n + 300 {
         write(i).await;
     }
+    w.purge_log().await.unwrap();
     drop(w);
     let kept = first_kept(dir.path());
     eprintln!("first record still in the log: {kept}");

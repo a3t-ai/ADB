@@ -120,6 +120,34 @@ impl RowCache {
         }
     }
 
+    /// A put wrote these rows and they are in the table now: the cache takes them (a
+    /// row written is the row a read by its id returns next), and reads of them under
+    /// way are spoiled. Dropping them instead sent the next UPDATE of the same key back
+    /// to Lance for a ~17 ms point read (local bench, 15 Nov).
+    pub fn wrote(&self, rows: &[StoredRow]) {
+        if self.cap == 0 {
+            return;
+        }
+        let mut s = self.state.lock().unwrap();
+        for r in rows {
+            let id: &str = &r.id;
+            if let Some(e) = s.reading.get_mut(id) {
+                e.1 = true;
+            }
+            if let Some(cur) = s.rows.get_mut(id) {
+                *cur = r.clone();
+                continue;
+            }
+            while s.rows.len() >= self.cap {
+                let Some(old) = s.order.pop_front() else { break };
+                s.rows.remove(&old);
+            }
+            let id: Arc<str> = Arc::from(id);
+            s.order.push_back(id.clone());
+            s.rows.insert(id, r.clone());
+        }
+    }
+
     /// The table was swapped: drop everything, spoil every read under way.
     pub fn clear(&self) {
         let mut s = self.state.lock().unwrap();
@@ -174,6 +202,21 @@ mod tests {
         assert!(c.begin("a").is_ok());
         c.drop_rows(&[row("a", 3)]);
         assert!(c.begin("a").is_err(), "a put drops it");
+    }
+
+    #[test]
+    fn a_put_writes_through_and_a_read_under_way_cant_put_the_old_row_back() {
+        let c = RowCache::with_capacity(8);
+        // A read of `a` starts, a put of `a` lands, the read finishes with what it saw.
+        let Err(t) = c.begin("a") else { panic!() };
+        c.wrote(&[row("a", 2)]);
+        c.finish(t, Some(&row("a", 1)));
+        let Ok(r) = c.begin("a") else { panic!("written through") };
+        assert_eq!(r.data.value["applied_offset"], 2, "the put's row, not the read's older one");
+        // A later put replaces it in place.
+        c.wrote(&[row("a", 3)]);
+        assert_eq!(c.begin("a").ok().unwrap().data.value["applied_offset"], 3);
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

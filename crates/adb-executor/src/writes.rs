@@ -606,6 +606,9 @@ fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
 /// Writes through the log.
 pub struct DurableWrites<L: Log> {
     seq: Mutex<Sequencer<L>>,
+    /// The sequencer's log, shared: trimming and FORGET redaction use it without the
+    /// sequencer (they need no ordering; holding it stalled every write).
+    log: Arc<L>,
     /// The partition's Lance table (stage D2: written alongside the in-memory
     /// backends; reads move to it in D3). `None` = log + memory only.
     store: Option<Arc<PartitionStore>>,
@@ -645,6 +648,10 @@ pub struct DurableWrites<L: Log> {
     /// lowest of the memory table's, the platform tables' and the engine's archived
     /// offsets ([`Self::archive_tick`]). 1 until the first archive.
     archive_floor: std::sync::atomic::AtomicU64,
+    /// A compaction started by the maintenance tick is under way.
+    compacting: Arc<std::sync::atomic::AtomicBool>,
+    /// The log's tip at the last trim ([`Self::purge_log`]).
+    purged_at: std::sync::atomic::AtomicU64,
     /// The floor the last `Effect::Archived` record announced.
     archive_marked: std::sync::atomic::AtomicU64,
     /// The offset of the last `Archived` record: records up to it are nothing new
@@ -864,7 +871,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         let (record, wait) = seq.submit_record(ts, None, effects).await.map_err(log_err)?;
         store.hint_rows(record.offset.0, hint);
-        self.to_store_submitted(&record, seq.log()).await;
+        self.to_store_submitted(&record).await;
         drop(seq);
         crate::steps::lap("update.4 submit under lock", &mut t);
         self.committed(record.offset.0, wait).await?;
@@ -917,7 +924,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         self.keys_gone(&effects);
         self.note_forgotten(ids.iter().map(|id| (m, id.clone())));
-        self.to_store_submitted(&record, seq.log()).await;
+        self.to_store_submitted(&record).await;
         drop(seq);
         crate::steps::lap("forget.4 submit under lock", &mut t);
         self.committed(record.offset.0, wait).await?;
@@ -999,7 +1006,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         if reshape {
             self.platform_reshape.store(off, std::sync::atomic::Ordering::SeqCst);
         }
-        self.to_store_submitted(&record, seq.log()).await;
+        self.to_store_submitted(&record).await;
         let (go, go_rx) = tokio::sync::oneshot::channel();
         let ticket = PlatformTicket { record, go: go_rx, done };
         match self.platform_tickets.lock().unwrap().as_ref() {
@@ -1098,22 +1105,28 @@ impl<L: Log + 'static> DurableWrites<L> {
             .collect();
         let now = CommitTs::from_datetime(time::now());
         // PF-16: in place, without the sequencer; only the swap holds readers, briefly.
-        let stats = store.compact_with_windows(HISTORY, now, &pins, windows).await.map_err(store_err)?;
+        // On the compaction runtime, within the node's budget (`adb_store::budget`).
+        let st = Arc::clone(store);
+        let stats = adb_store::budget::run(async move { st.compact_with_windows(HISTORY, now, &pins, windows).await }).await.map_err(store_err)?;
         // With object storage the archive holds every payload before the log loses any.
         if store.log_floor().is_some() {
             store.archive().await.map_err(store_err)?;
         }
         let mut redacted = 0;
         if !rows.is_empty() {
-            let mut seq = seq_lock!(self);
-            // Close the segment holding the newest records, then rewrite the closed
-            // ones without the forgotten payloads; offsets (and every subscriber's
-            // position) stay.
-            let ts = seq.begin();
-            let marker = seq.append_record_on_new_segment(ts, Vec::new()).await.map_err(log_err)?;
-            self.to_store(&marker, seq.log()).await;
+            // Close the segment holding the newest records (the only step that takes
+            // the sequencer), then rewrite the closed ones without the forgotten
+            // payloads, while writes go on into the new segment; offsets (and every
+            // subscriber's position) stay. Done under the sequencer, the rewrite held
+            // every write for up to 1.4 s (local bench, 15 Nov).
+            {
+                let mut seq = seq_lock!(self);
+                let ts = seq.begin();
+                let marker = seq.append_record_on_new_segment(ts, Vec::new()).await.map_err(log_err)?;
+                self.to_store(&marker).await;
+            }
             let redact = |r: &mut LogRecord| redact_record(r, &rows);
-            redacted = seq.log().rewrite_closed(&redact).await.map_err(log_err)?;
+            redacted = self.log.rewrite_closed(&redact).await.map_err(log_err)?;
         }
         // Gone from the table and the log: no longer hidden at read time.
         {
@@ -1130,6 +1143,21 @@ impl<L: Log + 'static> DurableWrites<L> {
         );
         self.usage_stale().await;
         Ok(Some(stats))
+    }
+
+    /// Start a compaction in the background unless one is under way: the maintenance
+    /// tick goes on (log trim, archive) while it waits for the node's budget and runs.
+    pub fn compact_in_background(self: &Arc<Self>) {
+        if self.compacting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = me.compact().await {
+                tracing::warn!(error = %e, "compaction failed; retrying later");
+            }
+            me.compacting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     /// Compaction from the maintenance timer (thresholds, nightly) or an admin.
@@ -1171,7 +1199,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         data.subject_id = Some(id.0.clone());
         let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id.clone(), version: 1, data });
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok((id.0, record.offset.0))
     }
 
@@ -1293,7 +1321,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id, version: 1, data });
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.branches.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(())
     }
 
@@ -1329,7 +1357,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let ts = seq.begin();
         let record = seq.append_record(ts, None, vec![Effect::Unregister { id: RecordId(id) }]).await.map_err(log_err)?;
         self.branches.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(true)
     }
 
@@ -1439,7 +1467,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let effect = Effect::Unregister { id: RecordId(crate::branches::Tag::id_of(namespace, name)) };
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.branches.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(true)
     }
 
@@ -1557,7 +1585,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let effect = Effect::Unregister { id: RecordId(crate::branches::Branch::id_of(namespace, name)) };
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.branches.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(true)
     }
 
@@ -1629,7 +1657,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             n += effects.len() as u64;
             let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
             self.live.lock().unwrap().extend(keys);
-            self.to_store(&record, seq.log()).await;
+            self.to_store(&record).await;
         }
         Ok(n)
     }
@@ -1730,7 +1758,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         self.platform_applied.send_modify(|a| *a = (*a).max(record.offset.0));
         platform.apply(&record).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
         self.live.lock().unwrap().extend(keys);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok((record.offset.0, after))
     }
 
@@ -1762,7 +1790,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             },
         };
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(record.offset.0)
     }
 
@@ -1848,7 +1876,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
         self.note_forgotten(held.iter().map(|k| (m, k.clone())));
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         drop(seq);
         Ok(held.len() as u64)
     }
@@ -1902,7 +1930,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         let n = effects.len() as u64;
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(n)
     }
 
@@ -1911,7 +1939,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let ts = seq.begin();
         let effect = Effect::Unregister { id: RecordId(id.to_string()) };
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(())
     }
 
@@ -1982,7 +2010,7 @@ impl<L: Log + 'static> DurableWrites<L> {
                 let effects = vec![Effect::Archived { cold, floor: LogOffset(floor), node: point.node.clone() }];
                 let ts = seq.begin();
                 let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-                self.to_store(&record, seq.log()).await;
+                self.to_store(&record).await;
                 record
             };
             self.archive_marked.store(floor, std::sync::atomic::Ordering::SeqCst);
@@ -2151,7 +2179,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let mut seq = seq_lock!(self);
         let ts = seq.begin();
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(n)
     }
 
@@ -2254,7 +2282,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2450,7 +2478,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(effects.len() as u64)
     }
 
@@ -2570,7 +2598,7 @@ impl<L: Log + 'static> DurableWrites<L> {
                     Ok((record, wait)) => {
                         drop(h);
                         self.engine_submitted.fetch_max(record.offset.0, std::sync::atomic::Ordering::SeqCst);
-                        self.to_store_submitted(&record, seq.log()).await;
+                        self.to_store_submitted(&record).await;
                         let (go, go_rx) = tokio::sync::oneshot::channel();
                         pending = Some((record.offset.0, wait, go));
                         EngineTicket { space: space.to_string(), record: Some(record), go: Some(go_rx), notices, done }
@@ -2753,14 +2781,14 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Every `PURGE_EVERY` records it also trims the log (stage D3.5): startup only
     /// needs the records above what Lance has made durable, so segments below
     /// `durable_offset + 1` go. A failed purge is logged; the log just keeps them.
-    async fn to_store(&self, record: &LogRecord, log: &L) {
-        self.to_store_with(record, log, true).await
+    async fn to_store(&self, record: &LogRecord) {
+        self.to_store_with(record, true).await
     }
 
     /// As [`Self::to_store`] for a record submitted but maybe not yet durable (PF-1):
     /// the applier holds it until [`Self::committed`] marks it.
-    async fn to_store_submitted(&self, record: &LogRecord, log: &L) {
-        self.to_store_with(record, log, false).await
+    async fn to_store_submitted(&self, record: &LogRecord) {
+        self.to_store_with(record, false).await
     }
 
     /// Wait for a submitted record's commit, outside the sequencer. A failure stops
@@ -2821,14 +2849,14 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(())
     }
 
-    async fn to_store_with(&self, record: &LogRecord, log: &L, durable: bool) {
+    async fn to_store_with(&self, record: &LogRecord, durable: bool) {
         let _whole = crate::steps::timer("to_store (all, under lock)");
         let applied = self.barrier().map_or(0, |b| b.applied_offset());
         self.key_offsets.lock().unwrap().note(record, applied);
         crate::steps::value("record effects", record.effects.len() as u64);
         self.last_off.fetch_max(record.offset.0, std::sync::atomic::Ordering::SeqCst);
         self.last_ts.fetch_max(record.commit_ts.0, std::sync::atomic::Ordering::SeqCst);
-        let (Some(s), Some(applier)) = (&self.store, &self.applier) else { return };
+        let (Some(_), Some(applier)) = (&self.store, &self.applier) else { return };
         // TTL timers (W9.12) for records written with one; validity timers for facts
         // with a bound ahead (AQL v0.10).
         for e in &record.effects {
@@ -2850,63 +2878,75 @@ impl<L: Log + 'static> DurableWrites<L> {
         } else {
             applier.enqueue_submitted(record.clone());
         }
-        if record.offset.0 % purge_every() == 0 {
-            let t0 = std::time::Instant::now();
-            let _timed = scopeguard_timer(t0);
-            let mut pt = std::time::Instant::now();
-            let durable_off = s.durable_offset().await;
-            crate::steps::lap("purge.1 durable offset", &mut pt);
-            match durable_off {
-                // Lance doesn't fsync on local disk (risk K8): sync first, so the
-                // records purged from the log are on disk in Lance, not only cached.
-                Ok(d) if d.0 > 0 => {
-                    let synced = s.sync_to_disk().await;
-                    crate::steps::lap("purge.2 lance sync to disk", &mut pt);
-                    if let Err(e) = synced {
-                        tracing::warn!(error = %e, "store sync failed; log not purged");
-                        return;
-                    }
-                    // Keep what subscribers haven't acked, up to `retain_max` behind the
-                    // tip (E3); never above Lance's durable offset.
-                    let mut floor = d.next();
-                    // With object storage: never above what it can rebuild (the lowest of the
-                    // memory table's, platform tables' and engine's archived offsets).
-                    if s.log_floor().is_some() {
-                        floor = LogOffset(floor.0.min(self.archive_floor.load(std::sync::atomic::Ordering::SeqCst)));
-                    }
-                    // Platform tables apply synchronously; the log keeps a platform
-                    // record only if its apply failed (they catch up on the next open).
-                    if let Some(p) = self.platform_floor().await {
-                        floor = LogOffset(floor.0.min(p.0));
-                    }
-                    crate::steps::lap("purge.3 platform floor", &mut pt);
-                    // FlowR's engine needs the records above its snapshots (stage H).
-                    if let Some(e) = &self.engine {
-                        let host = e.lock().await;
-                        crate::steps::lap("purge.4 engine lock wait", &mut pt);
-                        if let Some(f) = host.floor().await {
-                            floor = LogOffset(floor.0.min(f.0));
-                        }
-                        drop(host);
-                        crate::steps::lap("purge.5 engine floor", &mut pt);
-                    }
-                    if let Some(cursor) = self.subs.min_cursor() {
-                        let cap = record.offset.0.saturating_sub(self.retain_max);
-                        floor = LogOffset(floor.0.min(cursor.max(cap) + 1));
-                    }
-                    if floor.0 <= 1 {
-                        return;
-                    }
-                    let purged = log.purge_below(floor).await;
-                    crate::steps::lap("purge.6 log purge below", &mut pt);
-                    if let Err(e) = purged {
-                        tracing::warn!(below = floor.0, error = %e, "log purge failed; segments kept");
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "Lance durable offset unavailable; log not purged"),
+    }
+
+    /// Trim the log below what Lance holds on disk (and everything else that needs it),
+    /// once `ADB_PURGE_EVERY` records have come since the last trim. Called by the
+    /// maintenance tick, not on the write path: inline, it ran under the sequencer every
+    /// 256 records and held every write up to 100 ms (local bench, 15 Nov). The floor is
+    /// worked out without the sequencer; only the trim itself takes it.
+    pub async fn purge_log(&self) -> AdbResult<()> {
+        let tip = self.last_off.load(std::sync::atomic::Ordering::SeqCst);
+        let since = self.purged_at.load(std::sync::atomic::Ordering::SeqCst);
+        if tip < since + purge_every() {
+            return Ok(());
+        }
+        let Some(s) = &self.store else { return Ok(()) };
+        let _timed = crate::steps::timer("purge (all)");
+        let mut pt = std::time::Instant::now();
+        let durable_off = s.durable_offset().await;
+        crate::steps::lap("purge.1 durable offset", &mut pt);
+        let d = match durable_off {
+            Ok(d) if d.0 > 0 => d,
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "Lance durable offset unavailable; log not purged");
+                return Ok(());
+            }
+        };
+        // Lance doesn't fsync on local disk (risk K8): sync first, so the records purged
+        // from the log are on disk in Lance, not only cached.
+        if let Err(e) = s.sync_to_disk().await {
+            tracing::warn!(error = %e, "store sync failed; log not purged");
+            return Ok(());
+        }
+        crate::steps::lap("purge.2 lance sync to disk", &mut pt);
+        // Keep what subscribers haven't acked, up to `retain_max` behind the tip (E3);
+        // never above Lance's durable offset.
+        let mut floor = d.next();
+        // With object storage: never above what it can rebuild (the lowest of the memory
+        // table's, platform tables' and engine's archived offsets).
+        if s.log_floor().is_some() {
+            floor = LogOffset(floor.0.min(self.archive_floor.load(std::sync::atomic::Ordering::SeqCst)));
+        }
+        // Platform tables apply synchronously; the log keeps a platform record only if
+        // its apply failed (they catch up on the next open).
+        if let Some(p) = self.platform_floor().await {
+            floor = LogOffset(floor.0.min(p.0));
+        }
+        crate::steps::lap("purge.3 platform floor", &mut pt);
+        // FlowR's engine needs the records above its snapshots (stage H).
+        if let Some(e) = &self.engine {
+            let host = e.lock().await;
+            if let Some(f) = host.floor().await {
+                floor = LogOffset(floor.0.min(f.0));
             }
         }
+        crate::steps::lap("purge.4 engine floor", &mut pt);
+        if let Some(cursor) = self.subs.min_cursor() {
+            let cap = tip.saturating_sub(self.retain_max);
+            floor = LogOffset(floor.0.min(cursor.max(cap) + 1));
+        }
+        self.purged_at.store(tip, std::sync::atomic::Ordering::SeqCst);
+        if floor.0 <= 1 {
+            return Ok(());
+        }
+        let purged = self.log.purge_below(floor).await;
+        crate::steps::lap("purge.5 log purge below", &mut pt);
+        if let Err(e) = purged {
+            tracing::warn!(below = floor.0, error = %e, "log purge failed; segments kept");
+        }
+        Ok(())
     }
 }
 
@@ -2916,16 +2956,6 @@ pub const PURGE_EVERY: u64 = 256;
 fn purge_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("ADB_PURGE_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(PURGE_EVERY).max(1))
-}
-
-struct PurgeTimer(std::time::Instant);
-impl Drop for PurgeTimer {
-    fn drop(&mut self) {
-        crate::steps::add("purge (under lock)", self.0.elapsed());
-    }
-}
-fn scopeguard_timer(t0: std::time::Instant) -> PurgeTimer {
-    PurgeTimer(t0)
 }
 
 /// Apply every log record above the table's `_meta` offset (records lost from the
@@ -3026,7 +3056,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         // The table is the only copy: answer with the record as reads shape it.
         let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
-        self.to_store_submitted(&record, seq.log()).await;
+        self.to_store_submitted(&record).await;
         crate::steps::lap("store.6 to applier (under lock)", &mut t);
         // Counted under the sequencer, so concurrent STOREs can't both pass the quota.
         self.note_stored(namespace, bytes).await;
@@ -3156,7 +3186,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             }
         }
         let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         self.note_stored(namespace, fact_bytes).await;
         Ok(stored)
     }
@@ -3233,7 +3263,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             }
             let resolved = t0.elapsed();
             let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
-            self.to_store(&record, seq.log()).await;
+            self.to_store(&record).await;
             tracing::debug!(target: "adb::write", ?memory_type, held_us = resolved.as_micros() as u64, log_us = (t0.elapsed() - resolved).as_micros() as u64, "update committed");
             return Ok(effects.len() as u64);
         }
@@ -3246,7 +3276,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             effects.extend(ids.iter().map(|id| Effect::Embed { memory: memory_type.into(), id: RecordId(id.clone()), embedding: v.clone() }));
         }
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(ids.len() as u64)
     }
 
@@ -3283,7 +3313,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.keys_gone(&effects);
         self.note_forgotten(ids.iter().map(|id| (Memory::from(memory_type), id.clone())));
         let removed = ids.len() as u64;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         drop(seq);
         // Hidden from every read from the commit on; the bytes leave disk at the next
         // compaction (user, 7 Nov: no read may miss a FORGET; disk removal can wait).
@@ -3437,7 +3467,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             _ => None,
         });
         self.note_forgotten(gone);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         drop(seq);
         Ok(n)
     }
@@ -3481,7 +3511,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             .collect();
         let n = effects.len() as u64;
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(n)
     }
 
@@ -3498,7 +3528,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             edges.iter().map(|e| Effect::Forget { memory: e.data.memory, lineage_id: RecordId(e.key().to_string()) }).collect();
         let n = effects.len() as u64;
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(n)
     }
 
@@ -3515,7 +3545,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         data.ttl_at = Some(CommitTs(ts.0 + ttl.unwrap_or(DEFAULT_EVENT_TTL).as_micros() as i64));
         let effect = Effect::PublishEvent(NewRow { id: id.clone(), lineage_id: id.clone(), version: 1, data });
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok((id.0, record.offset.0))
     }
 
@@ -3536,7 +3566,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let effect = Effect::Register(NewRow { id: id.clone(), lineage_id: id.clone(), version: 1, data });
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.subs.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok((id.0, cursor + 1))
     }
 
@@ -3551,7 +3581,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let effect = Effect::UpdateSubCursor { sub_id: RecordId(subscription.to_string()), cursor: LogOffset(offset) };
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.subs.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(offset)
     }
 
@@ -3564,7 +3594,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let effect = Effect::Unregister { id: RecordId(subscription.to_string()) };
         let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
         self.subs.apply(&record);
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(true)
     }
 
@@ -3831,7 +3861,7 @@ impl<L: Log + 'static> DurableWrites<L> {
                 let new = edge_version(&cur, None, weight, seq.new_id(ts));
                 let effect = Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: new.clone() };
                 let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-                self.to_store(&record, seq.log()).await;
+                self.to_store(&record).await;
                 return crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0))
                     .ok_or_else(|| AdbError::Internal("edge without to_memory".into()));
             }
@@ -3852,7 +3882,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let Effect::PutEdge(n) = &effect else { unreachable!() };
         let link = crate::reads::to_link(&adb_store::StoredRow::from_new(&adb_store::qualified(n), ts, 0, 0))
             .ok_or_else(|| AdbError::Internal("edge without to_memory".into()))?;
-        self.to_store(&record, seq.log()).await;
+        self.to_store(&record).await;
         Ok(link)
     }
 }

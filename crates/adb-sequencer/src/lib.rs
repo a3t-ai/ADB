@@ -59,7 +59,9 @@ impl Txn<'_> {
 
 /// Orders one partition's writes onto its log.
 pub struct Sequencer<L: Log> {
-    log: L,
+    /// Shared ([`Sequencer::shared_log`]): maintenance — trimming, redaction — reaches
+    /// the log without the sequencer; only writes go through it.
+    log: std::sync::Arc<L>,
     epoch: Epoch,
     clock: CommitClock,
     ids: IdGen,
@@ -83,11 +85,17 @@ impl<L: Log> Sequencer<L> {
 
     /// As [`Sequencer::new`] with an injected wall clock (tests).
     pub fn with_wall_clock(log: L, epoch: Epoch, wall: fn() -> CommitTs) -> Self {
-        Self { log, epoch, clock: CommitClock::default(), ids: IdGen::new(), seen: HashMap::new(), wall, submitted: LogOffset::ZERO }
+        Self { log: std::sync::Arc::new(log), epoch, clock: CommitClock::default(), ids: IdGen::new(), seen: HashMap::new(), wall, submitted: LogOffset::ZERO }
     }
 
     pub fn log(&self) -> &L {
         &self.log
+    }
+
+    /// The log, for work that needs no ordering: trimming below a durable offset,
+    /// rewriting closed segments. Appends go through the sequencer only.
+    pub fn shared_log(&self) -> std::sync::Arc<L> {
+        std::sync::Arc::clone(&self.log)
     }
 
     /// Prepare and commit one transaction. `build` receives the transaction (commit

@@ -124,6 +124,9 @@ pub struct LocalWal {
     files: parking_lot::RwLock<()>,
     /// Held open (and exclusively locked) while the log is open.
     _lock: File,
+    /// Trimming and rewriting closed segments one at a time: a trim deleting a segment
+    /// a rewrite is reading (or about to rename back) would fail it or leave a stray file.
+    maintenance: Mutex<()>,
 }
 
 impl std::fmt::Debug for LocalWal {
@@ -286,7 +289,7 @@ impl LocalWal {
                 .map_err(io)?
         };
 
-        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), files: parking_lot::RwLock::new(()), _lock: lock })
+        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), files: parking_lot::RwLock::new(()), _lock: lock, maintenance: Mutex::new(()) })
     }
 
     /// Number of `fdatasync` calls so far.
@@ -490,6 +493,7 @@ impl Log for LocalWal {
     }
 
     async fn rewrite_closed(&self, redact: &(dyn for<'r> Fn(&'r mut LogRecord) -> bool + Sync)) -> LogResult<usize> {
+        let _one = self.maintenance.lock();
         // The closed segments and their index entries (the last segment is the
         // writer's: never rewritten).
         let closed: Vec<(u64, LogOffset, Vec<Entry>)> = {
@@ -551,6 +555,12 @@ impl Log for LocalWal {
             file.sync_all().map_err(io)?;
             drop(file);
             let _files = self.files.write();
+            // Trimmed meanwhile (it can't be: trims wait for `maintenance`; checked
+            // all the same): never bring a deleted segment back.
+            if !self.state.lock().segments.contains(&seg) {
+                let _ = fs::remove_file(&tmp);
+                continue;
+            }
             fs::rename(&tmp, &path).map_err(io)?;
             sync_dir(&self.dir)?;
             let mut s = self.state.lock();
@@ -567,6 +577,7 @@ impl Log for LocalWal {
     }
 
     async fn purge_below(&self, offset: LogOffset) -> LogResult<()> {
+        let _one = self.maintenance.lock();
         let doomed: Vec<u64> = {
             let mut s = self.state.lock();
             // A segment can go when the next one starts at or below `offset`.

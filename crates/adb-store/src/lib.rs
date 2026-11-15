@@ -18,6 +18,7 @@ pub use filter::predicate_filter;
 pub use hot::{CacheConfig, CacheStats, Cached, Hit, HotCache, Keep, Rule, Shape};
 pub use lance;
 pub mod ostore;
+pub mod budget;
 pub use rows::{decode, key_of, LiveKey, namespace_of, namespaced, qualified, row_id, scoped_id, space_id, unscoped, valid_namespace, without_namespace, StoredRow, DEFAULT_SCOPE, NAMESPACE_SEP, SCOPE_SEP};
 pub use schema::{memory_schema, META_ID, RECORD_KINDS};
 pub use store::{configure_lance_runtime, sql_str, archive_tree, restore_table, restore_tree, table_meta_offset, tree_archived, ArchivePending, ArchivePolicy, ArchiveStats, CompactStats, PartitionStore, StoreConfig, TierStats, TombEntry, COLD_BASE_ID, DEFAULT_EMBEDDING_DIM};

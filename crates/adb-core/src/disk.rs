@@ -41,3 +41,14 @@ pub fn raise_open_files() -> std::io::Result<u64> {
     }
     Ok(l.rlim_cur as u64)
 }
+
+/// Lower the calling thread's CPU priority (Linux nice value `nice`, 0..19): for
+/// background work (compaction) that must not take CPU from requests. Raising a
+/// thread's nice needs no privilege. Best effort: an error leaves the priority as is.
+pub fn lower_thread_priority(nice: i32) {
+    // SAFETY: `gettid` and `setpriority` on the calling thread, no pointers.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, nice);
+    }
+}

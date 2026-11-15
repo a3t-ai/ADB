@@ -577,9 +577,12 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 if night {
                     last_nightly = Some(now.date_naive());
                 }
-                if let Err(e) = w.compact().await {
-                    tracing::warn!(error = %e, "compaction failed; retrying later");
-                }
+                // In the background, within the node's budget: the tick goes on.
+                w.compact_in_background();
+            }
+            // The log trimmed below what Lance holds, off the write path.
+            if let Err(e) = w.purge_log().await {
+                tracing::warn!(error = %e, "log purge failed; retrying");
             }
             // S3 option B: every `ADB_ARCHIVE_EVERY_SECS` (default 30), archive a
             // checkpoint to object storage if `ArchivePolicy` says it is due.
