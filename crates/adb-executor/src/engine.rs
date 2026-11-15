@@ -442,9 +442,13 @@ impl PartitionRole {
 /// timer is aborted, but stops only when the runtime next polls it): retry for up
 /// to 10 s, yielding to the runtime between tries.
 async fn open_wal(dir: &std::path::Path, role: PartitionRole) -> Result<LocalWal, String> {
+    open_wal_sync(dir, role, adb_log::WalSync::Ack).await
+}
+
+async fn open_wal_sync(dir: &std::path::Path, role: PartitionRole, sync: adb_log::WalSync) -> Result<LocalWal, String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match LocalWal::open(role.id, WalConfig::new(role.log_dir(dir))) {
+        match LocalWal::open(role.id, WalConfig::new(role.log_dir(dir)).with_sync(sync)) {
             Err(adb_log::LogError::Locked(_)) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -699,8 +703,14 @@ impl LocalEngine {
 
     /// The partition's local WAL in `dir/p{n}`, opened.
     pub async fn open_partition_wal(dir: &std::path::Path, role: PartitionRole) -> Result<Arc<LocalWal>, String> {
+        Self::open_partition_wal_sync(dir, role, adb_log::WalSync::Ack).await
+    }
+
+    /// As [`Self::open_partition_wal`], syncing as `sync` says: `Behind` for an owner
+    /// whose replica holds every record, `Never` for a reader's copy.
+    pub async fn open_partition_wal_sync(dir: &std::path::Path, role: PartitionRole, sync: adb_log::WalSync) -> Result<Arc<LocalWal>, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
-        Ok(Arc::new(open_wal(dir, role).await?))
+        Ok(Arc::new(open_wal_sync(dir, role, sync).await?))
     }
 
     /// The local WAL in `dir/p0`, opened (a cluster node's state machine holds it).

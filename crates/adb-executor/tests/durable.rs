@@ -284,7 +284,7 @@ async fn log_is_purged_below_lances_durable_offset() {
     use adb_store::{PartitionStore, StoreConfig};
 
     let dir = tempfile::tempdir().unwrap();
-    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };
+    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096, sync: Default::default() };
     let store_cfg = StoreConfig {
         root: dir.path().join("store"),
         embedding_dim: 4,
@@ -351,7 +351,7 @@ async fn log_is_kept_until_object_storage_holds_it() {
     std::env::set_var("ADB_ARCHIVE_MAX_AGE_SECS", "3600");
     let dir = tempfile::tempdir().unwrap();
     let cold = tempfile::tempdir().unwrap();
-    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };
+    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096, sync: Default::default() };
     let store_cfg = StoreConfig {
         root: dir.path().join("store"),
         embedding_dim: 4,
@@ -380,7 +380,7 @@ async fn log_is_kept_until_object_storage_holds_it() {
     }
     // Nothing archived yet: the log still holds offset 1 although Lance has it.
     let first_kept = |dir: &std::path::Path| {
-        let wal = LocalWal::open(PartitionId(0), WalConfig { dir: dir.join("p0"), segment_bytes: 4096 }).unwrap();
+        let wal = LocalWal::open(PartitionId(0), WalConfig { dir: dir.join("p0"), segment_bytes: 4096, sync: Default::default() }).unwrap();
         (1..=n + 400).find(|o| futures::executor::block_on(wal.read(LogOffset(*o), 1)).is_ok()).unwrap_or(0)
     };
     assert_eq!(store.log_floor(), Some(LogOffset(1)));

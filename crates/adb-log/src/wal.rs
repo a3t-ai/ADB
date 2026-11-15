@@ -6,8 +6,12 @@
 //!   MessagePack with field names (self-describing, so tagged effects and JSON
 //!   payloads decode, and fields can be added later).
 //! - **Durability:** one writer thread drains every queued append, writes them and
-//!   calls `fdatasync` once (group commit). `append` resolves only after that sync, so
-//!   an acknowledged write survives a crash.
+//!   calls `fdatasync` once (group commit). With [`WalSync::Ack`] (the default)
+//!   `append` resolves only after that sync, so an acknowledged write survives a
+//!   crash. [`WalSync::Behind`] resolves once the batch is written (page cache) and
+//!   syncs right after, off the ack path: for an owner whose replica holds every
+//!   record in memory, so the ack costs no disk wait (S3 option B). [`WalSync::Never`]
+//!   never syncs: a reader's copy of a log it can rebuild from object storage.
 //! - **Recovery:** on open, segments are scanned in order. A bad frame in the last
 //!   segment is a torn tail from a crash: the file is cut back to the last good
 //!   frame. A bad frame in an older segment is corruption and fails the open.
@@ -42,6 +46,21 @@ pub struct WalConfig {
     pub dir: PathBuf,
     /// Roll to a new segment past this size.
     pub segment_bytes: u64,
+    /// When an append is acknowledged relative to its `fdatasync`.
+    pub sync: WalSync,
+}
+
+/// When the WAL syncs, relative to acknowledging an append.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalSync {
+    /// Acknowledged after the group's `fdatasync`.
+    #[default]
+    Ack,
+    /// Acknowledged once written (page cache); the `fdatasync` follows at once, off the
+    /// ack path. Only where another node holds every acknowledged record.
+    Behind,
+    /// Never synced: a cache of a log held elsewhere.
+    Never,
 }
 
 impl WalConfig {
@@ -49,7 +68,13 @@ impl WalConfig {
         // `ADB_WAL_SEGMENT_BYTES` (at least 4 KiB): the log is purged a whole closed
         // segment at a time, so retention (`ADB_LOG_RETAIN`) is as fine as a segment.
         let segment_bytes = std::env::var("ADB_WAL_SEGMENT_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).map_or(64 * 1024 * 1024, |b| b.max(4096));
-        Self { dir: dir.into(), segment_bytes }
+        Self { dir: dir.into(), segment_bytes, sync: WalSync::Ack }
+    }
+
+    /// The same, syncing as `sync` says.
+    pub fn with_sync(mut self, sync: WalSync) -> Self {
+        self.sync = sync;
+        self
     }
 }
 
@@ -341,17 +366,23 @@ fn writer_loop(
         let _t = adb_core::steps::timer("wal writer write + fsync");
 
         let mut written = Vec::with_capacity(batch.len());
+        let sync = |file: &File| match config.sync {
+            WalSync::Never => Ok(()),
+            _ => file.sync_data().map_err(io),
+        };
         let result = (|| -> LogResult<()> {
             for job in &batch {
                 if size > 0 && (job.roll || size + job.frame.len() as u64 > config.segment_bytes) {
-                    file.sync_data().map_err(io)?;
+                    sync(&file)?;
                     segment = job.offset.0;
                     file = OpenOptions::new()
                         .create_new(true)
                         .append(true)
                         .open(segment_path(&config.dir, segment))
                         .map_err(io)?;
-                    sync_dir(&config.dir)?;
+                    if config.sync != WalSync::Never {
+                        sync_dir(&config.dir)?;
+                    }
                     state.lock().segments.push(segment);
                     size = 0;
                 }
@@ -359,18 +390,33 @@ fn writer_loop(
                 written.push(Entry { segment, pos: size, len: (job.frame.len() - HEADER) as u32 });
                 size += job.frame.len() as u64;
             }
-            file.sync_data().map_err(io)
+            match config.sync {
+                WalSync::Ack => sync(&file),
+                WalSync::Behind | WalSync::Never => Ok(()),
+            }
         })();
 
         let mut s = state.lock();
         match result {
             Ok(()) => {
-                s.syncs += 1;
+                if config.sync == WalSync::Ack {
+                    s.syncs += 1;
+                }
                 s.index.extend(written);
                 s.durable = batch.last().unwrap().offset;
                 drop(s);
                 for job in batch {
                     let _ = job.done.send(Ok(job.offset));
+                }
+                // Behind: acknowledged from the page cache; synced now, before the next
+                // batch. A failed sync stops the log (as a failed write does).
+                if config.sync == WalSync::Behind {
+                    let r = file.sync_data();
+                    let mut s = state.lock();
+                    match r {
+                        Ok(()) => s.syncs += 1,
+                        Err(e) => s.failed = Some(e.to_string()),
+                    }
                 }
             }
             Err(e) => {
@@ -572,7 +618,32 @@ mod tests {
     }
 
     fn open(dir: &Path, segment_bytes: u64) -> LocalWal {
-        LocalWal::open(PartitionId(5), WalConfig { dir: dir.to_path_buf(), segment_bytes }).unwrap()
+        LocalWal::open(PartitionId(5), WalConfig { dir: dir.to_path_buf(), segment_bytes, sync: WalSync::Ack }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn behind_acks_then_syncs_and_never_does_not_sync() {
+        for (mode, synced) in [(WalSync::Behind, true), (WalSync::Never, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let wal = LocalWal::open(PartitionId(5), WalConfig { dir: dir.path().to_path_buf(), segment_bytes: 300, sync: mode }).unwrap();
+                for o in 1..=20 {
+                    wal.append(record(o)).await.unwrap();
+                }
+                assert_eq!(wal.durable_offset(), LogOffset(20));
+                // Behind: each batch is synced right after its ack.
+                for _ in 0..100 {
+                    if !synced || wal.syncs() > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert_eq!(wal.syncs() > 0, synced, "{mode:?}");
+            }
+            // Written either way: a reopen (no power cut) has every record.
+            let wal = LocalWal::open(PartitionId(5), WalConfig { dir: dir.path().to_path_buf(), segment_bytes: 300, sync: mode }).unwrap();
+            assert_eq!(wal.read(LogOffset(1), 100).await.unwrap().len(), 20, "{mode:?}");
+        }
     }
 
     #[tokio::test]
@@ -691,7 +762,7 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[HEADER + 2] ^= 0x01;
         fs::write(&path, bytes).unwrap();
-        assert!(LocalWal::open(PartitionId(5), WalConfig { dir: dir.path().to_path_buf(), segment_bytes: 300 }).is_err());
+        assert!(LocalWal::open(PartitionId(5), WalConfig { dir: dir.path().to_path_buf(), segment_bytes: 300, sync: Default::default() }).is_err());
     }
 
     #[tokio::test]

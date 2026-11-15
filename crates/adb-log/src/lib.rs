@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 pub mod wal;
-pub use wal::{LocalWal, WalConfig};
+pub use wal::{LocalWal, WalConfig, WalSync};
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum LogError {

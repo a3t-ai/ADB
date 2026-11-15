@@ -44,6 +44,9 @@ pub struct Replica {
     wake: Arc<tokio::sync::Notify>,
     /// Compaction runs beside the applies, so reads don't wait for it.
     compacting: Arc<std::sync::atomic::AtomicBool>,
+    /// A reader (step 6): a cache of the owner's log and object storage, so its table
+    /// needn't reach disk before its log is trimmed (no `syncfs`).
+    cache_only: bool,
 }
 
 /// How often a follower checks whether its tables need compacting.
@@ -109,6 +112,7 @@ impl Replica {
             applied: tokio::sync::watch::Sender::new(0),
             wake: Arc::new(tokio::sync::Notify::new()),
             compacting: Default::default(),
+            cache_only: false,
         };
         let n = r.step().await?;
         tracing::info!(records = n, offset = r.log.last_offset().0, "replica caught up");
@@ -161,6 +165,11 @@ impl Replica {
                 Err(e) => return Err(format!("log: {e}")),
             }
         }
+    }
+
+    /// Mark this as a reader's copy (see `cache_only`).
+    pub fn cache_only(&mut self) {
+        self.cache_only = true;
     }
 
     /// Apply what the WAL gained since the last step; trim it. Returns the
@@ -366,7 +375,9 @@ impl Replica {
         if durable.0 == 0 {
             return Ok(());
         }
-        self.store.sync_to_disk().await.map_err(s("store"))?;
+        if !self.cache_only {
+            self.store.sync_to_disk().await.map_err(s("store"))?;
+        }
         let mut floor = durable.0 + 1;
         // Below what the platform tables hold in Lance, not in memory (PF-5).
         if let Some(p) = &self.platform {

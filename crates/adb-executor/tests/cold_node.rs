@@ -15,7 +15,7 @@ async fn a_node_archives_everything_and_trims_its_log_to_it() {
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
 
     // Small log segments, so the purge can drop whole segments in a short test.
-    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096 };
+    let wal_cfg = WalConfig { dir: dir.path().join("p0"), segment_bytes: 4096, sync: Default::default() };
     let wal: adb_executor::EngineLog = std::sync::Arc::new(LocalWal::open(PartitionId(0), wal_cfg.clone()).unwrap());
     let (engine, _) = LocalEngine::durable_on(dir.path(), wal).await.unwrap();
     for i in 0..50 {

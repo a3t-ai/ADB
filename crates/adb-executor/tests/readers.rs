@@ -55,6 +55,7 @@ async fn every_node_reads_from_its_own_readers() {
     std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
     std::env::set_var("ADB_READER_REBASE_SECS", "1");
+    std::env::set_var("ADB_READERS", "1");
     let peers = LocalPeers::new();
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let place = |me| Arc::new(Static { me, map: RwLock::new(Arc::new(map2())) }) as Arc<dyn Placement>;

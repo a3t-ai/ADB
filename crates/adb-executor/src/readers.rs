@@ -1,17 +1,26 @@
-//! Readers on every node (S3 option B, step 6).
+//! Readers (S3 option B, step 6).
 //!
 //! A node answers reads of a partition another node owns from its own **reader** of
-//! that partition, without asking the owner for the data:
+//! that partition, without asking the owner for the data. Which nodes keep one:
+//!
+//! - **The partition's replica, always.** Every acknowledged record is already in its
+//!   memory (step 5): the reader takes its records from there and its commit offset is
+//!   what the buffer holds — no call to the owner at all.
+//! - **Any other node, while the partition is hot there** (`ADB_READER_HOT` reads per
+//!   second at that node); it is dropped after `ADB_READER_IDLE_SECS` without reads.
+//!   Elsewhere a read goes to the owner or the replica, in turn. So a write is applied
+//!   on two nodes, more only where reads need it.
 //!
 //! - **Built from object storage**: the partition's last checkpoint (a shallow clone:
 //!   the large files stay on object storage, read by range) and the WAL segments
 //!   above it ([`crate::restore::restore_partition_from_object_storage`]).
-//! - **Kept up by the owner's tail**: the committed records after it, pulled from the
-//!   owner (`log_tail`: never past its commit offset — records a failover could drop
-//!   are never shown) into the reader's own log and applied ([`crate::Replica`]).
-//! - **Fresh reads**: a read first asks the owner for its commit offset — one call for
-//!   all reads waiting at that moment — and waits until the reader has applied it, so
-//!   it sees every write acknowledged before it began. `ADB_READ_STALE_MS` (default 0):
+//! - **Kept up by the tail**: the records after it — from the replica's buffer, or
+//!   pulled from the owner (`log_tail`: never past its commit offset — records a
+//!   failover could drop are never shown) — into the reader's own log (never synced:
+//!   it is a cache) and applied ([`crate::Replica`]).
+//! - **Fresh reads**: a read first asks for the commit offset (the replica's buffer,
+//!   or the owner — one call for all reads waiting at that moment) and waits until the
+//!   reader has applied it, so it sees every write acknowledged before it began. `ADB_READ_STALE_MS` (default 0):
 //!   a reader that heard from the owner that recently answers at once instead, up to
 //!   that much behind.
 //! - **Rebuilt** at the next checkpoint: every `ADB_READER_REBASE_SECS` (default 600) a
@@ -32,12 +41,13 @@ use serde_json::Value;
 use crate::engine::{EngineLog, LocalEngine, PartitionRole};
 use crate::reads::Reads;
 
-/// The owner, as a reader sees it.
+/// Where a reader's records come from: the partition's replica buffer on this node
+/// when it is the replica, else the owner.
 #[async_trait]
 pub trait ReaderSource: Send + Sync {
     /// Committed records from `from` (at most `max`).
     async fn tail(&self, from: u64, max: usize) -> Result<Vec<LogRecord>, String>;
-    /// The owner's commit offset.
+    /// The offset every acknowledged write is at or below.
     async fn commit_offset(&self) -> Result<u64, String>;
 }
 
@@ -70,6 +80,10 @@ pub struct Reader {
     asking: tokio::sync::Mutex<()>,
     asked: std::sync::Mutex<Option<(Instant, u64)>>,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Records have arrived for it (the replica's buffer took some): apply now.
+    poke: Arc<tokio::sync::Notify>,
+    /// When it last answered a read (idle readers are dropped).
+    read_at: std::sync::Mutex<Instant>,
 }
 
 impl Drop for Reader {
@@ -94,9 +108,11 @@ async fn build(base: &std::path::Path, gen: u64, partition: Partition, cold: Opt
             tracing::info!(partition, floor, records = st.segment_records, "reader built from object storage");
         }
     }
-    let log = LocalEngine::open_partition_wal(dir, role).await?;
+    // A cache of the owner's log and object storage: never synced.
+    let log = LocalEngine::open_partition_wal_sync(dir, role, adb_log::WalSync::Never).await?;
     let elog: EngineLog = Arc::clone(&log) as EngineLog;
-    let replica = Box::pin(crate::Replica::open_role(dir, role, Arc::clone(&elog))).await?;
+    let mut replica = Box::pin(crate::Replica::open_role(dir, role, Arc::clone(&elog))).await?;
+    replica.cache_only();
     let reads = Arc::new(replica.reader(elog));
     Ok((Open { reads, log, floor, gen }, replica))
 }
@@ -117,6 +133,8 @@ impl Reader {
             asking: Default::default(),
             asked: Default::default(),
             task: Default::default(),
+            poke: Default::default(),
+            read_at: std::sync::Mutex::new(Instant::now()),
         });
         let task = tokio::spawn(follow(Arc::downgrade(&r), dir, cold, replica));
         *r.task.lock().unwrap() = Some(task);
@@ -149,8 +167,19 @@ impl Reader {
         self.owner_offset().await
     }
 
+    /// New records are at the source: pull and apply them now, not at the next poll.
+    pub fn nudge(&self) {
+        self.poke.notify_one();
+    }
+
+    /// How long since it last answered a read.
+    pub fn idle(&self) -> Duration {
+        self.read_at.lock().unwrap().elapsed()
+    }
+
     /// A read-only statement, answered here as the owner would.
     pub async fn query(&self, aql: &str, variables: Option<&std::collections::HashMap<String, Value>>) -> Result<Value, String> {
+        *self.read_at.lock().unwrap() = Instant::now();
         let upto = self.upto().await?;
         let open = self.open.read().await;
         open.reads.query(aql, variables, LogOffset(upto)).await
@@ -158,6 +187,7 @@ impl Reader {
 
     /// This reader's reads, once it holds everything committed now.
     pub async fn fresh_reads(&self) -> Result<Arc<dyn Reads>, String> {
+        *self.read_at.lock().unwrap() = Instant::now();
         let upto = self.upto().await?;
         let open = self.open.read().await;
         open.reads.caught_up(LogOffset(upto), Duration::from_secs(10)).await?;
@@ -174,6 +204,7 @@ impl Reader {
 async fn follow(me: std::sync::Weak<Reader>, dir: PathBuf, cold: Option<String>, mut replica: crate::Replica) {
     let mut rebased = Instant::now();
     let wake = replica.wake();
+    let Some(poke) = me.upgrade().map(|r| Arc::clone(&r.poke)) else { return };
     loop {
         let Some(r) = me.upgrade() else { return };
         let (log, floor) = {
@@ -186,10 +217,20 @@ async fn follow(me: std::sync::Weak<Reader>, dir: PathBuf, cold: Option<String>,
             Ok(recs) => {
                 *r.heard.lock().unwrap() = Some(Instant::now());
                 let n = recs.len();
+                // Queued together, waited on once.
+                let mut last = None;
                 for rec in recs {
-                    if let Err(e) = log.append(rec).await {
-                        tracing::warn!(partition = r.partition, error = %e, "reader: appending the owner's record failed");
-                        break;
+                    match log.enqueue(rec, false) {
+                        Ok(w) => last = Some(w),
+                        Err(e) => {
+                            tracing::warn!(partition = r.partition, error = %e, "reader: appending the owner's record failed");
+                            break;
+                        }
+                    }
+                }
+                if let Some(w) = last {
+                    if let Err(e) = w.await {
+                        tracing::warn!(partition = r.partition, error = %e, "reader: appending the owner's records failed");
                     }
                 }
                 if n > 0 {
@@ -226,6 +267,7 @@ async fn follow(me: std::sync::Weak<Reader>, dir: PathBuf, cold: Option<String>,
         }
         drop(r);
         tokio::select! {
+            _ = poke.notified() => {}
             _ = wake.notified() => {}
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }

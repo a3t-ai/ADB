@@ -18,6 +18,12 @@
 //!   Past `ADB_REPLICA_MEM_BYTES` (default 100 MB) the oldest records spill to disk,
 //!   fsynced (object storage slow or down); past `ADB_REPLICA_SPILL_MAX_BYTES`
 //!   (default 4 GB) appends are refused (`replica_full`) and the owner's writes wait.
+//! - **Ack from memory:** the owner's WAL acknowledges a record once written (page
+//!   cache) and fsyncs right after, off the ack path (`WalSync::Behind`): with the
+//!   replica's copy in memory, a write waits for no disk. A power cut on the owner
+//!   loses at most its last unsynced batch locally, and the replica holds it; the
+//!   partition moves there once the owner's lease lapses. `ADB_WAL_ACK=fsync` waits
+//!   for the owner's fsync as well.
 //! - `ADB_WAL_REPLICAS=0`: no replica; a write is acknowledged after the local fsync.
 
 use std::collections::{HashMap, VecDeque};
@@ -40,6 +46,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// `ADB_WAL_REPLICAS`: 1 (default) or 0.
 pub fn replicas() -> u64 {
     env_u64("ADB_WAL_REPLICAS", 1).min(1)
+}
+
+/// How a cluster owner with a replica syncs its WAL: `ADB_WAL_ACK=memory` (default,
+/// `Behind`) or `fsync` (`Ack`).
+pub fn owner_sync() -> adb_log::WalSync {
+    match std::env::var("ADB_WAL_ACK").map(|v| v.trim().to_ascii_lowercase()) {
+        Ok(v) if v == "fsync" => adb_log::WalSync::Ack,
+        _ => adb_log::WalSync::Behind,
+    }
 }
 
 /// One replication call: records of `epoch` (empty: only the shipped offset).
@@ -282,6 +297,9 @@ struct Buffer {
     /// Older records on disk: (first, last) offsets, bytes.
     spilled: Option<(u64, u64)>,
     spill_bytes: u64,
+    /// Records have arrived from this epoch's owner with no gap: everything it
+    /// acknowledged is here (before that, it may hold some it hasn't sent here yet).
+    synced: bool,
 }
 
 /// What a node keeps as the replica of other nodes' partitions.
@@ -333,6 +351,9 @@ impl ReplicaBuffers {
             if first > b.held + 1 {
                 return Err(format!("gap:{}: partition {p}'s replica holds up to {}; sent from {first}", b.held, b.held));
             }
+        }
+        if !req.records.is_empty() {
+            b.synced = true;
         }
         for r in req.records {
             if r.offset.0 <= b.held {
@@ -396,6 +417,34 @@ impl ReplicaBuffers {
             }
         }
         Ok((b.epoch, out))
+    }
+
+    /// The last record held for partition `p`, once the buffer is synced with its owner
+    /// (see `synced`): every acknowledged write is at or below it.
+    pub fn held(&self, p: Partition) -> Option<u64> {
+        self.parts.lock().unwrap().get(&p).filter(|b| b.synced).map(|b| b.held)
+    }
+
+    /// Up to `max` records of partition `p` from offset `from`, when memory holds them
+    /// (empty past the last one held); `None` when it doesn't (spilled, on object
+    /// storage, or not synced): the caller asks the owner.
+    pub fn tail_from(&self, p: Partition, from: u64, max: usize) -> Option<Vec<LogRecord>> {
+        let parts = self.parts.lock().unwrap();
+        let b = parts.get(&p).filter(|b| b.synced)?;
+        if from > b.held {
+            return Some(Vec::new());
+        }
+        let front = b.mem.front()?.0;
+        if from < front {
+            return None;
+        }
+        let skip = (from - front) as usize;
+        let mut out = Vec::with_capacity(max.min(b.mem.len().saturating_sub(skip)));
+        for (o, bytes) in b.mem.iter().skip(skip).take(max) {
+            debug_assert!(*o >= from);
+            out.push(rmp_serde::from_slice(bytes).ok()?);
+        }
+        Some(out)
     }
 
     /// Forget partition `p`'s buffer (this node took the partition over: its tail is in

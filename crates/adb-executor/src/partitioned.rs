@@ -128,24 +128,39 @@ pub struct PartitionedEngine {
     readers: std::sync::Mutex<HashMap<Partition, ReaderSlot>>,
     /// At most this many readers built at once (each replays its partition's tail).
     reader_builds: Arc<tokio::sync::Semaphore>,
+    /// Reads per partition at this node in the current second (when a reader pays).
+    read_rate: std::sync::Mutex<(std::time::Instant, HashMap<Partition, u64>)>,
+    /// Forwarded reads alternate between the owner and the replica.
+    spread: std::sync::atomic::AtomicU64,
     me: std::sync::Weak<PartitionedEngine>,
 }
 
-/// A reader's owner: whoever owns the partition in the current map.
-struct OwnerSource {
+/// A reader's records: this node's replica buffer while it is the partition's replica
+/// (every acknowledged record is there), else the owner in the current map.
+struct PartSource {
     partition: Partition,
     node: std::sync::Weak<PartitionedEngine>,
 }
 
 #[async_trait]
-impl crate::readers::ReaderSource for OwnerSource {
+impl crate::readers::ReaderSource for PartSource {
     async fn tail(&self, from: u64, max: usize) -> Result<Vec<adb_core::log::LogRecord>, String> {
         let node = self.node.upgrade().ok_or("the partition router has stopped")?;
+        if node.is_replica(self.partition) {
+            if let Some(recs) = node.replicas.tail_from(self.partition, from, max) {
+                return Ok(recs);
+            }
+        }
         node.handle(self.partition).await?.op_as("log_tail", json!({ "from": from, "max": max })).await
     }
 
     async fn commit_offset(&self) -> Result<u64, String> {
         let node = self.node.upgrade().ok_or("the partition router has stopped")?;
+        if node.is_replica(self.partition) {
+            if let Some(held) = node.replicas.held(self.partition) {
+                return Ok(held);
+            }
+        }
         node.handle(self.partition).await?.op_as("commit_offset", json!({})).await
     }
 }
@@ -167,6 +182,17 @@ fn reader_builds() -> usize {
 /// `ADB_READERS`: readers on (default) or off (`0`: reads go to the owner).
 fn readers_on() -> bool {
     std::env::var("ADB_READERS").map_or(true, |v| v != "0" && v != "off")
+}
+
+/// `ADB_READER_HOT`: reads per second of a partition at a node that is neither its
+/// owner nor its replica past which that node keeps a reader of it (default 1000).
+fn reader_hot() -> u64 {
+    std::env::var("ADB_READER_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(1000)
+}
+
+/// `ADB_READER_IDLE_SECS`: such a reader is dropped after this long without reads (60).
+fn reader_idle() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("ADB_READER_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
 }
 
 /// Where an owned partition's records go: its replica in the current map.
@@ -311,11 +337,12 @@ impl PartitionedEngine {
                             tracing::warn!(partition = p, error = %e, "taking the partition over failed; retrying");
                         }
                     }
-                    // Readers of the partitions others own, built ahead of the first read.
-                    if Some(a.owner) != me && *p != node.sys() {
+                    // The replica's reader, built ahead of the first read.
+                    if Some(a.owner) != me && a.replica == me && *p != node.sys() {
                         let _ = node.reader(*p).await;
                     }
                 }
+                node.drop_idle_readers();
             }
         });
         Ok(node)
@@ -335,6 +362,8 @@ impl PartitionedEngine {
             replicas: Arc::new(crate::replication::ReplicaBuffers::new(dir.join("parts"))),
             readers: Default::default(),
             reader_builds: Arc::new(tokio::sync::Semaphore::new(reader_builds())),
+            read_rate: std::sync::Mutex::new((std::time::Instant::now(), HashMap::new())),
+            spread: Default::default(),
             me: me.clone(),
         })
     }
@@ -362,6 +391,76 @@ impl PartitionedEngine {
     /// The partition `namespace` lives in (`""`: records without a namespace).
     pub fn partition_of(&self, namespace: &str) -> Partition {
         routing::partition_of(&self.map(), namespace)
+    }
+
+    /// Whether this node is partition `p`'s replica in the current map.
+    pub fn is_replica(&self, p: Partition) -> bool {
+        match &self.cluster {
+            None => false,
+            Some(c) => self.map().assignments.get(&p).is_some_and(|a| a.replica == Some(c.placement.me())),
+        }
+    }
+
+    /// Count a read of `p` here; whether `p` is hot here (`ADB_READER_HOT`).
+    fn hot(&self, p: Partition) -> bool {
+        let mut rate = self.read_rate.lock().unwrap();
+        if rate.0.elapsed() >= std::time::Duration::from_secs(1) {
+            *rate = (std::time::Instant::now(), HashMap::new());
+        }
+        let n = rate.1.entry(p).or_default();
+        *n += 1;
+        *n >= reader_hot()
+    }
+
+    /// Drop the readers of partitions this node is not the replica of that had no reads
+    /// for `ADB_READER_IDLE_SECS` (their directories go when they are next built).
+    fn drop_idle_readers(&self) {
+        let idle = reader_idle();
+        let gone: Vec<Partition> = {
+            let readers = self.readers.lock().unwrap();
+            readers
+                .iter()
+                .filter_map(|(p, slot)| match slot {
+                    ReaderSlot::Ready(r) if !self.is_replica(*p) && r.idle() >= idle => Some(*p),
+                    _ => None,
+                })
+                .collect()
+        };
+        if gone.is_empty() {
+            return;
+        }
+        let mut readers = self.readers.lock().unwrap();
+        for p in gone {
+            if readers.remove(&p).is_some() {
+                tracing::info!(partition = p, "reader idle: dropped");
+            }
+        }
+    }
+
+    /// Whether this node has a reader of `p` ready (tests, metrics).
+    pub fn has_reader(&self, p: Partition) -> bool {
+        self.ready_reader(p).is_some()
+    }
+
+    /// The reader of `p` if one is ready here (none is built).
+    fn ready_reader(&self, p: Partition) -> Option<Arc<crate::readers::Reader>> {
+        match self.readers.lock().unwrap().get(&p) {
+            Some(ReaderSlot::Ready(r)) => Some(Arc::clone(r)),
+            _ => None,
+        }
+    }
+
+    /// The reader to answer a read of `p` here: the replica's always, another node's
+    /// once `p` is hot here; `None` sends the read on.
+    async fn reader_for_read(&self, p: Partition) -> Option<Arc<crate::readers::Reader>> {
+        if self.is_replica(p) || self.ready_reader(p).is_some() {
+            self.hot(p);
+            return self.reader(p).await;
+        }
+        if self.hot(p) {
+            return self.reader(p).await;
+        }
+        None
     }
 
     /// Whether this node holds its lease (one node: always).
@@ -453,7 +552,7 @@ impl PartitionedEngine {
         let permits = Arc::clone(&self.reader_builds);
         tokio::spawn(async move {
             let _permit = permits.acquire_owned().await;
-            let source = Arc::new(OwnerSource { partition: p, node: Arc::downgrade(&me) });
+            let source = Arc::new(PartSource { partition: p, node: Arc::downgrade(&me) });
             let t0 = std::time::Instant::now();
             let built = Box::pin(crate::readers::Reader::open(me.dir.join("parts").join(format!("reader-p{p}")), p, Some(cold), source)).await;
             let mut readers = me.readers.lock().unwrap();
@@ -526,7 +625,7 @@ impl PartitionedEngine {
         let (e, _) = match (&self.cluster, crate::replication::replicas()) {
             // A cluster owner: every record also on the partition's replica (step 5).
             (Some(_), n) if n > 0 => {
-                let wal = LocalEngine::open_partition_wal(&pdir, role).await?;
+                let wal = LocalEngine::open_partition_wal_sync(&pdir, role, crate::replication::owner_sync()).await?;
                 let target = Arc::new(PartTarget { partition: p, node: self.me.clone() });
                 let log = crate::replication::ReplicatedLog::new(wal as Arc<dyn adb_log::Log>, target);
                 Box::pin(LocalEngine::durable_partition_on(&pdir, role, log as crate::engine::EngineLog)).await?
@@ -601,7 +700,7 @@ impl PartitionedEngine {
         let h = self.handle(p).await?;
         let mut t = Target::of(p, namespace, &h);
         if matches!(h, Handle::Remote(_)) {
-            if let Some(r) = self.reader(p).await {
+            if let Some(r) = self.reader_for_read(p).await {
                 match r.fresh_reads().await {
                     Ok(reads) => t.reads = reads,
                     Err(e) => tracing::debug!(partition = p, error = %e, "reader behind; this read goes to the owner"),
@@ -669,12 +768,24 @@ impl PartitionedEngine {
     async fn on_owner(self: &Arc<Self>, ns: &str, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
         let p = self.partition_of(ns);
         // A read of a partition another node owns: answered here, by its reader (step 6).
-        if !self.owns(p) && crate::follower::follower_reads(aql) {
-            if let Some(r) = self.reader(p).await {
+        let read = !self.owns(p) && crate::follower::follower_reads(aql);
+        if read {
+            if let Some(r) = self.reader_for_read(p).await {
                 // A reader behind or failing: the owner answers instead.
                 match Box::pin(r.query(aql, variables)).await {
                     Ok(v) => return Ok(v),
                     Err(e) => tracing::debug!(partition = p, error = %e, "reader didn't answer; asking the owner"),
+                }
+            }
+            // No reader here: every other read to the replica (its reader), the rest
+            // to the owner; the replica unable to answer passes it to the owner.
+            if let Some(addr) = self.replica_addr(p) {
+                if self.spread.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 0 {
+                    let peers = &self.cluster.as_ref().expect("a replica means a cluster").peers;
+                    match peers.query(&addr, aql, variables, reach).await {
+                        Ok(v) => return Ok(v),
+                        Err(e) => tracing::debug!(partition = p, error = %e, "the replica didn't answer; asking the owner"),
+                    }
                 }
             }
         }
@@ -723,6 +834,15 @@ impl PartitionedEngine {
             Some(ns) => {
                 let p = self.partition_of(&ns);
                 if !self.owns(p) {
+                    // The replica answers reads sent to it from its reader, when ready.
+                    if self.is_replica(p) && crate::follower::follower_reads(aql) {
+                        if let Some(r) = self.ready_reader(p) {
+                            self.hot(p);
+                            if let Ok(v) = Box::pin(r.query(aql, variables)).await {
+                                return Ok(v);
+                            }
+                        }
+                    }
                     return Err(not_owner(p, &self.map()));
                 }
                 Box::pin(self.part(p)).await?.query(aql, variables).await
@@ -744,7 +864,20 @@ impl PartitionedEngine {
         if a.replica != Some(me) {
             return Err(format!("not_replica: node {me} is not partition {p}'s replica (epoch {})", a.epoch));
         }
-        self.replicas.append(p, a.epoch, req)
+        let ack = self.replicas.append(p, a.epoch, req)?;
+        // Its reader applies them now.
+        if let Some(r) = self.ready_reader(p) {
+            r.nudge();
+        }
+        Ok(ack)
+    }
+
+    /// Partition `p`'s replica's address, when it has one other than this node.
+    fn replica_addr(&self, p: Partition) -> Option<String> {
+        let map = self.map();
+        let me = self.cluster.as_ref()?.placement.me();
+        let r = map.assignments.get(&p)?.replica.filter(|r| *r != me)?;
+        map.members.get(&r).map(|m| m.addr.clone())
     }
 
     /// What this node holds as partition `p`'s replica: (epoch, records above object storage).
