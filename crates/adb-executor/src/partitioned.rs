@@ -125,6 +125,11 @@ pub struct PartitionedEngine {
     catalog: std::sync::RwLock<BTreeMap<String, Partition>>,
     /// When the catalog was last read from the system partition.
     catalog_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The quota rules (the system partition's), as last read and when: refreshed in the
+    /// background every `ADB_CATALOG_TTL_MS`, so a write's quota check never calls
+    /// another node under its partition's sequencer (Hetzner round 7: a round trip
+    /// under the sequencer on every write serialised a whole node).
+    quota_rules: std::sync::RwLock<Option<(std::time::Instant, Vec<crate::branches::Quota>)>>,
     /// Other spaces read from their own partitions (memory layers); each partition
     /// engine holds it weakly.
     spaces: Arc<dyn crate::spaces::Spaces>,
@@ -283,10 +288,19 @@ impl crate::spaces::Spaces for RouterSpaces {
 
     async fn quotas(&self) -> AdbResult<Vec<crate::branches::Quota>> {
         let node = self.node()?;
-        match node.system_handle().await.map_err(AdbError::Internal)? {
-            Handle::Local(e) => local_spaces(&e)?.quotas().await,
-            h => h.op_as("quotas", json!({})).await.map_err(AdbError::Internal),
+        // The system partition's owner reads its registry; any other node its copy
+        // (fetched once here if it has none yet, then kept fresh in the background).
+        if let Some(e) = node.system_local() {
+            return local_spaces(&e)?.quotas().await;
         }
+        // Younger than `ADB_CATALOG_TTL_MS` (the background keeps it so): no call.
+        let ttl = Duration::from_millis(std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
+        if let Some((t, q)) = node.quota_rules.read().unwrap().as_ref() {
+            if t.elapsed() < ttl {
+                return Ok(q.clone());
+            }
+        }
+        node.refresh_quotas().await.map_err(AdbError::Internal)
     }
 
     async fn usage_elsewhere(&self, quota: &crate::branches::Quota, except: adb_core::log::PartitionId) -> AdbResult<(u64, u64)> {
@@ -371,6 +385,7 @@ impl PartitionedEngine {
                 }
                 node.drop_idle_readers();
                 node.drop_unowned();
+                node.quotas_due().await;
             }
         });
         Ok(node)
@@ -388,6 +403,7 @@ impl PartitionedEngine {
             takeovers: Arc::new(tokio::sync::Semaphore::new(takeovers())),
             catalog: Default::default(),
             catalog_at: Default::default(),
+            quota_rules: Default::default(),
             spaces: Arc::new(RouterSpaces { node: me.clone() }),
             replicas: Arc::new(crate::replication::ReplicaBuffers::new(dir.join("parts"))),
             readers: Default::default(),
@@ -763,6 +779,31 @@ impl PartitionedEngine {
             return Ok(());
         }
         self.refresh_catalog().await
+    }
+
+    /// Read the quota rules again from the system partition (they are configuration:
+    /// a change reaches the other nodes within `ADB_CATALOG_TTL_MS`).
+    pub async fn refresh_quotas(&self) -> Result<Vec<crate::branches::Quota>, String> {
+        let q: Vec<crate::branches::Quota> = match self.system_handle().await? {
+            Handle::Local(e) => {
+                let local = local_spaces(&e).map_err(|e| e.to_string())?;
+                crate::spaces::Spaces::quotas(&local).await.map_err(|e| e.to_string())?
+            }
+            h => h.op_as("quotas", json!({})).await?,
+        };
+        *self.quota_rules.write().unwrap() = Some((std::time::Instant::now(), q.clone()));
+        Ok(q)
+    }
+
+    /// Keep the copy of the quota rules fresh (the background loop, not the write path).
+    async fn quotas_due(&self) {
+        let ttl = Duration::from_millis(std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
+        let due = self.quota_rules.read().unwrap().as_ref().is_none_or(|(t, _)| t.elapsed() >= ttl);
+        if due && self.cluster.is_some() && self.system_local().is_none() {
+            if let Err(e) = self.refresh_quotas().await {
+                tracing::debug!(error = %e, "quota rules not refreshed; the last copy stays");
+            }
+        }
     }
 
     /// Read the catalog again from the system partition.

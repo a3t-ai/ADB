@@ -105,38 +105,50 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
         return Err("a cluster node needs object storage (ADB_COLD_URI): a replica keeps the WAL in memory only".into());
     }
     let token = adb_server::auth::token_from_env();
-    // The control group, on a voter.
+    // The control group, on a voter: on the control plane's own runtime (its threads,
+    // its connections), so request load can't hold up Raft or the planner.
+    let rt = adb_cluster::control::runtime();
     if config.voters.contains_key(&config.id) {
-        let node = ControlNode::start(dir, config.id, config.voters.clone()).await?;
-        let app = node.router();
-        let listener = bind(SocketAddr::new(host, config.control_port)).await?;
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!(error = %e, "control endpoint stopped");
-            }
-        });
-        // A cluster started again from object storage: partitions start above the
-        // epochs it already shows.
-        let cold = adb_executor::engine::object_storage().expect("checked above");
-        let floors: adb_cluster::control::EpochFloors = Arc::new(move || {
-            let cold = cold.clone();
-            Box::pin(async move {
-                let parts = adb_cluster::control::partitions();
-                let mut out = BTreeMap::new();
-                for p in 0..=parts {
-                    let epochs = adb_executor::writes::segments::list_epochs(&cold, adb_core::log::PartitionId(p)).await.map_err(|e| e.to_string())?;
-                    if let Some((e, _)) = epochs.last() {
-                        out.insert(p, *e);
-                    }
+        let (dir, id, voters, control_port) = (dir.to_path_buf(), config.id, config.voters.clone(), config.control_port);
+        rt.spawn(async move {
+            let node = ControlNode::start(&dir, id, voters).await?;
+            let app = node.router();
+            let listener = bind(SocketAddr::new(host, control_port)).await.map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "control endpoint stopped");
                 }
-                Ok(out)
-            })
-        });
-        tokio::spawn(Arc::clone(&node).run_with(adb_cluster::control::partitions(), Some(floors)));
-        tracing::info!(node = config.id, port = config.control_port, "control group voter started");
+            });
+            // A cluster started again from object storage: partitions start above the
+            // epochs it already shows.
+            let cold = adb_executor::engine::object_storage().expect("checked above");
+            let floors: adb_cluster::control::EpochFloors = Arc::new(move || {
+                let cold = cold.clone();
+                Box::pin(async move {
+                    let parts = adb_cluster::control::partitions();
+                    let mut out = BTreeMap::new();
+                    for p in 0..=parts {
+                        let epochs = adb_executor::writes::segments::list_epochs(&cold, adb_core::log::PartitionId(p)).await.map_err(|e| e.to_string())?;
+                        if let Some((e, _)) = epochs.last() {
+                            out.insert(p, *e);
+                        }
+                    }
+                    Ok(out)
+                })
+            });
+            tokio::spawn(Arc::clone(&node).run_with(adb_cluster::control::partitions(), Some(floors)));
+            tracing::info!(node = id, port = control_port, "control group voter started");
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     }
     // The map, from the control plane.
-    let client = ControlClient::start(config.id, config.advertise.clone(), config.advertise_flight.clone(), config.voters.clone(), || 0.0);
+    // The heartbeats too: their task on the control runtime.
+    let client = {
+        let _on = rt.enter();
+        ControlClient::start(config.id, config.advertise.clone(), config.advertise_flight.clone(), config.voters.clone(), || 0.0)
+    };
     let mut rx = client.subscribe();
     let t0 = std::time::Instant::now();
     while !whole(&rx.borrow()) {

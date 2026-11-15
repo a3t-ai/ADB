@@ -88,6 +88,19 @@ pub struct ControlNode {
     proposing: tokio::sync::Mutex<()>,
 }
 
+/// The control plane's own runtime: the Raft group, its endpoint, the planner and the
+/// heartbeats run here, on `ADB_CONTROL_THREADS` threads (default 2) no request ever
+/// uses, with their own connections. A stuck data path may stop the system; it must
+/// never make a live node look dead (Hetzner round 7: a node busy with requests missed
+/// its heartbeats).
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        let n = std::env::var("ADB_CONTROL_THREADS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(2);
+        tokio::runtime::Builder::new_multi_thread().worker_threads(n).thread_name("adb-control").enable_all().build().expect("the control runtime")
+    })
+}
+
 /// `ADB_START_GRACE_SECS`: how long a new leader waits for every voter to be live
 /// before the first placement (default 30).
 fn start_grace() -> std::time::Duration {
