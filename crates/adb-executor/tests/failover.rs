@@ -98,10 +98,17 @@ async fn killing_an_owner_loses_no_acknowledged_write() {
     }
     // Many requests at once while node 2 takes its partitions over: each partition is
     // still taken over exactly once (one opener per partition).
+    // Half of them given up after 5 ms, mid-takeover (a client timeout): a caller that
+    // goes away must not let the next one start a second open of the same partition.
     let burst: Vec<_> = (0..50)
-        .map(|_| {
+        .map(|k| {
             let (n, q) = (Arc::clone(&nodes[1]), q.clone());
-            tokio::spawn(async move { n.query(&q, None).await })
+            tokio::spawn(async move {
+                match k % 2 {
+                    0 => tokio::time::timeout(Duration::from_millis(5), n.query(&q, None)).await.ok(),
+                    _ => Some(n.query(&q, None).await),
+                }
+            })
         })
         .collect();
     for b in burst {

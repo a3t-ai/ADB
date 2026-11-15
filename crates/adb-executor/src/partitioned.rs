@@ -680,17 +680,18 @@ impl PartitionedEngine {
             }
             let t0 = std::time::Instant::now();
             let me = self.me.upgrade().ok_or("the partition router has stopped")?;
-            // The open in a task of its own: a request given up (a client timeout) mustn't
-            // leave a takeover half done; whoever asks next waits for the same open.
-            let e = slot
-                .get_or_try_init(|| async move {
-                    tokio::spawn(async move { Box::pin(me.open_part(p)).await })
-                        .await
-                        .map_err(|e| format!("opening partition {p}: {e}"))?
-                })
-                .await?;
+            // The slot's initialisation runs inside a task of its own, never in the caller:
+            // a caller given up (a client timeout) would abandon an initialisation held in
+            // its own future, and the next caller start a second open on the same
+            // directory while the first still ran (Hetzner round 8: a takeover failed and
+            // writes waited 44 s). The task can't be cancelled; every caller waits on the
+            // one open.
+            let task_slot = Arc::clone(&slot);
+            let e = tokio::spawn(async move { task_slot.get_or_try_init(|| async { Box::pin(me.open_part(p)).await }).await.map(Arc::clone) })
+                .await
+                .map_err(|e| format!("opening partition {p}: {e}"))??;
             crate::steps::add("partition open wait", t0.elapsed());
-            Ok(Arc::clone(e))
+            Ok(e)
         })
     }
 
