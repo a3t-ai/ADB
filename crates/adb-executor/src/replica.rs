@@ -150,18 +150,6 @@ impl Replica {
         &self.store
     }
 
-    /// Hand what this replica keeps open to the leader's engine
-    /// ([`crate::LocalEngine::durable_warm`]); call after a last [`Self::step`].
-    pub fn into_warm(self) -> crate::engine::Warm {
-        crate::engine::Warm {
-            store: self.store,
-            embedder: self.embedder,
-            platform: self.platform.expect("a replica set member's replica has platform tables"),
-            engine: self.engine.expect("a replica set member's replica has engine spaces"),
-            engine_next: self.engine_next,
-        }
-    }
-
     /// Records from `from` on, skipping a purged stretch (its records were
     /// applied: the log is purged only below what everything holds).
     async fn read(&self, from: &mut LogOffset) -> Result<Vec<adb_core::log::LogRecord>, String> {

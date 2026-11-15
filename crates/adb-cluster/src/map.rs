@@ -50,6 +50,11 @@ pub struct Member {
 pub enum ControlCmd {
     /// Fix the partition count (once; later ones must match).
     Init { partitions: Partition },
+    /// The highest epoch object storage already shows for each partition (a cluster
+    /// started again from object storage, its control state lost): a partition's first
+    /// assignment here starts above it, so the new owners read everything earlier
+    /// owners wrote (their restores read only epochs below their own).
+    EpochFloors { floors: BTreeMap<Partition, u64> },
     /// A node joins (or rejoins, perhaps at a new address).
     Join {
         node: NodeId,
@@ -76,6 +81,9 @@ pub struct PartitionMap {
     pub partitions: Partition,
     pub members: BTreeMap<NodeId, Member>,
     pub assignments: BTreeMap<Partition, Assignment>,
+    /// Per partition, the epoch its first assignment starts above ([`ControlCmd::EpochFloors`]).
+    #[serde(default)]
+    pub epoch_floor: BTreeMap<Partition, u64>,
     /// Namespace placement overrides: pattern → memory partition.
     #[serde(default)]
     pub pins: BTreeMap<String, Partition>,
@@ -114,6 +122,12 @@ impl PartitionMap {
                     return Err(Refused::PartitionCount { have: self.partitions, asked: *partitions });
                 }
                 self.partitions = *partitions;
+            }
+            ControlCmd::EpochFloors { floors } => {
+                for (p, e) in floors {
+                    let f = self.epoch_floor.entry(*p).or_default();
+                    *f = (*f).max(*e);
+                }
             }
             ControlCmd::Join { node, addr, flight } => {
                 self.members.insert(*node, Member { addr: addr.clone(), flight: flight.clone() });
@@ -156,7 +170,7 @@ impl PartitionMap {
                     if assignment.owner != cur.owner && assignment.epoch == cur.epoch {
                         return Err(Refused::OwnerWithoutEpoch { partition: *partition, current: cur.epoch });
                     }
-                } else if assignment.epoch > 1 {
+                } else if assignment.epoch > self.first_epoch(*partition) {
                     return Err(Refused::Epoch { partition: *partition, current: 0, asked: assignment.epoch });
                 }
                 self.assignments.insert(*partition, assignment.clone());
@@ -164,6 +178,12 @@ impl PartitionMap {
         }
         self.version += 1;
         Ok(())
+    }
+
+    /// The epoch a partition's first assignment takes: one above what object storage
+    /// already shows for it (1 on a new cluster).
+    pub fn first_epoch(&self, p: Partition) -> u64 {
+        self.epoch_floor.get(&p).copied().unwrap_or(0) + 1
     }
 
     /// The partitions `node` owns.
@@ -239,7 +259,7 @@ pub fn plan(map: &PartitionMap, live: &BTreeSet<NodeId>, reported: &BTreeMap<Nod
                 let Some(owner) = pick(&count, true, None) else { continue };
                 count.get_mut(&owner).unwrap().0 += 1;
                 let replica = place_replica(&mut count, owner);
-                (Assignment { owner, replica, epoch: 1 }, "new partition")
+                (Assignment { owner, replica, epoch: map.first_epoch(p) }, "new partition")
             }
             Some(a) => {
                 let owner_live = live.contains(&a.owner);

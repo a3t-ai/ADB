@@ -6,19 +6,17 @@ version = 4
 name = "adb-cli"
 version = "0.1.0"
 dependencies = [
+ "adb-cluster",
  "adb-core",
  "adb-embed",
  "adb-executor",
  "adb-mcp",
- "adb-platform",
- "adb-raft",
  "adb-server",
  "adb-store",
  "arrow-array",
  "arrow-cast",
  "arrow-flight",
  "arrow-schema",
- "async-trait",
  "axum 0.7.9",
  "chrono",
  "clap",
@@ -33,7 +31,6 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tonic",
- "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -226,26 +223,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "adb-raft"
-version = "0.1.0"
-dependencies = [
- "adb-core",
- "adb-log",
- "async-trait",
- "axum 0.7.9",
- "futures",
- "memmap2",
- "openraft",
- "reqwest 0.12.28",
- "rmp-serde",
- "serde",
- "serde_json",
- "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1535,12 +1512,6 @@ name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
-
-[[package]]
-name = "bytecount"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "bytemuck"
@@ -5529,15 +5500,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "memmap2"
-version = "0.9.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6377,7 +6339,6 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "smallvec",
- "tabled",
  "thiserror 2.0.21",
  "tracing",
  "validit",
@@ -6499,17 +6460,6 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
-
-[[package]]
-name = "papergrid"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6978128c8b51d8f4080631ceb2302ab51e32cc6e8615f735ee2f83fd269ae3f1"
-dependencies = [
- "bytecount",
- "fnv",
- "unicode-width",
-]
 
 [[package]]
 name = "parking"
@@ -8524,16 +8474,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tabled"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e39a2ee1fbcd360805a771e1b300f78cc88fec7b8d3e2f71cd37bbf23e725c7d"
-dependencies = [
- "papergrid",
- "testing_table",
-]
-
-[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8556,15 +8496,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "testing_table"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f8daae29995a24f65619e19d8d31dea5b389f3d853d8bf297bbf607cd0014cc"
-dependencies = [
- "unicode-width",
 ]
 
 [[package]]

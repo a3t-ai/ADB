@@ -21,7 +21,6 @@ use clap::{Parser, Subcommand};
 mod alloc;
 mod branch;
 mod cluster;
-mod follower;
 mod import;
 mod import_engine;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -141,9 +140,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return serve_embed(*host, *port).await;
     }
 
-    // A replica set member (M3): the engine opens only while this node leads.
+    // A cluster node (S3 option B, step 8): ADB_NODE_ID set.
     if let (Some(dir), Commands::Serve { http: true, host, port, flight_port } | Commands::ServeHttp { host, port, flight_port }) = (&cli.data_dir, &command) {
-        if let Some(config) = adb_raft::ClusterConfig::from_env()? {
+        if let Some(config) = cluster::ClusterConfig::from_env(*port, *flight_port)? {
             return cluster::run(dir, config, *host, *port, *flight_port, shutdown_signal()).await;
         }
     }

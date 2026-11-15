@@ -455,17 +455,6 @@ async fn open_wal(dir: &std::path::Path, role: PartitionRole) -> Result<LocalWal
 
 /// The partition's Lance table in `dir/store`, sized by the embedding settings
 /// (W9.10), and the embedder they name.
-/// What a follower keeps open and applied (a [`crate::Replica`]), handed to the
-/// engine when the node becomes the leader.
-pub struct Warm {
-    pub(crate) store: Arc<PartitionStore>,
-    pub(crate) embedder: Option<Arc<adb_embed::Embedder>>,
-    pub(crate) platform: Arc<adb_platform::PlatformStore>,
-    pub(crate) engine: adb_engine::EngineHost,
-    /// The first log record the follower's engine host hasn't seen.
-    pub(crate) engine_next: adb_core::log::LogOffset,
-}
-
 /// Object storage behind the node (S3 option B, `.ai/S3_OPTION_B_PLAN.md`): on by
 /// default (`ADB_S3=on`), at `ADB_COLD_URI` (e.g. `s3://adb-1/prod/cluster-a`,
 /// credentials from `AWS_*`; any Lance URI, a local path too). `ADB_S3=off`, or no
@@ -682,12 +671,12 @@ impl LocalEngine {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
         let wal: EngineLog = Arc::new(open_wal(&dir, role).await?);
-        Box::pin(Self::durable_with(dir, wal, None, None, role)).await
+        Box::pin(Self::durable_with(dir, wal, None, role)).await
     }
 
     /// [`Self::durable_partition`] over `log` (a cluster owner's replicated log, step 5).
     pub async fn durable_partition_on(dir: impl Into<std::path::PathBuf>, role: PartitionRole, log: EngineLog) -> Result<(Self, ReplayStats), String> {
-        Box::pin(Self::durable_with(dir.into(), log, None, None, role)).await
+        Box::pin(Self::durable_with(dir.into(), log, None, role)).await
     }
 
     /// Step 6, for readers on other nodes: committed records from `from` (at most `max`,
@@ -724,14 +713,7 @@ impl LocalEngine {
     /// node's local WAL. Everything else is as [`Self::durable`].
     pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
         // Boxed: keeps the callers' future types shallow (the compiler's query depth).
-        Box::pin(Self::durable_with(dir.into(), wal, None, None, PartitionRole::SINGLE)).await
-    }
-
-    /// As [`Self::durable_on`], taking over a follower's already-open table,
-    /// platform tables and engine spaces (CA-34: a new leader does not reopen
-    /// what its replica kept applied).
-    pub async fn durable_warm(dir: impl Into<std::path::PathBuf>, wal: EngineLog, warm: Warm) -> Result<(Self, ReplayStats), String> {
-        Box::pin(Self::durable_with(dir.into(), wal, Some(warm), None, PartitionRole::SINGLE)).await
+        Box::pin(Self::durable_with(dir.into(), wal, None, PartitionRole::SINGLE)).await
     }
 
     /// A branch engine (B2): its own WAL, sequencer and delta table in `dir`, reading
@@ -740,7 +722,7 @@ impl LocalEngine {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("branch data dir {}: {e}", dir.display()))?;
         let wal: EngineLog = Arc::new(open_wal(&dir, PartitionRole::SINGLE).await?);
-        Box::pin(Self::durable_with(dir, wal, None, Some(parent), PartitionRole::SINGLE)).await
+        Box::pin(Self::durable_with(dir, wal, Some(parent), PartitionRole::SINGLE)).await
     }
 
     /// The engine's data directory.
@@ -949,45 +931,29 @@ impl LocalEngine {
         self.durable.as_ref()
     }
 
-    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, warm: Option<Warm>, parent: Option<crate::branch_engine::ParentView>, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
+    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, parent: Option<crate::branch_engine::ParentView>, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
-        let warm_cache = warm.is_some();
-        let (store, embedder, platform_open, engine_open) = match warm {
-            Some(w) => {
-                // A follower compaction under way stops before it writes (PF-38).
-                w.store.yield_compaction(true);
-                (w.store, w.embedder, Some(w.platform), Some((w.engine, Some(w.engine_next))))
-            }
-            None => {
-                let (store, embedder) = open_store(&dir, role.id).await?;
-                // The field indexes it had, in the background (PF-40).
-                store.warm(false);
-                (store, embedder, None, None)
-            }
-        };
+        let (store, embedder) = open_store(&dir, role.id).await?;
+        // The field indexes it had, in the background (PF-40).
+        store.warm(false);
         let opened = std::time::Instant::now();
 
         // W10: the hot cache follows every apply from here on (the catch-up too).
-        // A follower kept one from the same settings (C-19): the takeover keeps it.
-        if !(warm_cache && store.hot().is_some()) {
-            store.set_cache(hot_cache(cache_config(&dir)?)).await.map_err(|e| e.to_string())?;
-        }
+        store.set_cache(hot_cache(cache_config(&dir)?)).await.map_err(|e| e.to_string())?;
         let (mut writes, stats) =
             DurableWrites::open(seq, Arc::clone(&store)).await.map_err(|e| e.to_string())?;
-        let platform = match (platform_open, role.platform) {
-            (Some(p), _) => Some(p),
-            (None, true) => Some(Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?)),
-            (None, false) => None,
+        let platform = match role.platform {
+            true => Some(Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(|e| e.to_string())?)),
+            false => None,
         };
         if let Some(p) = &platform {
             writes.attach_platform(Arc::clone(p)).await.map_err(|e| e.to_string())?;
         }
         // FlowR's engine store (stage H): its spaces under `<dir>/engine`.
-        let engine = match (engine_open, role.engine) {
-            (Some(e), _) => Some(e),
-            (None, true) => Some((adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?, None)),
-            (None, false) => None,
+        let engine = match role.engine {
+            true => Some((adb_engine::EngineHost::open(dir.join("engine")).await.map_err(|e| e.to_string())?, None)),
+            false => None,
         };
         let t_engine = std::time::Instant::now();
         let replayed = match engine {
@@ -995,7 +961,6 @@ impl LocalEngine {
             None => 0,
         };
         tracing::info!(write_path = ?(t_engine - opened), engine_spaces = ?t_engine.elapsed(), "engine open steps");
-        store.yield_compaction(false);
         if replayed > 0 {
             tracing::info!(records = replayed, "engine spaces replayed");
         }

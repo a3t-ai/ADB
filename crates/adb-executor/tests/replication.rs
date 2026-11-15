@@ -92,6 +92,8 @@ async fn an_owner_acknowledges_what_its_replica_holds() {
     let cold = tempfile::tempdir().unwrap();
     std::env::set_var("ADB_COLD_URI", format!("file://{}", cold.path().display()));
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
+    // Segments only when asked: a ship in between lets the replica drop records.
+    std::env::set_var("ADB_WAL_SEGMENT_MS", "3600000");
     let peers = LocalPeers::new();
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let p1 = Arc::new(Static { me: 1, map: RwLock::new(Arc::new(map2(1))) });

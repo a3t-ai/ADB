@@ -72,6 +72,9 @@ pub struct NotLeader {
     pub leader: Option<String>,
 }
 
+/// Reads the highest epoch object storage shows per partition (`run_with`).
+pub type EpochFloors = Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BTreeMap<Partition, u64>, String>> + Send>> + Send + Sync>;
+
 /// A started control-group voter.
 pub struct ControlNode {
     pub id: NodeId,
@@ -129,6 +132,12 @@ impl ControlNode {
     /// The leader's work, while this voter leads: every heartbeat interval, the
     /// partition count first, then what the planner proposes. Runs until dropped.
     pub async fn run(self: Arc<Self>, partitions: Partition) {
+        self.run_with(partitions, None).await
+    }
+
+    /// [`Self::run`]; before the partition count is set, `floors` gives the highest
+    /// epoch object storage shows per partition ([`ControlCmd::EpochFloors`]).
+    pub async fn run_with(self: Arc<Self>, partitions: Partition, floors: Option<EpochFloors>) {
         let mut tick = tokio::time::interval(leases::heartbeat());
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut leading = false;
@@ -153,6 +162,22 @@ impl ControlNode {
             }
             let map = self.map();
             if map.partitions == 0 {
+                if let Some(f) = &floors {
+                    match f().await {
+                        Ok(floors) if !floors.is_empty() => {
+                            tracing::info!(partitions = floors.len(), "object storage already holds partitions: their epochs start above what it shows");
+                            if let Err(e) = self.propose(ControlCmd::EpochFloors { floors }).await {
+                                tracing::warn!(error = %e, "epoch floors not set");
+                                continue;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "object storage's epochs not read; retrying");
+                            continue;
+                        }
+                    }
+                }
                 if let Err(e) = self.propose(ControlCmd::Init { partitions }).await {
                     tracing::warn!(error = %e, "partition count not set");
                 }

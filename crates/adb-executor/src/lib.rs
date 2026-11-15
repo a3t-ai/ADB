@@ -38,4 +38,4 @@ pub use reads::{LanceReads, Reads};
 pub use writes::{DurableWrites, ReplayStats, Writes, COMPACT_AFTER_WRITES};
 pub use replica::Replica;
 pub use follower::{follower_reads, FollowerReads, NOT_LEADER};
-pub use engine::{EngineLog, Warm};
+pub use engine::EngineLog;
