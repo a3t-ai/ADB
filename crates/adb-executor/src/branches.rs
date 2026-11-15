@@ -119,7 +119,7 @@ impl Layers {
 }
 
 /// DB-12: one reader of a memory space: who inherits it, how, and at which tag.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dependent {
     pub namespace: String,
     pub mode: LayerMode,
@@ -159,7 +159,7 @@ impl Quota {
 
 /// DB-9: a past point of a space: a tag, or an offset from a memory point (DB-7). `ts`
 /// goes with the offset once the log no longer holds that record.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointRef {
     #[serde(default)]

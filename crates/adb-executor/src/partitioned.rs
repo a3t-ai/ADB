@@ -1,4 +1,4 @@
-//! A cluster node's partitions behind one engine (S3 option B, step 3).
+//! A node's partitions behind one engine (S3 option B, steps 3 and 4).
 //!
 //! Every memory partition is a [`LocalEngine`] of its own ([`PartitionRole::memory`],
 //! `dir/parts/p{n}`), opened on first use; the system partition
@@ -6,13 +6,19 @@
 //! **namespace catalog** (platform table `adb_namespaces`: every namespace that has
 //! been written, and its partition).
 //!
+//! **In a cluster** ([`PartitionedEngine::open_cluster`], step 4) a node holds only the
+//! partitions it owns; any other is a [`RemotePartition`] — the same calls, sent to its
+//! owner ([`crate::remote`]). Any node accepts any request: a statement on one
+//! namespace goes whole to that namespace's owner (one hop); a stale map is corrected
+//! by the owner's `not_owner` answer, and the call is retried once.
+//!
 //! A statement runs within the scope its call carries ([`Reach`], built by A3T/FlowR;
 //! ADB only enforces it):
 //!
 //! - **One namespace** (every stage names the same one): run as is on that
 //!   namespace's partition — the common case (an agent's own memory).
 //! - **Otherwise** (no `NAMESPACE`, or several): the router's own executor runs it over
-//!   [`RoutedReads`] / [`RoutedWrites`]. Reads go to the namespaces of the catalog the
+//!   the partitions' reads and writes. Reads go to the namespaces of the catalog the
 //!   scope allows — each with the exact-namespace filter every read path already
 //!   enforces — or, for a full-access call, to each partition holding data; the
 //!   results are unioned, then ordered and cut as one engine would (`ORDER BY`, the
@@ -30,23 +36,52 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-
 
 use adb_cluster::map::{Partition, PartitionMap};
 use adb_cluster::routing::{self, Reach};
 use adb_core::{AdbError, AdbResult, Link, LinkSelect, MemoryRecord, MemoryType, Modifiers, Predicate, Scope};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
 
 use crate::engine::{to_wire, Engine, LocalEngine, PartitionRole};
 use crate::reads::Reads;
+use crate::remote::{dispatch_op, not_owner, owner_in, Peers, Placement, RemotePartition};
 use crate::writes::Writes;
 use crate::Executor;
 
 /// The catalog's platform table.
 pub const CATALOG: &str = "adb_namespaces";
+
+/// A partition, here or on its owner.
+#[derive(Clone)]
+pub enum Handle {
+    Local(Arc<LocalEngine>),
+    Remote(Arc<RemotePartition>),
+}
+
+impl Handle {
+    pub fn io(&self) -> (Arc<dyn Writes>, Arc<dyn Reads>) {
+        match self {
+            Handle::Local(e) => e.io(),
+            Handle::Remote(r) => (Arc::clone(r) as Arc<dyn Writes>, Arc::clone(r) as Arc<dyn Reads>),
+        }
+    }
+
+    /// A partition operation by name ([`crate::remote::dispatch_op`]), here or on the owner.
+    pub async fn op(&self, op: &str, args: Value) -> Result<Value, String> {
+        match self {
+            Handle::Local(e) => Box::pin(dispatch_op(e, op, args)).await,
+            Handle::Remote(r) => r.op(op, args).await,
+        }
+    }
+
+    pub async fn op_as<T: DeserializeOwned>(&self, op: &str, args: Value) -> Result<T, String> {
+        serde_json::from_value(self.op(op, args).await?).map_err(|e| format!("{op}: {e}"))
+    }
+}
 
 /// One place a routed read or write runs: a partition, and the namespace it is
 /// limited to there (`None`: every namespace in it — a full-access call only).
@@ -58,69 +93,109 @@ struct Target {
     reads: Arc<dyn Reads>,
 }
 
-/// A cluster node's partitions as one [`Engine`].
+impl Target {
+    fn of(partition: Partition, namespace: Option<String>, h: &Handle) -> Self {
+        let (writes, reads) = h.io();
+        Target { partition, namespace, writes, reads }
+    }
+}
+
+struct Cluster {
+    placement: Arc<dyn Placement>,
+    peers: Arc<dyn Peers>,
+}
+
+/// A node's partitions as one [`Engine`].
 pub struct PartitionedEngine {
     dir: PathBuf,
-    map: std::sync::RwLock<PartitionMap>,
+    /// The map on one node (in a cluster: the placement's, current).
+    map: std::sync::RwLock<Arc<PartitionMap>>,
+    cluster: Option<Cluster>,
     parts: tokio::sync::Mutex<HashMap<Partition, Arc<LocalEngine>>>,
-    system: Arc<LocalEngine>,
-    /// Namespace → partition, as recorded in [`CATALOG`].
+    /// The system partition's engine, once this node has opened it (it owns it).
+    system: OnceLock<Arc<LocalEngine>>,
+    /// Namespace → partition, as recorded in [`CATALOG`] (refreshed before every
+    /// statement spanning partitions: other nodes add namespaces too).
     catalog: std::sync::RwLock<BTreeMap<String, Partition>>,
+    /// When the catalog was last read from the system partition.
+    catalog_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Other spaces read from their own partitions (memory layers); each partition
     /// engine holds it weakly.
     spaces: Arc<dyn crate::spaces::Spaces>,
 }
 
-/// Each space read from its own partition (`crate::spaces`).
+/// Each space read from its own partition, here or on its owner (`crate::spaces`).
 struct RouterSpaces {
     node: std::sync::Weak<PartitionedEngine>,
 }
 
 impl RouterSpaces {
-    async fn local(&self, space: &str) -> AdbResult<crate::spaces::LocalSpaces> {
-        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
-        let e = node.engine_of(space).await.map_err(AdbError::Internal)?;
-        e.local_spaces().ok_or_else(|| AdbError::Internal(format!("partition of {space:?} has no table")))
+    fn node(&self) -> AdbResult<Arc<PartitionedEngine>> {
+        self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))
     }
+
+    async fn handle_of(&self, space: &str) -> AdbResult<Handle> {
+        let node = self.node()?;
+        node.handle(node.partition_of(space)).await.map_err(AdbError::Internal)
+    }
+}
+
+fn local_spaces(e: &LocalEngine) -> AdbResult<crate::spaces::LocalSpaces> {
+    e.local_spaces().ok_or_else(|| AdbError::Internal("this partition has no table".into()))
 }
 
 #[async_trait]
 impl crate::spaces::Spaces for RouterSpaces {
     async fn versions(&self, memory: adb_core::log::Memory, space: &str) -> AdbResult<Vec<adb_store::StoredRow>> {
-        self.local(space).await?.versions(memory, space).await
+        match self.handle_of(space).await? {
+            Handle::Local(e) => local_spaces(&e)?.versions(memory, space).await,
+            h => h.op_as("space_versions", json!({ "memory": memory, "space": space })).await.map_err(AdbError::Internal),
+        }
     }
 
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<crate::branches::Tag>> {
-        self.local(space).await?.tag(space, name).await
+        match self.handle_of(space).await? {
+            Handle::Local(e) => local_spaces(&e)?.tag(space, name).await,
+            h => h.op_as("space_tag", json!({ "space": space, "name": name })).await.map_err(AdbError::Internal),
+        }
     }
 
     async fn layers_of(&self, space: &str) -> AdbResult<Vec<crate::branches::Layer>> {
-        self.local(space).await?.layers_of(space).await
+        match self.handle_of(space).await? {
+            Handle::Local(e) => local_spaces(&e)?.layers_of(space).await,
+            h => h.op_as("space_layers", json!({ "space": space })).await.map_err(AdbError::Internal),
+        }
     }
 
     async fn quotas(&self) -> AdbResult<Vec<crate::branches::Quota>> {
-        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
-        let sys = node.system.local_spaces().ok_or_else(|| AdbError::Internal("the system partition has no table".into()))?;
-        sys.quotas().await
+        let node = self.node()?;
+        match node.system_handle().await.map_err(AdbError::Internal)? {
+            Handle::Local(e) => local_spaces(&e)?.quotas().await,
+            h => h.op_as("quotas", json!({})).await.map_err(AdbError::Internal),
+        }
     }
 
     async fn usage_elsewhere(&self, quota: &crate::branches::Quota, except: adb_core::log::PartitionId) -> AdbResult<(u64, u64)> {
-        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
+        let node = self.node()?;
+        node.catalog_recent().await.map_err(AdbError::Internal)?;
         let mut total = (0, 0);
         let parts: BTreeSet<Partition> = node.catalog.read().unwrap().iter().filter(|(ns, _)| quota.covers(ns)).map(|(_, p)| *p).collect();
         for p in parts.into_iter().filter(|p| *p != except.0) {
-            let (r, b) = node.part(p).await.map_err(AdbError::Internal)?.usage_covered(quota).await.map_err(AdbError::Internal)?;
+            let (r, b): (u64, u64) = node.handle(p).await.map_err(AdbError::Internal)?.op_as("usage_covered", json!({ "quota": quota })).await.map_err(AdbError::Internal)?;
             total = (total.0 + r, total.1 + b);
         }
         Ok(total)
     }
 
     async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {
-        let node = self.node.upgrade().ok_or_else(|| AdbError::Internal("the partition router has stopped".into()))?;
+        let node = self.node()?;
+        // A pin anywhere holds a tag: every namespace, as of now.
+        node.refresh_catalog().await.map_err(AdbError::Internal)?;
         let mut out = Vec::new();
-        for e in node.data_parts().await.map_err(AdbError::Internal)? {
-            if let Some(l) = e.local_spaces() {
-                out.extend(l.layered_by(space).await?);
+        for h in node.data_handles().await.map_err(AdbError::Internal)? {
+            match h {
+                Handle::Local(e) => out.extend(local_spaces(&e)?.layered_by(space).await?),
+                h => out.extend(h.op_as::<Vec<String>>("space_layered_by", json!({ "space": space })).await.map_err(AdbError::Internal)?),
             }
         }
         Ok(out)
@@ -128,82 +203,161 @@ impl crate::spaces::Spaces for RouterSpaces {
 }
 
 impl PartitionedEngine {
-    /// Open a node's partitions under `dir` with `map` (the system partition now, the
-    /// memory partitions on first use) and load the catalog.
+    /// One node holding every partition of `map` (the system partition now, the
+    /// memory partitions on first use), and its catalog.
     pub async fn open(dir: impl Into<PathBuf>, map: PartitionMap) -> Result<Arc<Self>, String> {
-        let dir = dir.into();
         if map.partitions == 0 {
             return Err("the partition map has no partitions yet".into());
         }
-        let sys = routing::system_partition(&map);
-        let (system, _) = LocalEngine::durable_partition(dir.join("parts").join(format!("p{sys}")), PartitionRole::system(sys)).await?;
-        let mut catalog = BTreeMap::new();
-        if let Some(p) = system.platform() {
-            if p.list_tables().map_err(|e| e.to_string())?.iter().any(|t| t == CATALOG) {
-                let rows = p.query(CATALOG, None, usize::MAX >> 1).await.map_err(|e| e.to_string())?;
-                for r in adb_platform::batches_to_json(&rows) {
-                    let ns = r.get("namespace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let part = r.get("partition").and_then(|v| v.as_str()).and_then(|v| v.parse().ok());
-                    if let Some(part) = part {
-                        catalog.insert(ns, part);
-                    }
-                }
-            }
+        let node = Self::new(dir.into(), map, None);
+        Box::pin(node.handle(node.sys())).await?;
+        Box::pin(node.refresh_catalog()).await?;
+        Ok(node)
+    }
+
+    /// A cluster node (step 4): it holds the partitions `placement`'s map gives it and
+    /// reaches the others through `peers`.
+    pub async fn open_cluster(dir: impl Into<PathBuf>, placement: Arc<dyn Placement>, peers: Arc<dyn Peers>) -> Result<Arc<Self>, String> {
+        let map = placement.map();
+        if map.partitions == 0 {
+            return Err("the partition map has no partitions yet".into());
         }
-        Ok(Arc::new_cyclic(|me| Self {
+        let node = Self::new(dir.into(), (*map).clone(), Some(Cluster { placement, peers }));
+        if node.owns(node.sys()) {
+            Box::pin(node.handle(node.sys())).await?;
+        }
+        Ok(node)
+    }
+
+    fn new(dir: PathBuf, map: PartitionMap, cluster: Option<Cluster>) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
             dir,
-            map: std::sync::RwLock::new(map),
+            map: std::sync::RwLock::new(Arc::new(map)),
+            cluster,
             parts: Default::default(),
-            system: Arc::new(system),
-            catalog: std::sync::RwLock::new(catalog),
+            system: OnceLock::new(),
+            catalog: Default::default(),
+            catalog_at: Default::default(),
             spaces: Arc::new(RouterSpaces { node: me.clone() }),
-        }))
+        })
     }
 
-    /// The system partition's data directory.
-    fn system_dir(&self) -> PathBuf {
-        let sys = routing::system_partition(&self.map.read().unwrap());
-        self.dir.join("parts").join(format!("p{sys}"))
+    /// The current map.
+    pub fn map(&self) -> Arc<PartitionMap> {
+        match &self.cluster {
+            Some(c) => c.placement.map(),
+            None => Arc::clone(&self.map.read().unwrap()),
+        }
     }
 
-    /// The system partition's engine.
-    pub fn system(&self) -> &Arc<LocalEngine> {
-        &self.system
+    fn sys(&self) -> Partition {
+        routing::system_partition(&self.map())
+    }
+
+    /// Whether this node owns partition `p` (one node: every one).
+    pub fn owns(&self, p: Partition) -> bool {
+        match &self.cluster {
+            None => true,
+            Some(c) => self.map().assignments.get(&p).is_some_and(|a| a.owner == c.placement.me()),
+        }
     }
 
     /// The partition `namespace` lives in (`""`: records without a namespace).
     pub fn partition_of(&self, namespace: &str) -> Partition {
-        routing::partition_of(&self.map.read().unwrap(), namespace)
+        routing::partition_of(&self.map(), namespace)
     }
 
-    /// The engine of memory partition `p`, opened on first use.
+    /// Partition `p`: its engine if this node owns it, else its owner.
+    pub async fn handle(&self, p: Partition) -> Result<Handle, String> {
+        let Some(c) = &self.cluster else { return Ok(Handle::Local(Box::pin(self.part(p)).await?)) };
+        let map = self.map();
+        let a = map.assignments.get(&p).ok_or_else(|| not_owner(p, &map))?;
+        if a.owner == c.placement.me() {
+            return Ok(Handle::Local(Box::pin(self.part(p)).await?));
+        }
+        let addr = map.members.get(&a.owner).map(|m| m.addr.clone()).ok_or_else(|| not_owner(p, &map))?;
+        Ok(Handle::Remote(Arc::new(RemotePartition { partition: p, addr, peers: Arc::clone(&c.peers) })))
+    }
+
+    async fn system_handle(&self) -> Result<Handle, String> {
+        self.handle(self.sys()).await
+    }
+
+    /// The handle of `namespace`'s partition.
+    async fn handle_of(&self, namespace: &str) -> Result<Handle, String> {
+        self.handle(self.partition_of(namespace)).await
+    }
+
+    /// The engine of partition `p` on this node, opened on first use.
     pub async fn part(&self, p: Partition) -> Result<Arc<LocalEngine>, String> {
         let mut parts = self.parts.lock().await;
         if let Some(e) = parts.get(&p) {
             return Ok(Arc::clone(e));
         }
+        let sys = self.sys();
         let pdir = self.dir.join("parts").join(format!("p{p}"));
-        // Cluster-wide settings (one embedding model, one set of cache rules): the
-        // system partition's, copied before a partition opens.
         std::fs::create_dir_all(&pdir).map_err(|e| format!("partition data dir {}: {e}", pdir.display()))?;
-        let sys_dir = self.system_dir();
-        if let Some(c) = adb_embed::EmbedConfig::load(&sys_dir)? {
-            c.save(&pdir)?;
+        if p != sys {
+            // Cluster-wide settings (one embedding model, one set of cache rules): the
+            // system partition's, copied before a partition opens.
+            drop(parts);
+            let settings: Value = match self.system.get() {
+                Some(s) => dispatch_op(s, "settings", json!({})).await?,
+                // Boxed: opening a partition may reach the system partition's handle.
+                None => Box::pin(self.system_handle()).await?.op("settings", json!({})).await.unwrap_or(Value::Null),
+            };
+            if let Some(c) = settings.get("embedding").cloned().filter(|v| !v.is_null()) {
+                serde_json::from_value::<adb_embed::EmbedConfig>(c).map_err(|e| e.to_string())?.save(&pdir)?;
+            }
+            if let Some(c) = settings.get("cache").cloned().filter(|v| !v.is_null()) {
+                serde_json::from_value::<adb_store::CacheConfig>(c).map_err(|e| e.to_string())?.save(&pdir)?;
+            }
+            parts = self.parts.lock().await;
+            if let Some(e) = parts.get(&p) {
+                return Ok(Arc::clone(e));
+            }
         }
-        if let Some(c) = adb_store::CacheConfig::load(&sys_dir)? {
-            c.save(&pdir)?;
-        }
-        let (e, _) = LocalEngine::durable_partition(&pdir, PartitionRole::memory(p)).await?;
+        let role = if p == sys { PartitionRole::system(p) } else { PartitionRole::memory(p) };
+        let (e, _) = Box::pin(LocalEngine::durable_partition(&pdir, role)).await?;
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
         parts.insert(p, Arc::clone(&e));
+        if p == sys {
+            let _ = self.system.set(Arc::clone(&e));
+        }
         Ok(e)
     }
 
-    /// Every namespace written so far, with its partition.
+    /// Every namespace written so far, with its partition (as last read).
     pub fn catalog(&self) -> BTreeMap<String, Partition> {
         self.catalog.read().unwrap().clone()
+    }
+
+    /// The catalog, read again if older than `ADB_CATALOG_TTL_MS` (default 1000): for
+    /// checks that run on many writes (pattern quotas), which may lag a namespace
+    /// another node added that long ago.
+    pub async fn catalog_recent(&self) -> Result<(), String> {
+        let ttl = Duration::from_millis(std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
+        let fresh = self.catalog_at.lock().unwrap().is_some_and(|t| t.elapsed() < ttl);
+        if fresh || self.cluster.is_none() {
+            return Ok(());
+        }
+        self.refresh_catalog().await
+    }
+
+    /// Read the catalog again from the system partition.
+    pub async fn refresh_catalog(&self) -> Result<(), String> {
+        let rows: Vec<Value> = self.system_handle().await?.op_as("catalog_rows", json!({})).await?;
+        *self.catalog_at.lock().unwrap() = Some(std::time::Instant::now());
+        let mut catalog = self.catalog.write().unwrap();
+        for r in rows {
+            let ns = r.get("namespace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if let Some(p) = r.get("partition").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()) {
+                catalog.insert(ns, p);
+            }
+        }
+        Ok(())
     }
 
     /// Record `namespace` in the catalog (before its first write commits).
@@ -212,8 +366,9 @@ impl PartitionedEngine {
             return Ok(());
         }
         let p = self.partition_of(namespace);
-        let row = serde_json::json!({ "namespace": namespace, "partition": p.to_string() });
-        self.system.platform_write(adb_core::log::Effect::TableInsert { table: CATALOG.into(), rows: vec![row.as_object().cloned().unwrap_or_default()] }).await?;
+        let row = json!({ "namespace": namespace, "partition": p.to_string() });
+        let effect = adb_core::log::Effect::TableInsert { table: CATALOG.into(), rows: vec![row.as_object().cloned().unwrap_or_default()] };
+        self.system_handle().await?.op("platform_write", json!({ "effect": effect })).await?;
         self.catalog.write().unwrap().insert(namespace.to_string(), p);
         Ok(())
     }
@@ -227,16 +382,12 @@ impl PartitionedEngine {
             Reach::All => {
                 let partitions: BTreeSet<Partition> = catalog.values().copied().collect();
                 for p in partitions {
-                    let e = self.part(p).await?;
-                    let (writes, reads) = e.io();
-                    out.push(Target { partition: p, namespace: None, writes, reads });
+                    out.push(Target::of(p, None, &self.handle(p).await?));
                 }
             }
             Reach::Only(_) => {
                 for (ns, p) in catalog.iter().filter(|(ns, _)| reach.allows(ns)) {
-                    let e = self.part(*p).await?;
-                    let (writes, reads) = e.io();
-                    out.push(Target { partition: *p, namespace: Some(ns.clone()), writes, reads });
+                    out.push(Target::of(*p, Some(ns.clone()), &self.handle(*p).await?));
                 }
             }
         }
@@ -249,50 +400,62 @@ impl PartitionedEngine {
             return Err(out_of_reach(namespace));
         }
         let p = self.partition_of(namespace);
-        let e = self.part(p).await.map_err(AdbError::Internal)?;
-        let (writes, reads) = e.io();
-        Ok(Target { partition: p, namespace: Some(namespace.to_string()), writes, reads })
+        let h = self.handle(p).await.map_err(AdbError::QueryError)?;
+        Ok(Target::of(p, Some(namespace.to_string()), &h))
     }
 
-    /// The engine of `namespace`'s partition.
-    pub async fn engine_of(&self, namespace: &str) -> Result<Arc<LocalEngine>, String> {
-        self.part(self.partition_of(namespace)).await
-    }
-
-    /// The memory partitions holding data (the catalog's), opened.
-    async fn data_parts(&self) -> Result<Vec<Arc<LocalEngine>>, String> {
+    /// The partitions holding data (the catalog's), here or remote.
+    async fn data_handles(&self) -> Result<Vec<Handle>, String> {
         let ps: BTreeSet<Partition> = self.catalog.read().unwrap().values().copied().collect();
         let mut out = Vec::new();
         for p in ps {
-            out.push(self.part(p).await?);
+            out.push(self.handle(p).await?);
         }
         Ok(out)
     }
 
     /// Run `aql` within `reach` (see the module docs).
     pub async fn query_in(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
-        let touches = touches(aql);
-        for (ns, _) in &touches {
-            if let Some(ns) = ns {
-                if !reach.allows(ns) {
-                    return Err(out_of_reach(ns).to_string());
-                }
-            }
-        }
-        let names: BTreeSet<Option<&str>> = touches.iter().map(|(ns, _)| ns.as_deref()).collect();
-        let writes_any = touches.iter().any(|(_, w)| *w);
-        // One namespace: as is, on its partition.
-        if let (1, Some(Some(ns))) = (names.len(), names.iter().next()) {
+        let (single, writes_any) = single_namespace(aql, reach)?;
+        if let Some(ns) = single {
             if writes_any {
-                self.note(ns).await?;
+                self.note(&ns).await?;
             }
-            let e = self.part(self.partition_of(ns)).await?;
-            return e.query(aql, variables).await;
+            return Box::pin(self.on_owner(&ns, aql, variables, reach)).await;
         }
+        Box::pin(self.across(aql, variables, reach)).await
+    }
+
+    /// A statement on one namespace, on its partition: here, or forwarded whole to the
+    /// owner (one hop; a `not_owner` answer means the map here was stale: retried once,
+    /// at the owner it names or the map now names).
+    async fn on_owner(self: &Arc<Self>, ns: &str, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        let p = self.partition_of(ns);
+        let mut last: Option<String> = None;
+        for attempt in 0..2 {
+            let addr = match self.handle(p).await? {
+                Handle::Local(e) => return Box::pin(e.query(aql, variables)).await,
+                Handle::Remote(r) => match (&last, attempt) {
+                    (Some(e), 1) => owner_in(e).filter(|a| *a != r.addr).unwrap_or_else(|| r.addr.clone()),
+                    _ => r.addr.clone(),
+                },
+            };
+            let peers = &self.cluster.as_ref().expect("a remote partition means a cluster").peers;
+            match peers.query(&addr, aql, variables, reach).await {
+                Err(e) if e.starts_with("not_owner:") && attempt == 0 => last = Some(e),
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or_else(|| "not_owner".into()))
+    }
+
+    /// A statement spanning partitions: the router's executor over their reads and writes.
+    async fn across(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
         let first = aql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or_default();
         if first.eq_ignore_ascii_case("WATCH") {
             return Err("WATCH needs NAMESPACE in a cluster: watches across partitions come later".into());
         }
+        self.refresh_catalog().await?;
         let io = Arc::new(Routed { node: Arc::clone(self), reach: reach.clone() });
         let executor = Executor::with_io(Arc::clone(&io) as Arc<dyn Writes>, io as Arc<dyn Reads>);
         let r = match variables {
@@ -300,6 +463,67 @@ impl PartitionedEngine {
             _ => executor.execute(aql).await,
         };
         r.map(|r| to_wire(&r)).map_err(|e| e.to_string())
+    }
+
+    /// A statement another node forwarded here (it was on one namespace, which this
+    /// node owned in that node's map): run here, or `not_owner` — never forwarded on.
+    pub async fn serve_query(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        let (single, _) = single_namespace(aql, reach)?;
+        match single {
+            Some(ns) => {
+                let p = self.partition_of(&ns);
+                if !self.owns(p) {
+                    return Err(not_owner(p, &self.map()));
+                }
+                Box::pin(self.part(p)).await?.query(aql, variables).await
+            }
+            None => Box::pin(self.across(aql, variables, reach)).await,
+        }
+    }
+
+    /// A partition call another node sent here: run on the partition if this node
+    /// owns it, else `not_owner`.
+    pub async fn serve_part(&self, p: Partition, call: crate::remote::PartCall) -> Result<crate::remote::PartReply, String> {
+        if !self.owns(p) {
+            return Err(not_owner(p, &self.map()));
+        }
+        let e = self.part(p).await?;
+        crate::remote::serve_part(&e, call).await
+    }
+
+    /// A partition operation on `namespace`'s partition.
+    async fn op_ns<T: DeserializeOwned>(&self, namespace: &str, op: &str, args: Value) -> Result<T, String> {
+        self.handle_of(namespace).await?.op_as(op, args).await
+    }
+
+    /// A partition operation on every partition holding data, gathered.
+    async fn op_all<T: DeserializeOwned>(&self, op: &str, args: Value) -> Result<Vec<T>, String> {
+        // Every partition holding data, as of now (other nodes add namespaces too).
+        self.refresh_catalog().await?;
+        let mut out = Vec::new();
+        for h in self.data_handles().await? {
+            out.push(h.op_as(op, args.clone()).await?);
+        }
+        Ok(out)
+    }
+}
+
+/// The one namespace every stage of `aql` names (`None`: none, or several), and
+/// whether it writes; a named namespace outside `reach` is refused.
+fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), String> {
+    let touches = touches(aql);
+    for (ns, _) in &touches {
+        if let Some(ns) = ns {
+            if !reach.allows(ns) {
+                return Err(out_of_reach(ns).to_string());
+            }
+        }
+    }
+    let names: BTreeSet<Option<&str>> = touches.iter().map(|(ns, _)| ns.as_deref()).collect();
+    let writes_any = touches.iter().any(|(_, w)| *w);
+    match (names.len(), names.iter().next()) {
+        (1, Some(Some(ns))) => Ok((Some(ns.to_string()), writes_any)),
+        _ => Ok((None, writes_any)),
     }
 }
 
@@ -347,7 +571,7 @@ impl Routed {
     async fn targets(&self, namespace: Option<&str>) -> AdbResult<Vec<Target>> {
         match namespace {
             Some(ns) => Ok(vec![self.node.target_of(&self.reach, ns).await?]),
-            None => self.node.targets(&self.reach).await.map_err(AdbError::Internal),
+            None => self.node.targets(&self.reach).await.map_err(AdbError::QueryError),
         }
     }
 
@@ -426,6 +650,11 @@ impl Routed {
             out.push(f(t).await?);
         }
         Ok(out)
+    }
+
+    /// The system partition's writes (topics, subscriptions, platform tables).
+    async fn system(&self) -> AdbResult<Arc<dyn Writes>> {
+        Ok(self.node.system_handle().await.map_err(AdbError::QueryError)?.io().0)
     }
 }
 
@@ -541,7 +770,12 @@ impl Writes for Routed {
     }
 
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
-        let n = self.each(namespace, |t| { let data = data.clone(); async move { t.writes.update(memory_type, predicate, data, in_scope, t.namespace.as_deref()).await } }).await?;
+        let n = self
+            .each(namespace, |t| {
+                let data = data.clone();
+                async move { t.writes.update(memory_type, predicate, data, in_scope, t.namespace.as_deref()).await }
+            })
+            .await?;
         Ok(n.into_iter().sum())
     }
 
@@ -570,169 +804,161 @@ impl Writes for Routed {
     }
 
     async fn publish(&self, topic: &str, payload: Value, ttl: Option<Duration>) -> AdbResult<(String, u64)> {
-        self.node.system.io().0.publish(topic, payload, ttl).await
+        self.system().await?.publish(topic, payload, ttl).await
     }
 
     async fn subscribe(&self, spec: adb_gateway::SubSpec, from: Option<u64>) -> AdbResult<(String, u64)> {
-        self.node.system.io().0.subscribe(spec, from).await
+        self.system().await?.subscribe(spec, from).await
     }
 
     async fn ack(&self, subscription: &str, offset: u64) -> AdbResult<u64> {
-        self.node.system.io().0.ack(subscription, offset).await
+        self.system().await?.ack(subscription, offset).await
     }
 
     async fn unsubscribe(&self, subscription: &str) -> AdbResult<bool> {
-        self.node.system.io().0.unsubscribe(subscription).await
+        self.system().await?.unsubscribe(subscription).await
     }
 
     async fn platform(&self, effect: adb_core::log::Effect) -> AdbResult<u64> {
-        self.node.system.io().0.platform(effect).await
+        self.system().await?.platform(effect).await
     }
 
     async fn platform_many(&self, effects: Vec<adb_core::log::Effect>) -> AdbResult<u64> {
-        self.node.system.io().0.platform_many(effects).await
+        self.system().await?.platform_many(effects).await
     }
 }
 
 #[async_trait]
 impl Engine for Arc<PartitionedEngine> {
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
-        self.query_in(aql, variables, &Reach::All).await
+        Box::pin(self.query_in(aql, variables, &Reach::All)).await
     }
 
     async fn stats(&self) -> Result<Value, String> {
         let parts: Vec<Partition> = self.parts.lock().await.keys().copied().collect();
-        Ok(serde_json::json!({ "partitions_open": parts, "namespaces": self.catalog.read().unwrap().len() }))
+        Ok(json!({ "partitions_open": parts, "namespaces": self.catalog.read().unwrap().len() }))
     }
 
+    /// The platform tables, on the node owning the system partition (`None` elsewhere:
+    /// the transports send those calls to that node, step 4b).
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
-        self.system.platform()
+        self.system.get().and_then(|s| s.platform())
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
-        self.system.platform_write(effect).await
+        self.system_handle().await?.op_as("platform_write", json!({ "effect": effect })).await
     }
 
     async fn platform_write_many(&self, effects: Vec<adb_core::log::Effect>) -> Result<u64, String> {
-        self.system.platform_write_many(effects).await
+        self.system_handle().await?.op_as("platform_write_many", json!({ "effects": effects })).await
     }
 
+    /// FlowR's engine store, on the node owning the system partition (step 4b).
     fn flowr_engine(&self, space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
-        self.system.flowr_engine(space)
+        self.system.get().and_then(|s| s.flowr_engine(space))
     }
 
     async fn engine_restore(&self, space: &str, changes: Vec<Value>, first: bool) -> Result<usize, String> {
-        self.system.engine_restore(space, changes, first).await
+        let s = self.system.get().ok_or("FlowR's engine store is on the node owning the system partition")?;
+        s.engine_restore(space, changes, first).await
     }
 
     // ---- one namespace: its partition
 
     async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
         self.note(namespace).await?;
-        self.engine_of(namespace).await?.branch_create(namespace, name, parent, created_by).await
+        self.op_ns(namespace, "branch_create", json!({ "namespace": namespace, "name": name, "parent": parent, "created_by": created_by })).await
     }
 
     async fn branch_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        self.engine_of(namespace).await?.branch_drop(namespace, name).await
+        self.op_ns(namespace, "branch_drop", json!({ "namespace": namespace, "name": name })).await
     }
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
         match namespace {
-            Some(ns) => self.engine_of(ns).await?.branch_list(Some(ns)).await,
-            None => {
-                let mut out = Vec::new();
-                for e in self.data_parts().await? {
-                    out.extend(e.branch_list(None).await?);
-                }
-                Ok(out)
-            }
+            Some(ns) => self.op_ns(ns, "branch_list", json!({ "namespace": ns })).await,
+            None => Ok(self.op_all::<Vec<crate::branches::Branch>>("branch_list", json!({ "namespace": null })).await?.into_iter().flatten().collect()),
         }
     }
 
     async fn branch_create_past(&self, namespace: &str, name: &str, created_by: Option<&str>, at: &crate::branches::PointRef) -> Result<Value, String> {
-        self.engine_of(namespace).await?.branch_create_past(namespace, name, created_by, at).await
+        self.op_ns(namespace, "branch_create_past", json!({ "namespace": namespace, "name": name, "created_by": created_by, "at": at })).await
     }
 
     async fn space_stats(&self, namespace: &str, branch: Option<&str>, max_age: Duration) -> Result<Value, String> {
-        self.engine_of(namespace).await?.space_stats(namespace, branch, max_age).await
+        self.op_ns(namespace, "space_stats", json!({ "namespace": namespace, "branch": branch, "max_age_ms": max_age.as_millis() as u64 })).await
     }
 
     async fn space_records(&self, namespace: &str, memory: MemoryType, branch: Option<&str>, after: Option<&str>, limit: usize) -> Result<Value, String> {
-        self.engine_of(namespace).await?.space_records(namespace, memory, branch, after, limit).await
+        self.op_ns(namespace, "space_records", json!({ "namespace": namespace, "memory": memory, "branch": branch, "after": after, "limit": limit })).await
     }
 
+    /// A space's change stream: served by the node owning its partition.
     async fn space_gateway(&self, namespace: &str, branch: Option<&str>) -> Result<Arc<adb_gateway::Gateway>, String> {
-        self.engine_of(namespace).await?.space_gateway(namespace, branch).await
+        match self.handle_of(namespace).await? {
+            Handle::Local(e) => e.space_gateway(namespace, branch).await,
+            Handle::Remote(r) => Err(format!("not_owner:0:{}: namespace {namespace:?}'s changes are served by its owner", r.addr)),
+        }
     }
 
     async fn branch_conflicts(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<Value, String> {
-        self.engine_of(namespace).await?.branch_conflicts(namespace, name, memories).await
+        self.op_ns(namespace, "branch_conflicts", json!({ "namespace": namespace, "name": name, "memories": memories })).await
     }
 
     async fn branch_merge(&self, namespace: &str, name: &str, memories: &[MemoryType], main_offset: u64, resolutions: Vec<crate::merge::Resolution>, by: Option<&str>) -> Result<Value, String> {
-        self.engine_of(namespace).await?.branch_merge(namespace, name, memories, main_offset, resolutions, by).await
+        self.op_ns(namespace, "branch_merge", json!({ "namespace": namespace, "name": name, "memories": memories, "main_offset": main_offset, "resolutions": resolutions, "by": by })).await
     }
 
     async fn branch_rebase(&self, namespace: &str, name: &str, main_offset: u64, resolutions: Vec<crate::merge::Resolution>) -> Result<Value, String> {
-        self.engine_of(namespace).await?.branch_rebase(namespace, name, main_offset, resolutions).await
+        self.op_ns(namespace, "branch_rebase", json!({ "namespace": namespace, "name": name, "main_offset": main_offset, "resolutions": resolutions })).await
     }
 
     async fn merge_revert(&self, namespace: &str, merge_id: &str, by: Option<&str>, force_skip: bool) -> Result<Value, String> {
-        self.engine_of(namespace).await?.merge_revert(namespace, merge_id, by, force_skip).await
+        self.op_ns(namespace, "merge_revert", json!({ "namespace": namespace, "merge_id": merge_id, "by": by, "force_skip": force_skip })).await
     }
 
     async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
-        self.engine_of(namespace).await?.parent_rows(memory, namespace, branch, at).await
+        self.op_ns(namespace, "parent_rows", json!({ "memory": memory, "namespace": namespace, "branch": branch, "at": at })).await
     }
 
     async fn branch_place(&self, namespace: &str, name: &str, url: &str) -> Result<crate::branches::Branch, String> {
-        self.engine_of(namespace).await?.branch_place(namespace, name, url).await
+        self.op_ns(namespace, "branch_place", json!({ "namespace": namespace, "name": name, "url": url })).await
     }
 
     async fn branch_pending(&self, namespace: &str, name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
-        self.engine_of(namespace).await?.branch_pending(namespace, name).await
+        self.op_ns(namespace, "branch_pending", json!({ "namespace": namespace, "name": name })).await
     }
 
     async fn branch_pending_ack(&self, namespace: &str, name: &str, n: usize) -> Result<(), String> {
-        self.engine_of(namespace).await?.branch_pending_ack(namespace, name, n).await
+        self.op_ns(namespace, "branch_pending_ack", json!({ "namespace": namespace, "name": name, "n": n })).await
     }
 
     async fn tag_create(&self, namespace: &str, name: &str, created_by: Option<&str>) -> Result<crate::branches::Tag, String> {
-        self.engine_of(namespace).await?.tag_create(namespace, name, created_by).await
+        self.op_ns(namespace, "tag_create", json!({ "namespace": namespace, "name": name, "created_by": created_by })).await
     }
 
     async fn tag_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        self.engine_of(namespace).await?.tag_drop(namespace, name).await
+        self.op_ns(namespace, "tag_drop", json!({ "namespace": namespace, "name": name })).await
     }
 
     async fn tag_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Tag>, String> {
         match namespace {
-            Some(ns) => self.engine_of(ns).await?.tag_list(Some(ns)).await,
-            None => {
-                let mut out = Vec::new();
-                for e in self.data_parts().await? {
-                    out.extend(e.tag_list(None).await?);
-                }
-                Ok(out)
-            }
+            Some(ns) => self.op_ns(ns, "tag_list", json!({ "namespace": ns })).await,
+            None => Ok(self.op_all::<Vec<crate::branches::Tag>>("tag_list", json!({ "namespace": null })).await?.into_iter().flatten().collect()),
         }
     }
 
     async fn layers_get(&self, namespace: &str) -> Result<Vec<crate::branches::Layer>, String> {
-        self.engine_of(namespace).await?.layers_get(namespace).await
+        self.op_ns(namespace, "layers_get", json!({ "namespace": namespace })).await
     }
 
     async fn layers_dependents(&self, space: &str) -> Result<Vec<crate::branches::Dependent>, String> {
-        let mut out = Vec::new();
-        for e in self.data_parts().await? {
-            out.extend(e.layers_dependents(space).await?);
-        }
-        Ok(out)
+        Ok(self.op_all::<Vec<crate::branches::Dependent>>("layers_dependents", json!({ "space": space })).await?.into_iter().flatten().collect())
     }
 
     async fn space_usage(&self, namespace: Option<&str>) -> Result<Value, String> {
         match namespace {
-            Some(ns) => self.engine_of(ns).await?.space_usage(Some(ns)).await,
+            Some(ns) => self.op_ns(ns, "space_usage", json!({ "namespace": ns })).await,
             None => Err("space usage of every namespace in a cluster: ask per namespace".into()),
         }
     }
@@ -744,105 +970,106 @@ impl Engine for Arc<PartitionedEngine> {
     async fn branch_promote(&self, namespace: &str, name: &str, into: &str, allow_stale: bool) -> Result<Value, String> {
         self.note(into).await?;
         if self.partition_of(namespace) == self.partition_of(into) {
-            return self.engine_of(namespace).await?.branch_promote(namespace, name, into, allow_stale).await;
+            return self.op_ns(namespace, "branch_promote", json!({ "namespace": namespace, "name": name, "into": into, "allow_stale": allow_stale })).await;
         }
-        let (src, dst) = (self.engine_of(namespace).await?, self.engine_of(into).await?);
-        let branch = src.promote_check(namespace, name, allow_stale).await?;
-        let rows = src.copy_out(namespace, Some(name), &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools], now()).await?;
-        let n = dst.copy_in(into, rows).await?;
+        let (src, dst) = (self.handle_of(namespace).await?, self.handle_of(into).await?);
+        let branch: crate::branches::Branch = src.op_as("promote_check", json!({ "namespace": namespace, "name": name, "allow_stale": allow_stale })).await?;
+        let all = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
+        let rows: Value = src.op("copy_out", json!({ "namespace": namespace, "branch": name, "memories": all, "at": now() })).await?;
+        let n: u64 = dst.op_as("copy_in", json!({ "into": into, "rows": rows })).await?;
         // D1, as on one engine: the new agent carries the old one's layers, reads its
         // episodes as of now (a history layer, read from the old one's partition), and
         // its first record says where it came from.
-        let old_layers = src.layers_get(namespace).await?;
+        let old_layers: Vec<crate::branches::Layer> = src.op_as("layers_get", json!({ "namespace": namespace })).await?;
         let safe: String = into.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).take(55).collect();
         let tag = format!("promoted-{safe}");
-        src.tag_create(namespace, &tag, None).await?;
+        src.op("tag_create", json!({ "namespace": namespace, "name": tag, "created_by": null })).await?;
         let mut layers = vec![crate::branches::Layer { space: namespace.to_string(), mode: crate::branches::LayerMode::History, tag: Some(tag), memories: vec![MemoryType::Episodic], sealed: false }];
         layers.extend(old_layers);
-        dst.layers_set(into, layers).await?;
+        dst.op("layers_set", json!({ "namespace": into, "layers": layers })).await?;
         let s = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
         let aql = format!(
             "STORE INTO EPISODIC (event = \"promoted_from\", from_namespace = {}, from_branch = {}, point_offset = \"{}\", point_ts = \"{}\") NAMESPACE {}",
             s(namespace), s(name), branch.point_offset, branch.point_ts, s(into)
         );
-        dst.query(&aql, None).await?;
-        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
+        dst.op("query", json!({ "aql": aql, "variables": null })).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
     }
 
     async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {
         self.note(into).await?;
         if self.partition_of(namespace) == self.partition_of(into) {
-            return self.engine_of(namespace).await?.space_clone(namespace, into).await;
+            return self.op_ns(namespace, "space_clone", json!({ "namespace": namespace, "into": into })).await;
         }
-        let rows = self.engine_of(namespace).await?.copy_out(namespace, None, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools], now()).await?;
-        let n = self.engine_of(into).await?.copy_in(into, rows).await?;
-        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
+        let all = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
+        let rows: Value = self.handle_of(namespace).await?.op("copy_out", json!({ "namespace": namespace, "branch": null, "memories": all, "at": now() })).await?;
+        let n: u64 = self.op_ns(into, "copy_in", json!({ "into": into, "rows": rows })).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
     }
 
     async fn space_clone_at(&self, namespace: &str, into: &str, at: &crate::branches::PointRef) -> Result<Value, String> {
         self.note(into).await?;
         if self.partition_of(namespace) == self.partition_of(into) {
-            return self.engine_of(namespace).await?.space_clone_at(namespace, into, at).await;
+            return self.op_ns(namespace, "space_clone_at", json!({ "namespace": namespace, "into": into, "at": at })).await;
         }
-        let src = self.engine_of(namespace).await?;
-        let (offset, ts) = src.resolve_point(namespace, at).await?;
-        let rows = src.copy_out(namespace, None, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools], ts).await?;
-        let n = self.engine_of(into).await?.copy_in(into, rows).await?;
-        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
+        let src = self.handle_of(namespace).await?;
+        let (offset, ts): (u64, adb_core::log::CommitTs) = src.op_as("resolve_point", json!({ "namespace": namespace, "at": at })).await?;
+        let all = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
+        let rows: Value = src.op("copy_out", json!({ "namespace": namespace, "branch": null, "memories": all, "at": ts })).await?;
+        let n: u64 = self.op_ns(into, "copy_in", json!({ "into": into, "rows": rows })).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
     }
 
     async fn space_copy_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<Value, String> {
         self.note(into).await?;
         if self.partition_of(namespace) == self.partition_of(into) {
-            return self.engine_of(namespace).await?.space_copy_procedures(namespace, into, tools).await;
+            return self.op_ns(namespace, "space_copy_procedures", json!({ "namespace": namespace, "into": into, "tools": tools })).await;
         }
-        let memories: &[MemoryType] = if tools { &[MemoryType::Procedural, MemoryType::Tools] } else { &[MemoryType::Procedural] };
-        let rows = self.engine_of(namespace).await?.copy_out(namespace, None, memories, now()).await?;
-        let n = self.engine_of(into).await?.copy_in(into, rows).await?;
-        Ok(serde_json::json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN }, "procedures_only": true }))
+        let memories: Vec<MemoryType> = if tools { vec![MemoryType::Procedural, MemoryType::Tools] } else { vec![MemoryType::Procedural] };
+        let rows: Value = self.handle_of(namespace).await?.op("copy_out", json!({ "namespace": namespace, "branch": null, "memories": memories, "at": now() })).await?;
+        let n: u64 = self.op_ns(into, "copy_in", json!({ "into": into, "rows": rows })).await?;
+        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN }, "procedures_only": true }))
     }
 
     async fn layers_set(&self, namespace: &str, layers: Vec<crate::branches::Layer>) -> Result<crate::branches::Layers, String> {
         // Layer spaces are read from their own partitions (RouterSpaces).
         self.note(namespace).await?;
-        self.engine_of(namespace).await?.layers_set(namespace, layers).await
+        self.op_ns(namespace, "layers_set", json!({ "namespace": namespace, "layers": layers })).await
     }
 
     // ---- every partition
 
     async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
-        let mut n = 0;
-        for e in self.data_parts().await? {
-            n += e.forget_lineages(memory, lineages).await?;
-        }
-        Ok(n)
+        Ok(self.op_all::<u64>("forget_lineages", json!({ "memory": memory, "lineages": lineages })).await?.into_iter().sum())
     }
 
     // ---- quotas: kept once, in the system partition (every partition reads them)
 
     async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>, history_days: Option<u64>) -> Result<crate::branches::Quota, String> {
-        self.system.quota_set(pattern, max_bytes, max_records, history_days).await
+        self.system_handle().await?.op_as("quota_set", json!({ "pattern": pattern, "max_bytes": max_bytes, "max_records": max_records, "history_days": history_days })).await
     }
 
     async fn quota_drop(&self, pattern: &str) -> Result<bool, String> {
-        self.system.quota_drop(pattern).await
+        self.system_handle().await?.op_as("quota_drop", json!({ "pattern": pattern })).await
     }
 
     async fn quota_list(&self) -> Result<Vec<crate::branches::Quota>, String> {
-        self.system.quota_list().await
+        self.system_handle().await?.op_as("quotas", json!({})).await
     }
 
     // ---- settings: cluster-wide
 
     async fn embedding(&self) -> Result<Value, String> {
-        self.system.embedding().await
+        self.system_handle().await?.op("embedding", json!({})).await
     }
 
     /// Checked and saved by the system partition (which restarts ADB to apply them),
-    /// and saved for every other partition, so all embed with one model.
+    /// and saved for every other partition on this node, so all embed with one model.
+    /// Changed on the node owning the system partition.
     async fn set_embedding(&self, settings: Value) -> Result<Value, String> {
+        let s = self.system.get().ok_or("embedding settings are changed on the node owning the system partition")?;
         let c: adb_embed::EmbedConfig = serde_json::from_value(settings.clone()).map_err(|e| format!("embedding settings: {e}"))?;
-        let r = self.system.set_embedding(settings).await?;
+        let r = s.set_embedding(settings).await?;
         if let Ok(dirs) = std::fs::read_dir(self.dir.join("parts")) {
             for d in dirs.flatten().filter(|d| d.path().is_dir()) {
                 c.save(&d.path())?;
@@ -852,24 +1079,29 @@ impl Engine for Arc<PartitionedEngine> {
     }
 
     async fn cache(&self) -> Result<Value, String> {
-        self.system.cache().await
+        self.system_handle().await?.op("cache", json!({})).await
     }
 
-    /// Applied to the system partition and every open one (saved by each); a partition
-    /// opened later copies the system partition's.
+    /// Applied to the system partition and every partition holding data (each saves
+    /// them); a partition opened later copies the system partition's.
     async fn set_cache(&self, settings: Value) -> Result<Value, String> {
-        let r = self.system.set_cache(settings.clone()).await?;
-        for e in self.parts.lock().await.values() {
+        let r = self.system_handle().await?.op("set_cache", json!({ "settings": settings })).await?;
+        let sys = self.sys();
+        for (p, e) in self.parts.lock().await.iter().filter(|(p, _)| **p != sys) {
+            let _ = p;
             e.set_cache(settings.clone()).await?;
+        }
+        for h in self.data_handles().await? {
+            if let Handle::Remote(r) = h {
+                r.op("set_cache", json!({ "settings": settings })).await?;
+            }
         }
         Ok(r)
     }
 
     async fn compact(&self) -> Result<Value, String> {
-        let mut out = vec![self.system.compact().await?];
-        for e in self.data_parts().await? {
-            out.push(e.compact().await?);
-        }
+        let mut out = vec![self.system_handle().await?.op("compact", json!({})).await?];
+        out.extend(self.op_all::<Value>("compact", json!({})).await?);
         Ok(Value::Array(out))
     }
 }

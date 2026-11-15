@@ -63,7 +63,7 @@ pub fn system_partition(map: &PartitionMap) -> Partition {
 }
 
 /// The namespaces a call may reach.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reach {
     /// A full-access token: every namespace.
     All,

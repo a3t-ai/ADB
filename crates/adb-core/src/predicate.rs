@@ -493,7 +493,7 @@ pub struct Modifiers {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_fields: Option<Vec<String>>,
     /// Query timeout
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "option_duration_millis")]
     pub timeout: Option<Duration>,
     /// Minimum confidence/similarity threshold
@@ -509,7 +509,7 @@ pub struct Modifiers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Time-to-live for stored records
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "option_duration_millis")]
     pub ttl: Option<Duration>,
     /// Aggregate functions

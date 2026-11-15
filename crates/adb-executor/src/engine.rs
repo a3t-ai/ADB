@@ -698,6 +698,11 @@ impl LocalEngine {
         Box::pin(Self::durable_with(dir, wal, None, Some(parent), PartitionRole::SINGLE)).await
     }
 
+    /// The engine's data directory.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     /// This partition's own table and registry, for a router reading other partitions'
     /// spaces (`crate::spaces`).
     pub fn local_spaces(&self) -> Option<crate::spaces::LocalSpaces> {
