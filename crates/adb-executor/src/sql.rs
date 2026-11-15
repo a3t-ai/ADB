@@ -5,7 +5,8 @@
 //! |---|---|
 //! | `memory_raw` | the memory table as stored: every version, edges, tombstones, `_meta`; `value` is JSONB |
 //! | `memory` | the same rows, readable: `value` as JSON text, `sealed` / `embedding` as booleans |
-//! | `memory_current` | `memory`'s current rows (not superseded, forgotten or expired; no `_meta`) |
+//! | `memory_current` | `memory`'s current rows (not superseded, forgotten or expired; no `_meta`, no tombstone-log entries) |
+//! | `tombstone_log` | every FORGET and expiry, as the tombstone log records it (`value`: event, lineage, memory, key, namespace, rows, time, offset) |
 //! | `<table>` | each platform table (`flowr_workflows`, `users`, …), as stored |
 //!
 //! DDL, DML and statements (`SET`, transactions) are refused; results stop at a row
@@ -106,10 +107,11 @@ async fn memory_views(ctx: &SessionContext) -> DfResult<()> {
     ctx.sql(&format!(
         "CREATE VIEW memory_current AS SELECT * FROM memory WHERE NOT tombstone AND superseded_by IS NULL \
          AND (valid_to IS NULL OR valid_to > now()) AND (ttl_at IS NULL OR ttl_at > now()) \
-         AND id <> '{}' AND kind <> 'meta'",
+         AND id <> '{}' AND kind <> 'meta' AND kind <> 'tomb_log'",
         adb_store::META_ID
     ))
     .await?;
+    ctx.sql("CREATE VIEW tombstone_log AS SELECT * FROM memory WHERE kind = 'tomb_log'").await?;
     Ok(())
 }
 

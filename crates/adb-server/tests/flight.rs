@@ -196,12 +196,16 @@ async fn sql_over_memory_and_platform_tables() {
     assert_eq!(ids(&rows), ["2"], "f1 has two versions");
     let rows = get(&mut c, sql("SELECT id FROM memory_raw WHERE id = '_meta'")).await.unwrap();
     assert_eq!(ids(&rows), ["_meta"]);
+    // The FORGET of f2, in the tombstone log.
+    let rows = get(&mut c, sql("SELECT key AS id, value FROM tombstone_log")).await.unwrap();
+    assert_eq!(ids(&rows), ["f2"], "{rows:?}");
+    assert!(rows[0]["value"].as_str().unwrap().contains("\"event\":\"forget\""), "{rows:?}");
 
     // A join across memory and a platform table, and the table list.
     let rows = get(&mut c, sql("SELECT a.id FROM agent_configs a JOIN memory_current m ON m.key = 'f1' WHERE a.org_id = 'o2'")).await.unwrap();
     assert_eq!(ids(&rows), ["a3"]);
     let rows = get(&mut c, sql("SELECT table_name AS id FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name")).await.unwrap();
-    assert_eq!(ids(&rows), ["agent_configs", "memory", "memory_current", "memory_raw"]);
+    assert_eq!(ids(&rows), ["agent_configs", "memory", "memory_current", "memory_raw", "tombstone_log"]);
 
     // The limit, and writes refused.
     let rows = get(&mut c, json!({ "sql": "SELECT id FROM agent_configs", "limit": 2 })).await.unwrap();
