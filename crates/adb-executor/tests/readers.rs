@@ -52,6 +52,7 @@ fn ns_of(v: &Value) -> Vec<i64> {
 async fn every_node_reads_from_its_own_readers() {
     let cold = tempfile::tempdir().unwrap();
     std::env::set_var("ADB_COLD_URI", format!("file://{}", cold.path().display()));
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
     std::env::set_var("ADB_READER_REBASE_SECS", "1");
     let peers = LocalPeers::new();
@@ -77,7 +78,16 @@ async fn every_node_reads_from_its_own_readers() {
 
     // Read through node 2: its reader answers, and has everything.
     let q = format!(r#"RECALL FROM SEMANTIC WHERE n >= 0 NAMESPACE "{ns}" LIMIT 100"#);
-    let v = n2.query(&q, None).await.unwrap();
+    // The reader is built in the background; meanwhile the owner answers.
+    let mut v = n2.query(&q, None).await.unwrap();
+    assert_eq!(ns_of(&v), (0..25).collect::<Vec<_>>(), "answered while the reader builds");
+    for _ in 0..100 {
+        if v["metadata"]["served_by"] == "follower" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        v = n2.query(&q, None).await.unwrap();
+    }
     assert_eq!(v["metadata"]["served_by"], "follower", "served by node 2's reader: {}", v["metadata"]);
     assert_eq!(ns_of(&v), (0..25).collect::<Vec<_>>());
     assert!(d2.path().join(format!("parts/reader-p{p}")).exists(), "the reader is on node 2's disk");

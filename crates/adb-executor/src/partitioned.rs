@@ -125,7 +125,9 @@ pub struct PartitionedEngine {
     /// What this node holds as the replica of other nodes' partitions (step 5).
     replicas: Arc<crate::replication::ReplicaBuffers>,
     /// Readers of partitions other nodes own (step 6), opened on first read.
-    readers: tokio::sync::Mutex<HashMap<Partition, Arc<crate::readers::Reader>>>,
+    readers: std::sync::Mutex<HashMap<Partition, ReaderSlot>>,
+    /// At most this many readers built at once (each replays its partition's tail).
+    reader_builds: Arc<tokio::sync::Semaphore>,
     me: std::sync::Weak<PartitionedEngine>,
 }
 
@@ -146,6 +148,20 @@ impl crate::readers::ReaderSource for OwnerSource {
         let node = self.node.upgrade().ok_or("the partition router has stopped")?;
         node.handle(self.partition).await?.op_as("commit_offset", json!({})).await
     }
+}
+
+/// A reader's state on this node.
+enum ReaderSlot {
+    /// Being built in the background: reads go to the owner meanwhile.
+    Building,
+    Ready(Arc<crate::readers::Reader>),
+    /// The last build failed: tried again after a while.
+    Failed(std::time::Instant),
+}
+
+/// `ADB_READER_BUILDS`: readers built at once on a node (default 4).
+fn reader_builds() -> usize {
+    std::env::var("ADB_READER_BUILDS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(4)
 }
 
 /// `ADB_READERS`: readers on (default) or off (`0`: reads go to the owner).
@@ -295,6 +311,10 @@ impl PartitionedEngine {
                             tracing::warn!(partition = p, error = %e, "taking the partition over failed; retrying");
                         }
                     }
+                    // Readers of the partitions others own, built ahead of the first read.
+                    if Some(a.owner) != me && *p != node.sys() {
+                        let _ = node.reader(*p).await;
+                    }
                 }
             }
         });
@@ -314,6 +334,7 @@ impl PartitionedEngine {
             spaces: Arc::new(RouterSpaces { node: me.clone() }),
             replicas: Arc::new(crate::replication::ReplicaBuffers::new(dir.join("parts"))),
             readers: Default::default(),
+            reader_builds: Arc::new(tokio::sync::Semaphore::new(reader_builds())),
             me: me.clone(),
         })
     }
@@ -404,31 +425,53 @@ impl PartitionedEngine {
     /// The reader of memory partition `p`, if this node reads it rather than owns it
     /// (a cluster, object storage, `ADB_READERS` on): opened on first use; `None` falls
     /// back to asking the owner.
+    ///
+    /// A reader is built in the background (a few at a time, `ADB_READER_BUILDS`): until
+    /// it is ready this answers `None`, and the read goes to the owner — a read never
+    /// waits for a reader to be built.
     pub async fn reader(&self, p: Partition) -> Option<Arc<crate::readers::Reader>> {
         if self.cluster.is_none() || !readers_on() || p == self.sys() {
             return None;
         }
-        let mut readers = self.readers.lock().await;
-        if self.owns(p) {
-            // Owned now (a takeover): its reader is of no more use.
-            readers.remove(&p);
-            return None;
-        }
-        if let Some(r) = readers.get(&p) {
-            return Some(Arc::clone(r));
-        }
         let cold = crate::engine::object_storage()?;
-        let source = Arc::new(OwnerSource { partition: p, node: self.me.clone() });
-        match Box::pin(crate::readers::Reader::open(self.dir.join("parts").join(format!("reader-p{p}")), p, Some(cold), source)).await {
-            Ok(r) => {
-                readers.insert(p, Arc::clone(&r));
-                Some(r)
+        {
+            let mut readers = self.readers.lock().unwrap();
+            if self.owns(p) {
+                // Owned now (a takeover): its reader is of no more use.
+                readers.remove(&p);
+                return None;
             }
-            Err(e) => {
-                tracing::warn!(partition = p, error = %e, "reader not opened; reads go to the owner");
-                None
+            match readers.get(&p) {
+                Some(ReaderSlot::Ready(r)) => return Some(Arc::clone(r)),
+                Some(ReaderSlot::Building) => return None,
+                Some(ReaderSlot::Failed(at)) if at.elapsed() < std::time::Duration::from_secs(30) => return None,
+                _ => {}
             }
+            readers.insert(p, ReaderSlot::Building);
         }
+        let me = self.me.upgrade()?;
+        let permits = Arc::clone(&self.reader_builds);
+        tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            let source = Arc::new(OwnerSource { partition: p, node: Arc::downgrade(&me) });
+            let t0 = std::time::Instant::now();
+            let built = Box::pin(crate::readers::Reader::open(me.dir.join("parts").join(format!("reader-p{p}")), p, Some(cold), source)).await;
+            let mut readers = me.readers.lock().unwrap();
+            match built {
+                Ok(r) if !me.owns(p) => {
+                    tracing::info!(partition = p, took_ms = t0.elapsed().as_millis() as u64, "reader ready");
+                    readers.insert(p, ReaderSlot::Ready(r));
+                }
+                Ok(_) => {
+                    readers.remove(&p);
+                }
+                Err(e) => {
+                    tracing::warn!(partition = p, error = %e, "reader not built; reads go to the owner, retried later");
+                    readers.insert(p, ReaderSlot::Failed(std::time::Instant::now()));
+                }
+            }
+        });
+        None
     }
 
     async fn system_handle(&self) -> Result<Handle, String> {
@@ -628,7 +671,11 @@ impl PartitionedEngine {
         // A read of a partition another node owns: answered here, by its reader (step 6).
         if !self.owns(p) && crate::follower::follower_reads(aql) {
             if let Some(r) = self.reader(p).await {
-                return Box::pin(r.query(aql, variables)).await;
+                // A reader behind or failing: the owner answers instead.
+                match Box::pin(r.query(aql, variables)).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => tracing::debug!(partition = p, error = %e, "reader didn't answer; asking the owner"),
+                }
             }
         }
         let mut last: Option<String> = None;
@@ -655,7 +702,10 @@ impl PartitionedEngine {
         if first.eq_ignore_ascii_case("WATCH") {
             return Err("WATCH needs NAMESPACE in a cluster: watches across partitions come later".into());
         }
-        self.refresh_catalog().await?;
+        // At most ADB_CATALOG_TTL_MS old: a namespace another node created within that
+        // may be missed by a statement naming none (re-reading it on every such
+        // statement cost a platform-table read each).
+        self.catalog_recent().await?;
         let io = Arc::new(Routed { node: Arc::clone(self), reach: reach.clone() });
         let executor = Executor::with_io(Arc::clone(&io) as Arc<dyn Writes>, io as Arc<dyn Reads>);
         let r = match variables {

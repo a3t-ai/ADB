@@ -89,6 +89,8 @@ const READS: &[&str] = &[
 #[tokio::test(flavor = "multi_thread")]
 async fn any_node_answers_and_a_stale_map_corrects_itself() {
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     let ref_dir = tempfile::tempdir().unwrap();
     let (reference, _) = LocalEngine::durable(ref_dir.path()).await.unwrap();
     let reference: Arc<dyn Engine> = Arc::new(reference);

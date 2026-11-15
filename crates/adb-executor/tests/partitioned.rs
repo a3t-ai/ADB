@@ -67,6 +67,8 @@ const READS: &[&str] = &[
 #[tokio::test(flavor = "multi_thread")]
 async fn partitions_answer_as_one_engine_and_scopes_hold() {
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     let ref_dir = tempfile::tempdir().unwrap();
     let (reference, _) = LocalEngine::durable(ref_dir.path()).await.unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -122,6 +124,8 @@ async fn partitions_answer_as_one_engine_and_scopes_hold() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shared_partition_never_leaks_across_the_scope() {
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
     let home = node.partition_of("a3t-shared--bot");
@@ -171,6 +175,8 @@ async fn memory_layers_reach_across_partitions() {
     use adb_core::MemoryType;
     use adb_executor::branches::{Layer, LayerMode};
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
     let (src, dst) = ("compliance", (0..1000).map(|i| format!("trading{i}")).find(|n| node.partition_of(n) != node.partition_of("compliance")).unwrap());
@@ -233,6 +239,8 @@ async fn memory_layers_reach_across_partitions() {
 async fn copies_cross_partitions() {
     use adb_executor::branches::PointRef;
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
     let elsewhere = |prefix: &str| -> &'static str {
@@ -300,6 +308,8 @@ async fn copies_cross_partitions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn quotas_and_settings_span_partitions() {
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     let dir = tempfile::tempdir().unwrap();
     let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
     let a = "acme--a";

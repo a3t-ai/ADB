@@ -65,6 +65,8 @@ fn records(v: &Value) -> Vec<Value> {
 #[tokio::test(flavor = "multi_thread")]
 async fn any_node_over_http_and_flight() {
     std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     std::env::set_var("ADB_SCOPED_TOKENS", json!([{ "name": "a3t", "token": SCOPED, "write": ["a3t-shared--*"] }]).to_string());
     // The map: partition p owned by node p % 3 + 1; every node's two endpoints.
     let ports: Vec<(u16, u16)> = (0..3).map(|_| (free_port(), free_port())).collect();

@@ -62,6 +62,7 @@ fn ns_of(v: &Value) -> Vec<i64> {
 async fn killing_an_owner_loses_no_acknowledged_write() {
     let cold = tempfile::tempdir().unwrap();
     std::env::set_var("ADB_COLD_URI", format!("file://{}", cold.path().display()));
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
     std::env::set_var("ADB_ARCHIVE_EVERY_SECS", "3600");
     std::env::set_var("ADB_WAL_SEGMENT_MS", "3600000"); // segments only when asked
     let peers = LocalPeers::new();
