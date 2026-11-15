@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adb_cluster::map::{Partition, PartitionMap};
@@ -114,14 +114,12 @@ pub struct PartitionedEngine {
     /// Each partition's engine, opened once: concurrent callers share the one open, and
     /// partitions open (or are taken over) side by side — no node-wide lock (a takeover
     /// of one partition held up every request, and a second opener raced the first).
-    parts: std::sync::Mutex<HashMap<Partition, PartSlot>>,
+    parts: std::sync::Mutex<HashMap<Partition, (u64, PartSlot)>>,
     /// Partitions being taken over by the background task, and how many at once.
     opening: std::sync::Mutex<BTreeSet<Partition>>,
     /// Takeovers done here (tests, metrics).
     taken_over: std::sync::atomic::AtomicU64,
     takeovers: Arc<tokio::sync::Semaphore>,
-    /// The system partition's engine, once this node has opened it (it owns it).
-    system: OnceLock<Arc<LocalEngine>>,
     /// Namespace → partition, as recorded in [`CATALOG`] (refreshed before every
     /// statement spanning partitions: other nodes add namespaces too).
     catalog: std::sync::RwLock<BTreeMap<String, Partition>>,
@@ -372,6 +370,7 @@ impl PartitionedEngine {
                     }
                 }
                 node.drop_idle_readers();
+                node.drop_unowned();
             }
         });
         Ok(node)
@@ -387,7 +386,6 @@ impl PartitionedEngine {
             opening: Default::default(),
             taken_over: Default::default(),
             takeovers: Arc::new(tokio::sync::Semaphore::new(takeovers())),
-            system: OnceLock::new(),
             catalog: Default::default(),
             catalog_at: Default::default(),
             spaces: Arc::new(RouterSpaces { node: me.clone() }),
@@ -479,6 +477,26 @@ impl PartitionedEngine {
         self.ready_reader(p).is_some()
     }
 
+    /// Close the engines of partitions this node no longer owns (moved by a failover or
+    /// a rebalance): they take no writes, and a later takeover opens a fresh one.
+    fn drop_unowned(&self) {
+        if self.cluster.is_none() {
+            return;
+        }
+        let map = self.map();
+        let me = self.cluster.as_ref().map(|c| c.placement.me());
+        let mut parts = self.parts.lock().unwrap();
+        let gone: Vec<Partition> = parts
+            .iter()
+            .filter(|(p, (e, c))| c.initialized() && map.assignments.get(p).is_none_or(|a| Some(a.owner) != me || a.epoch != *e))
+            .map(|(p, _)| *p)
+            .collect();
+        for p in gone {
+            parts.remove(&p);
+            tracing::info!(partition = p, "partition moved away: its engine closed here");
+        }
+    }
+
     /// The reader of `p` if one is ready here (none is built).
     fn ready_reader(&self, p: Partition) -> Option<Arc<crate::readers::Reader>> {
         match self.readers.lock().unwrap().get(&p) {
@@ -532,12 +550,14 @@ impl PartitionedEngine {
             std::fs::remove_dir_all(pdir).map_err(|e| format!("taking over partition {p}: {e}"))?;
         }
         let cold = crate::engine::object_storage();
+        // Sealed first: from here no record of the old owner is acknowledged by this
+        // replica, so the tail taken now holds every one it ever acknowledged.
+        let (tail_epoch, tail) = self.replicas.seal(p, epoch)?;
         let mut ends_at = 0;
         if let Some(cold) = &cold {
             let st = crate::restore::restore_partition_from_object_storage(pdir, cold, adb_core::log::PartitionId(p), Some(epoch)).await?;
             ends_at = st.log_ends_at;
         }
-        let (tail_epoch, tail) = self.replicas.tail(p)?;
         let role = if p == self.sys() { PartitionRole::system(p) } else { PartitionRole::memory(p) };
         let mut appended = 0;
         if !tail.is_empty() && tail_epoch < epoch {
@@ -625,8 +645,21 @@ impl PartitionedEngine {
     /// partition's, through here again.
     pub fn part(&self, p: Partition) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Arc<LocalEngine>, String>> + Send + '_>> {
         Box::pin(async move {
-            let slot = Arc::clone(self.parts.lock().unwrap().entry(p).or_default());
+            // One slot per partition and epoch: a partition this node owns again at a
+            // newer epoch gets a new slot (and a takeover); an engine a newer owner fenced
+            // at this epoch answers `moved` until the map here catches up.
+            let epoch = self.map().assignments.get(&p).map_or(0, |a| a.epoch);
+            let slot = {
+                let mut parts = self.parts.lock().unwrap();
+                if parts.get(&p).is_some_and(|(e, _)| *e != epoch) {
+                    parts.remove(&p);
+                }
+                Arc::clone(&parts.entry(p).or_insert_with(|| (epoch, Default::default())).1)
+            };
             if let Some(e) = slot.get() {
+                if e.moved() {
+                    return Err(format!("moved: partition {p} moved to a newer owner; retry"));
+                }
                 return Ok(Arc::clone(e));
             }
             let t0 = std::time::Instant::now();
@@ -664,8 +697,8 @@ impl PartitionedEngine {
         if p != sys {
             // Cluster-wide settings (one embedding model, one set of cache rules): the
             // system partition's, copied before a partition opens.
-            let settings: Value = match self.system.get() {
-                Some(s) => dispatch_op(s, "settings", json!({})).await?,
+            let settings: Value = match self.system_local() {
+                Some(s) => dispatch_op(&s, "settings", json!({})).await?,
                 // Boxed: opening a partition may reach the system partition's handle.
                 None => Box::pin(self.system_handle()).await?.op("settings", json!({})).await.unwrap_or(Value::Null),
             };
@@ -697,15 +730,22 @@ impl PartitionedEngine {
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
-        if p == sys {
-            let _ = self.system.set(Arc::clone(&e));
-        }
         Ok(e)
+    }
+
+    /// The system partition's engine, while this node owns it and has it open: looked
+    /// up, not kept, so an engine closed when the partition moved away is not used.
+    fn system_local(&self) -> Option<Arc<LocalEngine>> {
+        if !self.owns(self.sys()) {
+            return None;
+        }
+        let parts = self.parts.lock().unwrap();
+        parts.get(&self.sys()).and_then(|(_, c)| c.get().cloned()).filter(|e| !e.moved())
     }
 
     /// The partitions open here, with their engines.
     fn opened(&self) -> Vec<(Partition, Arc<LocalEngine>)> {
-        self.parts.lock().unwrap().iter().filter_map(|(p, c)| c.get().map(|e| (*p, Arc::clone(e)))).collect()
+        self.parts.lock().unwrap().iter().filter_map(|(p, (_, c))| c.get().map(|e| (*p, Arc::clone(e)))).collect()
     }
 
     /// Every namespace written so far, with its partition (as last read).
@@ -1346,7 +1386,7 @@ impl Engine for Arc<PartitionedEngine> {
     /// The platform tables, on the node owning the system partition (`None` elsewhere:
     /// the transports send those calls to that node, step 4b).
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
-        self.system.get().and_then(|s| s.platform())
+        self.system_local().and_then(|s| s.platform())
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
@@ -1359,11 +1399,11 @@ impl Engine for Arc<PartitionedEngine> {
 
     /// FlowR's engine store, on the node owning the system partition (step 4b).
     fn flowr_engine(&self, space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
-        self.system.get().and_then(|s| s.flowr_engine(space))
+        self.system_local().and_then(|s| s.flowr_engine(space))
     }
 
     async fn engine_restore(&self, space: &str, changes: Vec<Value>, first: bool) -> Result<usize, String> {
-        let s = self.system.get().ok_or("FlowR's engine store is on the node owning the system partition")?;
+        let s = self.system_local().ok_or("FlowR's engine store is on the node owning the system partition")?;
         s.engine_restore(space, changes, first).await
     }
 
@@ -1571,7 +1611,7 @@ impl Engine for Arc<PartitionedEngine> {
     /// and saved for every other partition on this node, so all embed with one model.
     /// Changed on the node owning the system partition.
     async fn set_embedding(&self, settings: Value) -> Result<Value, String> {
-        let s = self.system.get().ok_or("embedding settings are changed on the node owning the system partition")?;
+        let s = self.system_local().ok_or("embedding settings are changed on the node owning the system partition")?;
         let c: adb_embed::EmbedConfig = serde_json::from_value(settings.clone()).map_err(|e| format!("embedding settings: {e}"))?;
         let r = s.set_embedding(settings).await?;
         if let Ok(dirs) = std::fs::read_dir(self.dir.join("parts")) {

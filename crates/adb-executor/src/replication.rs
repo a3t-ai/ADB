@@ -300,6 +300,9 @@ struct Buffer {
     /// Records have arrived from this epoch's owner with no gap: everything it
     /// acknowledged is here (before that, it may hold some it hasn't sent here yet).
     synced: bool,
+    /// This node took the partition over at this epoch ([`ReplicaBuffers::seal`]):
+    /// records of older epochs are refused from then on, whatever the map says.
+    sealed: u64,
 }
 
 /// What a node keeps as the replica of other nodes' partitions.
@@ -333,9 +336,14 @@ impl ReplicaBuffers {
         }
         let mut parts = self.parts.lock().unwrap();
         let b = parts.entry(p).or_default();
+        // Taken over here: the old owner's records can no longer be acknowledged (the
+        // map this call was checked against may be older than the takeover).
+        if req.epoch < b.sealed {
+            return Err(format!("fenced: partition {p} was taken over here at epoch {}; epoch {} is stale", b.sealed, req.epoch));
+        }
         if req.epoch > b.epoch {
             // A new owner: what an older one sent is replaced by what this one holds.
-            *b = Buffer { epoch: req.epoch, ..Default::default() };
+            *b = Buffer { epoch: req.epoch, sealed: b.sealed, ..Default::default() };
             let _ = std::fs::remove_file(self.spill_path(p));
         }
         if req.epoch < b.epoch {
@@ -447,10 +455,29 @@ impl ReplicaBuffers {
         Some(out)
     }
 
+    /// Take partition `p` over at `epoch`: from now on no record of an older epoch is
+    /// accepted (an append that checked an older map is refused here, under the same
+    /// lock), and what is held now is returned — every record this replica ever
+    /// acknowledged for the old owner. Read the tail any other way and an append landing
+    /// after the read is acknowledged yet missing from the new owner's log (Hetzner
+    /// round 6: 22 acknowledged writes lost).
+    pub fn seal(&self, p: Partition, epoch: u64) -> Result<(u64, Vec<LogRecord>), String> {
+        {
+            let mut parts = self.parts.lock().unwrap();
+            let b = parts.entry(p).or_default();
+            b.sealed = b.sealed.max(epoch);
+        }
+        self.tail(p)
+    }
+
     /// Forget partition `p`'s buffer (this node took the partition over: its tail is in
-    /// the new owner's log now).
+    /// the new owner's log now). The seal stays.
     pub fn clear(&self, p: Partition) {
-        self.parts.lock().unwrap().remove(&p);
+        let mut parts = self.parts.lock().unwrap();
+        if let Some(b) = parts.get_mut(&p) {
+            *b = Buffer { sealed: b.sealed, ..Default::default() };
+        }
+        drop(parts);
         let _ = std::fs::remove_file(self.spill_path(p));
     }
 

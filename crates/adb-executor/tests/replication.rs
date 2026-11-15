@@ -55,6 +55,26 @@ fn the_replica_buffer() {
     assert!(e.starts_with("replica_full:"), "{e}");
 }
 
+/// A takeover seals the buffer: the tail it reads holds every record this replica
+/// acknowledged, and an append of the old epoch that checked an older map (the map
+/// here passes it) is refused from then on — before, one landing after the tail was
+/// read was acknowledged and lost (Hetzner round 6). Clearing keeps the seal.
+#[test]
+fn a_takeover_seals_the_replica_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = ReplicaBuffers::with_limits(dir.path(), 1 << 20, 1 << 24);
+    assert_eq!(b.append(5, 1, req(1, 0, 1, 10)).unwrap().held, 10);
+    let (epoch, tail) = b.seal(5, 2).unwrap();
+    assert_eq!((epoch, tail.len()), (1, 10), "every acknowledged record");
+    // The old owner's next records, checked against a map still at epoch 1: refused.
+    let e = b.append(5, 1, req(1, 0, 11, 12)).unwrap_err();
+    assert!(e.starts_with("fenced:"), "{e}");
+    b.clear(5);
+    assert!(b.append(5, 1, req(1, 0, 11, 12)).unwrap_err().starts_with("fenced:"), "the seal outlives the buffer");
+    // The new owner (epoch 2) replicates as usual.
+    assert_eq!(b.append(5, 2, req(2, 10, 11, 12)).unwrap().held, 12);
+}
+
 struct Static {
     me: NodeId,
     map: RwLock<Arc<PartitionMap>>,

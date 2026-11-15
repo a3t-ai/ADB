@@ -18,6 +18,20 @@ const token = process.env.ADB_AUTH_TOKEN;
 const H = { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) };
 const run = Date.now().toString(36);
 const ns = k => `perf-res-${run}-${k % NSN}`;
+console.log(`run ${run} (namespaces perf-res-${run}-0..${NSN - 1})`);
+
+// As a load balancer with health checks: a node that couldn't be reached is skipped
+// for 2 s (a dead node no longer holds a writer for its whole timeout).
+const downUntil = new Map();
+const pick = () => {
+  const now = Date.now();
+  for (let k = 0; k < NODES.length; k++) {
+    const n = NODES[turn++ % NODES.length];
+    if ((downUntil.get(n) ?? 0) <= now) return n;
+  }
+  return NODES[turn++ % NODES.length];
+};
+const unreachable = e => /fetch failed|ECONNREFUSED|EHOSTUNREACH|aborted due to timeout/.test(String(e.message ?? e));
 
 async function q(url, aql, ms = 10000) {
   const r = await fetch(`${url}/query`, { method: 'POST', headers: H, body: JSON.stringify({ query: aql }), signal: AbortSignal.timeout(ms) });
@@ -38,7 +52,7 @@ async function writer() {
     const i = next++;
     const key = `${run}k${i}`;
     for (let attempt = 0; attempt < NODES.length * 4 && Date.now() < end; attempt++) {
-      const node = NODES[turn++ % NODES.length];
+      const node = pick();
       try {
         await q(node, `STORE INTO SEMANTIC (key = "${key}", n = ${i}) NAMESPACE "${ns(i)}"`, 8000);
         const now = Date.now();
@@ -51,6 +65,7 @@ async function writer() {
         break;
       } catch (e) {
         errors++;
+        if (unreachable(e)) downUntil.set(node, Date.now() + 2000);
         const m = String(e.message ?? e).slice(0, 60);
         errs.set(m, (errs.get(m) ?? 0) + 1);
         await new Promise(r => setTimeout(r, 20));

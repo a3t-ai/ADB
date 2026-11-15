@@ -940,6 +940,11 @@ impl LocalEngine {
     }
 
     /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
+    /// A newer owner fenced this partition's engine: it takes no more writes.
+    pub fn moved(&self) -> bool {
+        self.durable.as_ref().is_some_and(|d| d.moved())
+    }
+
     pub fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
     }

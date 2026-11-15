@@ -676,6 +676,9 @@ pub struct DurableWrites<L: Log> {
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
     poisoned: Arc<std::sync::atomic::AtomicBool>,
+    /// A newer owner holds this partition (a commit was fenced): this engine takes no
+    /// more writes; the node goes on, and its router drops it (a cluster partition).
+    moved: Arc<std::sync::atomic::AtomicBool>,
     /// DB-7: the last committed record (offset, commit time µs), for answers' memory point.
     last_off: std::sync::atomic::AtomicU64,
     last_ts: std::sync::atomic::AtomicI64,
@@ -2282,7 +2285,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2813,7 +2816,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// reset HTTP/2 stream) dropped `go` unanswered: the committer read that as "did
     /// not commit" and refused every later write, with no log line and no restart.
     fn commit_task(&self, offset: u64, wait: adb_log::CommitWait, go: Option<tokio::sync::oneshot::Sender<bool>>) -> tokio::task::JoinHandle<Result<(), String>> {
-        let (barrier, poisoned) = (self.barrier(), Arc::clone(&self.poisoned));
+        let (barrier, poisoned, moved) = (self.barrier(), Arc::clone(&self.poisoned), Arc::clone(&self.moved));
         tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             let w = wait.await;
@@ -2830,8 +2833,16 @@ impl<L: Log + 'static> DurableWrites<L> {
                     if let Some(b) = &barrier {
                         b.abandon();
                     }
-                    tracing::error!(offset, error = %e, "a submitted record did not commit: this engine stops taking writes and restarts");
-                    crate::engine::request_restart();
+                    // A newer owner fenced this one (the partition moved): only this
+                    // partition stops here. Restarting the node for it took every other
+                    // partition down too (Hetzner round 6).
+                    if e.to_string().contains("fenced:") {
+                        moved.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::warn!(offset, error = %e, "the partition moved to a newer owner: this engine takes no more writes; the node goes on");
+                    } else {
+                        tracing::error!(offset, error = %e, "a submitted record did not commit: this engine stops taking writes and restarts");
+                        crate::engine::request_restart();
+                    }
                     Err(e.to_string())
                 }
             };
@@ -2842,7 +2853,15 @@ impl<L: Log + 'static> DurableWrites<L> {
         })
     }
 
+    /// Whether a newer owner holds this partition (see `moved`).
+    pub fn moved(&self) -> bool {
+        self.moved.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn writable(&self) -> AdbResult<()> {
+        if self.moved() {
+            return Err(AdbError::QueryError("moved: this partition moved to a newer owner; retry".into()));
+        }
         if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(AdbError::Internal("this ADB engine is restarting after a write failed to commit; retry".into()));
         }

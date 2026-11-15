@@ -88,13 +88,20 @@ pub struct ControlNode {
     proposing: tokio::sync::Mutex<()>,
 }
 
-/// `ADB_REBALANCE_SECS`: at most one rebalancing step this often (default 10). A node
-/// taking a partition over needs that long or less (S3 option B, 15 Nov).
+/// `ADB_START_GRACE_SECS`: how long a new leader waits for every voter to be live
+/// before the first placement (default 30).
 fn start_grace() -> std::time::Duration {
     std::time::Duration::from_secs(std::env::var("ADB_START_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30))
 }
 
-/// `ADB_REBALANCE_SECS` (see [`rebalance_every`]).
+/// `ADB_REBALANCE_SETTLE_SECS`: how long the cluster is whole, with no repair, before
+/// rebalancing (default 60).
+fn rebalance_settle() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("ADB_REBALANCE_SETTLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60))
+}
+
+/// `ADB_REBALANCE_SECS`: at most one rebalancing step this often (default 10). A node
+/// taking a partition over needs that long or less (S3 option B, 15 Nov).
 fn rebalance_every() -> std::time::Duration {
     std::time::Duration::from_secs(std::env::var("ADB_REBALANCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10))
 }
@@ -155,6 +162,9 @@ impl ControlNode {
         // A new leader waits a full interval before its first rebalance step.
         let mut rebalanced = std::time::Instant::now();
         let mut led_since = std::time::Instant::now();
+        // The last repair (a lost owner or replica replaced): no rebalancing until the
+        // cluster has been whole for `ADB_REBALANCE_SETTLE_SECS`.
+        let mut repaired = std::time::Instant::now();
         loop {
             tick.tick().await;
             let now = self.is_leader();
@@ -216,8 +226,15 @@ impl ControlNode {
                 }
             }
             let mut changes = plan(&map, &live, &reported);
-            // The map whole: one step toward an even spread, every `ADB_REBALANCE_SECS`.
-            if changes.is_empty() && rebalanced.elapsed() >= rebalance_every() {
+            if !changes.is_empty() {
+                repaired = std::time::Instant::now();
+            }
+            // One step toward an even spread, every `ADB_REBALANCE_SECS`, only while every
+            // member is live and nothing was repaired for `ADB_REBALANCE_SETTLE_SECS`:
+            // moving partitions among the survivors of a failure, under its load, took a
+            // second node down (Hetzner round 6).
+            let whole = map.members.keys().all(|m| live.contains(m));
+            if changes.is_empty() && whole && repaired.elapsed() >= rebalance_settle() && rebalanced.elapsed() >= rebalance_every() {
                 if let Some(c) = crate::map::rebalance(&map, &live) {
                     rebalanced = std::time::Instant::now();
                     changes.push(c);

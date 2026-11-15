@@ -137,6 +137,11 @@ async fn killing_an_owner_loses_no_acknowledged_write() {
     // Node 1, still thinking it owns the partition, is fenced on its next write.
     let e = nodes[0].query(&format!(r#"STORE INTO SEMANTIC (key = "stale", n = 1000) NAMESPACE "{ns}""#), None).await.unwrap_err();
     assert!(e.contains("fenced") || e.contains("not committed"), "{e}");
+    // Fenced, it stops that partition only: no restart of the node (it took every other
+    // partition down with it, Hetzner round 6), and its next write there says `moved`.
+    assert!(tokio::time::timeout(Duration::from_millis(300), adb_executor::restart_requested()).await.is_err(), "a fence restarts nothing");
+    let e = nodes[0].query(&format!(r#"STORE INTO SEMANTIC (key = "stale2", n = 1001) NAMESPACE "{ns}""#), None).await.unwrap_err();
+    assert!(e.contains("moved") || e.contains("fenced"), "{e}");
     assert!(!ns_of(&nodes[1].query(&q, None).await.unwrap()).contains(&1000), "the stale write is nowhere");
 
     // An owner without a lease stops serving its partitions.
