@@ -252,3 +252,32 @@ async fn watch_events_over_sse() {
         assert_eq!(frame["added"][0]["id"], "a", "{frame}");
     }
 }
+
+/// `GET /subscriptions/{id}/events` on one node: a published message arrives as an
+/// SSE `delivery`, an unknown subscription is a 404 (the handler goes through
+/// `Engine::next_events`, the same path a cluster node forwards).
+#[tokio::test]
+async fn subscription_events_over_sse() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let app = adb_server::router(Arc::new(engine));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let (s, v) = post(&format!("{base}/query"), json!({ "query": r#"SUBSCRIBE TOPIC "news""# })).await;
+    assert_eq!(s, 200, "{v}");
+    let sub = v.pointer("/data/data/subscription").and_then(Value::as_str).unwrap().to_string();
+    let (s, v) = post(&format!("{base}/query"), json!({ "query": r#"PUBLISH TOPIC "news" (headline = "one")"# })).await;
+    assert_eq!(s, 200, "{v}");
+    let r = reqwest::get(format!("{base}/subscriptions/{sub}/events")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let mut body = r.bytes_stream();
+    let mut seen = String::new();
+    while !seen.contains("event: delivery") {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.next()).await.expect("a delivery").unwrap().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.contains("\"headline\":\"one\""), "{seen}");
+    assert_eq!(reqwest::get(format!("{base}/subscriptions/nope/events")).await.unwrap().status(), 404);
+}

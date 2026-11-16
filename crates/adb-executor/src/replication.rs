@@ -188,6 +188,17 @@ async fn replicate_loop(
             let records = if last > held {
                 match wal.read(LogOffset(held + 1), batch).await {
                     Ok(r) => r,
+                    // Below `oldest` the WAL was purged — only ever once object storage
+                    // held those records (a partition restored from it starts its WAL
+                    // above the restore floor). The replica takes them as shipped and
+                    // gets the rest from here. Asking for them again forever stalled
+                    // every write after a restart.
+                    Err(adb_log::LogError::Purged { oldest, .. }) => {
+                        let floor = oldest.0.saturating_sub(1);
+                        shipped.fetch_max(floor, std::sync::atomic::Ordering::SeqCst);
+                        held = held.max(floor);
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, from = held + 1, "replication: reading the WAL failed");
                         tokio::time::sleep(backoff).await;
@@ -518,5 +529,47 @@ impl ReplicaBuffers {
     pub fn usage(&self, p: Partition) -> (usize, u64, u64) {
         let parts = self.parts.lock().unwrap();
         parts.get(&p).map(|b| (b.mem.len(), b.mem_bytes, b.spill_bytes)).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod purged_wal_tests {
+    use super::*;
+    use adb_core::log::{CommitTs, Epoch, LogOffset, LogRecord, PartitionId};
+
+    fn rec(o: u64) -> LogRecord {
+        LogRecord { partition: PartitionId(3), offset: LogOffset(o), epoch: Epoch(1), commit_ts: CommitTs(o as i64), txn_id: None, effects: vec![] }
+    }
+
+    struct Buffers(ReplicaBuffers);
+
+    #[async_trait]
+    impl ReplicaTarget for Buffers {
+        fn target(&self) -> Option<(String, u64)> {
+            Some(("replica".into(), 1))
+        }
+        async fn replicate(&self, _addr: &str, req: ReplicateReq) -> Result<ReplicateAck, String> {
+            self.0.append(3, 1, req)
+        }
+    }
+
+    /// An owner whose WAL starts above a purged range (a partition restored from
+    /// object storage, or purged after archiving) still gets its writes acknowledged
+    /// by a new replica: the purged range counts as shipped.
+    #[tokio::test]
+    async fn a_new_replica_of_a_purged_wal_acknowledges_writes() {
+        let wal = Arc::new(adb_log::MemLog::new(PartitionId(3)));
+        for o in 1..=10 {
+            wal.append(rec(o)).await.unwrap();
+        }
+        wal.purge_below(LogOffset(6)).await.unwrap();
+        assert!(matches!(wal.read(LogOffset(1), 1).await, Err(adb_log::LogError::Purged { .. })));
+        let dir = tempfile::tempdir().unwrap();
+        let replica = Arc::new(Buffers(ReplicaBuffers::with_limits(dir.path(), 1 << 20, 1 << 24)));
+        let log = ReplicatedLog::new(wal as Arc<dyn Log>, Arc::clone(&replica) as Arc<dyn ReplicaTarget>);
+        tokio::time::timeout(Duration::from_secs(5), log.append(rec(11))).await.expect("the write is acknowledged, not stalled").unwrap();
+        assert!(log.acked() >= 11);
+        let (_, tail) = replica.0.tail(3).unwrap();
+        assert_eq!(tail.iter().map(|r| r.offset.0).collect::<Vec<_>>(), (6..=11).collect::<Vec<_>>(), "the replica holds what isn't shipped");
     }
 }

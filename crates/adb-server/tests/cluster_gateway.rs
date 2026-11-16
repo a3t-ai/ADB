@@ -129,6 +129,83 @@ async fn any_node_over_http_and_flight() {
         assert_eq!(r["data"]["data"]["records"][0]["data"]["note"].as_str().map(str::len), Some(3 << 20), "{key}");
     }
 
+    // Topics on a node that doesn't own the system partition (the gateway's): every
+    // step there — SUBSCRIBE, PUBLISH, MCP next_events, the SSE stream, ACK,
+    // UNSUBSCRIBE — answered as on one node.
+    let away = &nodes[(sys_owner + 1) % 3].http;
+    let (s, v) = query(&http, away, TOKEN, r#"SUBSCRIBE TOPIC "parity""#).await;
+    assert_eq!(s, 200, "{v}");
+    let sub = v.pointer("/data/data/subscription").and_then(Value::as_str).unwrap_or_else(|| panic!("a subscription id: {v}")).to_string();
+    let (s, v) = query(&http, away, TOKEN, r#"PUBLISH TOPIC "parity" (n = 7)"#).await;
+    assert_eq!(s, 200, "{v}");
+    let mcp = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "next_events", "arguments": { "subscription": sub, "wait_seconds": 5 } } });
+    let r: Value = http.post(format!("{away}/mcp/message")).bearer_auth(TOKEN).json(&mcp).send().await.unwrap().json().await.unwrap();
+    let text = r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_else(|| panic!("next_events: {r}"));
+    let batch: Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("next_events: {text}"));
+    let first = batch["deliveries"][0].clone();
+    assert_eq!(first["changes"][0]["value"]["n"], 7, "{batch}");
+    let offset = first["offset"].as_u64().unwrap();
+    let sse = http.get(format!("{away}/subscriptions/{sub}/events?from={offset}")).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(sse.status(), 200);
+    let mut body = sse.bytes_stream();
+    let mut seen = String::new();
+    while !seen.contains("event: delivery") {
+        use futures::StreamExt as _;
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.next()).await.expect("an SSE delivery").unwrap().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.contains(&format!("id: {offset}")), "{seen}");
+    let missing = http.get(format!("{away}/subscriptions/nope/events")).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(missing.status(), 404);
+    let (s, v) = query(&http, away, TOKEN, &format!(r#"ACK "{sub}" OFFSET {offset}"#)).await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = query(&http, away, TOKEN, &format!(r#"UNSUBSCRIBE "{sub}""#)).await;
+    assert_eq!(s, 200, "{v}");
+    // WATCH on a namespace, through any node: it runs on the namespace's partition and
+    // its id names that partition; frames through MCP and SSE on other nodes; UNWATCH.
+    let (s, v) = query(&http, &nodes[0].http, TOKEN, r#"WATCH RECALL FROM SEMANTIC ALL NAMESPACE "demo--w" DEBOUNCE 50ms"#).await;
+    assert_eq!(s, 200, "{v}");
+    let cq = v.pointer("/data/data/cq_id").and_then(Value::as_str).unwrap_or_else(|| panic!("a watch id: {v}")).to_string();
+    let p = engines[0].partition_of("demo--w");
+    assert_eq!(cq.split_once('.').map(|(q, _)| q.to_string()), Some(p.to_string()), "{cq}");
+    let snapshot = v.pointer("/data/data/offset").and_then(Value::as_u64).unwrap_or(0);
+    let (s, v) = query(&http, &nodes[1].http, TOKEN, r#"STORE INTO SEMANTIC (key = "w1", n = 1) NAMESPACE "demo--w""#).await;
+    assert_eq!(s, 200, "{v}");
+    let mcp = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "watch_changes", "arguments": { "cq_id": cq, "from": snapshot, "wait_seconds": 10 } } });
+    let r: Value = http.post(format!("{}/mcp/message", nodes[1].http)).bearer_auth(TOKEN).json(&mcp).send().await.unwrap().json().await.unwrap();
+    let text = r.pointer("/result/content/0/text").and_then(Value::as_str).unwrap_or_else(|| panic!("watch_changes: {r}"));
+    let frames: Value = serde_json::from_str(text).unwrap_or_else(|_| panic!("watch_changes: {text}"));
+    let frame = frames["frames"][0].clone();
+    assert_eq!(frame["cq_id"], json!(cq), "{frames}");
+    assert!(frame.to_string().contains("w1"), "{frames}");
+    let sse = http.get(format!("{}/watches/{cq}/events?from={snapshot}", nodes[2].http)).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(sse.status(), 200);
+    let mut body = sse.bytes_stream();
+    let mut seen = String::new();
+    while !seen.contains("w1") {
+        use futures::StreamExt as _;
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.next()).await.expect("an SSE frame").unwrap().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(http.get(format!("{}/watches/{p}.nope/events", nodes[2].http)).bearer_auth(TOKEN).send().await.unwrap().status(), 404);
+    let (s, v) = query(&http, &nodes[0].http, TOKEN, &format!(r#"UNWATCH "{cq}""#)).await;
+    assert_eq!((s, v.pointer("/data/data/unwatched").cloned()), (200, Some(json!(true))), "{v}");
+    let (s, v) = query(&http, &nodes[0].http, TOKEN, r#"FORGET FROM SEMANTIC WHERE key = "w1" NAMESPACE "demo--w""#).await;
+    assert_eq!(s, 200, "{v}");
+
+    // MERGE ENTITY without a namespace, sent to a node that may not own its partition.
+    for k in ["person:ada", "person:ada-lovelace"] {
+        let (s, v) = query(&http, away, TOKEN, &format!(r#"STORE INTO SEMANTIC (key = "{k}", name = "Ada")"#)).await;
+        assert_eq!(s, 200, "{v}");
+    }
+    let (s, v) = query(&http, away, TOKEN, r#"MERGE ENTITY "person:ada" INTO "person:ada-lovelace""#).await;
+    assert_eq!(s, 200, "{v}");
+    let (_, v) = query(&http, away, TOKEN, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-lovelace""#).await;
+    assert_eq!(records(&v)[0]["aliases"], json!(["person:ada"]), "{v}");
+    // Out of the way of the scope checks below (they read every namespace-less row).
+    let (s, v) = query(&http, away, TOKEN, r#"FORGET FROM SEMANTIC WHERE key = "person:ada-lovelace""#).await;
+    assert_eq!(s, 200, "{v}");
+
     // Platform tables from a node that doesn't own the system partition: forwarded.
     let other = (sys_owner + 1) % 3;
     assert!(engines[other].system_flight().is_some() && engines[sys_owner].system_flight().is_none());

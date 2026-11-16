@@ -139,13 +139,12 @@ impl McpServer {
 
     /// A subscription's next deliveries through the gateway (stage E).
     async fn next_events(&self, args: &Value) -> Result<Value, String> {
-        let gw = self.engine.gateway().ok_or("subscriptions need a durable engine (start ADB with --data-dir)")?;
         let sub = args.get("subscription").and_then(Value::as_str).ok_or("Missing required: subscription")?;
         let from = args.get("from").and_then(Value::as_u64);
         let max = args.get("max").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
         let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
-        let batch = gw.next(sub, from, max, std::time::Duration::from_secs(wait)).await.map_err(|e| e.to_string())?;
-        serde_json::to_value(batch).map_err(|e| e.to_string())
+        // Any node of a cluster: the engine reaches the gateway where it lives.
+        self.engine.next_events(sub, from, max, std::time::Duration::from_secs(wait)).await
     }
 
     /// `watch`: `WATCH <query>` (MVP W6) — the snapshot frame `{cq_id, offset, result}`.
@@ -161,13 +160,13 @@ impl McpServer {
 
     /// A watch's next frames (W6), waiting up to `wait_seconds` for one.
     async fn watch_changes(&self, args: &Value) -> Result<Value, String> {
-        let w = self.engine.watcher().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
         let id = args.get("cq_id").and_then(Value::as_str).ok_or("Missing required: cq_id")?;
         let from = args.get("from").and_then(Value::as_u64);
         let max = args.get("max").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
         let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
-        let frames = w.next(id, from, max, std::time::Duration::from_secs(wait)).await.map_err(|e| e.to_string())?;
-        let next = frames.last().map(|f| f.offset).or(from);
+        // Any node of a cluster: the engine reaches the watch's partition.
+        let frames = self.engine.watch_frames(id, from, max, std::time::Duration::from_secs(wait)).await?;
+        let next = frames.as_array().and_then(|f| f.last()).and_then(|f| f["offset"].as_u64()).or(from);
         Ok(json!({ "frames": frames, "from": next }))
     }
 

@@ -42,6 +42,24 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// A watch's next frames (W6) after `from` as JSON — each `{cq_id, type, offset,
+    /// …}` — waiting up to `wait` for one. A cluster answers on any node: the watch
+    /// runs on its namespace's partition, which its id names.
+    async fn watch_frames(&self, cq_id: &str, from: Option<u64>, max: usize, wait: std::time::Duration) -> Result<Value, String> {
+        let w = self.watcher().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
+        let frames = w.next(cq_id, from, max, wait).await.map_err(|e| e.to_string())?;
+        serde_json::to_value(frames).map_err(|e| e.to_string())
+    }
+
+    /// A subscription's next deliveries (stage E) as JSON — `{deliveries, reset?,
+    /// next, tip}` — waiting up to `wait` for one. A cluster answers on any node: the
+    /// gateway is on the system partition's owner.
+    async fn next_events(&self, subscription: &str, from: Option<u64>, max: usize, wait: std::time::Duration) -> Result<Value, String> {
+        let gw = self.gateway().ok_or("subscriptions need a durable engine (start ADB with --data-dir)")?;
+        let batch = gw.next(subscription, from, max, wait).await.map_err(|e| e.to_string())?;
+        serde_json::to_value(batch).map_err(|e| e.to_string())
+    }
+
     /// Platform tables (stage G) for reads, for engines with a log.
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
         None

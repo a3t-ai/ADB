@@ -221,6 +221,27 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         // The system partition.
         "platform_write" => val(e.platform_write(arg(&a, "effect")?).await?),
         "platform_write_many" => val(e.platform_write_many(arg(&a, "effects")?).await?),
+        // Writes a remote partition handle sends on (any node, the owner runs them).
+        "w_publish" => {
+            let ttl = arg::<Option<u64>>(&a, "ttl_ms")?.map(Duration::from_millis);
+            val(e.io().0.publish(&s("topic")?, arg(&a, "payload")?, ttl).await.map_err(|x| x.to_string())?)
+        }
+        "w_subscribe" => val(e.io().0.subscribe(arg(&a, "spec")?, arg(&a, "from")?).await.map_err(|x| x.to_string())?),
+        "w_ack" => val(e.io().0.ack(&s("subscription")?, arg(&a, "offset")?).await.map_err(|x| x.to_string())?),
+        "w_unsubscribe" => val(e.io().0.unsubscribe(&s("subscription")?).await.map_err(|x| x.to_string())?),
+        "w_platform" => val(e.io().0.platform(arg(&a, "effect")?).await.map_err(|x| x.to_string())?),
+        "w_platform_many" => val(e.io().0.platform_many(arg(&a, "effects")?).await.map_err(|x| x.to_string())?),
+        "w_merge" => val(e.io().0.merge(&s("from")?, &s("into")?).await.map_err(|x| x.to_string())?),
+        // A watch's next frames, from this partition's watcher.
+        "watch_frames" => {
+            let wait = Duration::from_millis(arg::<u64>(&a, "wait_ms")?.min(30_000));
+            e.watch_frames(&s("cq_id")?, arg(&a, "from")?, arg(&a, "max")?, wait).await
+        }
+        // A subscription's next deliveries, from the gateway on the system partition.
+        "next_events" => {
+            let wait = Duration::from_millis(arg::<u64>(&a, "wait_ms")?.min(30_000));
+            e.next_events(&s("subscription")?, arg(&a, "from")?, arg(&a, "max")?, wait).await
+        }
         "catalog_rows" => {
             let Some(p) = e.platform() else { return val(Vec::<Value>::new()) };
             if !p.list_tables().map_err(|e| e.to_string())?.iter().any(|t| t == crate::partitioned::CATALOG) {
@@ -257,6 +278,12 @@ impl RemotePartition {
     }
 
     /// A partition operation by name on the owner.
+    /// [`Self::op`] with a typed answer, as a write's error.
+    async fn op_typed<T: serde::de::DeserializeOwned>(&self, op: &str, args: Value) -> AdbResult<T> {
+        let v = self.op(op, args).await.map_err(AdbError::QueryError)?;
+        serde_json::from_value(v).map_err(|e| AdbError::Internal(format!("{op}: {e}")))
+    }
+
     pub async fn op(&self, op: &str, args: Value) -> Result<Value, String> {
         match self.send(PartCall::Op { op: op.into(), args }).await? {
             PartReply::Value(v) => Ok(v),
@@ -340,6 +367,36 @@ impl Writes for RemotePartition {
 
     async fn unlink(&self, from_type: MemoryType, from_ids: &[String], to_type: MemoryType, to_ids: &[String], link_type: Option<&str>) -> AdbResult<u64> {
         expect!(self.call(PartCall::Unlink { from_type, from_ids: from_ids.to_vec(), to_type, to_ids: to_ids.to_vec(), link_type: link_type.map(String::from) }).await?, Count)
+    }
+
+    // Topics, subscriptions, platform tables and entity merges: run by the owner.
+
+    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
+        self.op_typed("w_merge", serde_json::json!({ "from": from, "into": into })).await
+    }
+
+    async fn publish(&self, topic: &str, payload: Value, ttl: Option<Duration>) -> AdbResult<(String, u64)> {
+        self.op_typed("w_publish", serde_json::json!({ "topic": topic, "payload": payload, "ttl_ms": ms(ttl) })).await
+    }
+
+    async fn subscribe(&self, spec: adb_gateway::SubSpec, from: Option<u64>) -> AdbResult<(String, u64)> {
+        self.op_typed("w_subscribe", serde_json::json!({ "spec": spec, "from": from })).await
+    }
+
+    async fn ack(&self, subscription: &str, offset: u64) -> AdbResult<u64> {
+        self.op_typed("w_ack", serde_json::json!({ "subscription": subscription, "offset": offset })).await
+    }
+
+    async fn unsubscribe(&self, subscription: &str) -> AdbResult<bool> {
+        self.op_typed("w_unsubscribe", serde_json::json!({ "subscription": subscription })).await
+    }
+
+    async fn platform(&self, effect: adb_core::log::Effect) -> AdbResult<u64> {
+        self.op_typed("w_platform", serde_json::json!({ "effect": effect })).await
+    }
+
+    async fn platform_many(&self, effects: Vec<adb_core::log::Effect>) -> AdbResult<u64> {
+        self.op_typed("w_platform_many", serde_json::json!({ "effects": effects })).await
     }
 }
 

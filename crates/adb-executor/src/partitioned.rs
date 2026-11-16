@@ -893,6 +893,9 @@ impl PartitionedEngine {
 
     /// Run `aql` within `reach` (see the module docs).
     pub async fn query_in(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        if let Some(r) = Box::pin(self.watch_routed(aql, variables, reach)).await {
+            return r;
+        }
         let (single, writes_any) = single_namespace(aql, reach)?;
         if let Some(ns) = single {
             if writes_any {
@@ -967,6 +970,65 @@ impl PartitionedEngine {
                 other => return other,
             }
         }
+    }
+
+    /// `WATCH` / `UNWATCH` (W6) on a cluster, `None` for any other statement. A watch
+    /// runs on the owner of its query's namespace's partition, and its id names that
+    /// partition (`<partition>.<id>`), so UNWATCH and its frames (MCP watch_changes,
+    /// SSE) reach it from any node.
+    async fn watch_routed(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Option<Result<Value, String>> {
+        use aql_parser::ast::Statement;
+        let first = aql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or_default();
+        if !first.eq_ignore_ascii_case("WATCH") && !first.eq_ignore_ascii_case("UNWATCH") {
+            return None;
+        }
+        // A statement that doesn't parse: the router's executor reports it.
+        let stmt = aql_parser::parse(aql).ok()?;
+        Some(match stmt {
+            Statement::Watch(w) => {
+                let Some(ns) = touches_of(&w.query).0 else {
+                    return Some(Err("WATCH needs NAMESPACE in a cluster: watches across partitions come later".into()));
+                };
+                if !reach.allows(&ns) {
+                    return Some(Err(out_of_reach(&ns).to_string()));
+                }
+                let p = self.partition_of(&ns);
+                Box::pin(self.on_owner(&ns, aql, variables, reach)).await.map(|mut v| {
+                    prefix_cq_ids(&mut v, p);
+                    v
+                })
+            }
+            Statement::Unwatch(u) => {
+                let Some((p, id)) = split_cq_id(&u.query_id) else {
+                    return Some(Err(format!("unknown watch {}: a cluster's watch ids are <partition>.<id>", u.query_id)));
+                };
+                let local = format!("UNWATCH {}", serde_json::to_string(id).unwrap_or_default());
+                Box::pin(self.query_on(p, &local)).await.map(|mut v| {
+                    prefix_cq_ids(&mut v, p);
+                    v
+                })
+            }
+            _ => return None,
+        })
+    }
+
+    /// `aql` on partition `p`'s owner (here, or one call to it).
+    async fn query_on(self: &Arc<Self>, p: Partition, aql: &str) -> Result<Value, String> {
+        match self.handle(p).await? {
+            Handle::Local(e) => Box::pin(e.query(aql, None)).await,
+            Handle::Remote(r) => r.op("query", json!({ "aql": aql, "variables": null })).await,
+        }
+    }
+
+    /// A watch's frames (`<partition>.<id>`), from its partition's watcher.
+    pub async fn watch_frames_of(self: &Arc<Self>, cq_id: &str, from: Option<u64>, max: usize, wait: Duration) -> Result<Value, String> {
+        let (p, id) = split_cq_id(cq_id).ok_or_else(|| format!("unknown watch {cq_id}"))?;
+        let mut v = match self.handle(p).await? {
+            Handle::Local(e) => e.watch_frames(id, from, max, wait).await?,
+            Handle::Remote(r) => r.op("watch_frames", json!({ "cq_id": id, "from": from, "max": max, "wait_ms": wait.as_millis() as u64 })).await?,
+        };
+        prefix_cq_ids(&mut v, p);
+        Ok(v)
     }
 
     /// A statement spanning partitions: the router's executor over their reads and writes.
@@ -1106,7 +1168,17 @@ fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), 
 fn touches(aql: &str) -> Vec<(Option<String>, bool)> {
     use aql_parser::Statement as S;
     let Ok(stmt) = aql_parser::parse(aql) else { return vec![(None, false)] };
-    fn of(s: &S) -> (Option<String>, bool) {
+    let of = touches_of;
+    match &stmt {
+        S::Pipeline(p) => p.stages.iter().map(of).collect(),
+        other => vec![of(other)],
+    }
+}
+
+/// One statement's `NAMESPACE` and whether it writes ([`touches`]).
+fn touches_of(s: &aql_parser::Statement) -> (Option<String>, bool) {
+    use aql_parser::Statement as S;
+    {
         match s {
             S::Recall(x) => (x.modifiers.namespace.clone(), false),
             S::Lookup(x) => (x.modifiers.namespace.clone(), false),
@@ -1115,12 +1187,35 @@ fn touches(aql: &str) -> Vec<(Option<String>, bool)> {
             S::Store(x) => (x.modifiers.namespace.clone(), true),
             S::Update(x) => (x.modifiers.namespace.clone(), true),
             S::Forget(x) => (x.modifiers.namespace.clone(), true),
+            // A watch is on its query's namespace (its partition registers it); the
+            // owner runs it — WATCH isn't a read a reader answers.
+            S::Watch(w) => (touches_of(&w.query).0, false),
             _ => (None, true),
         }
     }
-    match &stmt {
-        S::Pipeline(p) => p.stages.iter().map(of).collect(),
-        other => vec![of(other)],
+}
+
+/// A cluster watch id: `<partition>.<id on that partition>`.
+fn split_cq_id(cq_id: &str) -> Option<(Partition, &str)> {
+    let (p, id) = cq_id.split_once('.')?;
+    let p: Partition = p.parse().ok()?;
+    (!id.is_empty()).then_some((p, id))
+}
+
+/// Every `cq_id` in an answer (a WATCH's snapshot frame, UNWATCH's answer, frames)
+/// named with its partition.
+fn prefix_cq_ids(v: &mut Value, p: Partition) {
+    match v {
+        Value::Object(m) => {
+            if let Some(Value::String(id)) = m.get_mut("cq_id") {
+                if split_cq_id(id).is_none_or(|(q, _)| q != p) {
+                    *id = format!("{p}.{id}");
+                }
+            }
+            m.values_mut().for_each(|x| prefix_cq_ids(x, p));
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| prefix_cq_ids(x, p)),
+        _ => {}
     }
 }
 
@@ -1398,6 +1493,11 @@ impl Writes for Routed {
     async fn platform_many(&self, effects: Vec<adb_core::log::Effect>) -> AdbResult<u64> {
         self.system().await?.platform_many(effects).await
     }
+
+    /// MERGE ENTITY without a namespace: the entities without one, in their partition.
+    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
+        self.write_target(None).await?.writes.merge(from, into).await
+    }
 }
 
 #[async_trait]
@@ -1442,6 +1542,25 @@ impl Engine for Arc<PartitionedEngine> {
     /// FlowR's engine store, on the node owning the system partition (step 4b).
     fn flowr_engine(&self, space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
         self.system_local().and_then(|s| s.flowr_engine(space))
+    }
+
+    async fn watch_frames(&self, cq_id: &str, from: Option<u64>, max: usize, wait: Duration) -> Result<Value, String> {
+        self.watch_frames_of(cq_id, from, max, wait).await
+    }
+
+    /// The gateway lives with the system partition: here when this node owns it.
+    fn gateway(&self) -> Option<Arc<adb_gateway::Gateway>> {
+        self.system_local().and_then(|s| s.gateway())
+    }
+
+    async fn next_events(&self, subscription: &str, from: Option<u64>, max: usize, wait: Duration) -> Result<Value, String> {
+        match self.system_local() {
+            Some(s) => s.next_events(subscription, from, max, wait).await,
+            None => {
+                let args = json!({ "subscription": subscription, "from": from, "max": max, "wait_ms": wait.as_millis() as u64 });
+                self.system_handle().await?.op("next_events", args).await
+            }
+        }
     }
 
     async fn engine_restore(&self, space: &str, changes: Vec<Value>, first: bool) -> Result<usize, String> {
@@ -1688,5 +1807,23 @@ impl Engine for Arc<PartitionedEngine> {
         let mut out = vec![self.system_handle().await?.op("compact", json!({})).await?];
         out.extend(self.op_all::<Value>("compact", json!({})).await?);
         Ok(Value::Array(out))
+    }
+}
+
+#[cfg(test)]
+mod watch_routing_tests {
+    use super::*;
+
+    #[test]
+    fn a_watch_names_its_query_namespace_and_ids_carry_the_partition() {
+        let stmt = aql_parser::parse(r#"WATCH RECALL FROM SEMANTIC ALL NAMESPACE "demo--w" DEBOUNCE 50ms"#).expect("parses");
+        let aql_parser::ast::Statement::Watch(w) = stmt else { panic!("a WATCH: {stmt:?}") };
+        assert_eq!(touches_of(&w.query).0.as_deref(), Some("demo--w"), "{:?}", w.query);
+        assert_eq!(split_cq_id("12.abc"), Some((12, "abc")));
+        assert_eq!(split_cq_id("abc"), None);
+        assert_eq!(split_cq_id("12."), None);
+        let mut v = json!({ "data": { "cq_id": "abc", "frames": [{ "cq_id": "abc" }, { "cq_id": "7.abc" }] } });
+        prefix_cq_ids(&mut v, 7);
+        assert_eq!(v, json!({ "data": { "cq_id": "7.abc", "frames": [{ "cq_id": "7.abc" }, { "cq_id": "7.abc" }] } }));
     }
 }

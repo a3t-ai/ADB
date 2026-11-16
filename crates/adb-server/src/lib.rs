@@ -154,43 +154,52 @@ async fn subscription_events(
     Query(p): Query<EventsParams>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(gw) = s.engine.gateway() else {
-        return (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({ "error": "subscriptions need a durable engine (start ADB with --data-dir)" })))
-            .into_response();
-    };
-    if gw.registry().get(&id).is_none() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("unknown subscription {id}") }))).into_response();
-    }
     let resume = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .map(|last| last + 1);
     let from = p.from.or(resume);
+    // Through the engine, not a gateway here: on a cluster the gateway is on the
+    // system partition's owner, and any node serves the stream.
+    if let Err(e) = s.engine.next_events(&id, from, 1, Duration::ZERO).await {
+        let status = if e.contains("nknown subscription") {
+            StatusCode::NOT_FOUND
+        } else if e.contains("need a durable engine") {
+            StatusCode::NOT_IMPLEMENTED
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return (status, Json(serde_json::json!({ "error": e }))).into_response();
+    }
     use futures::StreamExt as _;
+    let engine = s.engine.clone();
     let stream = futures::stream::unfold(Some(from), move |state| {
-        let gw = gw.clone();
+        let engine = engine.clone();
         let id = id.clone();
         async move {
             let from = state?;
-            let events: Vec<Result<Event, Infallible>> = match gw.next(&id, from, 100, Duration::from_secs(15)).await {
-                Ok(b) if b.deliveries.is_empty() && b.reset.is_none() => {
-                    let hb = serde_json::json!({ "tip": b.tip, "next": b.next });
-                    return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(Some(b.next))));
+            let b = match engine.next_events(&id, from, 100, Duration::from_secs(15)).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let ev = Event::default().event("error").data(serde_json::json!({ "error": e }).to_string());
+                    return Some((futures::stream::iter(vec![Ok::<_, Infallible>(ev)]), None));
                 }
-                Ok(b) => {
-                    let next = b.next;
-                    let reset = b.reset.iter().map(|r| Ok(Event::default().event("reset").id(r.offset.to_string()).data(serde_json::to_string(r).unwrap_or_default())));
-                    let evs: Vec<Result<Event, Infallible>> = reset
-                        .chain(b.deliveries.iter().map(|d| {
-                            Ok(Event::default().event("delivery").id(d.offset.to_string()).data(serde_json::to_string(d).unwrap_or_default()))
-                        }))
-                        .collect();
-                    return Some((futures::stream::iter(evs), Some(Some(next))));
-                }
-                Err(e) => vec![Ok(Event::default().event("error").data(serde_json::json!({ "error": e.to_string() }).to_string()))],
             };
-            Some((futures::stream::iter(events), None))
+            let next = b["next"].as_u64();
+            let deliveries = b["deliveries"].as_array().cloned().unwrap_or_default();
+            let reset = b.get("reset").filter(|r| !r.is_null()).cloned();
+            if deliveries.is_empty() && reset.is_none() {
+                let hb = serde_json::json!({ "tip": b["tip"], "next": b["next"] });
+                return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(next)));
+            }
+            let id_of = |v: &Value| v["offset"].as_u64().map(|o| o.to_string()).unwrap_or_default();
+            let evs: Vec<Result<Event, Infallible>> = reset
+                .iter()
+                .map(|r| Ok(Event::default().event("reset").id(id_of(r)).data(r.to_string())))
+                .chain(deliveries.iter().map(|d| Ok(Event::default().event("delivery").id(id_of(d)).data(d.to_string()))))
+                .collect();
+            Some((futures::stream::iter(evs), Some(next)))
         }
     })
     .flatten();
@@ -209,39 +218,47 @@ async fn watch_events(
     Query(p): Query<EventsParams>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(w) = s.engine.watcher() else {
-        return (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({ "error": "watches need a durable engine (start ADB with --data-dir)" })))
-            .into_response();
-    };
-    if !w.contains(&id) {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("unknown watch {id}") }))).into_response();
-    }
     let last = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     let from = p.from.or(last);
+    // Through the engine: on a cluster the watch runs on its namespace's partition,
+    // which its id names, and any node serves the stream.
+    if let Err(e) = s.engine.watch_frames(&id, from, 1, Duration::ZERO).await {
+        let status = if e.starts_with("unknown watch") {
+            StatusCode::NOT_FOUND
+        } else if e.contains("need a durable engine") {
+            StatusCode::NOT_IMPLEMENTED
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return (status, Json(serde_json::json!({ "error": e }))).into_response();
+    }
     use futures::StreamExt as _;
+    let engine = s.engine.clone();
     let stream = futures::stream::unfold(Some(from), move |state| {
-        let w = w.clone();
+        let engine = engine.clone();
         let id = id.clone();
         async move {
             let from = state?;
-            match w.next(&id, from, 100, Duration::from_secs(15)).await {
-                Ok(frames) if frames.is_empty() => {
-                    let hb = serde_json::json!({ "offset": from });
-                    Some((futures::stream::iter(vec![Ok::<_, Infallible>(Event::default().event("heartbeat").data(hb.to_string()))]), Some(from)))
+            let frames = match engine.watch_frames(&id, from, 100, Duration::from_secs(15)).await {
+                Ok(f) => f.as_array().cloned().unwrap_or_default(),
+                Err(e) => {
+                    let ev = Event::default().event("error").data(serde_json::json!({ "error": e }).to_string());
+                    return Some((futures::stream::iter(vec![Ok::<_, Infallible>(ev)]), None));
                 }
-                Ok(frames) => {
-                    let next = frames.last().map(|f| f.offset);
-                    let evs: Vec<Result<Event, Infallible>> = frames
-                        .iter()
-                        .map(|f| Ok(Event::default().event(f.kind).id(f.offset.to_string()).data(serde_json::to_string(f).unwrap_or_default())))
-                        .collect();
-                    Some((futures::stream::iter(evs), Some(next)))
-                }
-                Err(e) => Some((
-                    futures::stream::iter(vec![Ok(Event::default().event("error").data(serde_json::json!({ "error": e.to_string() }).to_string()))]),
-                    None,
-                )),
+            };
+            if frames.is_empty() {
+                let hb = serde_json::json!({ "offset": from });
+                return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(from)));
             }
+            let next = frames.last().and_then(|f| f["offset"].as_u64());
+            let evs: Vec<Result<Event, Infallible>> = frames
+                .iter()
+                .map(|f| {
+                    let kind = f["type"].as_str().unwrap_or("frame").to_string();
+                    Ok(Event::default().event(kind).id(f["offset"].as_u64().map(|o| o.to_string()).unwrap_or_default()).data(f.to_string()))
+                })
+                .collect();
+            Some((futures::stream::iter(evs), Some(next)))
         }
     })
     .flatten();
