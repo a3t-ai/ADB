@@ -86,7 +86,8 @@ pub async fn restore_partition(dir: &Path, point: &ArchivePoint, partition: Part
         let lineage = e["lineage"].as_str().ok_or_else(|| at("engine: no lineage"))?;
         stats.engine_files = adb_store::restore_tree(&point.cold, "engine", lineage, &work.join("engine")).await.map_err(|e| format!("{}: {e}", at("engine")))?;
     }
-    adb_log::LocalWal::create_at(&work.join(format!("p{}", partition.0)), LogOffset(point.floor + 1)).map_err(|e| format!("{}: {e}", at("log")))?;
+    let floor_ts = point.node.get("floor_ts").and_then(|v| v.as_i64()).map(adb_core::log::CommitTs);
+    adb_log::LocalWal::create_at(&work.join(format!("p{}", partition.0)), LogOffset(point.floor + 1), floor_ts).map_err(|e| format!("{}: {e}", at("log")))?;
 
     // Swap in: the old parts aside, the new ones in place, then the old ones removed.
     let old = dir.join(".before-restore");

@@ -87,6 +87,14 @@ pub trait Log: Send + Sync {
     /// Object storage now holds every record up to `offset` (WAL segments, S3 option B):
     /// a replicated log tells its replica, which may drop them. Default: nothing.
     fn note_shipped(&self, _offset: LogOffset) {}
+
+    /// The record just below this log's first one, when it is known only from where
+    /// the log was started (a partition restored from object storage: the archive
+    /// holds the records up to its floor, the log starts above it): its offset and
+    /// commit time. Default: none.
+    fn floor_commit(&self) -> Option<(LogOffset, adb_core::log::CommitTs)> {
+        None
+    }
 }
 
 /// A shared log: the sequencer appends while readers (stage E subscribers) read the
@@ -123,6 +131,10 @@ impl<L: Log + ?Sized> Log for std::sync::Arc<L> {
 
     fn last_offset(&self) -> LogOffset {
         (**self).last_offset()
+    }
+
+    fn floor_commit(&self) -> Option<(LogOffset, adb_core::log::CommitTs)> {
+        (**self).floor_commit()
     }
 
     fn durable_offset(&self) -> LogOffset {

@@ -314,6 +314,9 @@ impl Log for RedactingLog {
     fn partition(&self) -> adb_core::log::PartitionId {
         self.inner.partition()
     }
+    fn floor_commit(&self) -> Option<(LogOffset, CommitTs)> {
+        self.inner.floor_commit()
+    }
     async fn append(&self, record: LogRecord) -> adb_log::LogResult<LogOffset> {
         self.inner.append(record).await
     }
@@ -548,6 +551,29 @@ fn sub_idle() -> Duration {
 
 pub(crate) fn retain_max() -> u64 {
     std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
+}
+
+/// The commit time of the record at `offset` (none for 0): from the log, or — when
+/// the log no longer has it locally because it starts above an archive floor (a
+/// partition restored from object storage) — from where the log was started.
+/// Reading only the log failed every open after such a restore ("offset 2 was
+/// purged"). A floor without a recorded time (a point archived before it was kept)
+/// gives none: the clock then resumes from the wall clock.
+pub(crate) async fn commit_ts_at<L: Log + ?Sized>(log: &L, offset: u64) -> AdbResult<Option<CommitTs>> {
+    if offset == 0 {
+        return Ok(None);
+    }
+    match log.read(LogOffset(offset), 1).await {
+        Ok(recs) => Ok(recs.first().filter(|r| r.offset.0 == offset).map(|r| r.commit_ts)),
+        Err(LogError::Purged { .. }) => {
+            let floor = log.floor_commit().filter(|(o, _)| o.0 == offset).map(|(_, ts)| ts);
+            if floor.is_none() {
+                tracing::warn!(offset, "the log's record {offset} is only in the archive and its commit time was not kept; the clock resumes from the wall clock");
+            }
+            Ok(floor)
+        }
+        Err(e) => Err(log_err(e)),
+    }
 }
 
 fn log_err(e: LogError) -> AdbError {
@@ -1224,7 +1250,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let off = seq.log().last_offset().0;
         let ts = match off {
             0 => CommitTs::from_datetime(time::now()),
-            n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+            n => commit_ts_at(seq.log(), n).await?.unwrap_or_else(|| CommitTs::from_datetime(time::now())),
         };
         Ok((off, ts))
     }
@@ -1334,7 +1360,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let off = seq.log().last_offset().0;
         let ts = match off {
             0 => CommitTs::from_datetime(time::now()),
-            n => seq.log().read(LogOffset(n), 1).await.map_err(log_err)?.first().map(|r| r.commit_ts).unwrap_or_else(|| CommitTs::from_datetime(time::now())),
+            n => commit_ts_at(seq.log(), n).await?.unwrap_or_else(|| CommitTs::from_datetime(time::now())),
         };
         Ok((off, ts))
     }
@@ -2007,6 +2033,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             if let Some(current) = store.archived_current() {
                 node.insert("memory".into(), current);
             }
+            // The floor record's commit time: a node restored to this point starts its
+            // log above the floor, and resumes its clock after it (`commit_ts_at`).
+            if let Some(ts) = commit_ts_at(self.log.as_ref(), floor).await? {
+                node.insert("floor_ts".into(), serde_json::json!(ts.0));
+            }
             let point = crate::restore::ArchivePoint { cold: cold.clone(), floor, node: serde_json::Value::Object(node) };
             let record = {
                 let mut seq = seq_lock!(self);
@@ -2230,10 +2261,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let (hydrated_rows, live) = hydrate(&store).await?;
         tracing::info!(store_caught_up, ?caught_up_in, hydrated_rows, live_keys = live.len(), hydrated_in = ?(t.elapsed() - caught_up_in), "store opened");
         let last_offset = seq.log().last_offset();
-        let last_commit_ts = match last_offset.0 {
-            0 => None,
-            _ => seq.log().read(last_offset, 1).await.map_err(log_err)?.first().map(|r| r.commit_ts),
-        };
+        let last_commit_ts = commit_ts_at(seq.log(), last_offset.0).await?;
         let stats = ReplayStats { records: last_offset.0, effects: 0, last_offset, last_commit_ts, store_caught_up, hydrated_rows };
         if let Some(last) = stats.last_commit_ts {
             seq.resume_after(last);
@@ -2984,7 +3012,20 @@ pub async fn catch_up<L: Log>(store: &PartitionStore, log: &L) -> AdbResult<u64>
     let mut from = store.applied_offset().await.map_err(store_err)?.next();
     let mut applied = 0;
     loop {
-        let batch = log.read(from, 1024).await.map_err(log_err)?;
+        let batch = match log.read(from, 1024).await {
+            Ok(b) => b,
+            // Purged above the table's offset: the log drops records only below what
+            // the table (and the platform tables and the engine) made durable, so the
+            // gap held nothing the table lacks. The table's offset counts memory
+            // records only: after a platform-only record it sits below a restore
+            // floor, and the WAL of a partition restored from object storage starts
+            // above that floor — opening it failed ("offset 2 was purged").
+            Err(LogError::Purged { oldest, .. }) if oldest.0 > from.0 => {
+                from = oldest;
+                continue;
+            }
+            Err(e) => return Err(log_err(e)),
+        };
         let Some(last) = batch.last().map(|r| r.offset) else { break };
         for chunk in batch.chunks(256) {
             applied += store.apply_many(chunk).await.map_err(store_err)? as u64;

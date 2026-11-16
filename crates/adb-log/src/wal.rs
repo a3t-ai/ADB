@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use adb_core::log::{Epoch, LogOffset, LogRecord, PartitionId};
+use adb_core::log::{CommitTs, Epoch, LogOffset, LogRecord, PartitionId};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
@@ -127,7 +127,13 @@ pub struct LocalWal {
     /// Trimming and rewriting closed segments one at a time: a trim deleting a segment
     /// a rewrite is reading (or about to rename back) would fail it or leave a stray file.
     maintenance: Mutex<()>,
+    /// The record below the first, from [`FLOOR_FILE`] (a log started at an offset).
+    floor: Option<(LogOffset, CommitTs)>,
 }
+
+/// Beside a log started at an offset ([`LocalWal::create_at`]): the offset and commit
+/// time of the record just below its first, which only the archive holds.
+const FLOOR_FILE: &str = "floor";
 
 impl std::fmt::Debug for LocalWal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -185,14 +191,29 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, ()> {
 impl LocalWal {
     /// Create an empty log in `dir` (which must hold none) whose first record will be
     /// `first`: a node restored from object storage up to `first - 1` (S3 option B).
-    pub fn create_at(dir: &Path, first: LogOffset) -> LogResult<()> {
+    pub fn create_at(dir: &Path, first: LogOffset, floor_ts: Option<CommitTs>) -> LogResult<()> {
         fs::create_dir_all(dir).map_err(io)?;
         let existing = fs::read_dir(dir).map_err(io)?.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".wal"));
         if existing {
             return Err(io(format!("{} already holds a log", dir.display())));
         }
+        // What the archive's last record was, for a reader of the log's last record
+        // (the sequencer resumes its clock after it) while the log holds nothing yet.
+        if let (Some(ts), true) = (floor_ts, first.0 > 1) {
+            let body = format!("{} {}\n", first.0 - 1, ts.0);
+            let mut f = File::create(dir.join(FLOOR_FILE)).map_err(io)?;
+            f.write_all(body.as_bytes()).map_err(io)?;
+            f.sync_all().map_err(io)?;
+        }
         File::create(segment_path(dir, first.0.max(1))).map_err(io)?;
         sync_dir(dir)
+    }
+
+    /// `<offset> <commit_ts>`, as [`Self::create_at`] wrote it.
+    fn read_floor(dir: &Path) -> Option<(LogOffset, CommitTs)> {
+        let text = fs::read_to_string(dir.join(FLOOR_FILE)).ok()?;
+        let mut it = text.split_whitespace();
+        Some((LogOffset(it.next()?.parse().ok()?), CommitTs(it.next()?.parse().ok()?)))
     }
 
     /// Open (or create) the log in `config.dir`, recovering from a crash if needed.
@@ -289,7 +310,8 @@ impl LocalWal {
                 .map_err(io)?
         };
 
-        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), files: parking_lot::RwLock::new(()), _lock: lock, maintenance: Mutex::new(()) })
+        let floor = Self::read_floor(&config.dir);
+        Ok(Self { partition, dir: config.dir, state, jobs: Some(jobs), writer: Some(writer), files: parking_lot::RwLock::new(()), _lock: lock, maintenance: Mutex::new(()), floor })
     }
 
     /// Number of `fdatasync` calls so far.
@@ -450,6 +472,10 @@ impl Drop for LocalWal {
 impl Log for LocalWal {
     fn partition(&self) -> PartitionId {
         self.partition
+    }
+
+    fn floor_commit(&self) -> Option<(LogOffset, CommitTs)> {
+        self.floor
     }
 
     async fn append(&self, record: LogRecord) -> LogResult<LogOffset> {

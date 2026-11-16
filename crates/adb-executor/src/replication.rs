@@ -77,6 +77,14 @@ pub struct ReplicateAck {
 pub trait ReplicaTarget: Send + Sync {
     /// `(replica address, epoch)`; `None`: no replica assigned now.
     fn target(&self) -> Option<(String, u64)>;
+    /// Why this owner may no longer write (the partition moved to a newer epoch or
+    /// another owner), or `None`. Checked before every replication call: an owner
+    /// that kept replicating after the map moved on sent its writes to the NEW
+    /// epoch's replica — itself, in a rolling restart — and acknowledged them while
+    /// the new owner never got them. Default: never.
+    fn superseded(&self) -> Option<String> {
+        None
+    }
     async fn replicate(&self, addr: &str, req: ReplicateReq) -> Result<ReplicateAck, String>;
 }
 
@@ -173,6 +181,12 @@ async fn replicate_loop(
         // Send until the replica holds everything appended so far.
         let mut backoff = Duration::from_millis(20);
         loop {
+            if let Some(why) = target.superseded() {
+                tracing::warn!(partition = wal.partition().0, why = %why, "replication: this owner's epoch is over; writes stop");
+                *fenced.lock().unwrap() = Some(format!("fenced: {why}"));
+                acked.send_modify(|_| {});
+                return;
+            }
             let Some((addr, epoch)) = target.target() else {
                 // No replica assigned: writes wait (the control plane picks one).
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -267,6 +281,10 @@ async fn replicate_loop(
 impl Log for ReplicatedLog {
     fn partition(&self) -> PartitionId {
         self.wal.partition()
+    }
+
+    fn floor_commit(&self) -> Option<(LogOffset, adb_core::log::CommitTs)> {
+        self.wal.floor_commit()
     }
 
     async fn append(&self, record: LogRecord) -> LogResult<LogOffset> {

@@ -224,6 +224,10 @@ fn reader_idle() -> std::time::Duration {
 struct PartTarget {
     partition: Partition,
     node: std::sync::Weak<PartitionedEngine>,
+    /// The epoch this owner opened the partition at, and this node: the replica is
+    /// the one the map names for THAT ownership, never a later epoch's.
+    epoch: u64,
+    me: adb_cluster::map::NodeId,
 }
 
 #[async_trait]
@@ -232,8 +236,19 @@ impl crate::replication::ReplicaTarget for PartTarget {
         let node = self.node.upgrade()?;
         let map = node.map();
         let a = map.assignments.get(&self.partition)?;
+        if a.owner != self.me || a.epoch != self.epoch {
+            return None;
+        }
         let addr = map.members.get(&a.replica?)?.addr.clone();
-        Some((addr, a.epoch))
+        Some((addr, self.epoch))
+    }
+
+    fn superseded(&self) -> Option<String> {
+        let node = self.node.upgrade()?;
+        let map = node.map();
+        let a = map.assignments.get(&self.partition)?;
+        (a.epoch > self.epoch || (a.epoch == self.epoch && a.owner != self.me))
+            .then(|| format!("partition {} is at epoch {} (owner {}); this owner held epoch {}", self.partition, a.epoch, a.owner, self.epoch))
     }
 
     async fn replicate(&self, addr: &str, req: crate::replication::ReplicateReq) -> Result<crate::replication::ReplicateAck, String> {
@@ -568,7 +583,15 @@ impl PartitionedEngine {
         let cold = crate::engine::object_storage();
         // Sealed first: from here no record of the old owner is acknowledged by this
         // replica, so the tail taken now holds every one it ever acknowledged.
+        let was_replica = self.replicas.held(p).is_some();
         let (tail_epoch, tail) = self.replicas.seal(p, epoch)?;
+        // The control plane moves a partition only to its replica (failover promotes
+        // it; a rebalance makes a node the replica first). A node taking over without
+        // ever having been the replica has only object storage: whatever the old owner
+        // acknowledged and had not shipped is not here.
+        if !was_replica {
+            tracing::warn!(partition = p, epoch, "taking over a partition this node never replicated: only what object storage holds; acknowledged writes the old owner had not shipped are not here");
+        }
         let mut ends_at = 0;
         if let Some(cold) = &cold {
             let st = crate::restore::restore_partition_from_object_storage(pdir, cold, adb_core::log::PartitionId(p), Some(epoch)).await?;
@@ -731,7 +754,8 @@ impl PartitionedEngine {
             // A cluster owner: every record also on the partition's replica (step 5).
             (Some(_), n) if n > 0 => {
                 let wal = LocalEngine::open_partition_wal_sync(&pdir, role, crate::replication::owner_sync()).await?;
-                let target = Arc::new(PartTarget { partition: p, node: self.me.clone() });
+                let me_id = self.cluster.as_ref().map(|c| c.placement.me()).unwrap_or_default();
+                let target = Arc::new(PartTarget { partition: p, node: self.me.clone(), epoch: epoch.unwrap_or(1), me: me_id });
                 let log = crate::replication::ReplicatedLog::new(wal as Arc<dyn adb_log::Log>, target);
                 Box::pin(LocalEngine::durable_partition_on(&pdir, role, log as crate::engine::EngineLog)).await?
             }
