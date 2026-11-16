@@ -139,6 +139,7 @@ dependencies = [
  "aql-parser",
  "aql-planner",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "datafusion",
  "flowr-storage",

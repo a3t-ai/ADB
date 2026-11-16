@@ -221,3 +221,52 @@ async fn layers_quotas_and_copies_cross_nodes() {
     assert_eq!(eps, ["promoted_from", "said hello"], "its origin, and the old agent's episodes from node 1");
     assert_eq!(via.branch_list(Some(agent)).await.unwrap().len(), 1);
 }
+
+/// The superadmin's SQL view on a cluster: asked through any node, it runs on the
+/// system partition's owner over every partition's memory rows (gathered from their
+/// owners) and the platform tables, and answers as one engine does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sql_view_spans_every_node() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let ref_dir = tempfile::tempdir().unwrap();
+    let (reference, _) = LocalEngine::durable(ref_dir.path()).await.unwrap();
+    let reference: Arc<dyn Engine> = Arc::new(reference);
+    let peers = LocalPeers::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for n in 1..=3u64 {
+        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{n}"), &node);
+        nodes.push(node);
+    }
+    workload(&|_| Arc::clone(&reference)).await;
+    let via = |i: usize| -> Arc<dyn Engine> { Arc::new(Arc::clone(&nodes[i % 3])) };
+    workload(&via).await;
+
+    let rows = |r: adb_executor::sql::SqlResult| -> Vec<String> {
+        let mut out = Vec::new();
+        for b in &r.batches {
+            let cols: Vec<_> = (0..b.num_columns()).map(|c| datafusion::arrow::util::display::ArrayFormatter::try_new(b.column(c).as_ref(), &Default::default()).unwrap()).collect();
+            for i in 0..b.num_rows() {
+                out.push(cols.iter().map(|f| f.value(i).to_string()).collect::<Vec<_>>().join("|"));
+            }
+        }
+        out
+    };
+    let q = "SELECT namespace, count(*) AS n, sum(CASE WHEN tombstone THEN 1 ELSE 0 END) AS gone FROM memory GROUP BY namespace ORDER BY namespace";
+    let want = rows(reference.sql("SELECT namespace, count(*) AS n FROM memory_current GROUP BY namespace ORDER BY namespace", None).await.unwrap());
+    assert!(want.len() >= 4, "{want:?}");
+    let mut catalogs = BTreeSet::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let got = rows(node.sql("SELECT namespace, count(*) AS n FROM memory_current GROUP BY namespace ORDER BY namespace", None).await.unwrap_or_else(|e| panic!("node {}: {e}", i + 1)));
+        assert_eq!(got, want, "memory_current through node {}", i + 1);
+        // The raw view and a platform table answer too.
+        assert!(!rows(node.sql(q, None).await.unwrap()).is_empty());
+        let catalog = rows(node.sql("SELECT count(*) FROM adb_namespaces", None).await.unwrap_or_else(|e| panic!("node {}: {e}", i + 1)));
+        assert_ne!(catalog, vec!["0".to_string()], "the catalog through node {}", i + 1);
+        catalogs.insert(catalog);
+    }
+    assert_eq!(catalogs.len(), 1, "every node reads the same catalog: {catalogs:?}");
+}

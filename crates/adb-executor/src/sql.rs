@@ -39,6 +39,9 @@ pub struct SqlResult {
     pub batches: Vec<RecordBatch>,
 }
 
+/// Most memory rows one partition gives a cluster's SQL view ([`run_gathered`]).
+pub const PARTITION_ROWS: usize = 200_000;
+
 /// Run `sql` over the memory table (if any) and the platform tables (if any).
 pub async fn run(
     store: Option<Arc<PartitionStore>>,
@@ -46,9 +49,65 @@ pub async fn run(
     sql: &str,
     limit: Option<usize>,
 ) -> Result<SqlResult, String> {
+    run_on(store.map(Memory::Store), platform, sql, limit).await
+}
+
+/// [`run`] on a cluster: the memory table is every partition's rows, gathered
+/// ([`memory_raw`] on each), the platform tables the system partition's.
+pub async fn run_gathered(memory: SqlResult, platform: Option<Arc<PlatformStore>>, sql: &str, limit: Option<usize>) -> Result<SqlResult, String> {
+    run_on(Some(Memory::Rows(memory)), platform, sql, limit).await
+}
+
+enum Memory {
+    Store(Arc<PartitionStore>),
+    Rows(SqlResult),
+}
+
+/// A partition's memory table as stored, every row (at most [`PARTITION_ROWS`]): what
+/// a cluster's SQL view gathers from each partition.
+pub async fn memory_raw(store: &PartitionStore) -> Result<SqlResult, String> {
+    let r = store
+        .query_in(SessionConfig::new(), |ctx| async move {
+            let df = ctx.table("memory").await?.limit(0, Some(PARTITION_ROWS + 1))?;
+            let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+            Ok(SqlResult { schema, batches: df.collect().await? })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    if r.batches.iter().map(|b| b.num_rows()).sum::<usize>() > PARTITION_ROWS {
+        return Err(format!("a partition holds more than {PARTITION_ROWS} memory rows: too many for the cluster's SQL view"));
+    }
+    Ok(r)
+}
+
+/// `r` as one Arrow IPC stream (base64), for a call between nodes.
+pub fn to_ipc(r: &SqlResult) -> Result<String, String> {
+    use base64::Engine as _;
+    let mut buf = Vec::new();
+    {
+        let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &r.schema).map_err(|e| e.to_string())?;
+        for b in &r.batches {
+            w.write(b).map_err(|e| e.to_string())?;
+        }
+        w.finish().map_err(|e| e.to_string())?;
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(buf))
+}
+
+/// [`to_ipc`]'s reverse.
+pub fn from_ipc(s: &str) -> Result<SqlResult, String> {
+    use base64::Engine as _;
+    let buf = base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())?;
+    let r = datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buf), None).map_err(|e| e.to_string())?;
+    let schema = r.schema();
+    let batches = r.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    Ok(SqlResult { schema, batches })
+}
+
+async fn run_on(memory: Option<Memory>, platform: Option<Arc<PlatformStore>>, sql: &str, limit: Option<usize>) -> Result<SqlResult, String> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let config = SessionConfig::new().with_information_schema(true);
-    let has_memory = store.is_some();
+    let has_memory = memory.is_some();
     let session = |ctx: SessionContext| async move {
         if has_memory {
             memory_views(&ctx).await?;
@@ -67,8 +126,16 @@ pub async fn run(
         }
     };
     let run = async {
-        match &store {
-            Some(s) => s.query_in(config, session).await.map_err(|e| e.to_string()),
+        match memory {
+            Some(Memory::Store(s)) => s.query_in(config, session).await.map_err(|e| e.to_string()),
+            Some(Memory::Rows(r)) => {
+                let ctx = SessionContext::new_with_config(config);
+                ctx.register_udf(adb_store::filter::json_scalar_udf());
+                ctx.register_udf(adb_store::filter::json_text_udf());
+                let table = datafusion::datasource::MemTable::try_new(r.schema, vec![r.batches]).map_err(|e| e.to_string())?;
+                ctx.register_table("memory", Arc::new(table)).map_err(|e| e.to_string())?;
+                session(ctx).await.map_err(|e| e.to_string())
+            }
             None => session(SessionContext::new_with_config(config)).await.map_err(|e| e.to_string()),
         }
     };

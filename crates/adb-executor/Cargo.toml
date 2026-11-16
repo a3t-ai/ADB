@@ -23,6 +23,8 @@ adb-gateway = { path = "../adb-gateway" }
 adb-platform = { path = "../adb-platform" }
 adb-cluster = { path = "../adb-cluster" }
 datafusion.workspace = true
+# Arrow IPC between nodes in JSON calls (the cluster's SQL view).
+base64 = "0.22"
 aql-parser.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

@@ -255,6 +255,12 @@ pub trait Engine: Send + Sync {
         Err("SQL needs a durable engine (start ADB with --data-dir)".into())
     }
 
+    /// This engine's memory table as stored, every row: what a cluster's SQL view
+    /// gathers from each partition ([`crate::sql::memory_raw`]).
+    async fn memory_raw(&self) -> Result<crate::sql::SqlResult, String> {
+        Err("SQL needs a durable engine (start ADB with --data-dir)".into())
+    }
+
     /// FlowR's engine store, space `space` (stage H); `None` without a data dir.
     fn flowr_engine(&self, _space: &str) -> Option<Arc<dyn flowr_storage::engine::EngineStore>> {
         None
@@ -1338,6 +1344,14 @@ impl Engine for LocalEngine {
             b.wait_for_committed().await;
         }
         crate::sql::run(Some(Arc::clone(store)), self.platform(), sql, limit).await
+    }
+
+    async fn memory_raw(&self) -> Result<crate::sql::SqlResult, String> {
+        let Some((store, barrier)) = &self.store else { return Err("SQL needs a durable engine (start ADB with --data-dir)".into()) };
+        if let Some(b) = barrier {
+            b.wait_for_committed().await;
+        }
+        crate::sql::memory_raw(store).await
     }
 
     async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> Result<crate::branches::Branch, String> {

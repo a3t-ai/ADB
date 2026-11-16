@@ -186,6 +186,8 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "space_usage" => e.space_usage(o("namespace")?.as_deref()).await,
         "forget_lineages" => val(e.forget_lineages(arg(&a, "memory")?, &arg::<Vec<String>>(&a, "lineages")?).await?),
         "compact" => e.compact().await,
+        // The cluster's SQL view: this partition's memory rows, Arrow IPC.
+        "memory_raw" => Ok(json!({ "ipc": crate::sql::to_ipc(&e.memory_raw().await?)? })),
         "embedding" => e.embedding().await,
         "cache" => e.cache().await,
         // Cluster-wide settings, copied into a partition before it opens.

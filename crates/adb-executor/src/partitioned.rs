@@ -1145,8 +1145,40 @@ impl PartitionedEngine {
         if !self.owns(p) {
             return Err(not_owner(p, &self.map()));
         }
+        // The cluster's SQL view runs on the system partition's owner, over the node.
+        if let crate::remote::PartCall::Op { op, args } = &call {
+            if op == "sql" && p == self.sys() {
+                let r = self.sql_view(args["sql"].as_str().unwrap_or_default(), args["limit"].as_u64().map(|l| l as usize)).await?;
+                return Ok(crate::remote::PartReply::Value(json!({ "ipc": crate::sql::to_ipc(&r)? })));
+            }
+        }
         let e = self.part(p).await?;
         crate::remote::serve_part(&e, call).await
+    }
+
+    /// Read-only SQL (the superadmin's debug view, [`crate::sql`]) on a cluster: run
+    /// on the system partition's owner, over the platform tables there and the memory
+    /// rows of every partition holding data (and the system partition's), gathered.
+    pub async fn sql_view(&self, sql: &str, limit: Option<usize>) -> Result<crate::sql::SqlResult, String> {
+        let ipc = |v: Value, what: &str| -> Result<crate::sql::SqlResult, String> { crate::sql::from_ipc(v["ipc"].as_str().ok_or_else(|| format!("{what}: no rows in the answer"))?) };
+        let sys = match self.system_handle().await? {
+            Handle::Remote(r) => return ipc(r.op("sql", json!({ "sql": sql, "limit": limit })).await?, "sql"),
+            Handle::Local(e) => e,
+        };
+        self.refresh_catalog().await?;
+        let mut parts: BTreeSet<Partition> = self.catalog.read().unwrap().values().copied().collect();
+        parts.insert(self.sys());
+        let gathered = futures::future::try_join_all(parts.into_iter().map(|p| async move {
+            match self.handle(p).await? {
+                Handle::Local(e) => e.memory_raw().await,
+                Handle::Remote(r) => ipc(r.op("memory_raw", json!({})).await?, "memory_raw"),
+            }
+            .map_err(|e| format!("partition {p}: {e}"))
+        }))
+        .await?;
+        let schema = Arc::clone(&gathered.first().ok_or("no partitions")?.schema);
+        let batches = gathered.into_iter().flat_map(|r| r.batches).collect();
+        crate::sql::run_gathered(crate::sql::SqlResult { schema, batches }, sys.platform(), sql, limit).await
     }
 
     /// A partition operation on `namespace`'s partition.
@@ -1553,6 +1585,10 @@ impl Engine for Arc<PartitionedEngine> {
     /// the transports send those calls to that node, step 4b).
     fn platform(&self) -> Option<Arc<adb_platform::PlatformStore>> {
         self.system_local().and_then(|s| s.platform())
+    }
+
+    async fn sql(&self, sql: &str, limit: Option<usize>) -> Result<crate::sql::SqlResult, String> {
+        self.sql_view(sql, limit).await
     }
 
     async fn platform_write(&self, effect: adb_core::log::Effect) -> Result<u64, String> {
