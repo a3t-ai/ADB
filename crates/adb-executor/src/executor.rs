@@ -751,7 +751,7 @@ impl Executor {
         let resolved;
         let step = match (&step.memory_type, &step.predicate) {
             (MemoryType::Semantic, Predicate::Key { field, value: adb_core::Value::String(k) }) if matches!(field.as_str(), "id" | "key") => {
-                match self.writes.alias_of(k) {
+                match self.writes.alias_resolve(k).await? {
                     Some(to) => {
                         resolved = StepPlan { predicate: Predicate::Key { field: field.clone(), value: adb_core::Value::String(to) }, ..step.clone() };
                         &resolved

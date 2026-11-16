@@ -174,6 +174,12 @@ pub trait Writes: Send + Sync {
         None
     }
 
+    /// [`Self::alias_of`], where the answer may be on another node (a cluster's
+    /// router asks each partition in the call's scope).
+    async fn alias_resolve(&self, key: &str) -> AdbResult<Option<String>> {
+        Ok(self.alias_of(key))
+    }
+
     /// `PUBLISH TOPIC`: a committed `event` row (stage E). Returns its id and offset.
     async fn publish(&self, _topic: &str, _payload: serde_json::Value, _ttl: Option<Duration>) -> AdbResult<(String, u64)> {
         Err(needs_log())

@@ -39,6 +39,11 @@ pub struct WatchSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub variables: HashMap<String, Value>,
     pub debounce_ms: u64,
+    /// A cluster's watch across partitions (a statement naming no namespace): the
+    /// call's scope it runs in. It is the router's ([`Watcher::poke`]), registered on
+    /// the system partition; a partition's own watcher leaves it alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub across: Option<Value>,
 }
 
 impl WatchSpec {
@@ -49,7 +54,7 @@ impl WatchSpec {
             return Err(format!("DEBOUNCE {debounce_ms}ms: allowed 50ms-500ms"));
         }
         WatchSet::of(&statement)?;
-        Ok(Self { statement, variables, debounce_ms })
+        Ok(Self { statement, variables, debounce_ms, across: None })
     }
 
     pub fn watch_set(&self) -> WatchSet {
@@ -240,6 +245,17 @@ pub enum WatchError {
     Query(String),
 }
 
+/// What [`Watcher::touched_since`] found.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Touched {
+    /// Read up to here: the next call's `after`.
+    pub tip: u64,
+    /// The watches a record can have changed.
+    pub touched: Vec<String>,
+    /// Records forgotten (memory, lineage).
+    pub forgotten: Vec<(Memory, String)>,
+}
+
 /// The partition's watches and the task that keeps them current.
 pub struct Watcher {
     log: Arc<dyn Log>,
@@ -299,6 +315,72 @@ impl Watcher {
         let frame = cq.full(id, "snapshot");
         cqs.insert(id.to_string(), cq);
         Ok(frame)
+    }
+
+    /// Mark watches changed from outside this watcher's log (a cluster's watch across
+    /// partitions, told by the partitions): they re-run after their debounce. The
+    /// caller first raises the applied tip, so the frames get a new offset.
+    pub fn poke(&self, ids: &[String]) {
+        let mut cqs = self.cqs.lock();
+        for id in ids {
+            if let Some(c) = cqs.get_mut(id) {
+                c.dirty.get_or_insert_with(Instant::now);
+            }
+        }
+    }
+
+    /// A record forgotten elsewhere (another partition): out of every watch's buffered
+    /// frames and result, as a FORGET in this log would be.
+    pub fn forget(&self, memory: Memory, key: &str) {
+        for c in self.cqs.lock().values_mut() {
+            scrub(c, memory, key);
+        }
+        self.frames.send_modify(|g| *g += 1);
+    }
+
+    /// For a cluster's watches across partitions: the records of this log after
+    /// `after` (`None`: none, just the tip) that can change `watches`, waiting up to
+    /// `wait` for one to be applied. Reads at most `max` records per call.
+    pub async fn touched_since(&self, after: Option<u64>, watches: &[(String, WatchSpec)], max: usize, wait: Duration) -> Touched {
+        let mut applied = self.applied.clone();
+        let Some(after) = after else { return Touched { tip: self.tip(), ..Default::default() } };
+        if self.tip() <= after {
+            let _ = tokio::time::timeout(wait, applied.wait_for(|t| *t > after)).await;
+        }
+        let tip = self.tip().min(after + max as u64);
+        let sets: Vec<(&String, WatchSet)> = watches.iter().map(|(id, s)| (id, s.watch_set())).collect();
+        let mut out = Touched { tip: after, ..Default::default() };
+        let mut touched = HashSet::new();
+        while out.tip < tip {
+            let n = ((tip - out.tip) as usize).min(READ_BATCH);
+            let records = match self.log.read(LogOffset(out.tip + 1), n).await {
+                Ok(r) if !r.is_empty() => r,
+                Ok(_) => break,
+                Err(LogError::Purged { .. }) => {
+                    // Behind the log: every watch may have changed.
+                    return Touched { tip, touched: watches.iter().map(|(id, _)| id.clone()).collect(), forgotten: out.forgotten };
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "watch: log read failed");
+                    break;
+                }
+            };
+            for r in &records {
+                for (id, set) in &sets {
+                    if set.touches(r) {
+                        touched.insert((*id).clone());
+                    }
+                }
+                for e in &r.effects {
+                    if let Effect::Forget { memory, lineage_id } = e {
+                        out.forgotten.push((*memory, lineage_id.0.clone()));
+                    }
+                }
+                out.tip = r.offset.0;
+            }
+        }
+        out.touched = touched.into_iter().collect();
+        out
     }
 
     /// Whether the watcher has work left: committed records not yet matched, dirty

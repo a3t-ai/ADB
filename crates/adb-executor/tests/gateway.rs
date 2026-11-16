@@ -270,3 +270,182 @@ async fn the_sql_view_spans_every_node() {
     }
     assert_eq!(catalogs.len(), 1, "every node reads the same catalog: {catalogs:?}");
 }
+
+/// `WATCH` with no NAMESPACE on a cluster: asked through one node, it runs on the
+/// system partition's owner across the partitions within the call's scope; writes to
+/// namespaces on other nodes reach its frames, read through a third node; UNWATCH
+/// from any node ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_across_partitions_sees_every_node() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let peers = LocalPeers::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for n in 1..=3u64 {
+        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{n}"), &node);
+        nodes.push(node);
+    }
+    // Namespaces on at least two nodes (and a write before the watch: a catalog).
+    let owners: BTreeSet<u64> = NS.iter().map(|ns| u64::from(nodes[0].partition_of(ns)) % 3 + 1).collect();
+    assert!(owners.len() >= 2);
+    for ns in NS {
+        nodes[0].query(&format!(r#"STORE INTO SEMANTIC (key = "{ns}-seed", topic = "seed") NAMESPACE "{ns}""#), None).await.unwrap();
+    }
+    let sys = u64::from(PARTITIONS) % 3 + 1;
+    // 0: takes the watch, 2: reads its frames (neither runs it); 1: the system
+    // partition's owner, where the writes go in.
+    let via = |k: u64| match k {
+        0 => &nodes[(sys % 3) as usize],
+        1 => &nodes[(sys - 1) as usize],
+        _ => &nodes[((sys + 1) % 3) as usize],
+    };
+    let w = via(0).query(r#"WATCH RECALL FROM SEMANTIC WHERE topic = "w" DEBOUNCE 50ms"#, None).await.unwrap();
+    let snap = &w["data"];
+    let snap = if snap["cq_id"].is_string() { snap.clone() } else { w["data"]["value"].clone() };
+    let id = snap["cq_id"].as_str().unwrap_or_else(|| panic!("a watch id: {w}")).to_string();
+    assert!(id.starts_with("c."), "{id}");
+    let scoped = nodes[0]
+        .query_in(r#"WATCH RECALL FROM SEMANTIC WHERE topic = "w" DEBOUNCE 50ms"#, None, &Reach::Only(vec!["a3t-shared--*".into()]))
+        .await
+        .unwrap();
+    let scoped_snap = if scoped["data"]["cq_id"].is_string() { scoped["data"].clone() } else { scoped["data"]["value"].clone() };
+    let scoped_id = scoped_snap["cq_id"].as_str().unwrap().to_string();
+
+    for ns in NS {
+        via(1).query(&format!(r#"STORE INTO SEMANTIC (key = "{ns}-w", topic = "w") NAMESPACE "{ns}""#), None).await.unwrap();
+    }
+    // Frames through the third node until every write is in.
+    let keys_in = |frames: &Value, kind: &str| -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for f in frames.as_array().unwrap() {
+            let list = if f["type"] == "diff" { f[kind].clone() } else { f["result"]["data"]["records"].clone() };
+            for r in list.as_array().cloned().unwrap_or_default() {
+                if let Some(k) = r.pointer("/data/key").and_then(|k| k.as_str()) {
+                    out.insert(k.to_string());
+                }
+            }
+        }
+        out
+    };
+    let collect = |cq: String, want: usize| {
+        let reader = Arc::clone(via(2));
+        async move {
+            let mut from = None;
+            let mut seen = BTreeSet::new();
+            let t0 = std::time::Instant::now();
+            while seen.len() < want && t0.elapsed() < std::time::Duration::from_secs(30) {
+                let frames = reader.watch_frames(&cq, from, 100, std::time::Duration::from_secs(2)).await.unwrap();
+                if let Some(last) = frames.as_array().unwrap().last() {
+                    from = last["offset"].as_u64();
+                }
+                seen.extend(keys_in(&frames, "added"));
+            }
+            (seen, from)
+        }
+    };
+    let (seen, from) = collect(id.clone(), NS.len()).await;
+    let want: BTreeSet<String> = NS.iter().map(|ns| format!("{ns}-w")).collect();
+    assert_eq!(seen, want, "the watch across partitions saw every node's write");
+    let (scoped_seen, _) = collect(scoped_id.clone(), 2).await;
+    let scoped_want: BTreeSet<String> = ["a3t-shared--bot-w", "a3t-shared--ops-w"].into_iter().map(String::from).collect();
+    assert_eq!(scoped_seen, scoped_want, "the scoped watch saw only its scope");
+
+    // A FORGET on another node: the next frame removes it.
+    via(1).query(r#"FORGET FROM SEMANTIC WHERE key = "demo--y-w" NAMESPACE "demo--y""#, None).await.unwrap();
+    let mut removed = false;
+    let mut from = from;
+    for _ in 0..15 {
+        let frames = via(2).watch_frames(&id, from, 100, std::time::Duration::from_secs(2)).await.unwrap();
+        if let Some(last) = frames.as_array().unwrap().last() {
+            from = last["offset"].as_u64();
+        }
+        if frames.as_array().unwrap().iter().any(|f| f["removed"].as_array().is_some_and(|r| !r.is_empty())) {
+            removed = true;
+            break;
+        }
+    }
+    assert!(removed, "the forgotten record left the watch");
+
+    // The system partition's owner restarts: the watch is registered there and runs
+    // again; a reader resuming gets a reset, then the frames go on.
+    {
+        let owner = (sys - 1) as usize;
+        let old = nodes.remove(owner);
+        peers.remove(&format!("node{sys}"));
+        drop(old);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let place = Arc::new(Static { me: sys, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[owner].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{sys}"), &node);
+        nodes.insert(owner, node);
+    }
+    let via = |k: u64| match k {
+        0 => &nodes[(sys % 3) as usize],
+        1 => &nodes[(sys - 1) as usize],
+        _ => &nodes[((sys + 1) % 3) as usize],
+    };
+    let reset = via(2).watch_frames(&id, from, 10, std::time::Duration::from_secs(5)).await.unwrap();
+    assert_eq!(reset[0]["type"], "reset", "{reset}");
+    let mut from = reset[0]["offset"].as_u64();
+    via(0).query(r#"STORE INTO SEMANTIC (key = "after-restart", topic = "w") NAMESPACE "a3t-shared--ops""#, None).await.unwrap();
+    let mut seen = false;
+    for _ in 0..15 {
+        let frames = via(2).watch_frames(&id, from, 100, std::time::Duration::from_secs(2)).await.unwrap();
+        if let Some(last) = frames.as_array().unwrap().last() {
+            from = last["offset"].as_u64();
+        }
+        if keys_in(&frames, "added").contains("after-restart") {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the watch runs again after its owner restarted");
+
+    // UNWATCH through a node that doesn't run it.
+    let u = via(1).query(&format!("UNWATCH {}", serde_json::to_string(&id).unwrap()), None).await.unwrap();
+    assert!(u.to_string().contains("\"unwatched\":true"), "{u}");
+    let e = via(2).watch_frames(&id, None, 10, std::time::Duration::from_millis(10)).await.unwrap_err();
+    assert!(e.contains("unknown watch"), "{e}");
+}
+
+/// A merged entity's key (GR-12) on a cluster: a LOOKUP naming no namespace runs
+/// across partitions and still finds the entity it merged into, through every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merged_key_resolves_across_partitions() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let ref_dir = tempfile::tempdir().unwrap();
+    let (reference, _) = LocalEngine::durable(ref_dir.path()).await.unwrap();
+    let reference: Arc<dyn Engine> = Arc::new(reference);
+    let peers = LocalPeers::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for n in 1..=3u64 {
+        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{n}"), &node);
+        nodes.push(node);
+    }
+    workload(&|_| Arc::clone(&reference)).await;
+    let via = |i: usize| -> Arc<dyn Engine> { Arc::new(Arc::clone(&nodes[i % 3])) };
+    workload(&via).await;
+    let steps = [
+        r#"STORE INTO SEMANTIC (key = "person:ada-lovelace", born = 1815)"#,
+        r#"STORE INTO SEMANTIC (key = "person:ada", field = "maths")"#,
+        r#"MERGE ENTITY "person:ada-lovelace" INTO "person:ada""#,
+    ];
+    for (i, s) in steps.iter().enumerate() {
+        reference.query(s, None).await.unwrap();
+        via(i).query(s, None).await.unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+    let q = r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-lovelace""#;
+    let want = stable(&reference.query(q, None).await.unwrap());
+    assert_eq!(want.as_array().map(|a| a.len()), Some(1), "one engine finds the survivor: {want}");
+    for (i, node) in nodes.iter().enumerate() {
+        let got = stable(&node.query(q, None).await.unwrap());
+        assert_eq!(got, want, "through node {}", i + 1);
+    }
+}

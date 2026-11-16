@@ -30,9 +30,9 @@
 //!   checked the target exists (the target may still be forgotten later: following
 //!   it then finds nothing, as for any forgotten record). Links whose far end is
 //!   outside the scope are left out of the answer.
-//! - Topics, subscriptions and platform writes go to the system partition; `WATCH`
-//!   needs one namespace (watches across partitions come later, SUBSCRIPTIONS_CQ_SPEC
-//!   §6).
+//! - Topics, subscriptions and platform writes go to the system partition. A `WATCH`
+//!   on one namespace runs on its partition's owner; one across partitions on the
+//!   system partition's owner ([`crate::cluster_watch`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -143,6 +143,8 @@ pub struct PartitionedEngine {
     read_rate: std::sync::Mutex<(std::time::Instant, HashMap<Partition, u64>)>,
     /// Forwarded reads alternate between the owner and the replica.
     spread: std::sync::atomic::AtomicU64,
+    /// Watches across partitions, on the system partition's owner ([`crate::cluster_watch`]).
+    cwatches: tokio::sync::Mutex<Option<Arc<crate::cluster_watch::ClusterWatches>>>,
     me: std::sync::Weak<PartitionedEngine>,
 }
 
@@ -401,6 +403,16 @@ impl PartitionedEngine {
                 node.drop_idle_readers();
                 node.drop_unowned();
                 node.quotas_due().await;
+                // The system partition's owner runs the watches across partitions, from
+                // its takeover on (their frames go on without a request).
+                if node.system_epoch_here().is_some() && opened.contains(&node.sys()) {
+                    let n = Arc::clone(&node);
+                    tokio::spawn(async move {
+                        if let Err(e) = n.cluster_watches().await {
+                            tracing::debug!(error = %e, "watches across partitions not started yet");
+                        }
+                    });
+                }
             }
         });
         Ok(node)
@@ -425,6 +437,7 @@ impl PartitionedEngine {
             reader_builds: Arc::new(tokio::sync::Semaphore::new(reader_builds())),
             read_rate: std::sync::Mutex::new((std::time::Instant::now(), HashMap::new())),
             spread: Default::default(),
+            cwatches: Default::default(),
             me: me.clone(),
         })
     }
@@ -1011,7 +1024,11 @@ impl PartitionedEngine {
         Some(match stmt {
             Statement::Watch(w) => {
                 let Some(ns) = touches_of(&w.query).0 else {
-                    return Some(Err("WATCH needs NAMESPACE in a cluster: watches across partitions come later".into()));
+                    return Some(match self.system_handle().await {
+                        Ok(Handle::Local(_)) => Box::pin(self.cluster_watch(aql, variables, reach)).await,
+                        Ok(Handle::Remote(r)) => r.op("cluster_watch", json!({ "aql": aql, "variables": variables, "reach": reach })).await,
+                        Err(e) => Err(e),
+                    });
                 };
                 if !reach.allows(&ns) {
                     return Some(Err(out_of_reach(&ns).to_string()));
@@ -1023,6 +1040,13 @@ impl PartitionedEngine {
                 })
             }
             Statement::Unwatch(u) => {
+                if let Some(id) = u.query_id.strip_prefix(crate::cluster_watch::PREFIX) {
+                    return Some(match self.system_handle().await {
+                        Ok(Handle::Local(_)) => self.cluster_unwatch(id).await,
+                        Ok(Handle::Remote(r)) => r.op("cluster_unwatch", json!({ "id": id })).await,
+                        Err(e) => Err(e),
+                    });
+                }
                 let Some((p, id)) = split_cq_id(&u.query_id) else {
                     return Some(Err(format!("unknown watch {}: a cluster's watch ids are <partition>.<id>", u.query_id)));
                 };
@@ -1046,6 +1070,12 @@ impl PartitionedEngine {
 
     /// A watch's frames (`<partition>.<id>`), from its partition's watcher.
     pub async fn watch_frames_of(self: &Arc<Self>, cq_id: &str, from: Option<u64>, max: usize, wait: Duration) -> Result<Value, String> {
+        if let Some(id) = cq_id.strip_prefix(crate::cluster_watch::PREFIX) {
+            return match self.system_handle().await? {
+                Handle::Local(_) => self.cluster_watches().await?.frames(id, from, max, wait).await,
+                Handle::Remote(r) => r.op("cluster_watch_frames", json!({ "id": id, "from": from, "max": max, "wait_ms": wait.as_millis() as u64 })).await,
+            };
+        }
         let (p, id) = split_cq_id(cq_id).ok_or_else(|| format!("unknown watch {cq_id}"))?;
         let mut v = match self.handle(p).await? {
             Handle::Local(e) => e.watch_frames(id, from, max, wait).await?,
@@ -1058,8 +1088,9 @@ impl PartitionedEngine {
     /// A statement spanning partitions: the router's executor over their reads and writes.
     async fn across(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
         let first = aql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or_default();
-        if first.eq_ignore_ascii_case("WATCH") {
-            return Err("WATCH needs NAMESPACE in a cluster: watches across partitions come later".into());
+        if first.eq_ignore_ascii_case("WATCH") || first.eq_ignore_ascii_case("UNWATCH") {
+            // `query_in` routes them (`watch_routed`); a forwarded one is not run here.
+            return Err("WATCH / UNWATCH are routed by the node that took the call".into());
         }
         // At most ADB_CATALOG_TTL_MS old: a namespace another node created within that
         // may be missed by a statement naming none (re-reading it on every such
@@ -1146,14 +1177,117 @@ impl PartitionedEngine {
             return Err(not_owner(p, &self.map()));
         }
         // The cluster's SQL view runs on the system partition's owner, over the node.
+        // So do the watches across partitions.
         if let crate::remote::PartCall::Op { op, args } = &call {
-            if op == "sql" && p == self.sys() {
-                let r = self.sql_view(args["sql"].as_str().unwrap_or_default(), args["limit"].as_u64().map(|l| l as usize)).await?;
-                return Ok(crate::remote::PartReply::Value(json!({ "ipc": crate::sql::to_ipc(&r)? })));
+            if p == self.sys() {
+                let a = |k: &str| args[k].as_str().unwrap_or_default();
+                let reply = |v: Value| Ok(crate::remote::PartReply::Value(v));
+                match op.as_str() {
+                    "sql" => {
+                        let r = self.sql_view(a("sql"), args["limit"].as_u64().map(|l| l as usize)).await?;
+                        return reply(json!({ "ipc": crate::sql::to_ipc(&r)? }));
+                    }
+                    "cluster_watch" | "cluster_unwatch" | "cluster_watch_frames" => {
+                        let node = self.me.upgrade().ok_or("the node is stopping")?;
+                        return reply(match op.as_str() {
+                            "cluster_watch" => {
+                                let vars: Option<HashMap<String, Value>> = serde_json::from_value(args["variables"].clone()).map_err(|e| e.to_string())?;
+                                let reach: Reach = serde_json::from_value(args["reach"].clone()).map_err(|e| e.to_string())?;
+                                Box::pin(node.cluster_watch(a("aql"), vars.as_ref(), &reach)).await?
+                            }
+                            "cluster_unwatch" => node.cluster_unwatch(a("id")).await?,
+                            _ => {
+                                let wait = Duration::from_millis(args["wait_ms"].as_u64().unwrap_or(0));
+                                let max = args["max"].as_u64().unwrap_or(100) as usize;
+                                node.cluster_watches().await?.frames(a("id"), args["from"].as_u64(), max, wait).await?
+                            }
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
         let e = self.part(p).await?;
         crate::remote::serve_part(&e, call).await
+    }
+
+    /// The system partition's epoch, when this node owns it (one node: 0).
+    pub(crate) fn system_epoch_here(&self) -> Option<u64> {
+        let sys = self.sys();
+        self.owns(sys).then(|| self.map().assignments.get(&sys).map_or(0, |a| a.epoch))
+    }
+
+    /// An operation on the system partition, here or on its owner.
+    pub(crate) async fn system_op(&self, op: &str, args: Value) -> Result<Value, String> {
+        self.system_handle().await?.op(op, args).await
+    }
+
+    /// The partitions holding data, as the catalog now says.
+    pub(crate) async fn data_partitions(&self) -> Result<BTreeSet<Partition>, String> {
+        self.refresh_catalog().await?;
+        Ok(self.catalog.read().unwrap().values().copied().collect())
+    }
+
+    /// A parsed statement across the partitions, within `reach` (a watch's re-run).
+    pub(crate) async fn run_across(self: &Arc<Self>, stmt: &aql_parser::ast::Statement, variables: &HashMap<String, Value>, reach: &Reach) -> Result<Value, String> {
+        self.catalog_recent().await?;
+        let io = Arc::new(Routed { node: Arc::clone(self), reach: reach.clone() });
+        let executor = Executor::with_io(Arc::clone(&io) as Arc<dyn Writes>, io as Arc<dyn Reads>);
+        executor.execute_statement(stmt, variables).await.map(|r| to_wire(&r)).map_err(|e| e.to_string())
+    }
+
+    /// The watches across partitions, on the system partition's owner (started here
+    /// on first use, again after this node took the system partition over).
+    pub(crate) async fn cluster_watches(self: &Arc<Self>) -> Result<Arc<crate::cluster_watch::ClusterWatches>, String> {
+        let epoch = self.system_epoch_here().ok_or_else(|| not_owner(self.sys(), &self.map()))?;
+        let mut g = self.cwatches.lock().await;
+        if let Some(cw) = g.as_ref() {
+            if cw.epoch == epoch && cw.alive() {
+                return Ok(Arc::clone(cw));
+            }
+            cw.stop();
+        }
+        let cw = crate::cluster_watch::ClusterWatches::start(self, epoch).await?;
+        *g = Some(Arc::clone(&cw));
+        Ok(cw)
+    }
+
+    /// `WATCH` across partitions (no NAMESPACE, or several), on the system partition's
+    /// owner: registered there with the call's scope, its snapshot taken across.
+    pub(crate) async fn cluster_watch(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        use aql_parser::ast::{StartPosition, Statement};
+        let started = std::time::Instant::now();
+        let Statement::Watch(w) = aql_parser::parse(aql).map_err(|e| e.to_string())? else { return Err("not a WATCH".into()) };
+        if let StartPosition::Offset(n) = w.start {
+            return Err(format!("WATCH … FROM OFFSET {n}: a new watch starts now; resume an existing one by its id (GET /watches/{{id}}/events?from=, MCP watch_changes)"));
+        }
+        let mut spec = adb_cq::WatchSpec::new(*w.query, variables.cloned().unwrap_or_default(), w.debounce)?;
+        spec.across = Some(serde_json::to_value(reach).map_err(|e| e.to_string())?);
+        // Refuse a query that fails before anything is committed.
+        self.run_across(&spec.statement, &spec.variables, reach).await?;
+        let cw = self.cluster_watches().await?;
+        let id = self.system_op("cq_register", json!({ "spec": spec })).await?["id"].as_str().ok_or("cq_register: no id")?.to_string();
+        let frame = match cw.add(&id, spec).await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = self.system_op("cq_unregister", json!({ "id": id })).await;
+                return Err(e);
+            }
+        };
+        Ok(to_wire(&crate::QueryResult::subscription(frame, started.elapsed().as_millis() as u64)))
+    }
+
+    /// `UNWATCH c.<id>`, on the system partition's owner.
+    pub(crate) async fn cluster_unwatch(self: &Arc<Self>, id: &str) -> Result<Value, String> {
+        let started = std::time::Instant::now();
+        let cw = self.cluster_watches().await?;
+        let existed = cw.contains(id);
+        if existed {
+            self.system_op("cq_unregister", json!({ "id": id })).await?;
+            cw.remove(id);
+        }
+        let v = json!({ "cq_id": format!("{}{id}", crate::cluster_watch::PREFIX), "unwatched": existed });
+        Ok(to_wire(&crate::QueryResult::subscription(v, started.elapsed().as_millis() as u64)))
     }
 
     /// Read-only SQL (the superadmin's debug view, [`crate::sql`]) on a cluster: run
@@ -1548,6 +1682,13 @@ impl Writes for Routed {
 
     async fn platform_many(&self, effects: Vec<adb_core::log::Effect>) -> AdbResult<u64> {
         self.system().await?.platform_many(effects).await
+    }
+
+    /// A merged entity's key across partitions: the first partition in scope that
+    /// knows it (GR-12).
+    async fn alias_resolve(&self, key: &str) -> AdbResult<Option<String>> {
+        let found = self.each(None, |t| async move { t.writes.alias_resolve(key).await }).await?;
+        Ok(found.into_iter().flatten().next())
     }
 
     /// MERGE ENTITY without a namespace: the entities without one, in their partition.

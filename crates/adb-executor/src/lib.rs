@@ -24,6 +24,7 @@ pub mod branch_engine;
 pub mod merge;
 pub mod restore;
 pub mod partitioned;
+pub mod cluster_watch;
 pub mod spaces;
 pub mod remote;
 pub mod replication;

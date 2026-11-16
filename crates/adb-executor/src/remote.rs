@@ -186,6 +186,13 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "space_usage" => e.space_usage(o("namespace")?.as_deref()).await,
         "forget_lineages" => val(e.forget_lineages(arg(&a, "memory")?, &arg::<Vec<String>>(&a, "lineages")?).await?),
         "compact" => e.compact().await,
+        // A merged entity's key, for a cluster's reads across partitions (GR-12).
+        "alias_of" => val(e.io().0.alias_of(&s("key")?)),
+        // A cluster's watches across partitions (the router's).
+        "cq_touched" => val(e.cq_touched(arg(&a, "after")?, &arg::<Vec<(String, adb_cq::WatchSpec)>>(&a, "watches")?, Duration::from_millis(arg(&a, "wait_ms")?)).await?),
+        "cq_register" => Ok(json!({ "id": e.cq_register(&arg(&a, "spec")?).await? })),
+        "cq_unregister" => val(e.cq_unregister(&s("id")?).await?),
+        "cq_across" => val(e.cq_across().await?),
         // The cluster's SQL view: this partition's memory rows, Arrow IPC.
         "memory_raw" => Ok(json!({ "ipc": crate::sql::to_ipc(&e.memory_raw().await?)? })),
         "embedding" => e.embedding().await,
@@ -336,6 +343,10 @@ impl Reads for RemotePartition {
 
 #[async_trait]
 impl Writes for RemotePartition {
+    async fn alias_resolve(&self, key: &str) -> AdbResult<Option<String>> {
+        self.op_typed("alias_of", serde_json::json!({ "key": key })).await
+    }
+
     async fn store(&self, memory_type: MemoryType, key: &str, payload: Value, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {
         expect!(self.call(PartCall::Store { memory: memory_type, key: key.into(), payload, scope, namespace: namespace.map(String::from), ttl_ms: ms(ttl), in_scope: in_scope.map(String::from) }).await?, Record)
     }

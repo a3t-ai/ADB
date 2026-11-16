@@ -1063,6 +1063,8 @@ impl LocalEngine {
                 let watcher = adb_cq::Watcher::new(watch_log, applied, runner, from);
                 for (id, value) in durable_handle.watches().await.map_err(|e| e.to_string())? {
                     let added = match serde_json::from_value::<adb_cq::WatchSpec>(value) {
+                        // A cluster's watch across partitions: the router runs it.
+                        Ok(spec) if spec.across.is_some() => Ok(()),
                         Ok(spec) => watcher.add(&id, spec).await.map(|_| ()).map_err(|e| e.to_string()),
                         Err(e) => Err(e.to_string()),
                     };
@@ -1141,6 +1143,35 @@ impl LocalEngine {
         let Some(d) = &self.durable else { return Ok(Vec::new()) };
         let done = d.engine_compact_journals().await.map_err(|e| e.to_string())?;
         Ok(done.into_iter().map(|(s, st)| (s, st.total, st.kept)).collect())
+    }
+
+    /// A cluster's watches across partitions, as this partition sees them: what its
+    /// log after `after` can have changed ([`adb_cq::Watcher::touched_since`]).
+    pub async fn cq_touched(&self, after: Option<u64>, watches: &[(String, adb_cq::WatchSpec)], wait: std::time::Duration) -> Result<adb_cq::Touched, String> {
+        let (watcher, _) = self.watcher.as_ref().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
+        Ok(watcher.touched_since(after, watches, 10_000, wait).await)
+    }
+
+    /// Register a cluster's watch across partitions (on the system partition).
+    pub async fn cq_register(&self, spec: &adb_cq::WatchSpec) -> Result<String, String> {
+        let d = self.durable.as_ref().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
+        Ok(d.register_watch(serde_json::to_value(spec).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?.0)
+    }
+
+    pub async fn cq_unregister(&self, id: &str) -> Result<(), String> {
+        let d = self.durable.as_ref().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
+        d.unregister_watch(id).await.map_err(|e| e.to_string())
+    }
+
+    /// The cluster's registered watches across partitions (on the system partition).
+    pub async fn cq_across(&self) -> Result<Vec<(String, adb_cq::WatchSpec)>, String> {
+        let d = self.durable.as_ref().ok_or("watches need a durable engine (start ADB with --data-dir)")?;
+        Ok(d.watches()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|(id, v)| serde_json::from_value::<adb_cq::WatchSpec>(v).ok().filter(|s| s.across.is_some()).map(|s| (id, s)))
+            .collect())
     }
 
     /// `WATCH` (register, snapshot) and `UNWATCH` (W6).
