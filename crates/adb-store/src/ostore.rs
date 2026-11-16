@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use object_store::ObjectStoreExt;
+
 /// A store and the path of the location in it.
 pub type Located = (std::sync::Arc<lance::io::ObjectStore>, object_store::path::Path);
 
@@ -22,4 +24,33 @@ pub async fn located(uri: &str) -> lance::Result<Located> {
     let l = lance::io::ObjectStore::from_uri(uri).await?;
     cache.lock().unwrap().entry(uri.to_string()).or_insert_with(|| l.clone());
     Ok(l)
+}
+
+/// The object `name` directly under `uri`, or `None` when there is none.
+pub async fn get_opt(uri: &str, name: &str) -> lance::Result<Option<Vec<u8>>> {
+    let (store, base) = located(uri).await?;
+    match store.inner.get(&base.join(name)).await {
+        Ok(r) => Ok(Some(r.bytes().await.map_err(lance::Error::from)?.to_vec())),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `bytes` as `name` under `uri` unless an object of that name is there. A
+/// store without conditional writes gets a plain write after a look (the caller reads
+/// the object back: the last writer of a race wins, and both see the same).
+pub async fn put_if_absent(uri: &str, name: &str, bytes: Vec<u8>) -> lance::Result<()> {
+    let (store, base) = located(uri).await?;
+    let path = base.join(name);
+    let opts = object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
+    match store.inner.put_opts(&path, bytes.clone().into(), opts).await {
+        Ok(_) | Err(object_store::Error::AlreadyExists { .. }) | Err(object_store::Error::Precondition { .. }) => Ok(()),
+        Err(e) => {
+            tracing::debug!(error = %e, "conditional write refused; writing after a look");
+            if get_opt(uri, name).await?.is_none() {
+                store.inner.put(&path, bytes.into()).await.map_err(lance::Error::from)?;
+            }
+            Ok(())
+        }
+    }
 }

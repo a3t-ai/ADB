@@ -13,7 +13,7 @@
 //! | `ADB_ADVERTISE` | this node's HTTP base as the others reach it (`http://10.0.0.1:3000`) |
 //! | `ADB_ADVERTISE_FLIGHT` | its Flight endpoint as the others reach it |
 //! | `ADB_PARTITIONS` | memory partitions (default 64; fixed for the cluster's life) |
-//! | `ADB_COLD_URI` | object storage — required: the replica keeps the WAL in memory only |
+//! | `ADB_COLD_URI` | object storage — required: the replica keeps the WAL in memory only; its `cluster.json` names the cluster ([`crate::cluster_mark`]) |
 //!
 //! A node starts serving once the map gives every partition an owner. Stopping is
 //! plain: its partitions move after its lease lapses (a planned hand-over is open).
@@ -103,6 +103,13 @@ fn whole(m: &PartitionMap) -> bool {
 pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, flight_port: u16, shutdown: impl std::future::Future<Output = &'static str>) -> Result<(), Box<dyn std::error::Error>> {
     if adb_executor::engine::object_storage().is_none() {
         return Err("a cluster node needs object storage (ADB_COLD_URI): a replica keeps the WAL in memory only".into());
+    }
+    // Which cluster this is: object storage's mark against this disk's, before Raft or
+    // a partition sees anything of this disk.
+    let cold = adb_executor::engine::object_storage().expect("checked above");
+    let first = config.voters.keys().next() == Some(&config.id);
+    if let Some(mark) = crate::cluster_mark::settle(dir, &cold, first, adb_cluster::control::partitions()).await? {
+        tracing::info!(node = config.id, cluster = %mark.id, "ADB cluster");
     }
     let token = adb_server::auth::token_from_env();
     // The control group, on a voter: on the control plane's own runtime (its threads,
