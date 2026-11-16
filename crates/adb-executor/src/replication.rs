@@ -133,6 +133,12 @@ impl ReplicatedLog {
     }
 }
 
+/// Records per replication call at most.
+const REPLICATE_BATCH: usize = 1024;
+/// How long a replica may refuse before it is a warning, and how often it is said.
+const REPLICATE_WARN_AFTER: Duration = Duration::from_secs(5);
+const REPLICATE_WARN_EVERY: Duration = Duration::from_secs(30);
+
 /// The replication task: wake on new records (or every second, to pass the shipped
 /// offset on), send what the replica lacks, move `acked`.
 async fn replicate_loop(
@@ -147,6 +153,13 @@ async fn replicate_loop(
     let mut held = start;
     let mut last_addr: Option<String> = None;
     let mut buf = Vec::new();
+    // Records per call: halved while the replica refuses a call as too large, whole
+    // again once the replica has caught up.
+    let mut batch = REPLICATE_BATCH;
+    // A replica that keeps refusing stalls this partition's writes: said at WARN
+    // (once per REPLICATE_WARN_EVERY), not only at debug.
+    let mut failing_since: Option<std::time::Instant> = None;
+    let mut warned_at: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             n = rx.recv_many(&mut buf, 4096) => {
@@ -173,7 +186,7 @@ async fn replicate_loop(
             let last = wal.last_offset().0;
             let ship = shipped.load(std::sync::atomic::Ordering::SeqCst);
             let records = if last > held {
-                match wal.read(LogOffset(held + 1), 1024).await {
+                match wal.read(LogOffset(held + 1), batch).await {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(error = %e, from = held + 1, "replication: reading the WAL failed");
@@ -187,6 +200,12 @@ async fn replicate_loop(
             let upto = records.last().map(|r| r.offset.0).unwrap_or(held);
             match target.replicate(&addr, ReplicateReq { epoch, shipped: ship, records }).await {
                 Ok(ack) => {
+                    if let Some(since) = failing_since.take() {
+                        if warned_at.is_some() {
+                            tracing::info!(partition = wal.partition().0, %addr, failing_for = ?since.elapsed(), "replication: the replica takes records again");
+                        }
+                        warned_at = None;
+                    }
                     // The replica's answer is what it holds.
                     held = ack.held;
                     let _ = upto;
@@ -196,6 +215,7 @@ async fn replicate_loop(
                         moved
                     });
                     if held >= wal.last_offset().0 {
+                        batch = REPLICATE_BATCH;
                         break;
                     }
                 }
@@ -210,7 +230,20 @@ async fn replicate_loop(
                     return;
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, %addr, "replication: retrying");
+                    let too_large = e.starts_with("too_large:");
+                    if too_large && batch > 1 {
+                        // Fewer records per call; no wait: the replica is fine.
+                        batch = (batch / 2).max(1);
+                        tracing::debug!(partition = wal.partition().0, batch, "replication: a call was too large; sending fewer records");
+                        continue;
+                    }
+                    let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                    if warned_at.is_none_or(|w| w.elapsed() >= REPLICATE_WARN_EVERY) && since.elapsed() >= REPLICATE_WARN_AFTER {
+                        tracing::warn!(error = %e, partition = wal.partition().0, %addr, failing_for = ?since.elapsed(), "replication: the replica refuses records; this partition's writes wait");
+                        warned_at = Some(std::time::Instant::now());
+                    } else {
+                        tracing::debug!(error = %e, %addr, "replication: retrying");
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(1));
                 }

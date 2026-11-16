@@ -26,9 +26,9 @@ const merged = all[0].map((r0, j) => {
   const rs = all.map(a => a[j]).filter(Boolean);
   const busy = rs.filter(r => !r.idle && r.ops > 0);
   const avg = f => busy.length ? busy.reduce((s, r) => s + r[f], 0) / busy.length : 0;
-  return { name: r0.name, c: r0.c, ops: rs.reduce((s, r) => s + r.ops, 0), p50: avg('p50'), p90: avg('p90'), p99: avg('p99'), errors: rs.reduce((s, r) => s + (r.errors ?? 0), 0), server: (rs.find(r => r.server) ?? {}).server ?? '' };
+  return { name: r0.name, c: r0.c, ops: rs.reduce((s, r) => s + r.ops, 0), p50: avg('p50'), p90: avg('p90'), p99: avg('p99'), errors: rs.reduce((s, r) => s + (r.errors ?? 0), 0), firstError: (rs.find(r => r.firstError) ?? {}).firstError, server: (rs.find(r => r.server) ?? {}).server ?? '' };
 });
 for (const r of merged) {
-  console.log(`  ${r.name.padEnd(38)} c=${String(r.c).padEnd(3)} ${String(r.ops).padStart(6)}/s  p50 ${r.p50.toFixed(1).padStart(6)} ms  p90 ${r.p90.toFixed(1).padStart(6)}  p99 ${r.p99.toFixed(1).padStart(7)}${r.errors ? `  errors ${r.errors}` : ''}${r.server ?? ''}  [${P} procs]`);
+  console.log(`  ${r.name.padEnd(38)} c=${String(r.c).padEnd(3)} ${String(r.ops).padStart(6)}/s  p50 ${r.p50.toFixed(1).padStart(6)} ms  p90 ${r.p90.toFixed(1).padStart(6)}  p99 ${r.p99.toFixed(1).padStart(7)}${r.errors ? `  errors ${r.errors} (${r.firstError})` : ''}${r.server ?? ''}  [${P} procs]`);
 }
 console.log('RESULTS ' + JSON.stringify(merged));

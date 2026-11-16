@@ -233,31 +233,171 @@ pub fn changes(db: &Path) -> Result<(Vec<Vec<Change>>, Counts), String> {
     Ok((batches, counts))
 }
 
-/// Send `db` into `space` of the ADB at `flight`.
-pub async fn import(db: &Path, flight: &str, space: &str) -> Result<(), String> {
-    use arrow_flight::flight_service_client::FlightServiceClient;
-    use futures::StreamExt;
-    let (batches, counts) = changes(db)?;
-    let channel = tonic::transport::Channel::from_shared(flight.to_string()).map_err(|e| e.to_string())?.connect().await.map_err(|e| format!("connect {flight}: {e}"))?;
-    let bearer: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>> = std::env::var("ADB_ENGINE_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("Bearer {t}").parse().map_err(|_| "ADB_ENGINE_TOKEN is not a valid header value".to_string()))
-        .transpose()?;
-    let mut client = FlightServiceClient::new(channel).max_encoding_message_size(64 << 20).max_decoding_message_size(64 << 20);
-    let total = batches.len();
-    for (i, batch) in batches.into_iter().enumerate() {
-        let body = json!({ "space": space, "changes": batch, "first": i == 0 });
-        let mut req = tonic::Request::new(arrow_flight::Action { r#type: "engine_restore".into(), body: body.to_string().into() });
-        if let Some(b) = &bearer {
+/// A Flight connection to one ADB with its engine token.
+struct Flight {
+    client: arrow_flight::flight_service_client::FlightServiceClient<tonic::transport::Channel>,
+    bearer: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl Flight {
+    async fn connect(url: &str, token_var: &str) -> Result<Self, String> {
+        let channel = tonic::transport::Channel::from_shared(url.to_string()).map_err(|e| e.to_string())?.connect().await.map_err(|e| format!("connect {url}: {e}"))?;
+        let bearer = std::env::var(token_var)
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("Bearer {t}").parse().map_err(|_| format!("{token_var} is not a valid header value")))
+            .transpose()?;
+        let client = arrow_flight::flight_service_client::FlightServiceClient::new(channel).max_encoding_message_size(64 << 20).max_decoding_message_size(64 << 20);
+        Ok(Self { client, bearer })
+    }
+
+    async fn action(&mut self, kind: &str, body: &Value) -> Result<Value, String> {
+        use futures::StreamExt;
+        let mut req = tonic::Request::new(arrow_flight::Action { r#type: kind.into(), body: body.to_string().into() });
+        if let Some(b) = &self.bearer {
             req.metadata_mut().insert("authorization", b.clone());
         }
-        let mut s = client.do_action(req).await.map_err(|e| format!("batch {}/{total}: {}", i + 1, e.message()))?.into_inner();
-        s.next().await.ok_or("no answer")?.map_err(|e| format!("batch {}/{total}: {}", i + 1, e.message()))?;
+        let mut s = self.client.do_action(req).await.map_err(|e| e.message().to_string())?.into_inner();
+        let r = s.next().await.ok_or("no answer")?.map_err(|e| e.message().to_string())?;
+        serde_json::from_slice(&r.body).map_err(|e| format!("answer: {e}"))
+    }
+
+    async fn restore(&mut self, space: &str, changes: &[Change], first: bool) -> Result<(), String> {
+        self.action("engine_restore", &json!({ "space": space, "changes": changes, "first": first })).await.map(|_| ())
+    }
+}
+
+/// Send `db` into `space` of the ADB at `flight`.
+pub async fn import(db: &Path, flight: &str, space: &str) -> Result<(), String> {
+    let (batches, counts) = changes(db)?;
+    let mut to = Flight::connect(flight, "ADB_ENGINE_TOKEN").await?;
+    let total = batches.len();
+    for (i, batch) in batches.into_iter().enumerate() {
+        to.restore(space, &batch, i == 0).await.map_err(|e| format!("batch {}/{total}: {e}", i + 1))?;
     }
     println!(
         "imported into space {space}: {} runs ({} journal entries, {} checkpoints), {} tasks, {} waits, {} event ids, {} outbox rows",
         counts.runs, counts.entries, counts.checkpoints, counts.tasks, counts.waits, counts.events, counts.outbox
+    );
+    Ok(())
+}
+
+/// The bytes of changes sent in one `engine_restore` (Flight messages stay well
+/// under 64 MB).
+const SNAPSHOT_BATCH_BYTES: usize = 8 << 20;
+/// Evicted journals read at once from the old ADB.
+const JOURNAL_READS: usize = 32;
+
+/// An ADB engine space's snapshot file (`<data>/engine/<space>/snapshot.json`).
+#[derive(serde::Deserialize)]
+struct Snapshot {
+    offset: u64,
+    core: flowr_storage::engine_core::EngineCore,
+}
+
+/// Move an engine space from another ADB's snapshot (`snapshot.json`, taken
+/// with the log replayed: the ADB stopped, or opened offline) into `space` of
+/// the ADB at `flight`. With `journals_from` (that ADB, serving its data
+/// offline; token `ADB_ENGINE_TOKEN_FROM`), each finished run's evicted journal
+/// is read back and goes along, so its history is kept; without it, finished
+/// runs keep their rows and lose their step history.
+pub async fn import_snapshot(snapshot: &Path, flight: &str, space: &str, journals_from: Option<&str>) -> Result<(), String> {
+    use futures::StreamExt;
+    let file = std::fs::File::open(snapshot).map_err(|e| format!("open {}: {e}", snapshot.display()))?;
+    let snap: Snapshot = serde_json::from_reader(std::io::BufReader::with_capacity(1 << 20, file)).map_err(|e| format!("{}: {e}", snapshot.display()))?;
+    let changes = snap.core.to_changes();
+    drop(snap.core);
+    let runs: HashMap<_, _> = changes.iter().filter_map(|c| match c {
+        Change::Run { id, state: Some(s) } => Some((*id, s.clone())),
+        _ => None,
+    }).collect();
+    let mut to = Flight::connect(flight, "ADB_ENGINE_TOKEN").await?;
+    let mut from = match journals_from {
+        Some(u) => Some(Flight::connect(u, "ADB_ENGINE_TOKEN_FROM").await?),
+        None => None,
+    };
+    let (mut batch, mut bytes, mut first, mut sent) = (Vec::new(), 0usize, true, 0usize);
+    let (mut entries_moved, mut journals_read, mut journals_missing) = (0usize, 0usize, 0usize);
+    // Sends `batch` once it is big enough (or `force`).
+    macro_rules! flush {
+        ($force:expr) => {
+            if !batch.is_empty() && ($force || bytes >= SNAPSHOT_BATCH_BYTES) {
+                to.restore(space, &batch, first).await.map_err(|e| format!("after {sent} changes: {e}"))?;
+                sent += batch.len();
+                first = false;
+                batch.clear();
+                bytes = 0;
+            }
+        };
+    }
+    let mut evicted = Vec::new();
+    for c in changes {
+        if let Change::JournalEvicted { run } = c {
+            evicted.push(run);
+            continue;
+        }
+        bytes += serde_json::to_vec(&c).map(|v| v.len()).unwrap_or(0);
+        batch.push(c);
+        flush!(false);
+    }
+    // The finished runs, each with its journal read back (when asked) and its
+    // final state again (entries move the row), then marked evicted.
+    for chunk in evicted.chunks(JOURNAL_READS * 8) {
+        let journals: Vec<(flowr_storage::engine::RunId, Vec<JournalEntry>)> = match from.as_mut() {
+            None => chunk.iter().map(|r| (*r, Vec::new())).collect(),
+            Some(f) => {
+                let mut out = Vec::with_capacity(chunk.len());
+                for part in chunk.chunks(JOURNAL_READS) {
+                    let reads = part.iter().map(|run| {
+                        let mut f = Flight { client: f.client.clone(), bearer: f.bearer.clone() };
+                        let run = *run;
+                        async move {
+                            let v = f.action("engine", &json!({ "space": space, "op": "read_from", "args": { "run": run, "after_seq": 0 } })).await?;
+                            if let Some(e) = v.get("err").or_else(|| v.get("error")) {
+                                return Err(format!("reading run {run}'s journal: {e}"));
+                            }
+                            let entries = match v.get("ok") {
+                                Some(Value::Null) | None => Vec::new(),
+                                Some(e) => serde_json::from_value::<Vec<JournalEntry>>(e.clone()).map_err(|e| format!("run {run}: {e}"))?,
+                            };
+                            Ok::<_, String>((run, entries))
+                        }
+                    });
+                    for r in futures::stream::iter(reads).buffered(JOURNAL_READS).collect::<Vec<_>>().await {
+                        out.push(r?);
+                    }
+                }
+                out
+            }
+        };
+        for (run, entries) in journals {
+            if from.is_some() {
+                if entries.is_empty() { journals_missing += 1 } else { journals_read += 1 }
+            }
+            if !entries.is_empty() {
+                entries_moved += entries.len();
+                let j = Change::Journal { run, entries };
+                bytes += serde_json::to_vec(&j).map(|v| v.len()).unwrap_or(0);
+                batch.push(j);
+                if let Some(s) = runs.get(&run) {
+                    batch.push(Change::Run { id: run, state: Some(s.clone()) });
+                }
+            }
+            batch.push(Change::JournalEvicted { run });
+            bytes += 64;
+            flush!(false);
+        }
+    }
+    flush!(true);
+    println!(
+        "imported into space {space} (snapshot at offset {}): {} runs, {} changes; evicted journals: {} read back ({} entries), {} without entries{}",
+        snap.offset,
+        runs.len(),
+        sent,
+        journals_read,
+        entries_moved,
+        journals_missing,
+        if from.is_none() { " (not read: no --journals-from)" } else { "" }
     );
     Ok(())
 }

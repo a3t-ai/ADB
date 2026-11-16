@@ -85,8 +85,16 @@ enum Commands {
     /// into an engine space of a running ADB over Arrow Flight (uses
     /// ADB_ENGINE_TOKEN); the space must hold no runs yet
     ImportFlowrEngine {
-        /// FlowR's flowr.db
+        /// FlowR's flowr.db, or with --snapshot an ADB engine space's snapshot.json
         path: std::path::PathBuf,
+        /// PATH is another ADB's engine snapshot (`<data>/engine/<space>/snapshot.json`,
+        /// taken with its log replayed), not a SQLite store
+        #[arg(long)]
+        snapshot: bool,
+        /// With --snapshot: that ADB's Flight endpoint, serving its data, to read
+        /// finished runs' journals back from (token ADB_ENGINE_TOKEN_FROM)
+        #[arg(long)]
+        journals_from: Option<String>,
         /// ADB's Flight endpoint
         #[arg(long, default_value = "http://127.0.0.1:3001")]
         flight: String,
@@ -121,7 +129,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Commands::ImportLancedb { path, flight, replace }) = &cli.command {
         return import::import(path, flight, *replace).await.map_err(|e| e.into());
     }
-    if let Some(Commands::ImportFlowrEngine { path, flight, space }) = &cli.command {
+    if let Some(Commands::ImportFlowrEngine { path, flight, space, snapshot, journals_from }) = &cli.command {
+        if *snapshot {
+            return import_engine::import_snapshot(path, flight, space, journals_from.as_deref()).await.map_err(|e| e.into());
+        }
         return import_engine::import(path, flight, space).await.map_err(|e| e.into());
     }
     if let Some(Commands::Sql { query, flight, limit }) = &cli.command {

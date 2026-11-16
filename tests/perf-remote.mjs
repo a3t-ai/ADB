@@ -24,7 +24,7 @@ const ROWS = Number(args.rows ?? 20000);
 // takes its share of every phase's concurrency, with its own keys.
 const PROCS = Math.max(1, Number(args.procs ?? 1));
 const WORKER = Number(args.worker ?? 0);
-const run = Date.now().toString(36) + (PROCS > 1 ? `w${WORKER}` : '');
+const run = Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + (PROCS > 1 ? `w${WORKER}` : '');
 const share = c => Math.floor(c / PROCS) + (WORKER < c % PROCS ? 1 : 0);
 
 const pct = (v, p) => v.length ? v[Math.min(v.length - 1, Math.floor(v.length * p))] : 0;
@@ -90,7 +90,7 @@ async function phase(name, c, op) {
   }));
   const secs = (Date.now() - t0) / 1000;
   lat.sort((a, b) => a - b);
-  const r = { name, c: total, ops: Math.round(ok / secs), p50: pct(lat, 0.5), p90: pct(lat, 0.9), p99: pct(lat, 0.99), errors };
+  const r = { name, c: total, ops: Math.round(ok / secs), p50: pct(lat, 0.5), p90: pct(lat, 0.9), p99: pct(lat, 0.99), errors, firstError };
   r.server = serverDelta(before, await snapshot());
   results.push(r);
   console.log(`  ${name.padEnd(38)} c=${String(c).padEnd(3)} ${String(r.ops).padStart(6)}/s  p50 ${r.p50.toFixed(1).padStart(6)} ms  p90 ${r.p90.toFixed(1).padStart(6)}  p99 ${r.p99.toFixed(1).padStart(7)}${errors ? `  errors ${errors} (${firstError})` : ''}${r.server}`);

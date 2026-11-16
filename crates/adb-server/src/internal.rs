@@ -67,12 +67,19 @@ async fn replicate(State(node): State<Arc<PartitionedEngine>>, Path(p): Path<Par
     }
 }
 
+/// The largest body an internal call carries. Axum's default (2 MB) refused any
+/// replication call above it with 413, and the partition's writes then waited for
+/// an ack forever: one record can be as large as a Flight message (64 MB), and a
+/// replication call carries many (the sender halves a batch that is still refused).
+pub const INTERNAL_BODY_MAX: usize = 256 << 20;
+
 /// The internal routes of a cluster node.
 pub fn routes(node: Arc<PartitionedEngine>) -> Router {
     Router::new()
         .route("/internal/query", post(query))
         .route("/internal/partition/:p", post(partition))
         .route("/internal/replicate/:p", post(replicate))
+        .layer(axum::extract::DefaultBodyLimit::max(INTERNAL_BODY_MAX))
         .with_state(node)
 }
 
@@ -129,6 +136,9 @@ impl Peers for HttpPeers {
         let r = r.send().await.map_err(|e| format!("{url}: {e}"))?;
         let status = r.status();
         let bytes = r.bytes().await.map_err(|e| format!("{url}: {e}"))?;
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(format!("too_large: {}", String::from_utf8_lossy(&bytes)));
+        }
         if !status.is_success() {
             return Err(String::from_utf8_lossy(&bytes).to_string());
         }

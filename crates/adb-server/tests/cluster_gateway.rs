@@ -115,6 +115,20 @@ async fn any_node_over_http_and_flight() {
     let r = flight_action(&nodes[2].flight, Some(TOKEN), "aql", json!({ "query": r#"RECALL FROM SEMANTIC ALL NAMESPACE "demo--y""# })).await.unwrap();
     assert_eq!(r["data"]["data"]["count"], 1, "{r}");
 
+    // Records above axum's default body limit (2 MB): written on the partition's
+    // owner, the record goes to the replica over HTTP (refused with 413 before, and
+    // the partition's writes waited for the replica forever); written through another
+    // node, the statement goes to the owner over HTTP too.
+    let big = "x".repeat(3 << 20);
+    let owner = usize::from(engines[0].partition_of("demo--big")) % 3;
+    for (via, key) in [(owner, "big-owner"), ((owner + 1) % 3, "big-forwarded")] {
+        let store = flight_action(&nodes[via].flight, Some(TOKEN), "aql", json!({ "query": format!(r#"STORE INTO WORKING (key = "{key}", note = "{big}") NAMESPACE "demo--big""#) }));
+        let r = tokio::time::timeout(Duration::from_secs(30), store).await.unwrap_or_else(|_| panic!("{key}: a 3 MB write is acknowledged (the replica takes it)")).unwrap();
+        assert_eq!(r["success"], true, "{key}: {}", r.to_string().chars().take(300).collect::<String>());
+        let r = flight_action(&nodes[(via + 2) % 3].flight, Some(TOKEN), "aql", json!({ "query": format!(r#"RECALL FROM WORKING KEY id = "{key}" NAMESPACE "demo--big""#) })).await.unwrap();
+        assert_eq!(r["data"]["data"]["records"][0]["data"]["note"].as_str().map(str::len), Some(3 << 20), "{key}");
+    }
+
     // Platform tables from a node that doesn't own the system partition: forwarded.
     let other = (sys_owner + 1) % 3;
     assert!(engines[other].system_flight().is_some() && engines[sys_owner].system_flight().is_none());
