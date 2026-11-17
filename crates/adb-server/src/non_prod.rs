@@ -91,7 +91,7 @@ impl NonProdPod {
         }
         let source = Arc::new(FlightParentSource { url: self.config.org.clone(), token: self.config.token.clone(), branch: None });
         let view = ParentView { source, namespace: b.namespace.clone(), branch: b.name.clone(), point: b.point().into() };
-        let (engine, _) = LocalEngine::durable_branch(self.dir_of(b), view).await?;
+        let (engine, _) = LocalEngine::durable_branch(self.dir_of(b), view, None).await?;
         write_origin(&engine, b).await?;
         self.apply_pending(&engine, b).await?;
         let engine = Arc::new(engine);

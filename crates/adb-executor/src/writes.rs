@@ -1336,6 +1336,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             point_offset,
             point_ts: point_ts.0,
             created_by: created_by.map(String::from),
+            uid: format!("{:x}", CommitTs::from_datetime(time::now()).0),
             placement: None,
             pending_forgets: Vec::new(),
         };

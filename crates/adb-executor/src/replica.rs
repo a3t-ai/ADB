@@ -79,7 +79,7 @@ impl Replica {
     /// reader (step 6) holds its table only.
     pub async fn open_role(dir: impl AsRef<std::path::Path>, role: crate::engine::PartitionRole, log: EngineLog) -> Result<Self, String> {
         let dir = dir.as_ref();
-        let (store, embedder) = crate::engine::open_store(dir, role.id).await?;
+        let (store, embedder) = crate::engine::open_store(dir, role.id, crate::engine::object_storage()).await?;
         // The hot cache, kept by every apply, so a takeover doesn't refill it (C-19).
         store.set_cache(crate::engine::hot_cache(crate::engine::cache_config(dir)?)).await.map_err(s("store"))?;
         // The live keys a takeover hands over, and the field indexes (PF-38, PF-40).

@@ -50,7 +50,7 @@ async fn start_pod(dir: &std::path::Path, org: &str, port: u16) -> (Arc<dyn Engi
     let b = b.into_iter().find(|b| b.name == "pod-try").unwrap();
     let source = Arc::new(FlightParentSource { url: org.into(), token: None, branch: None });
     let view = ParentView { source, namespace: "crm".into(), branch: "pod-try".into(), point: b.point().into() };
-    let (engine, _) = LocalEngine::durable_branch(dir, view).await.unwrap();
+    let (engine, _) = LocalEngine::durable_branch(dir, view, None).await.unwrap();
     // As `adb-cli`'s pod mode does (DB-20): a new pod's first record names its origin.
     adb_executor::branch_engine::write_origin(&engine, &b).await.unwrap();
     let pending = flight_action(org, None, "branch_pending", json!({ "namespace": "crm", "name": "pod-try" })).await.unwrap();
