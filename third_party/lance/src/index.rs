@@ -3248,7 +3248,9 @@ impl DatasetIndexExt for Dataset {
                 // We shouldn't have any indices with empty fields, but just in case, log an error
                 // but don't fail the operation (we might not be using that index)
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    // ADB patch: the system indices (fragment reuse, MemWAL) have no
+                    // fields by design; only another one is worth an error.
+                    if idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
