@@ -30,10 +30,6 @@ pub struct Branch {
     pub point_ts: i64,
     #[serde(default)]
     pub created_by: Option<String>,
-    /// Set when the branch is created: tells it apart from an earlier branch of the
-    /// same name, dropped (its place on object storage is kept).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub uid: String,
     /// B6: the branch engine runs in its own ADB process at this Flight URL (`None`:
     /// hosted in the org's process, `<data dir>/branches/`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,7 +373,6 @@ mod tests {
     fn chains_walk_to_main() {
         let b = Branches::default();
         let mk = |name: &str, parent: &str, off: u64| Branch {
-            uid: String::new(),
             id: Branch::id_of("crm", name),
             namespace: "crm".into(),
             name: name.into(),

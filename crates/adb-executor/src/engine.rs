@@ -508,13 +508,12 @@ pub fn object_storage() -> Option<String> {
     }
 }
 
-/// Open the table in `dir/store`, with object storage at `cold` (`{cold}/p{partition}`;
-/// [`object_storage`] for a partition, a branch's own place for a branch engine).
-pub(crate) async fn open_store(dir: &std::path::Path, partition: PartitionId, cold: Option<String>) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
+pub(crate) async fn open_store(dir: &std::path::Path, partition: PartitionId) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
     let settings = adb_embed::EmbedConfig::load(dir)?;
     let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
     // The replica set's other nodes may embed on this node's model (C-17b).
     adb_embed::peers::serve_with(embedder.clone());
+    let cold = object_storage();
     let store_cfg = StoreConfig { embedding_dim, embedding_model, cold, ..StoreConfig::new(dir.join("store")) };
     let store = Arc::new(PartitionStore::open(&store_cfg, partition).await.map_err(|e| e.to_string())?);
     Ok((store, embedder))
@@ -703,12 +702,12 @@ impl LocalEngine {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
         let wal: EngineLog = Arc::new(open_wal(&dir, role).await?);
-        Box::pin(Self::durable_with(dir, wal, None, role, object_storage())).await
+        Box::pin(Self::durable_with(dir, wal, None, role)).await
     }
 
     /// [`Self::durable_partition`] over `log` (a cluster owner's replicated log, step 5).
     pub async fn durable_partition_on(dir: impl Into<std::path::PathBuf>, role: PartitionRole, log: EngineLog) -> Result<(Self, ReplayStats), String> {
-        Box::pin(Self::durable_with(dir.into(), log, None, role, object_storage())).await
+        Box::pin(Self::durable_with(dir.into(), log, None, role)).await
     }
 
     /// Step 6, for readers on other nodes: committed records from `from` (at most `max`,
@@ -751,18 +750,16 @@ impl LocalEngine {
     /// node's local WAL. Everything else is as [`Self::durable`].
     pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
         // Boxed: keeps the callers' future types shallow (the compiler's query depth).
-        Box::pin(Self::durable_with(dir.into(), wal, None, PartitionRole::SINGLE, object_storage())).await
+        Box::pin(Self::durable_with(dir.into(), wal, None, PartitionRole::SINGLE)).await
     }
 
     /// A branch engine (B2): its own WAL, sequencer and delta table in `dir`, reading
-    /// its parent through `parent` (the org, or another branch). `cold`: the branch's
-    /// own place on object storage (its WAL segments and checkpoints), never a
-    /// partition's; `None` keeps it on local disk only.
-    pub async fn durable_branch(dir: impl Into<std::path::PathBuf>, parent: crate::branch_engine::ParentView, cold: Option<String>) -> Result<(Self, ReplayStats), String> {
+    /// its parent through `parent` (the org, or another branch).
+    pub async fn durable_branch(dir: impl Into<std::path::PathBuf>, parent: crate::branch_engine::ParentView) -> Result<(Self, ReplayStats), String> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("branch data dir {}: {e}", dir.display()))?;
         let wal: EngineLog = Arc::new(open_wal(&dir, PartitionRole::SINGLE).await?);
-        Box::pin(Self::durable_with(dir, wal, Some(parent), PartitionRole::SINGLE, cold)).await
+        Box::pin(Self::durable_with(dir, wal, Some(parent), PartitionRole::SINGLE)).await
     }
 
     /// The engine's data directory.
@@ -949,10 +946,6 @@ impl LocalEngine {
     /// Take the partition over at owner epoch `epoch` (`segments`): record where this
     /// owner starts on object storage before it takes writes.
     pub async fn begin_epoch(&self, epoch: u64) -> Result<(), String> {
-        // The partition's branches are owned at the same epoch (fenced with it).
-        if let Some(host) = &self.branch_host {
-            host.set_epoch(epoch);
-        }
         match &self.durable {
             Some(w) => w.begin_epoch(epoch).await.map_err(|e| e.to_string()),
             None => Ok(()),
@@ -980,12 +973,10 @@ impl LocalEngine {
         self.durable.as_ref()
     }
 
-    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, parent: Option<crate::branch_engine::ParentView>, role: PartitionRole, cold: Option<String>) -> Result<(Self, ReplayStats), String> {
+    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, parent: Option<crate::branch_engine::ParentView>, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
-        // A partition's branches live under its own place on object storage.
-        let branches_cold = cold.as_ref().filter(|_| parent.is_none()).map(|c| format!("{}/p{}/branches", c.trim_end_matches('/'), role.id.0));
-        let (store, embedder) = open_store(&dir, role.id, cold).await?;
+        let (store, embedder) = open_store(&dir, role.id).await?;
         // The field indexes it had, in the background (PF-40).
         store.warm(false);
         let opened = std::time::Instant::now();
@@ -1037,7 +1028,6 @@ impl LocalEngine {
                 dir.join("branches"),
                 Arc::new(crate::branch_engine::StoreSource { store: Arc::clone(&store), barrier: barrier.clone() }),
                 Arc::clone(writes.branches()),
-                branches_cold,
             ))),
             Some(_) => None,
         };

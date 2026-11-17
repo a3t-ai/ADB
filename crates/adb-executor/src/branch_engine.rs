@@ -9,11 +9,7 @@
 //! - [`overlay`]: the branch's own rows first, then the parent's; the nearest level
 //!   wins per lineage, and a `_branch_deleted` row hides one.
 //! - [`BranchHost`]: the org engine's branch engines, opened under
-//!   `<data dir>/branches/<namespace>__<name>` (hosted placement). With object
-//!   storage each branch has its own place, `{cold}/p{n}/branches/<place>`, where its
-//!   engine ships its WAL segments and checkpoints like a partition: a node that
-//!   takes the partition over (its directory rebuilt) restores a branch from there
-//!   when the branch is first used.
+//!   `<data dir>/branches/<namespace>__<name>` (hosted placement).
 //!
 //! The org's sequencer, WAL, table and compaction never see a branch's writes.
 
@@ -28,11 +24,6 @@ use async_trait::async_trait;
 
 use crate::apply::ApplyBarrier;
 use crate::branches::{Branch, Branches, MAIN};
-
-/// A name as a path segment: letters, digits and `-_.`; anything else `_`.
-fn safe(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect()
-}
 
 /// A parent's rows of `namespace` in `memory`, as they were at `at`.
 #[async_trait]
@@ -249,32 +240,11 @@ pub struct BranchHost {
     registry: Arc<Branches>,
     engines: tokio::sync::Mutex<HashMap<String, Arc<crate::LocalEngine>>>,
     remote: std::sync::OnceLock<Arc<dyn BranchRemote>>,
-    /// `{cold}/p{n}/branches` of the hosting partition (`None`: local disk only).
-    cold: Option<String>,
-    /// The hosting partition's owner epoch (0: not a cluster owner): its branch
-    /// engines are restored and fenced at it.
-    epoch: std::sync::atomic::AtomicU64,
 }
 
 impl BranchHost {
-    pub fn new(root: PathBuf, org: Arc<dyn ParentSource>, registry: Arc<Branches>, cold: Option<String>) -> Self {
-        Self { root, org, registry, engines: Default::default(), remote: Default::default(), cold, epoch: Default::default() }
-    }
-
-    /// The hosting partition is owned at `epoch` from now on (a cluster owner).
-    pub fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Branch `b`'s place on object storage: its own, under the hosting partition's
-    /// (`uid` keeps a branch made again under a dropped one's name apart from it).
-    fn cold_of(&self, b: &Branch) -> Option<String> {
-        let base = self.cold.as_ref()?;
-        let mut place = format!("{}__{}", safe(&b.namespace), safe(&b.name));
-        if !b.uid.is_empty() {
-            place = format!("{place}__{}", safe(&b.uid));
-        }
-        Some(format!("{base}/{place}"))
+    pub fn new(root: PathBuf, org: Arc<dyn ParentSource>, registry: Arc<Branches>) -> Self {
+        Self { root, org, registry, engines: Default::default(), remote: Default::default() }
     }
 
     /// How this org reaches branches in their own pods (B6); set once at start.
@@ -305,6 +275,7 @@ impl BranchHost {
     }
 
     fn dir_of(&self, b: &Branch) -> PathBuf {
+        let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect::<String>();
         self.root.join(format!("{}__{}", safe(&b.namespace), safe(&b.name)))
     }
 
@@ -325,26 +296,7 @@ impl BranchHost {
                 match engines.get(&b.id) {
                     Some(e) => Arc::clone(e),
                     None => {
-                        let (dir, cold) = (self.dir_of(b), self.cold_of(b));
-                        let epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
-                        // Not on this node's disk (a takeover rebuilt the partition, or it
-                        // never was here): what object storage holds of it first.
-                        if let (Some(cold), false) = (&cold, dir.exists()) {
-                            let st = crate::restore::restore_from_object_storage(&dir, cold, (epoch > 0).then_some(epoch))
-                                .await
-                                .map_err(|e| format!("branch {}: {e}", b.id))?;
-                            tracing::info!(branch = %b.id, log_ends_at = st.log_ends_at, "branch restored from object storage");
-                        }
-                        // The hosting partition's embedding model: a branch's vectors are
-                        // ranked with its parent's (LIKE reads both).
-                        if let Some(c) = self.root.parent().map(adb_embed::EmbedConfig::load).transpose()?.flatten() {
-                            std::fs::create_dir_all(&dir).map_err(|e| format!("branch {}: {e}", b.id))?;
-                            c.save(&dir)?;
-                        }
-                        let (e, _) = crate::LocalEngine::durable_branch(dir, view.clone(), cold).await?;
-                        if epoch > 0 {
-                            e.begin_epoch(epoch).await.map_err(|e| format!("branch {}: {e}", b.id))?;
-                        }
+                        let (e, _) = crate::LocalEngine::durable_branch(self.dir_of(b), view.clone()).await?;
                         // Compaction keeps what this branch's own branches read (B4).
                         if let Some(d) = e.durable_writes() {
                             let (registry, ns, name) = (Arc::clone(&self.registry), b.namespace.clone(), b.name.clone());
