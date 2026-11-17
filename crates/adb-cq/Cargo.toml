@@ -1,0 +1,18 @@
+[package]
+name = "adb-cq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB continuous queries: WATCH v1 — watch sets, re-run on match, diffs, resumable frames (MVP W6)"
+
+[dependencies]
+adb-core.workspace = true
+adb-log = { path = "../adb-log" }
+aql-parser.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

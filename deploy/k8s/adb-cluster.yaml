@@ -1,0 +1,113 @@
+# ADB as a 3-node cluster on object storage (S3 option B, .ai/S3_OPTION_B_PLAN.md
+# §3.0; the shared doc "ADB architecture: S3-backed cluster").
+#
+# - StatefulSet adb-0..2; node id = ordinal + 1. Every pod runs the same pieces: the
+#   control client, the gateway, owners, replicas and readers; adb-0..2 are also the
+#   control group's voters (port 3002).
+# - Every pod is Ready once it holds its lease and the map is complete: the Service
+#   `adb` (what FlowR and the console use) spreads requests over all of them; any pod
+#   answers any request (writes go to the partition's owner, reads to the local reader).
+# - The headless Service `adb-nodes` gives each pod a stable name for the calls
+#   between nodes (HTTP /internal/*, Flight, control), published before Ready.
+# - Object storage is required (`adb-s3`: ADB_COLD_URI, AWS_* with the endpoint).
+#   Local disk holds only what object storage lacks yet, plus a fixed cache.
+#
+# A pod that stops loses nothing acknowledged: its partitions move to their replicas
+# when its lease lapses (ADB_LEASE_MS, 3 s), the replica uploads what object storage
+# lacks, and serves. A new cluster with the same ADB_COLD_URI starts from object
+# storage alone. Moving from the earlier Raft replica set replaces the data format:
+# there is no migration (start from object storage, or empty).
+apiVersion: v1
+kind: Service
+metadata:
+  name: adb-nodes
+  namespace: a3t
+  labels: { app: adb }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: adb }
+  ports:
+    - { name: http, port: 3000, targetPort: http }
+    - { name: flight, port: 3001, targetPort: flight }
+    - { name: control, port: 3002, targetPort: control }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: adb
+  namespace: a3t
+  labels: { app: adb }
+spec:
+  serviceName: adb-nodes
+  replicas: 3
+  podManagementPolicy: Parallel
+  # Any pod serves any request, so pods roll one at a time.
+  updateStrategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 1 } }
+  selector:
+    matchLabels: { app: adb }
+  template:
+    metadata:
+      labels: { app: adb }
+    spec:
+      imagePullSecrets: [{ name: registry-credentials }]
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: adb
+          image: ghcr.io/srirammails/adb:CHANGE-ME
+          args: [adb, serve-http, --host, 0.0.0.0, --port, "3000", --flight-port, "3001"]
+          env:
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: ADB_DATA_DIR, value: /data/adb }
+            - { name: ADB_NODE_ID, value: from-hostname }
+            - name: ADB_CONTROL_PEERS
+              value: "1=http://adb-0.adb-nodes.a3t.svc.cluster.local:3002,2=http://adb-1.adb-nodes.a3t.svc.cluster.local:3002,3=http://adb-2.adb-nodes.a3t.svc.cluster.local:3002"
+            - { name: ADB_CONTROL_PORT, value: "3002" }
+            - { name: ADB_ADVERTISE, value: "http://$(POD_NAME).adb-nodes.a3t.svc.cluster.local:3000" }
+            - { name: ADB_ADVERTISE_FLIGHT, value: "http://$(POD_NAME).adb-nodes.a3t.svc.cluster.local:3001" }
+            # Fixed for the cluster's life (64 partitions, at most 5 nodes).
+            - { name: ADB_PARTITIONS, value: "64" }
+            - { name: RUST_LOG, value: "info,lance=warn" }
+            - name: ADB_COLD_URI
+              valueFrom: { secretKeyRef: { name: adb-s3, key: cold_uri } }
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: adb-s3, key: access_key_id } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: adb-s3, key: secret_access_key } }
+            - name: AWS_ENDPOINT
+              valueFrom: { secretKeyRef: { name: adb-s3, key: endpoint } }
+            - name: AWS_REGION
+              valueFrom: { secretKeyRef: { name: adb-s3, key: region } }
+            - name: ADB_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: adb-auth, key: token, optional: true } }
+            - name: ADB_ENGINE_TOKEN
+              valueFrom: { secretKeyRef: { name: adb-engine, key: token } }
+            # Gateway step 1 (AC-8): {"<pool>": "<token>"}; a pool token claims and
+            # follows its own pool only. Optional: without it only the engine token works.
+            - name: ADB_ENGINE_POOL_TOKENS
+              valueFrom: { secretKeyRef: { name: adb-pool-tokens, key: pools, optional: true } }
+          ports:
+            - { name: http, containerPort: 3000 }
+            - { name: flight, containerPort: 3001 }
+            - { name: control, containerPort: 3002 }
+          # Ready: the map is complete and this pod holds its lease.
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 2
+            failureThreshold: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 4Gi }
+          volumeMounts:
+            - { name: adb-data, mountPath: /data/adb, subPathExpr: $(POD_NAME) }
+      volumes:
+        - name: adb-data
+          hostPath: { path: /data/a3t-dev/adb-cluster, type: DirectoryOrCreate }

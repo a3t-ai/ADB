@@ -1,11 +1,524 @@
-//! ADB Server - Main Agent Database Instance
+//! ADB HTTP server — a drop-in replacement for ClawDB's server (`clawdb-server`).
 //!
-//! Provides the main `Adb` struct that orchestrates all backends
-//! and provides a unified interface for agent memory operations.
+//! A3T reaches agent memory through these endpoints today, so they keep ClawDB's
+//! paths and wire format:
 //!
-//! Note: The core Adb and AdbConfig types are now in adb-backends.
-//! This crate re-exports them for convenience and will contain
-//! HTTP/gRPC server implementations.
+//! | Endpoint | Purpose |
+//! |---|---|
+//! | `GET /health` | `{status, version}` |
+//! | `POST /query` | `{"query": AQL, "variables"?: {…}}` → `{success, data, error, execution_time_ms}` |
+//! | `GET /stats` | `{success, data: {working: n, …}}` |
+//! | `POST /mcp` | MCP over streamable HTTP (JSON responses) |
+//! | `GET /mcp/sse`, `POST /mcp/message?sessionId=…` | MCP over HTTP+SSE (no `sessionId`: reply in the body) |
+//! | `GET /subscriptions/{id}/events?from=N` | A subscription's deliveries as SSE (stage E): `event: delivery`, `id: <offset>`; reconnect with `Last-Event-ID` to resume; `event: heartbeat` with the tip when idle |
+//! | `GET /watches/{id}/events?from=N` | A continuous query's frames as SSE (W6): `event: diff` / `reset`, `id: <offset>`; `from` / `Last-Event-ID` = the last frame applied |
+//!
+//! With `ADB_AUTH_TOKEN` set, every endpoint but `/health` needs
+//! `Authorization: Bearer <token>` ([`auth`]).
 
-// Re-export from adb-backends for backward compatibility
-pub use adb_backends::{Adb, AdbConfig};
+#![recursion_limit = "256"]
+
+pub mod auth;
+pub mod branch_remote;
+pub mod flight;
+pub mod forward;
+pub mod internal;
+pub mod non_prod;
+pub mod scope;
+pub use flight::{serve_flight, serve_flight_until, serve_flight_with_token, serve_flight_with_tokens};
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use adb_executor::Engine;
+use adb_mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
+use adb_mcp::McpServer;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use futures::Stream;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tower_http::cors::{Any, CorsLayer};
+
+/// Shared state: the engine and the MCP handler over it.
+#[derive(Clone)]
+pub struct AppState {
+    engine: Arc<dyn Engine>,
+    mcp: McpServer,
+    sessions: Sessions,
+}
+
+impl AppState {
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
+        Self { mcp: McpServer::new(Arc::clone(&engine)), engine, sessions: Sessions::default() }
+    }
+}
+
+/// The full router, with the token from `ADB_AUTH_TOKEN` if set.
+pub fn router(engine: Arc<dyn Engine>) -> Router {
+    router_with_token(engine, auth::token_from_env())
+}
+
+/// The full router; with `token`, every endpoint but `/health` requires it.
+pub fn router_with_token(engine: Arc<dyn Engine>, token: Option<Arc<str>>) -> Router {
+    guarded(routes(engine), token)
+}
+
+/// A cluster node's router (step 4): the full router plus the calls between nodes
+/// (`/internal/*`), behind the same token.
+pub fn cluster_router(node: Arc<adb_executor::partitioned::PartitionedEngine>, token: Option<Arc<str>>) -> Router {
+    let engine: Arc<dyn Engine> = Arc::new(Arc::clone(&node));
+    guarded(routes(engine).merge(internal::routes(node)), token)
+}
+
+fn guarded(routes: Router, token: Option<Arc<str>>) -> Router {
+    let mut r = routes;
+    let scopes = Arc::new(scope::scopes_from_env());
+    if token.is_some() || !scopes.is_empty() {
+        r = r.layer(axum::middleware::from_fn(move |req, next| auth::require_token(token.clone(), Arc::clone(&scopes), req, next)));
+    }
+    // Outside auth: refused requests are counted too (OB-2).
+    r = r.layer(axum::middleware::from_fn(http_metrics));
+    r.layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+}
+
+/// OB-2: every HTTP request by its route (the template, `/subscriptions/:id/events`,
+/// never the raw path), with status and duration.
+async fn http_metrics(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let op = req.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str().to_string()).unwrap_or_else(|| "other".into());
+    let f = adb_core::metrics::InFlight::start("http", op);
+    let r = next.run(req).await;
+    f.done(!(r.status().is_client_error() || r.status().is_server_error()));
+    r
+}
+
+/// OB-1: every metric, Prometheus text format.
+async fn metrics_text() -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], adb_core::metrics::render())
+}
+
+/// OB-1: every metric as JSON, histograms with p50 / p90 / p99 (for the A3T UI).
+async fn metrics_json() -> axum::Json<serde_json::Value> {
+    axum::Json(adb_core::metrics::snapshot())
+}
+
+fn routes(engine: Arc<dyn Engine>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics_text))
+        .route("/admin/stats/metrics", get(metrics_json))
+        .route("/query", post(query))
+        .route("/stats", get(stats))
+        .route("/admin/embedding", get(embedding).put(set_embedding))
+        .route("/admin/cache", get(cache).put(set_cache))
+        .route("/admin/compact", axum::routing::post(compact))
+        .route("/mcp", post(mcp_post).get(mcp_get))
+        .route("/mcp/sse", get(mcp_sse))
+        .route("/mcp/message", post(mcp_message))
+        .route("/subscriptions/:id/events", get(subscription_events))
+        .route("/watches/:id/events", get(watch_events))
+        .with_state(AppState::new(engine))
+}
+
+/// Bind and serve until the process ends.
+pub async fn serve(addr: SocketAddr, engine: Arc<dyn Engine>) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(auth = auth::token_from_env().is_some(), "ADB listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, router(engine)).await
+}
+
+// ---------------------------------------------------------------- subscriptions
+
+#[derive(Deserialize)]
+struct EventsParams {
+    from: Option<u64>,
+}
+
+/// `GET /subscriptions/{id}/events` — deliveries as SSE (E1). Each delivery is an
+/// `event: delivery` with `id: <offset>`, so `Last-Event-ID` resumes after the last one
+/// received; idle periods send `event: heartbeat` with `{tip, next}`. A subscriber
+/// whose position left the log gets `event: reset` (the current rows, `id` = the
+/// offset they are as of) and then deliveries after it (W9). An error is sent as
+/// `event: error` and ends the stream.
+async fn subscription_events(
+    State(s): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(p): Query<EventsParams>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|last| last + 1);
+    let from = p.from.or(resume);
+    // Through the engine, not a gateway here: on a cluster the gateway is on the
+    // system partition's owner, and any node serves the stream.
+    if let Err(e) = s.engine.next_events(&id, from, 1, Duration::ZERO).await {
+        let status = if e.contains("nknown subscription") {
+            StatusCode::NOT_FOUND
+        } else if e.contains("need a durable engine") {
+            StatusCode::NOT_IMPLEMENTED
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return (status, Json(serde_json::json!({ "error": e }))).into_response();
+    }
+    use futures::StreamExt as _;
+    let engine = s.engine.clone();
+    let stream = futures::stream::unfold(Some(from), move |state| {
+        let engine = engine.clone();
+        let id = id.clone();
+        async move {
+            let from = state?;
+            let b = match engine.next_events(&id, from, 100, Duration::from_secs(15)).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let ev = Event::default().event("error").data(serde_json::json!({ "error": e }).to_string());
+                    return Some((futures::stream::iter(vec![Ok::<_, Infallible>(ev)]), None));
+                }
+            };
+            let next = b["next"].as_u64();
+            let deliveries = b["deliveries"].as_array().cloned().unwrap_or_default();
+            let reset = b.get("reset").filter(|r| !r.is_null()).cloned();
+            if deliveries.is_empty() && reset.is_none() {
+                let hb = serde_json::json!({ "tip": b["tip"], "next": b["next"] });
+                return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(next)));
+            }
+            let id_of = |v: &Value| v["offset"].as_u64().map(|o| o.to_string()).unwrap_or_default();
+            let evs: Vec<Result<Event, Infallible>> = reset
+                .iter()
+                .map(|r| Ok(Event::default().event("reset").id(id_of(r)).data(r.to_string())))
+                .chain(deliveries.iter().map(|d| Ok(Event::default().event("delivery").id(id_of(d)).data(d.to_string()))))
+                .collect();
+            Some((futures::stream::iter(evs), Some(next)))
+        }
+    })
+    .flatten();
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+// ---------------------------------------------------------------- watches (W6)
+
+/// `GET /watches/{id}/events?from=<offset>` — a continuous query's frames as SSE:
+/// `event: diff` / `reset`, `id: <offset>`. `from` (or `Last-Event-ID`) is the offset
+/// of the last frame the client applied (the `WATCH` snapshot's at first); without
+/// one, or past the buffer, the stream starts with a `reset` (W6 decision 2).
+async fn watch_events(
+    State(s): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(p): Query<EventsParams>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let last = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    let from = p.from.or(last);
+    // Through the engine: on a cluster the watch runs on its namespace's partition,
+    // which its id names, and any node serves the stream.
+    if let Err(e) = s.engine.watch_frames(&id, from, 1, Duration::ZERO).await {
+        let status = if e.starts_with("unknown watch") {
+            StatusCode::NOT_FOUND
+        } else if e.contains("need a durable engine") {
+            StatusCode::NOT_IMPLEMENTED
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return (status, Json(serde_json::json!({ "error": e }))).into_response();
+    }
+    use futures::StreamExt as _;
+    let engine = s.engine.clone();
+    let stream = futures::stream::unfold(Some(from), move |state| {
+        let engine = engine.clone();
+        let id = id.clone();
+        async move {
+            let from = state?;
+            let frames = match engine.watch_frames(&id, from, 100, Duration::from_secs(15)).await {
+                Ok(f) => f.as_array().cloned().unwrap_or_default(),
+                Err(e) => {
+                    let ev = Event::default().event("error").data(serde_json::json!({ "error": e }).to_string());
+                    return Some((futures::stream::iter(vec![Ok::<_, Infallible>(ev)]), None));
+                }
+            };
+            if frames.is_empty() {
+                let hb = serde_json::json!({ "offset": from });
+                return Some((futures::stream::iter(vec![Ok(Event::default().event("heartbeat").data(hb.to_string()))]), Some(from)));
+            }
+            let next = frames.last().and_then(|f| f["offset"].as_u64());
+            let evs: Vec<Result<Event, Infallible>> = frames
+                .iter()
+                .map(|f| {
+                    let kind = f["type"].as_str().unwrap_or("frame").to_string();
+                    Ok(Event::default().event(kind).id(f["offset"].as_u64().map(|o| o.to_string()).unwrap_or_default()).data(f.to_string()))
+                })
+                .collect();
+            Some((futures::stream::iter(evs), Some(next)))
+        }
+    })
+    .flatten();
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+// ---------------------------------------------------------------- REST
+
+#[derive(Serialize)]
+struct Health {
+    status: &'static str,
+    version: &'static str,
+}
+
+async fn health() -> Json<Health> {
+    Json(Health { status: "ok", version: env!("CARGO_PKG_VERSION") })
+}
+
+#[derive(Deserialize)]
+struct QueryRequest {
+    query: String,
+    #[serde(default)]
+    variables: Option<HashMap<String, Value>>,
+}
+
+#[derive(Serialize)]
+struct QueryResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// DB-18: the refusal's stable code (`adb_core::codes`), beside `error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_time_ms: Option<u64>,
+}
+
+fn code(error: &Option<String>) -> Option<&'static str> {
+    error.as_deref().map(adb_core::codes::code_of)
+}
+
+/// `POST /query` — ClawDB's shape: `data` is the whole wire `QueryResult`.
+async fn query(State(s): State<AppState>, headers: axum::http::HeaderMap, scope: Option<axum::Extension<Arc<scope::Scope>>>, Json(req): Json<QueryRequest>) -> (StatusCode, Json<QueryResponse>) {
+    let opts = adb_core::read_opts::ReadOpts::from_lookup(|k| headers.get(k).and_then(|v| v.to_str().ok()));
+    adb_core::read_opts::scope(opts, query_inner(s, scope, req)).await
+}
+
+/// Run `aql` as the caller may: with a scoped token, within its namespaces — on an
+/// engine that can (the partition router, step 4b), statements naming no namespace run
+/// inside the token's patterns; elsewhere every stage must name one (DB-3). `Err` with
+/// `forbidden` before anything ran: the token doesn't open it.
+pub(crate) async fn scoped_query(engine: &dyn Engine, scope: Option<&scope::Scope>, aql: &str, variables: Option<&std::collections::HashMap<String, Value>>) -> Result<Result<Value, String>, String> {
+    let Some(scope) = scope else { return Ok(engine.query(aql, variables).await) };
+    let reach = scope.reach_for(aql)?;
+    match engine.query_reach(aql, variables, &reach).await {
+        Some(r) => Ok(r),
+        None => {
+            scope.check_aql(aql)?;
+            Ok(engine.query(aql, variables).await)
+        }
+    }
+}
+
+async fn query_inner(s: AppState, scope: Option<axum::Extension<Arc<scope::Scope>>>, req: QueryRequest) -> (StatusCode, Json<QueryResponse>) {
+    let start = Instant::now();
+    static IN_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    adb_core::steps::value("http.query in flight", IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+    let scope = scope.map(|axum::Extension(s)| s);
+    let result = scoped_query(s.engine.as_ref(), scope.as_deref(), &req.query, req.variables.as_ref()).await;
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }));
+        }
+    };
+    // A scope the router refused once running (a named namespace outside it).
+    if let (Some(_), Err(e)) = (&scope, &result) {
+        if adb_core::codes::code_of(e) == "forbidden" {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (StatusCode::FORBIDDEN, Json(QueryResponse { success: false, data: None, code: Some("forbidden"), error: Some(e.clone()), execution_time_ms: None }));
+        }
+    }
+    IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    adb_core::steps::add("http.query handler", start.elapsed());
+    let ms = Some(start.elapsed().as_millis() as u64);
+    match result {
+        Ok(wire) => {
+            let success = wire.get("success").and_then(Value::as_bool).unwrap_or(true);
+            let error = wire.get("error").and_then(Value::as_str).map(String::from);
+            (StatusCode::OK, Json(QueryResponse { success, data: Some(wire), code: code(&error), error, execution_time_ms: ms }))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: ms }),
+        ),
+    }
+}
+
+/// `GET /stats` — `{success, data: {working: n, episodic: n, …}}`.
+/// `GET /admin/embedding` — the embedding settings and progress (W9.10).
+async fn embedding(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.embedding().await, StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// `PUT /admin/embedding` — `{provider, model, dimension, url?, api_key_env?}`:
+/// checked with a sample embedding, saved, applied by restarting ADB (W9.10).
+async fn set_embedding(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.set_embedding(body).await, StatusCode::BAD_REQUEST)
+}
+
+/// `GET /admin/cache` — the hot cache's mode, rules and figures (W10).
+async fn cache(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.cache().await, StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// `PUT /admin/cache` — `{max_bytes, rules: [{memory, scope?, keep}]}`: saved and
+/// applied at once (the cache is rebuilt from the table; no restart).
+async fn set_cache(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.set_cache(body).await, StatusCode::BAD_REQUEST)
+}
+
+/// `POST /admin/compact` — compact now (memory table, platform tables, hosted
+/// branches): what FORGET left hidden leaves the disk. Normally the maintenance
+/// timer does this.
+async fn compact(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    respond(s.engine.compact().await, StatusCode::CONFLICT)
+}
+
+fn respond(r: Result<Value, String>, on_error: StatusCode) -> (StatusCode, Json<QueryResponse>) {
+    match r {
+        Ok(data) => (StatusCode::OK, Json(QueryResponse { success: true, data: Some(data), error: None, code: None, execution_time_ms: None })),
+        Err(e) => (on_error, Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None })),
+    }
+}
+
+async fn stats(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse>) {
+    match s.engine.stats().await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(QueryResponse { success: true, data: Some(data), error: None, code: None, execution_time_ms: None }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(QueryResponse { success: false, data: None, code: Some(adb_core::codes::code_of(&e)), error: Some(e), execution_time_ms: None }),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------- MCP: streamable HTTP
+
+/// `POST /mcp` — one JSON-RPC message (or a batch) in, JSON out; notifications → 202.
+async fn mcp_post(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
+    match body {
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if let Some(r) = handle_value(&s.mcp, item).await {
+                    out.push(r);
+                }
+            }
+            if out.is_empty() {
+                StatusCode::ACCEPTED.into_response()
+            } else {
+                Json(out).into_response()
+            }
+        }
+        item => match handle_value(&s.mcp, item).await {
+            Some(r) => Json(r).into_response(),
+            None => StatusCode::ACCEPTED.into_response(),
+        },
+    }
+}
+
+/// `GET /mcp` — no server-initiated stream on the streamable transport (yet).
+async fn mcp_get() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+async fn handle_value(mcp: &McpServer, v: Value) -> Option<JsonRpcResponse> {
+    match serde_json::from_value::<JsonRpcRequest>(v) {
+        Ok(req) => mcp.handle(req).await,
+        Err(e) => Some(JsonRpcResponse::error(None, -32600, format!("Invalid request: {e}"))),
+    }
+}
+
+// ---------------------------------------------------------------- MCP: HTTP+SSE
+
+/// Open SSE sessions: session id → sender of serialized JSON-RPC responses.
+#[derive(Clone, Default)]
+struct Sessions(Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>);
+
+impl Sessions {
+    fn open(&self) -> (String, mpsc::UnboundedReceiver<String>) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.0.lock().unwrap().insert(id.clone(), tx);
+        (id, rx)
+    }
+    fn send(&self, id: &str, msg: String) -> bool {
+        self.0.lock().unwrap().get(id).map(|tx| tx.send(msg).is_ok()).unwrap_or(false)
+    }
+    fn close(&self, id: &str) {
+        self.0.lock().unwrap().remove(id);
+    }
+}
+
+/// Removes the session when the SSE stream is dropped (client disconnected).
+struct SessionGuard {
+    sessions: Sessions,
+    id: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.sessions.close(&self.id);
+        tracing::debug!("MCP SSE session closed: {}", self.id);
+    }
+}
+
+/// `GET /mcp/sse` — first event `endpoint` = where to POST messages; then one
+/// `message` event per JSON-RPC response.
+async fn mcp_sse(State(s): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (id, rx) = s.sessions.open();
+    tracing::info!("MCP SSE session opened: {id}");
+    let endpoint = format!("/mcp/message?sessionId={id}");
+    let guard = SessionGuard { sessions: s.sessions.clone(), id };
+    let stream = futures::stream::unfold((Some(endpoint), rx, guard), |(endpoint, mut rx, guard)| async move {
+        if let Some(e) = endpoint {
+            return Some((Ok(Event::default().event("endpoint").data(e)), (None, rx, guard)));
+        }
+        let msg = rx.recv().await?;
+        Some((Ok(Event::default().event("message").data(msg)), (None, rx, guard)))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+#[derive(Deserialize)]
+struct MessageQuery {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+/// `POST /mcp/message?sessionId=…` — 202, the response goes out on the session's SSE stream.
+/// Without `sessionId` it answers in the body like `POST /mcp`: FlowR's `call:mcp` maps a
+/// `/mcp/sse` resource URL to `/mcp/message` and posts there without opening a stream.
+async fn mcp_message(State(s): State<AppState>, Query(q): Query<MessageQuery>, Json(body): Json<Value>) -> Response {
+    let Some(session_id) = q.session_id else {
+        return mcp_post(State(s), Json(body)).await;
+    };
+    if !s.sessions.0.lock().unwrap().contains_key(&session_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(resp) = handle_value(&s.mcp, body).await {
+        let text = serde_json::to_string(&resp).unwrap_or_default();
+        if !s.sessions.send(&session_id, text) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    StatusCode::ACCEPTED.into_response()
+}

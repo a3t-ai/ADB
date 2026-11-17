@@ -117,12 +117,16 @@ pub struct Metadata {
     pub ttl: Option<Duration>,
     /// Record version (for optimistic concurrency)
     pub version: u64,
+    /// `RECALL … LIKE`: the cosine similarity of this record to the query (0–1),
+    /// what `MIN_CONFIDENCE` compares against (AQL v0.5 §14). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 impl Metadata {
     /// Create new metadata with current timestamp
     pub fn new(scope: Scope) -> Self {
-        let now = Utc::now();
+        let now = crate::time::now();
         Self {
             created_at: now,
             accessed_at: now,
@@ -130,6 +134,7 @@ impl Metadata {
             namespace: None,
             ttl: None,
             version: 1,
+            confidence: None,
         }
     }
 
@@ -151,7 +156,7 @@ impl Metadata {
     pub fn is_expired(&self) -> bool {
         if let Some(ttl) = self.ttl {
             let expires_at = self.created_at + chrono::Duration::from_std(ttl).unwrap_or_default();
-            Utc::now() > expires_at
+            crate::time::now() > expires_at
         } else {
             false
         }
@@ -159,7 +164,7 @@ impl Metadata {
 
     /// Update accessed_at to now
     pub fn touch(&mut self) {
-        self.accessed_at = Utc::now();
+        self.accessed_at = crate::time::now();
     }
 
     /// Increment version
@@ -188,6 +193,22 @@ pub struct MemoryRecord {
 }
 
 impl MemoryRecord {
+    /// The value `ORDER BY field` sorts on: the payload's `field`, else the
+    /// record's own `created_at` / `accessed_at` (also `updated_at`) as epoch
+    /// microseconds, or `version` — so `ORDER BY created_at DESC` (the MCP guide's
+    /// recency query) works on records that don't carry the field themselves.
+    pub fn order_value(&self, field: &str) -> Option<serde_json::Value> {
+        if let Some(v) = self.data.get(field) {
+            return Some(v.clone());
+        }
+        match field.strip_prefix("metadata.").unwrap_or(field) {
+            "created_at" => Some(self.metadata.created_at.timestamp_micros().into()),
+            "accessed_at" | "updated_at" => Some(self.metadata.accessed_at.timestamp_micros().into()),
+            "version" => Some(self.metadata.version.into()),
+            _ => None,
+        }
+    }
+
     /// Create a new memory record
     pub fn new(
         id: impl Into<String>,
@@ -345,6 +366,9 @@ impl MemoryRecord {
             if let Some(ttl) = self.metadata.ttl {
                 meta.insert("ttl".to_string(), serde_json::json!(ttl.as_millis() as u64));
             }
+            if let Some(c) = self.metadata.confidence {
+                meta.insert("confidence".to_string(), serde_json::json!(c));
+            }
             map.insert("metadata".to_string(), serde_json::Value::Object(meta));
             map.insert("data".to_string(), self.data.clone());
         }
@@ -445,5 +469,38 @@ mod tests {
 
         assert_eq!(parsed.id, record.id);
         assert_eq!(parsed.memory_type, record.memory_type);
+    }
+}
+
+/// `UPDATE`'s fields merged into a record's payload (AQL v0.9): each field replaces
+/// the payload's, and a `null` field removes it. A payload that isn't an object is
+/// replaced by the fields.
+pub fn merge_fields(value: &mut serde_json::Value, fields: &serde_json::Map<String, serde_json::Value>) {
+    if !value.is_object() {
+        *value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = value.as_object_mut().expect("object");
+    for (k, v) in fields {
+        if v.is_null() {
+            obj.remove(k);
+        } else {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_fields;
+    use serde_json::json;
+
+    #[test]
+    fn null_removes_a_field() {
+        let mut v = json!({"a": 1, "b": 2});
+        merge_fields(&mut v, json!({"a": null, "b": 3, "c": 4}).as_object().unwrap());
+        assert_eq!(v, json!({"b": 3, "c": 4}));
+        let mut s = json!("text");
+        merge_fields(&mut s, json!({"x": null, "y": 1}).as_object().unwrap());
+        assert_eq!(s, json!({"y": 1}));
     }
 }

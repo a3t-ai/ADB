@@ -76,9 +76,25 @@ throttling, not related to conditional writes. Example request IDs:
 
 | ID | Action | Owner |
 |---|---|---|
-| B1a | Re-run `gw.sh` in 24 h; if the three gateways still deny, open a Hetzner ticket with the request IDs above, or recreate the key and re-test. | @Sriram |
+| B1a | ☑ **Resolved.** Re-checked about an hour after the spike: 120/120 requests succeeded across all gateways, no 403s. It was propagation of the new key to every gateway. Lesson: after creating a key, wait for propagation (or run `gw.sh`) before benchmarking. | @Sriram |
 | B1b | Ask Hetzner whether `If-Match` on PUT is supported/expected to honour quoted ETags (RFC 9110). Informational — ADB doesn't depend on it. | @Sriram |
 | B1c | Rotate the access key used for this spike (it was shared in a chat session). | @Sriram |
+
+## Re-run on fsn1 (6 Oct 2026) — bucket `adb2`, the ADB spike bucket from now on
+
+| Test | Result |
+|---|---|
+| Raw S3 race, 100 rounds × 16 writers, `If-None-Match: *` | **100/100 exactly one winner, stored body correct, 0 violations** — create-only is atomic on fsn1 too |
+| Status codes across 320 racing PUTs | 20 × 200, 268 × 412, **32 × 404 `NoSuchBucket`** |
+| Bucket list × 150, by gateway | 18 gateways always 200; **2 gateways (`511edb6c`, `4dd1bdac`) always `NoSuchBucket`** |
+
+The 404s are the same class of problem as B1a, for a new **bucket** instead of a new
+key: some gateways haven't learned it yet. Lance treats a 404 on a manifest listing as
+"dataset not found", so no Lance benchmark runs until every gateway answers 200
+(tracked as B1d).
+
+Rule from B1a + B1d: **after creating a key or a bucket, wait until `gw.sh` shows every
+gateway answering 200 before benchmarking.**
 
 ## How to re-run
 

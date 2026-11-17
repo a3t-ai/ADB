@@ -2,14 +2,24 @@
 resolver = "2"
 members = [
     "crates/adb-core",
-    "crates/aql-parser",
     "crates/aql-planner",
-    "crates/adb-backends",
     "crates/adb-executor",
     "crates/adb-server",
     "crates/adb-mcp",
+    "crates/adb-store",
+    "crates/adb-log",
+    "crates/adb-sequencer",
+    "crates/adb-cluster",
+    "crates/adb-cq",
+    "crates/adb-gateway",
+    "crates/adb-platform",
+    "crates/adb-embed",
+    "crates/adb-engine",
     "adb-cli",
 ]
+# The patched lance crate is a dependency, not a member: excluded so its own tests
+# build standalone (`cd third_party/lance && cargo test`).
+exclude = ["third_party/lance"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,7 +27,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["ADB Contributors"]
 repository = "https://github.com/adb/adb"
-rust-version = "1.75"
+rust-version = "1.91"
 
 [workspace.dependencies]
 # Async runtime
@@ -30,7 +40,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Time
-chrono = { version = "=0.4.38", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 
 # Concurrent data structures
 dashmap = "5.5"
@@ -42,10 +52,25 @@ petgraph = "0.6"
 # Vector search
 usearch = "2.8"
 
-# Arrow/DataFusion (analytics)
-arrow = { version = "51", features = ["prettyprint"] }
-datafusion = "37"
-parquet = "51"
+# Log records: f16 embeddings (S9), ULID ids (D3 S1)
+half = { version = "2", features = ["serde"] }
+ulid = { version = "1", features = ["serde"] }
+# Local WAL: record encoding (self-describing, so tagged effects and JSON payloads work) and checksums
+rmp-serde = "1"
+crc32fast = "1"
+tempfile = "3"
+
+# Arrow/DataFusion/Lance: one version line across the workspace, set by Lance
+# (pinned exactly: MemWAL option A, ARCHITECTURE.md §9.2). Lance 12 needs
+# Rust >= 1.91 and protoc at build time.
+arrow = { version = "58", features = ["prettyprint"] }
+arrow-array = "58"
+arrow-schema = "58"
+datafusion = "54"
+parquet = "58"
+object_store = "0.14"
+lance = "=14.0.2"
+lance-index = "=14.0.2"
 
 # Parsing
 pest = "2.7"
@@ -63,7 +88,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.7", features = ["v4", "serde"] }
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # Testing
 criterion = "0.5"
@@ -71,9 +96,14 @@ proptest = "1.4"
 
 # Internal crates
 adb-core = { path = "crates/adb-core" }
-aql-parser = { path = "crates/aql-parser" }
+adb-engine = { path = "crates/adb-engine" }
+# FlowR's engine rules (stage H): the sibling flowr-system checkout, engine
+# modules only (no FlowR types). deploy.sh builds with both repos side by side.
+flowr-storage = { path = "../flowr-system/shared/flowr-storage", default-features = false }
+# AQL parser comes from the AQL repo (one grammar for AQL and ADB). For local
+# development against a sibling checkout, see .cargo/config.toml.example.
+aql-parser = { git = "https://github.com/srirammails/AQL.git", branch = "main" }
 aql-planner = { path = "crates/aql-planner" }
-adb-backends = { path = "crates/adb-backends" }
 adb-executor = { path = "crates/adb-executor" }
 adb-server = { path = "crates/adb-server" }
 adb-mcp = { path = "crates/adb-mcp" }
@@ -85,3 +115,26 @@ opt-level = 3
 
 [profile.bench]
 lto = true
+
+# Benchmarks (perf-*.mjs): release optimisation without LTO, so it builds fast;
+# the shipped images keep [profile.release].
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16
+# Rebuilds recompile only what changed (minutes, not the release profile's ~40 with
+# fat LTO). Use for every benchmark / test iteration: `cargo build --profile perf`.
+incremental = true
+
+[profile.prof]
+# Profiling (perf / flamegraphs): the perf profile with line tables and symbols. Build
+# with RUSTFLAGS="-C force-frame-pointers=yes" into its own target dir.
+inherits = "perf"
+debug = "line-tables-only"
+strip = false
+
+# Local patch of lance 14.0.2 (no fork): third_party/lance is the published crate plus
+# ADB's fixes, kept as a clean diff for an upstream PR (third_party/lance has its own
+# git history: the first commit is the crate as published).
+[patch.crates-io]
+lance = { path = "third_party/lance" }

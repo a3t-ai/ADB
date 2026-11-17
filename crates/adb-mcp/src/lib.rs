@@ -1,18 +1,15 @@
-//! ADB MCP Server - Model Context Protocol interface for Agent Database
+//! ADB MCP server — Model Context Protocol interface to agent memory.
 //!
-//! Exposes ADB operations as MCP tools that can be called by Claude Code or other MCP clients.
+//! Transport-independent: [`McpServer::handle`] serves stdio (`adb serve`), streamable
+//! HTTP and SSE (mounted by `adb-server`).
 //!
-//! ## Tools Provided
-//!
-//! - `store_working` - Store data in working memory
-//! - `recall_working` - Recall from working memory
-//! - `store_episodic` - Store event in episodic memory
-//! - `recall_episodic` - Recall events from episodic memory
-//! - `scan_procedural` - Find procedures by pattern matching
-//! - `get_context` - Get combined context (working + episodic history + related procedures)
+//! Tools: `aql_query`, `store_memory`, `recall_memory`, `get_stats` (ClawDB-compatible,
+//! used by A3T agents) and `remember`, `recall`, `forget`, `link` (for LLMs that should
+//! not need AQL). Resources: a memory guide and the AQL grammar. Prompt:
+//! `memory_smoke_test`.
 
+pub mod protocol;
 pub mod server;
 pub mod tools;
-pub mod protocol;
 
 pub use server::McpServer;

@@ -3,23 +3,43 @@ name = "adb-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ADB server - main database instance"
+description = "ADB HTTP server: ClawDB-compatible REST API and MCP (streamable HTTP + SSE)"
 
 [dependencies]
-adb-core = { path = "../adb-core" }
-adb-backends = { path = "../adb-backends" }
-aql-parser = { path = "../aql-parser" }
-aql-planner = { path = "../aql-planner" }
-tokio.workspace = true
+adb-executor = { path = "../adb-executor" }
+adb-cluster = { path = "../adb-cluster" }
+aql-parser.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rmp-serde.workspace = true
+adb-store = { path = "../adb-store" }
 async-trait.workspace = true
+adb-mcp = { path = "../adb-mcp" }
+tokio.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
-uuid.workspace = true
-chrono.workspace = true
+# Arrow Flight: FlowR's native call:adb wire (stage G; spike G1)
+adb-core = { path = "../adb-core" }
+adb-platform = { path = "../adb-platform" }
+adb-gateway = { path = "../adb-gateway" }
+flowr-storage.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-cast = "58"
+arrow-ipc = "58"
+arrow-flight = "58"
+tonic = "0.14"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+flowr-storage = { workspace = true, features = ["conformance"] }
+async-trait.workspace = true
+chrono.workspace = true
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+tempfile.workspace = true
+adb-embed = { path = "../adb-embed" }

@@ -6,10 +6,26 @@ license.workspace = true
 description = "ADB query executor"
 
 [dependencies]
+tempfile.workspace = true
 adb-core = { path = "../adb-core" }
-adb-backends = { path = "../adb-backends" }
+adb-engine.workspace = true
+flowr-storage.workspace = true
 aql-planner = { path = "../aql-planner" }
-aql-parser = { path = "../aql-parser" }
+adb-log = { path = "../adb-log" }
+adb-sequencer = { path = "../adb-sequencer" }
+adb-store = { path = "../adb-store" }
+adb-embed = { path = "../adb-embed" }
+half.workspace = true
+chrono.workspace = true
+rmp-serde.workspace = true
+adb-cq = { path = "../adb-cq" }
+adb-gateway = { path = "../adb-gateway" }
+adb-platform = { path = "../adb-platform" }
+adb-cluster = { path = "../adb-cluster" }
+datafusion.workspace = true
+# Arrow IPC between nodes in JSON calls (the cluster's SQL view).
+base64 = "0.22"
+aql-parser.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -17,7 +33,13 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Word recall's analyzer (W9.11): Snowball English.
+rust-stemmers = "1.2"
 
 [dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+flowr-storage = { workspace = true, features = ["conformance"] }
+uuid.workspace = true
+chrono.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
-adb-mcp = { path = "../adb-mcp" }

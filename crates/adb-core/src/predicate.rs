@@ -22,10 +22,13 @@ pub enum Predicate {
     Key { field: String, value: Value },
     /// LIKE $embedding (similarity search)
     Like { embedding_var: String },
-    /// PATTERN $var THRESHOLD 0.7
+    /// PATTERN $var THRESHOLD 0.7, or PATTERN "text": `text` is the literal, or the
+    /// variable's bound value once the executor binds it (W9).
     Pattern {
         pattern_var: String,
         threshold: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// ALL (match everything)
     All,
@@ -59,6 +62,7 @@ impl Predicate {
         Self::Pattern {
             pattern_var: pattern_var.into(),
             threshold,
+            text: None,
         }
     }
 
@@ -204,7 +208,7 @@ impl Condition {
 
 /// Get a nested field value using dotted path notation
 /// e.g., "metadata.namespace" returns data["metadata"]["namespace"]
-fn get_nested_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+pub fn get_nested_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = data;
     for part in parts {
@@ -387,6 +391,23 @@ impl Value {
     }
 }
 
+impl From<&serde_json::Value> for Value {
+    /// JSON → AQL value. Objects have no AQL literal form and become their JSON text.
+    fn from(json: &serde_json::Value) -> Self {
+        match json {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => match n.as_i64() {
+                Some(i) => Self::Int(i),
+                None => n.as_f64().map_or(Self::Null, Self::Float),
+            },
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Array(a) => Self::Array(a.iter().map(Self::from).collect()),
+            serde_json::Value::Object(_) => Self::String(json.to_string()),
+        }
+    }
+}
+
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
         Self::String(s.to_string())
@@ -472,7 +493,7 @@ pub struct Modifiers {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_fields: Option<Vec<String>>,
     /// Query timeout
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "option_duration_millis")]
     pub timeout: Option<Duration>,
     /// Minimum confidence/similarity threshold
@@ -484,25 +505,75 @@ pub struct Modifiers {
     /// Agent namespace
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// `BRANCH "name"` (AQL v0.11, B1): the memory branch; `None` = main.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Time-to-live for stored records
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "option_duration_millis")]
     pub ttl: Option<Duration>,
     /// Aggregate functions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<Vec<AggregateFunc>>,
+    /// GROUP BY fields (AQL v0.9): with `aggregate`, one result row per group
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<Vec<String>>,
     /// HAVING clause (filter after aggregation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub having: Option<Vec<Condition>>,
     /// Window for SCAN
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<Window>,
+    /// `LIKE $q`: the bound value of `$q` — text (ADB embeds it) or a vector —
+    /// set by the executor when it binds variables (MVP W4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub like_query: Option<serde_json::Value>,
+    /// Named scope (`IN SCOPE "team:billing"`, AQL v0.6): the memory boundary a
+    /// statement reads or writes. Separate from `scope` (private / shared / cluster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_scope: Option<String>,
     /// Include links with results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_links: Option<WithLinks>,
     /// Follow links to other memory types
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_links: Option<FollowLinks>,
+    /// `AS OF t` (AQL v0.10): the records as they were at t
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<TimePoint>,
+    /// `VALID AT t` (AQL v0.10): facts that held at t, as known now
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<TimePoint>,
+    /// `WITH HISTORY` (AQL v0.10): every version, current and replaced
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_history: bool,
+}
+
+/// A point in time in a history read (AQL v0.10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TimePoint {
+    /// A date or RFC 3339 string.
+    At { time: String },
+    /// `$t`, bound by the caller or an earlier pipeline stage.
+    Variable { name: String },
+    /// `7d AGO`.
+    Ago {
+        #[serde(with = "duration_millis")]
+        duration: Duration,
+    },
+}
+
+impl TimePoint {
+    /// The instant, against `now` for `AGO`; `None` for an unbound variable or a
+    /// string that isn't a date.
+    pub fn resolve(&self, now: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            TimePoint::At { time } => crate::time::parse_instant(time),
+            TimePoint::Variable { .. } => None,
+            TimePoint::Ago { duration } => chrono::Duration::from_std(*duration).ok().map(|d| now - d),
+        }
+    }
 }
 
 impl Modifiers {
@@ -630,21 +701,62 @@ impl Window {
     }
 }
 
-/// WITH LINKS modifier
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WithLinks {
-    /// Include all links
-    All,
-    /// Include only links of specific type
-    Type { link_type: String },
+/// Which links `WITH LINKS` / `FOLLOW LINKS` read (AQL v0.8, P1_GRAPH D4 / D5).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkSelect {
+    /// Only links of these types; empty = every type
+    #[serde(default)]
+    pub types: Vec<String>,
+    /// Which way the links point, seen from the record
+    #[serde(default)]
+    pub direction: LinkDirection,
+    /// Only links at least this heavy
+    #[serde(default)]
+    pub min_weight: Option<f32>,
 }
+
+impl LinkSelect {
+    /// Links of one type, outbound (the only kind before v0.8).
+    pub fn of_type(link_type: impl Into<String>) -> Self {
+        Self { types: vec![link_type.into()], ..Self::default() }
+    }
+
+    pub fn matches(&self, link: &crate::Link) -> bool {
+        (self.types.is_empty() || self.types.contains(&link.link_type)) && self.min_weight.is_none_or(|w| link.weight >= w)
+    }
+}
+
+/// Which way a link points, seen from a record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkDirection {
+    /// Links leaving the record
+    #[default]
+    Outbound,
+    /// Links pointing at the record
+    Inbound,
+    /// Both
+    Both,
+}
+
+impl LinkDirection {
+    pub fn outbound(self) -> bool {
+        self != Self::Inbound
+    }
+
+    pub fn inbound(self) -> bool {
+        self != Self::Outbound
+    }
+}
+
+/// WITH LINKS modifier
+pub type WithLinks = LinkSelect;
 
 /// FOLLOW LINKS modifier
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowLinks {
-    /// Link type to follow
-    pub link_type: String,
+    /// Links to follow
+    pub select: LinkSelect,
     /// Maximum depth (default 1)
     pub depth: Option<u32>,
 }

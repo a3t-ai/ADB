@@ -12,6 +12,12 @@ chrono.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
+half.workspace = true
+ulid.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tracing.workspace = true
+libc = "0.2"
+# OB-1: process metrics (`metrics.rs`); no protobuf (text format only).
+prometheus = { version = "=0.13.4", default-features = false }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }

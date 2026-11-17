@@ -10,16 +10,38 @@ name = "adb"
 path = "src/main.rs"
 
 [dependencies]
-adb-core = { path = "../crates/adb-core" }
-adb-backends = { path = "../crates/adb-backends" }
+# The allocator (see `alloc.rs`). Also takes over malloc for C and C++ code in this binary.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "profiling", "stats"] }
+# Reads jemalloc's own counters for the periodic `adb::alloc` log line.
+tikv-jemalloc-sys = "0.6"
 adb-server = { path = "../crates/adb-server" }
 adb-executor = { path = "../crates/adb-executor" }
 adb-mcp = { path = "../crates/adb-mcp" }
+adb-cluster = { path = "../crates/adb-cluster" }
+axum = "0.7"
 tokio.workspace = true
+adb-core = { path = "../crates/adb-core" }
+adb-embed = { path = "../crates/adb-embed" }
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
-serde = { version = "1.0", features = ["derive"] }
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+# `adb import-lancedb`: read a LanceDB directory, send it to ADB over Flight (stage G)
+adb-store = { path = "../crates/adb-store" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-cast = "58"
+arrow-flight = "58"
+tonic = "0.14"
+futures.workspace = true
+# `adb import-flowr-engine`: a FlowR SQLite engine store into an ADB space (stage H-5)
+rusqlite = { version = "0.41", features = ["bundled"] }
+flowr-storage.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { workspace = true, features = ["macros"] }

@@ -1,10 +1,10 @@
 # ADB (Agent Database) — Architecture
 
-> **Version:** 1.1 (final for build) — adds the Raft commit design from the updated 5 Oct spec
-> **Date:** 5 Oct 2026 · @Sriram
+> **Version:** 1.5 — platform tables for hosted A3T (§15.1) on top of v1.4 (subscriptions and continuous queries, [`SUBSCRIPTIONS_CQ_SPEC.md`](SUBSCRIPTIONS_CQ_SPEC.md), §11.7). Changes listed in §20.
+> **Date:** 24 Oct 2026 (v1.4: 9 Oct) · @Sriram
 > **Language:** AQL v0.5 (spec and reference implementation in the AQL repo)
-> **Supersedes:** `ARCHITECTURE_v0.1_in_memory.md` (in-memory engine),
-> `adb_lance_persistence.md` v0.2 (cache + write-behind draft), the 5 Oct cluster
+> **Supersedes:** `archive/ARCHITECTURE_v0.1_in_memory.md` (in-memory engine),
+> `archive/adb_lance_persistence.md` v0.2 (cache + write-behind draft), the 5 Oct cluster
 > draft, and the sidecar stack in AQL spec §23.
 > **Relates to:** `CLAWDB_REQUIREMENTS.md` — this document is its target (3), "Full
 > ADB"; targets (1) ClawDB and (2) the WASM playground map onto §13's profiles.
@@ -13,9 +13,10 @@
 
 ## 1. Overview
 
-ADB is an agent-memory database, offered as a hosted service and as an embeddable
-engine. Agents talk AQL (`STORE`, `RECALL`, `LINK`, `FORGET`, `REFLECT`, …);
-storage is an internal detail.
+ADB is an agent-memory database and part of the **A3T platform**. It is offered
+**as a hosted service only (SaaS, on Hetzner)**, plus a **local dev build** (single
+node) for development. Agents talk AQL (`STORE`, `RECALL`, `LINK`, `FORGET`,
+`REFLECT`, …); storage is an internal detail.
 
 A cluster is a fixed set of **4,096 global partitions**. Each partition is a state
 machine with **one writer**, fed by a **replicated log**, materialized into **one
@@ -27,8 +28,8 @@ Commits have two modes behind one log trait: **Raft** (about 1 ms, replicated on
 local NVMe, for the low-latency and enterprise tier) and **object-store commit**
 (10–100 ms, stateless nodes, a candidate for a cheap shared tier).
 
-The same engine runs as the WASM playground, embedded inside FlowR or an agent
-process, as a single-node server (ClawDB), and as a cluster (§13).
+The same engine runs as the cluster (production), as a single-node local dev build
+(ClawDB), and optionally as the WASM playground for demos (§13).
 
 ## 2. How we got here: what carries over
 
@@ -57,7 +58,9 @@ process, as a single-node server (ClawDB), and as a cluster (§13).
 - Cross-partition ACID by default (sagas/outbox first; 2PC only if a real use case
   appears).
 - Postgres-scale relational workloads. The hosted control plane uses its own
-  Postgres. FlowR's control-plane data is out of scope for v1 (§15).
+  Postgres. A3T's platform data in the hosted service is a goal (platform tables,
+  §15.1), but only the CRUD subset FlowR already uses; local dev and CE keep the
+  embedded LanceDB.
 
 ## 4. Design principles
 
@@ -124,18 +127,48 @@ partition = routing_override(tenant, key)                 -- control-plane excep
   on another partition) are fanned out by the SDK/router and merged (reciprocal-rank
   fusion for hybrid recall). Writes stay single-partition.
 
+### 6.1 Scaling and rebalancing (one Raft group per replica set)
+
+- Partitions are spread across the three owners of their replica set. **Ownership
+  moves by `claim(partition, epoch+1)`** and copies no data; a **leader change moves no
+  partitions** (§8).
+- **Capacity grows by adding replica sets**, not by adding a fourth node to a set.
+  Moving a partition to a new set is the cross-set handoff: claim, open, replay (§12).
+- A set always runs three voters (§11.6). Dropping to two is **degraded mode**, not a
+  scaling step.
+- **Every partition has an owner while its set is live.** Only hibernation (§14.1)
+  creates an unowned partition.
+
+### 6.2 Hot scopes: one scope, one sequencer
+
+- A scope maps to exactly one partition, and so to one sequencer, which never uses
+  more than one core (§8). **A single scope's write ceiling is one sequencer's
+  throughput.** Measured so far: a MemWAL put costs 0.13–0.16 ms with only the `id`
+  index maintained (G1/S6) — roughly 6k puts/s of apply capacity before sequencer
+  validation — and each put carries a whole group-commit batch, so a scope's
+  transaction rate can be higher than its put rate. To confirm with `id` + `subject_id`
+  maintained together and the full sequencer in the path. (The 200 puts/s in the
+  spikes was the offered load, not a ceiling.)
+- **Storage never limits the number of scopes.** 100k scopes is ~24 per partition;
+  scopes are rows filtered by `scope`.
+- Defences, cheapest first: key scopes finely (affinity keys); move the hot partition
+  to a quieter core or set; **split the scope** (`scope#0..N`), giving up its single
+  total order; serve hot reads from cache.
+- **The limit, stated:** a scope cannot have both unlimited write scale and a single
+  total order.
+
 ## 7. Table layout
 
 One Lance table per partition, `s3://{bucket}/p{partition}/memory.lance`. One table
 per partition keeps commits, recovery and hibernation independent, and lets a whole
-committed batch apply as one atomic `merge_insert`. (ClawDB's table-per-memory-type
-layout can't do that.)
+committed batch apply as one atomic MemWAL `put` (§9.3). (ClawDB's
+table-per-memory-type layout can't do that.)
 
 | Column | Type | Used by |
 |---|---|---|
 | `id` | ULID string, unenforced primary key | All |
 | `memory` | enum: working, tools, procedural, semantic, episodic | AQL `FROM`/`INTO` |
-| `kind` | enum: entity, fact, edge, episode, tool, meta | All |
+| `kind` | enum: entity, fact, edge, episode, tool, meta; `event` (topic message), `sub` (subscription + cursor), `cq` (continuous-query registration) — §11.7 | All |
 | `tenant_id`, `scope` | string | Isolation, filters, forget |
 | `subject_id`, `predicate`, `object_id` | string | Facts and edges |
 | `link_type`, `weight` | string, float | Edges (`LINK TYPE … WEIGHT …`) |
@@ -148,10 +181,12 @@ layout can't do that.)
 | `log_offset`, `epoch` | u64 | Idempotent replay, fencing |
 
 - **Indexes:** BTree on `id`, `subject_id`, `object_id`, `valid_from`; bitmap on
-  `memory` and `kind`; FTS on `text`; vector on `embedding`.
-- **Small partitions:** below a row threshold (initially ~50k vector rows) recall is
-  a brute-force scan; ANN indexes are built only above it, so 4,096 tables don't
-  each carry a near-empty index.
+  `memory` and `kind`; FTS on `text`; vector on `embedding` as **IVF_RQ, queried
+  with `refine`** (S8: recall@10 0.97–1.00; build 40 s at 500k × 768, 65 s at
+  500k × 1536). Embeddings are f32 in the table, f16 in the log (S9).
+- **Small partitions:** below a row threshold (**~10k vector rows**, S8: brute force
+  23 ms at 10k × 768, 146 ms at 50k) recall is a brute-force scan; ANN indexes are
+  built only above it, so 4,096 tables don't each carry a near-empty index.
 - **Control row:** `id = "_meta"`, `kind = meta`, carrying `applied_offset` and
   `epoch`, rewritten in every applied batch.
 
@@ -199,10 +234,21 @@ elections; heartbeats are batched per node pair.
 | Applier | The partition's owner | Apply committed batches to Lance (§9.3) |
 | Archiver | Per node | Ship sealed log segments to object storage |
 | Maintenance | Per partition, background | Flush, compaction, index build, old-version cleanup |
+| Matcher | The partition's owner, sequencer's core, after each apply `put` | Test effects against subscriptions and continuous queries; update CQ results; temporal timers (§11.7) |
+| Gateway | Always-on stateless tier | Agent connections (gRPC stream, MCP, WebSocket), delivery buffers, acks, catch-up, routing to owners (§11.7) |
+| Watcher tier (v2) | Always-on tier | Cross-partition continuous queries (§11.7) |
 
 **Cores:** partitions are assigned to cores (many per core) and each core runs a
 single-threaded executor for its sequencers, Dragonfly-style. A partition is never
 touched by two cores.
+
+**The sequencer is state, not a thread.** A sequencer is a partition's single-writer
+state — epoch, pending overlay, group-commit batch, `WORKING` / `TOOLS` hot tier, the
+MemWAL shard writer — run as a task on one core's executor. A core runs many of them;
+a sequencer never has a thread of its own. Nothing "starts a sequencer": what
+activates is the **partition** — it gets an owner, an epoch and loaded state (§14.1),
+and the sequencer is the code that runs over that state. A partition therefore never
+uses more than one core (§6.2).
 
 ## 9. Write path
 
@@ -251,24 +297,89 @@ Small writes need an in-memory layer in front of Lance's columnar base.
 | Built from | Lance | **`adb-backends`' in-memory engines**: DashMap rows, usearch for fresh vectors, petgraph for fresh edges, DataFusion/Arrow for fresh episodes |
 | WAL | Raft log **and** MemWAL (double write, unless MemWAL durability can be relaxed) | Raft log only |
 | Fresh-row reads | Lance merges memtable, L0 and base, using `maintained_indexes` | ADB merges memtable results (small) with Lance results |
-| Maturity | Format and index metadata exist in Lance 2.0.0 (regions, region manifests, flushed/merged generations, `maintained_indexes`; vector memtables inherit PQ/SQ params). **The writer-side API named in the draft (`LsmWriteSpec`, `flush_lsm`, `close_lsm_writers`, `writerConfigDefaults`, `use_lsm`) is not in the 2.0.0 crate** | Long-stable Lance APIs plus code ADB already has |
+| Maturity | **Shipped in Lance 12.0.0** (spike B2): `initialize_mem_wal` / `mem_wal_writer` → `ShardWriter` with per-shard epoch fencing, relaxable durability (`durable_write(false)`), maintained BTree / HNSW (f32) / FTS indexes, `LsmScanner` over memtable + flushed generations + base. Compaction into the base is caller-driven. New in 2026, so expect churn | Long-stable Lance APIs plus code ADB already has |
 
-**Decision:** spike A first; **B is the planned fallback**. The sequencer's overlay
-and the existing in-memory backends already are most of B, and the Raft log already
-is its WAL, so B removes the double-WAL and MemWAL-maturity risks. SlateDB stays
-behind the storage trait only as a last resort.
+**Decision (6 Oct 2026, Gate 1): option A — Lance MemWAL**, pinned at Lance
+`=12.0.0` ([`spikes/G1_memtable_A_vs_B.md`](spikes/G1_memtable_A_vs_B.md)):
+- One MemWAL shard per partition table; shard writer epoch = partition epoch.
+- `durable_write(false)`: the Raft log is the WAL, so MemWAL's own WAL flush is lazy
+  and losing it only lengthens replay. **No periodic MemWAL WAL flush**
+  (`max_wal_flush_interval = None`, R6): MemWAL writes a WAL entry only when ADB seals,
+  so a takeover replays nothing from object storage (0.4–0.55 s on fsn1, versus
+  ~75 ms per WAL entry replayed); the unsealed tail is replayed from the local Raft
+  log. ADB seals on its row/byte limit **or every 30 s** if the memtable is non-empty,
+  which bounds both the tail replay and the Raft log the partition pins.
+- **ADB garbage-collects MemWAL** (S11): Lance never deletes WAL files or flushed
+  generations. After generations are folded into the base table, `adb-store` deletes
+  the compacted generation folders and the WAL files below the shard's
+  `replay_after_wal_entry_position`.
+- `maintained_indexes` = `id` and `subject_id` BTrees only. Maintaining HNSW + FTS in
+  the memtable cost 13 ms per put (80 puts/s); with `id` alone a put costs 0.13–0.16 ms
+  and vector/FTS over fresh rows fall back to brute force on the memtable. **Still to
+  measure: `id` + `subject_id` maintained together** (the spike measured `id` alone).
+- **Memtable cap for recall:** brute-force vector search over unindexed memtable rows
+  must stay inside the recall budget, so the seal limit is set by recall latency as well
+  as by memory — at most ~10k vector rows per memtable (S8: brute force 23 ms at
+  10k × 768, 146 ms at 50k).
+- **Vector indexes are built off the hot path** (maintenance, never in a write or
+  read): IVF_RQ takes 4.6 s at 50k vectors and 40–65 s at 500k (S8).
+- Reads go through `LsmScanner` (memtable + flushed generations + base) with an
+  SSTable cache; fresh-row point lookups measured 1.6 ms.
+- ADB compacts generations into the base table
+  (`merge_insert(..).mark_sstables_as_compacted(..)`) and runs index maintenance (D5).
+
+**B is not built.** It stays a documented fallback behind `adb-store`'s storage trait;
+conformance tests target the trait so a future B is checked by the same suite. Revisit
+B only if a Lance release breaks the MemWAL API, MemWAL loses or corrupts data, or put
+cost regresses. If B is ever built, inserts use `append` (255 ms commits), not
+`merge_insert` (~1 s and table-sized reads). SlateDB stays a last resort.
 
 ### 9.3 Apply, with storage-level fencing
 
-Each applied batch is one atomic Lance commit containing its rows **and** the
-`_meta` row.
+With option A (§9.2) the applier writes through the partition's MemWAL shard writer
+(spike R11, [`spikes/R11_raft_memwal_recovery.md`](spikes/R11_raft_memwal_recovery.md)):
+
+- **One committed log batch = one `ShardWriter::put`** holding its rows **and** the
+  `_meta` row (`log_offset` = the batch's offset). One put is one WAL entry, so rows
+  and `_meta` persist together or not at all.
+- **Recovery:** the new owner opens the shard writer (claims the shard epoch = the
+  partition epoch, drops a fence sentinel at the WAL tip, replays the WAL), reads
+  `_meta` through `LsmScanner`, and replays the Raft log from `_meta + 1`. The
+  non-durable MemWAL tail that was lost is simply replayed from Raft. To avoid a cold
+  lookup across generations (2 s for 20 on fsn1, R6), the replay start is
+  `max(durable offset in the Raft state machine, _meta in the replayed memtable)`;
+  re-applying an already-applied batch is harmless.
+- **Stale owners are fenced by MemWAL:** the sentinel makes a predecessor's next WAL
+  write collide (create-only); its entries from before the sentinel are replayed by
+  the successor; its memtable flushes fail at the manifest commit. Tested: 300 local
+  + 100 Hetzner takeovers with the old owner still writing — 0 inconsistencies,
+  `_meta` never regressed.
+- **ADB drives memtable seals** (workaround for a Lance 12.0.0 bug where
+  generations sealed *during* WAL replay are committed without their `_pk_index`
+  sidecar, breaking all LSM reads): Lance's automatic seal limits are set far above
+  anything replay can reach; `adb-store` calls `force_seal_active()` at its own
+  row/byte limit. Drop when fixed upstream.
+- **Durable offset** for Raft log truncation: the `_meta` offset covered by a
+  completed seal (generation flush) or WAL flush — never the in-memory value. How to
+  observe it cheaply under `durable_write(false)` is part of R12.
+
+**Commits into the base table** (ADB folding generations in, §9.2) keep the S2 guard:
 
 - **Offset guard:** an applier commits a batch only if the table's
   `_meta.applied_offset` equals the offset it expects, and never applies an offset
-  at or below the stored one, enforced inside the commit (Lance's optimistic
-  concurrency plus a read check on `_meta`). Without it, a stale applier that lost
-  ownership mid-flight could re-apply an older batch after a newer one and revert
-  rows, because upsert-by-id has no ordering of its own.
+  at or below the stored one. Without it, a stale applier that lost ownership
+  mid-flight could re-apply an older batch after a newer one and revert rows,
+  because upsert-by-id has no ordering of its own.
+  - A read check on `_meta` **is not enough** (spike S2): on a commit conflict Lance
+    re-runs the merge against the latest version, so a stale batch lands on newer
+    data. Every apply therefore uses **`conflict_retries(0)`**. Each batch rewrites
+    `_meta`, so two applies always conflict and the commit is a CAS on the version
+    the applier read. On rejection the applier re-reads `_meta` and decides again.
+  - Defence in depth: rows merge with
+    **`UpdateIf("source.log_offset > target.log_offset")`**, so each row only moves
+    forward. Deletes are tombstone rows carrying `log_offset` until compaction.
+  - Maintenance commits (compaction, index build, cleanup) can reject an apply too;
+    the applier retries at the ADB level (measured in S3).
 - Records whose epoch is older than the partition's latest claim are dropped.
 - On losing ownership the applier stops and closes its writers.
 - **Durable offset:** recovery and log truncation use the `applied_offset` that is
@@ -304,6 +415,25 @@ latest; otherwise it redirects.
 - **Indexed-up-to:** indexes that don't cover fresh rows report "indexed up to
   offset N".
 
+### 10.1 Local cache (mandatory)
+
+Cold object-store reads measured **55–100 ms median with tails near 1 s** (S4,
+Hetzner fsn1) — far outside the 5 ms point-read and 25 ms recall targets. Every owner
+node therefore runs a **hybrid memory + NVMe cache** in front of Lance's data files,
+index files, manifests and generation datasets:
+
+- on a **disk or partition separate from the Raft log**, so cache I/O adds no fsync
+  jitter (§11.3);
+- warmed on partition wake (§14.1) and kept for partitions the node owns;
+- also caches manifests and index metadata, which cuts the ~14 requests per table
+  open (S7, §14.1);
+- object-store reads behind it reuse connections and use hedged requests for the
+  multi-second tails (storage baseline: TLS setup alone is 20–30 ms).
+
+S4 must be re-run with this cache warm to set the real read numbers. The cache also
+weakens the "stateless nodes" claim of the object-store commit tier (§11.5): nodes
+there still need warm local disks to serve reads fast.
+
 ## 11. Replication and commit
 
 The log is embedded: openraft runs in-process, one Raft group per replica set, with a
@@ -329,7 +459,9 @@ set**. Everything after that is materialization.
 
 - The leader replicates to followers **in parallel with its own local fsync**;
   commit = any majority has fsynced (in a 3-node set, possibly the two followers).
-  Verify that the pinned openraft version reports the leader's flush asynchronously.
+  From source (6 Oct): **openraft 0.10.0-alpha does this; 0.9.25 does not**. 0.9's
+  `RaftCore` waits for the leader's fsync before replicating, so commit ≈ leader
+  fsync + RTT + follower fsync. R3 measures both before pinning.
 - Group commit: one `fdatasync` per 2–5 ms batch, shared by every partition whose
   batch is in it.
 - Clients are acked at commit; visibility comes at apply (read-your-writes waits for
@@ -339,8 +471,9 @@ set**. Everything after that is materialization.
   nodes rejoin as non-voting learners until caught up.
 - MemWAL (option A) is a second durability layer for the same data, so its flushing
   can be lazy; losing unflushed Lance state only lengthens replay.
-- openraft is version-pinned deliberately (0.9 stable vs 0.10 alpha); log storage
-  sits behind `RaftLogStorage` (`raft-engine`, or segment files plus offset indexes).
+- **openraft is pinned at `=0.10.0-alpha.36`** (R1, 7 Oct 2026) behind a thin adapter
+  in `adb-log`; upgrades are deliberate. Log storage sits behind `RaftLogStorage` as
+  ADB's own segment files plus offset indexes (`raft-engine` is unmaintained, K6).
 - The WAL writer receives batches over a channel, does `pwrite` + `fdatasync`
   (io_uring only if profiling shows syscall cost matters) and acks after fsync.
 
@@ -396,33 +529,95 @@ What the spec left implicit, decided here:
 
 - **State machine and snapshots.** The replicated state machine is the log plus, per
   partition, `(owner, epoch, durable applied_offset, Lance version)`. A Raft snapshot
-  is that small map, a pointer; table data never travels between nodes. A lagging or
-  new follower installs the snapshot, then streams the log tail.
+  is that small map, a pointer; table data never travels between nodes (R7: 174 bytes
+  for three partitions). A lagging or new follower installs the snapshot, then streams
+  the log tail. It has **no log before the snapshot point**, so when it becomes owner of
+  a partition whose durable offset is older, it reads that range from a peer's log
+  (`adb-log` range-read RPC) or from the archive. openraft's automatic purge is off
+  (`max_in_snapshot_log_to_keep = u64::MAX`); ADB purges per §11.3.
 - **Who applies.** Only a partition's owner materializes it into Lance; other members
   hold the log, so each Lance table has exactly one writer.
 - **Reads.** The owner serves reads of applied state while its lease is valid and its
   claim is current. Linearizable reads, when requested, confirm ownership with a
   ReadIndex round through the leader. Followers serve nothing directly.
 - **Membership.** Replacing a node: add it as a learner, let it catch up from snapshot
-  plus tail, promote it (joint consensus), remove the old node. The control plane
+  plus tail, promote it (joint consensus), remove the old node. **To replace the
+  leader, transfer leadership to another voter first** (R8: removing it directly stalls
+  commits ~1 s for an election; with a transfer, 12–76 ms). **A node with a lost or
+  empty disk always returns under a new node id** (R7: openraft does not notice a
+  same-id node that lost its log, and a voter without its log/vote is unsafe). The control plane
   drives every step; a replica set never runs with fewer than three voters
   deliberately.
 - **Bootstrap.** The control plane creates a replica set, initializes the group with
   three voters, and assigns initial owners by committing claims; the routing map
   publishes owners, and SDKs follow redirects.
-- **Timing.** Heartbeat and election timeouts are set for in-region networks
-  (heartbeat ≈ 50 ms, election 300–600 ms as the starting point), with heartbeats
-  batched per node pair. After an election the control plane may transfer leadership
+- **Timing.** Heartbeat and election timeouts are set for in-region networks:
+  **heartbeat 30 ms, election 150–300 ms, pre-vote on** (R6: an unplanned leader crash
+  costs 465–565 ms; the earlier 50 / 300–600 ms took 0.9–1.4 s). Heartbeats are batched
+  per node pair. To be confirmed on the servers for false elections under load. After an election the control plane may transfer leadership
   back to keep the leader's load predictable.
 - **Testing.** Jepsen-style fault injection (network partitions, clock skew, leader
   and owner kills, disk-full, slow fsync) is a gate for the cluster milestone, on
   top of the single-node fault tests.
 
-### 11.7 Outbound streams
+### 11.7 Subscriptions and continuous queries
 
-Change feeds to analytics, webhooks or waiting agents may use Iggy (or
-Redis/Dragonfly Streams for lossy fan-out). They consume the committed log; they are
-never part of commit.
+Full spec: [`SUBSCRIPTIONS_CQ_SPEC.md`](SUBSCRIPTIONS_CQ_SPEC.md) (7 Oct 2026, adopted
+9 Oct with the adjustments below). Both features are fed from the **committed** log
+and are never on the commit path; agents never poll tables.
+
+| | Subscription (standard) | Continuous query (premium) |
+|---|---|---|
+| Agent asks | "Tell me when anything here changes" | "Tell me when this query's answer changes" |
+| API | `SUBSCRIBE SCOPE \| TOPIC … [KINDS …] [FROM OFFSET n \| FROM NOW]`, `PUBLISH TOPIC`, `ACK`, `UNSUBSCRIBE` | `WATCH <AQL query> [DEBOUNCE …]` → snapshot at offset N, then diffs; `UNWATCH` |
+| Engine work per write | Filter by scope/topic, forward the committed effects | Match against watch sets; update the result incrementally or re-run (debounced) |
+| Cost | Near zero (a cursor on the log) | Per-query state and evaluation, metered |
+
+**Placement.** A topic hashes like a scope (`hash(tenant, topic) mod 4096`), so a scope
+or topic lives in one partition and all its subscribers share one order. Each
+subscriber has its **own cursor** (broadcast, not competing consumers). Topic messages
+are ordinary committed writes (`kind = event`) with a per-topic TTL.
+
+**Execution.**
+- The **matcher** runs on the partition owner, on the sequencer's core, **right after
+  the apply `put`** (§9.3) — the moment a change becomes readable — against a
+  tenant-first index of subscriptions and continuous queries (static watch sets
+  percolator-style; read-sets for graph traversals). It has a time budget per batch;
+  work over budget goes to a per-partition evaluation task. The matcher never blocks
+  apply.
+- An always-on **gateway** tier holds agent connections (gRPC stream, MCP,
+  WebSocket), per-subscriber buffers and acks, catch-up reads, and routing to current
+  owners. A slow subscriber is switched to catch-up from its cursor; it never slows
+  the sequencer.
+- Cross-partition continuous queries wait for a **watcher tier** (v2).
+
+**Semantics.** Total order within a partition, none across partitions; delivery is
+**at-least-once**, tagged with the producing offset (clients drop offsets ≤ their last
+ack); deliveries are emitted at **apply**, so a pushed change is already readable on
+the owner. A continuous query registers by snapshot at offset N, then tails from N+1 —
+no missed or duplicated changes. The v1 `WATCH` subset is: filters / point lookups,
+current facts (with `valid_to` timers), count / sum / min / max, graph traversal
+(re-run on read-set hit), top-k vector recall (k+m buffer) and hybrid recall
+(re-run); anything else is rejected at registration.
+
+**Durability.** Registrations and cursors are rows in the partition table (`kind =
+sub | cq`) written through the log (`RegisterSub`, `UpdateSubCursor`, `RegisterCq`, …),
+so they inherit replication, hibernation, encryption and forget. Continuous-query
+results are not persisted; they are re-snapshotted on wake or failover.
+
+**Adjustments from the spikes** (recorded in the spec):
+- The matcher hook is after the MemWAL `put`, not after a `merge_insert` (option A).
+- **Catch-up past log retention is a reset, not a replay:** a `log_offset > cursor`
+  table scan sees only each row's current version (intermediate updates collapsed,
+  deleted / forgotten rows absent), so it is delivered as a `reset` with current state.
+  Exact change replay is promised only within log + archive retention.
+- **Subscriptions never keep a partition awake** (this replaces the v1.3 rule that
+  they block hibernation) — see §14.1 for scheduled wakes.
+- `UpdateSubCursor` costs log volume per ack batch; cursors are batched across
+  subscribers in one effect (open: gateway-held cursors with checkpoints).
+
+Exports to analytics and webhooks are ordinary subscribers; Iggy or Redis/Dragonfly
+Streams may sit behind the gateway for lossy fan-out.
 
 ## 12. Failure, recovery and rebalancing
 
@@ -434,11 +629,13 @@ object storage, replay the log tail. No data is copied between nodes. (v0.2's
 1. The owner's lease expires; the control plane picks a new owner within the replica
    set.
 2. The new owner appends `claim(partition, epoch=N+1)` through Raft.
-3. It opens the partition's Lance table (option A: MemWAL replays its own WAL into
-   memtables).
-4. It reads the durable `_meta.applied_offset`, then replays committed records after
-   it from the local log or the archive (upserts plus the offset guard make overlap
-   harmless).
+3. It opens the partition's Lance table and MemWAL shard writer. With no periodic
+   MemWAL WAL flush (§9.2) there is (almost) nothing to replay from object storage
+   (R6: 0.4–0.55 s on fsn1).
+4. It takes the replay start from `max(durable offset in the Raft state machine,
+   _meta in the replayed memtable)` (§9.3) and replays committed records after it from
+   the local log, a peer's log or the archive (R7); re-applying an already-applied
+   batch is harmless.
 5. It rebuilds the pending overlay and the `WORKING` / `TOOLS` hot tier from
    committed-but-unapplied records, then serves.
 
@@ -452,27 +649,35 @@ object storage, replay the log tail. No data is copied between nodes. (v0.2's
 | Majority of replica set lost | Writes stop for its partitions | Restore from object storage + archived log segments; possible loss of the unarchived tail |
 | Object storage slow or throttled | Flush and compaction lag; reads hit memtables and cache | Raft log stays durable locally; backpressure on compaction |
 
-**Rebalancing**
-- The control plane moves partition ownership by load (hot partitions, node CPU,
-  memory); data stays in object storage.
-- Snapshot hot partitions more often to keep replay, and therefore failover, short.
-- Moving a partition to another replica set is the same claim-open-replay sequence in
-  the target set.
+**Rebalancing** (one Raft group per replica set, §6.1)
+- Within a set, the control plane moves partition **ownership** by load (hot
+  partitions, core and node CPU, memory) with `claim(partition, epoch+1)`; data stays in
+  object storage. A **leader change moves no partitions**; leadership is moved
+  separately (transfer, §11.6).
+- **Capacity grows by adding replica sets.** Moving a partition to another set is the
+  same claim-open-replay sequence in the target set; a set never grows to a fourth
+  node.
+- Seal hot partitions often (§9.2) to keep tail replay, and therefore failover, short.
+- Every partition always has an owner while its set is live; only hibernation
+  (§14.1) leaves a partition unowned.
 
 ## 13. Deployment profiles (one engine)
 
+**Product decision (7 Oct 2026):** ADB ships as part of A3T, **SaaS only**. The only
+build that runs outside the service is the **local dev** single node. There is no
+embedded production profile and no BYOC.
+
 | Profile | Log | Storage | `CLAWDB_REQUIREMENTS` target | Use |
 |---|---|---|---|---|
-| **Playground** | None | In-memory | (2) WASM playground | Browser demo; parser + in-memory engine, no persistence |
-| **Embedded** | Local WAL file | Local directory or object storage | (1) | Inside FlowR or an agent process; replaces the §23 sidecar; v0.2 "embedded" |
-| **Single-node server** | Local WAL | Local or object storage | (1) ClawDB | `adb-server` (gRPC + MCP); dev, Claude Desktop, small installs; v0.2 "hybrid" via archived segments |
-| **Cluster — Raft tier** | openraft replica sets on NVMe | Object storage | (3) Full ADB | Low-latency and enterprise tier, dedicated tier; v0.2 "serverless" |
-| **Cluster — object-store tier** | Object-store log, conditional writes | Object storage | (3) Full ADB | Cheap shared tier; stateless nodes, 10–100 ms commits |
+| **Cluster — Raft tier** | openraft replica sets on NVMe | Object storage (Hetzner) | (3) Full ADB | **Production SaaS**: shared and dedicated tiers |
+| **Cluster — object-store tier** | Object-store log, conditional writes | Object storage | (3) Full ADB | Candidate cheap shared tier; only if O1–O3 justify it |
+| **Local dev (single node)** | Local WAL | Local directory | (1) ClawDB | `adb-server` (gRPC + MCP) for developers; not for production data |
+| **Playground** (optional) | None | In-memory | (2) WASM playground | Browser demo; parser + in-memory engine, no persistence |
 
-Embedded, single-node and cluster run the same sequencer, applier and table schema;
-only the log implementation and placement change (a single node owns all 4,096
-partitions, most of them hibernated). The single-node build exercises the whole
-write path.
+Local dev and the cluster run the same sequencer, applier and table schema; only the
+log implementation and placement change (a single node owns all 4,096 partitions,
+most of them hibernated), so the dev build exercises the whole write path. Dev data
+on local disk is not power-safe (K8) — acceptable for a dev build.
 
 ## 14. Scale-to-zero, tenancy and security
 
@@ -489,15 +694,89 @@ partition sleeps only when all of its tenants are idle. So:
 - The advantage over Neon (no per-tenant process to rehydrate) stands, at partition
   granularity.
 
-**Hibernate:** stop writes, drain batch and applier, flush so the durable
-`applied_offset` is current, close writers, release, drop caches.
-**Wake:** assign, open the table, read `_meta`, replay the (usually empty) tail,
-prewarm hot indexes and the `TOOLS` cache (v0.2's session loading), serve. Cold
-start scales with the unflushed tail and index warm-up, not total data.
+#### Operating modes: hibernated (default) or always-on
 
-**Object-storage budget:** with the log as the WAL, flushing is a checkpoint (e.g.
-4,096 partitions flushing every 60 s ≈ 70 PUT/s, plus compaction). Partitions are
-spread across buckets to stay inside per-bucket limits (e.g. Hetzner 750 req/s).
+Both modes are offered (decided 9 Oct 2026):
+- **Hibernated — the default.** Unless a customer asks otherwise, ADB and FlowR
+  hibernate when idle, to keep A3T's cost down. A3T bills per agent and listening time;
+  for billing, an agent is alive while its trigger is active.
+- **Always-on — on request.** The customer pays for the full run time and may run as
+  many agents as it wants; nothing hibernates.
+
+Pricing is not the focus at this stage; the goal is a working, usable product. The
+mode only decides whether the mechanisms below are applied.
+
+#### Two levels of hibernation
+
+**1. Partition hibernation.** The partition has no owner and is just files plus its
+durable offset. Nodes stay up. It wakes lazily on its first request.
+
+- **Hibernate:** stop writes, drain the batch and the applier, seal so the durable
+  offset equals the commit tip, close the shard writer, release ownership, drop caches.
+  **Subscriptions and continuous queries do not keep a partition awake** (§11.7): a
+  hibernated partition receives no writes, so nothing it holds can change. Their
+  registrations and cursors are already committed rows; continuous-query results are
+  rebuilt on wake. The gateway keeps agents' connections open and heartbeats.
+- **Wake** = claim + table open + replay + rebuild — never "start a sequencer" (§8):
+  1. **Claim the epoch** (one Raft entry).
+  2. **Open the Lance table and MemWAL shard writer:** manifests and index metadata —
+     ~14 object-store requests (S7), the dominant cost; served from the local cache
+     where possible (§10.1).
+  3. **Read the durable offset** (Raft state machine, §9.3) and **replay the tail**,
+     which is empty after a clean hibernate.
+  4. **Rebuild** the pending overlay and the `WORKING` / `TOOLS` hot tier. `WORKING`
+     lives in sequencer memory and is reconstructable only because it is logged. **A
+     scope that marks `WORKING` as `volatile` loses it on hibernate.**
+  5. **Load subscriptions and continuous queries:** the subscription index and CQ
+     registrations; re-snapshot each CQ at the current offset. The matcher is live
+     before the first new batch applies (CQ clients get a `reset` only if their last
+     delivered offset is older than the re-snapshot).
+  6. **Prewarm** the hot indexes and the local cache (v0.2's session loading).
+- **What wakes a partition:** a write or read for it, or a **scheduled wake**.
+  Subscribers alone never wake a partition. Results that change with the clock
+  (`valid_to` passing, TTL expiry, relative time windows) are driven by the owner's
+  timer wheel; a hibernated partition with a pending boundary registers a scheduled
+  wake with the control plane at its earliest boundary. Partitions with no CQs or
+  TTLs never schedule wakes.
+
+**2. Node / replica-set hibernation.** When a whole replica set is idle for a
+configurable period (e.g. 1–2 h):
+- seal every partition so each durable offset equals the commit tip; archive the log
+  tail; store the Raft snapshot (the small owner / epoch / offset map) in object
+  storage; then release the nodes.
+- **Node wake:** a request arrives for a partition in a hibernated set. The control
+  plane starts nodes, **bootstraps a fresh group from the archived snapshot** (with new
+  node ids — R7: a node without its disk never rejoins under its old id), and the nodes
+  come up owning no partitions. The requested partition wakes first; the others wake
+  lazily. **Never wake all 4,096 at boot.**
+
+**Invariant:** a live request never hits an unowned partition and fails. Waking the
+partition is the first step of serving that request.
+
+**Open conflict (§19), deferred:** §11.3 requires power-loss-protected NVMe on
+dedicated servers, and Hetzner dedicated servers are billed monthly, so releasing them
+saves nothing. Options: hourly-billed servers for hibernating sets (relying on the
+empty-tail invariant at hibernate time), a small always-on pool that hibernates only
+partitions, or the object-store commit tier (§11.5) for tiers that need true
+scale-to-zero. Deferred while pricing is not the focus: hibernated mode starts as
+**partition hibernation on an always-on pool**, which needs no new infrastructure.
+
+#### Wake throughput budget
+
+Hetzner limits requests to 750/s per bucket; one open + first query costs ~14
+requests, and S7 reached ~45 opens/s per bucket in practice. So:
+
+```
+opens/s ≈ Σ over buckets (750 − steady-state req/s) ÷ 14      (S7: ~45 per bucket)
+```
+
+With partitions spread over 20 buckets that is ~900 opens/s, so waking every
+partition takes ~5 s. Lazy wake makes that the worst case, not the normal case.
+Caching manifests and index metadata locally (§10.1) cuts the 14 requests per open.
+
+**Object-storage write budget:** with the Raft log as the WAL, MemWAL writes only at
+seals (§9.2): ~0.8 writes/s per busy partition (S6), less when idle. Partitions are
+spread across buckets to stay inside per-bucket limits.
 
 ### 14.2 Tenancy tiers
 
@@ -518,12 +797,19 @@ and sequencer constraints, which need plaintext. So:
   data key. Destroying the key crypto-shreds them, including backups, where physical
   deletion is impractical.
 - **Lance rows** keep searchable fields in plaintext (`text`, constraint fields,
-  `embedding`) under bucket server-side encryption per tenant prefix; non-searched
-  payload fields inside `value` stay encrypted with the tenant key.
+  `embedding`) under server-side encryption. AQL can filter on any payload field, so
+  all of `value` is plaintext too; only fields a scope declares **sealed** are
+  encrypted with the tenant key, in their own column, and can't be filtered
+  ([`D3_SCHEMA.md`](D3_SCHEMA.md) S2). Hetzner supports **SSE-C only** (no
+  SSE-S3, no bucket default), one key per store, i.e. per partition table (S12). So
+  at-rest keys are **per partition** in the shared tier and **per tenant** only in the
+  dedicated tier, where a tenant owns its partitions.
 - **Forget** (AQL `FORGET`) = destroy the key where the whole scope goes; delete the
   rows; compact; run old-version cleanup with a **short version-retention window**,
   so old Lance versions and flushed data are physically gone within a stated forget
-  SLA.
+  SLA. Verified in S11, with one addition: forget also needs MemWAL tombstones →
+  generation compaction → **MemWAL GC** (§9.2), because WAL files and generations
+  keep the plaintext otherwise. Old index files keep vectors until the version cleanup.
 - Embeddings are treated as sensitive data.
 
 ### 14.4 Credentials, authorization, audit
@@ -536,16 +822,66 @@ and sequencer constraints, which need plaintext. So:
 - Every committed record carries tenant, scope, agent and `txn_id`; hash-chaining
   log records gives a tamper-evident trail.
 
+## 14.4b Record ids and namespaces (schema v5, 4 Nov 2026)
+
+Keys are unique per (namespace, scope, memory type): a record in a namespace has the id
+`<namespace>|<scope part>~<key>`; without one, the id is as before. AQL is unchanged
+(`NAMESPACE` scopes keys too); a v4 table is rewritten once at open. Details:
+`.ai/NS_IDS.md`.
+
+## 14.5 Memory branches (agents as repos, 4 Nov 2026)
+
+A branch of an agent's memory space is **its own engine** — WAL, sequencer, delta table —
+hosted beside the org's engine or in its own pod. The org logs only the branch's control
+records and serves its parent's rows `AS OF` the branch point; branch writes never use
+the org's sequencer, table or compaction. Reads overlay the branch's rows on the parent's
+(nearest level per lineage). Promote = materialise the branch's view as a new agent
+space in production. Retention pins keep the org's history the open branches read
+(per namespace, in compaction). A FORGET on main erases the record from the org and
+from every branch engine's own copies before it returns; dropping a branch deletes its
+engine.
+Details: `.ai/BRANCHING.md`; spec: flowr-system `.ai/A3T_AGENTS_AS_REPOS_SPEC.md` §2.3.
+
 ## 15. Relationship to FlowR
 
-- FlowR uses ADB for **agent memory** in every profile: embedded in its process, or
-  as a service. Today FlowR's `call:a3t:agent` skips memory recall/store ("ClawDB
-  integration pending"); wiring it is a FlowR task against the single-node profile.
+- FlowR uses ADB for **agent memory** as a service (ADB is SaaS-only, §13), against
+  the local dev build during development. Today FlowR's `call:a3t:agent` skips memory
+  recall/store ("ClawDB integration pending"); wiring it is a FlowR task against the
+  local dev build.
 - FlowR's own control-plane data (templates, agents, canvases, deployments) and run
   state are **not** in the v1 memory schema. Clustering FlowR needs a shared queue,
-  shared state and pub/sub for live sessions. Whether that state becomes a second
-  ADB table family on the same log/sequencer engine is an open decision (§19), taken
-  after the single-node milestone.
+  shared state and pub/sub for live sessions. **Pub/sub is answered by ADB
+  subscriptions (§11.7):** each FlowR instance subscribes to the scopes or topics it
+  follows and sees every change in one order, with no FlowR-to-FlowR coordination.
+  Open: whether FlowR's run-state notifications use topics directly. The rest of
+  FlowR's state becomes a second table family on the same engine (§15.1, decided
+  24 Oct).
+
+### 15.1 Platform tables (hosted A3T)
+
+**Goal (decided 24 Oct 2026):** in the hosted service, A3T's platform data (agents,
+canvases, templates, deployments, audit) moves from the LanceDB embedded in each FlowR
+process (`A3T_DB_PATH`, `call:lancedb`) into ADB, so clustered and hibernating FlowR
+instances share one durable copy. **Local dev and CE keep the embedded LanceDB**; the
+FlowR resource type picks the backend, so A3T's flows don't change.
+
+- **Contract:** the six operations A3T's flows use today through `call:lancedb`
+  (69 steps): `create_table`, `insert`, `query` (SQL filter + limit), `update`
+  (filter + set), `delete` (filter), `list_tables`, with the same semantics.
+- **Engine:** a second table family next to the memory tables, on the same log,
+  sequencer and Lance store (§9). Each platform table has its own schema; writes go
+  through the log like memory writes; no AQL memory semantics (no supersede,
+  forget or links).
+- **Wire:** native, not HTTP. **Arrow Flight** (on gRPC) for platform tables: Lance
+  stores Arrow and FlowR's LanceDB handler already holds Arrow record batches, so
+  batches cross without conversion, and large results and bulk inserts stream.
+  Plain gRPC (AQL `proto/`) stays for AQL calls and subscription streams. In-cluster
+  round trips are similar for all three (HTTP keep-alive measured 0.16 ms); Flight's
+  gain is on large results and bulk writes. Any network option is slower per call
+  than the embedded LanceDB; the gain is shared, durable state.
+- **Prerequisites:** the durable engine (log, sequencer, store); a protocol spike
+  (HTTP + JSON vs gRPC + protobuf vs Flight on A3T-shaped queries) settles the wire
+  with numbers.
 
 ## 16. Crate plan
 
@@ -559,36 +895,47 @@ and sequencer constraints, which need plaintext. So:
 | `clawdb-wasm` | Keep | Playground profile |
 | **`adb-log`** (new) | New | Log trait; local WAL, openraft and object-store implementations; WAL writer thread; archiver |
 | **`adb-sequencer`** (new) | New | Validation, overlay, group commit, hot tier |
-| **`adb-store`** (new) | New | Storage trait; Lance applier, offset guard, maintenance (SlateDB fallback behind it) |
-| **`adb-cluster`** (new) | New | Control-plane client, routing map, leases, hibernation |
+| **`adb-store`** (new) | New | Storage trait; Lance MemWAL writer + `LsmScanner` reads, generation compaction, index maintenance, hot-tier cache; option B and SlateDB are fallbacks behind the trait |
+| **`adb-cluster`** (new) | New | Control-plane client, routing map, leases, hibernation, scheduled wakes, gateway routing table |
+| **`adb-cq`** (new) | New | Continuous-query result state, update strategies, read-set capture, debounce (§11.7) |
+| **`adb-gateway`** (new) | New | Client streams, delivery buffers, acks, catch-up, routing to owners (§11.7) |
 
 ## 17. Spike (about 2 weeks, single node): go/no-go on memtable option A
 
-- [ ] **0. Find a released Lance crate that exposes the MemWAL writer API**, and pin
-      it. If none does, go straight to option B.
+- [x] **0. Find a released Lance crate that exposes the MemWAL writer API**, and pin
+      it. → Lance 12.0.0 (spike B2).
 - [ ] `merge_insert` p99 for 1–50-row batches (A: LSM path; B: plain).
 - [ ] Point-read and `subject_id` scan p99 across memtable, flushed data and base.
-- [ ] Atomicity of one commit (rows + `_meta`) across a process kill.
-- [ ] Offset guard: two appliers racing on one table never revert a row.
+- [x] Atomicity of one commit (rows + `_meta`) across a process kill. → 1,000 kills on
+      Hetzner fsn1, 0 inconsistencies.
+- [x] Offset guard: two appliers racing on one table never revert a row. → only with
+      `conflict_retries(0)` + `UpdateIf` (§9.3).
 - [ ] Which indexes `maintained_indexes` covers (vector, FTS, scalar) — A only.
 - [ ] PUTs per active table per second, and whether MemWAL durability can be relaxed
       — A only.
 - [ ] Open / close / reopen cost per table, at 4,096 tables per bucket set.
-- [ ] Conditional writes (`If-None-Match` / `If-Match`) on Hetzner object storage —
-      **blocker** for Lance commits.
+- [x] Conditional writes (`If-None-Match` / `If-Match`) on Hetzner object storage —
+      **blocker** for Lance commits. → create-only works (spike B1).
 
 ## 18. Delivery path
 
 1. **Spike** (§17) → choose memtable A or B.
-2. **Single node / embedded:** sequencer, local WAL, applier, memory schema,
+2. **Single node (local dev build):** sequencer, local WAL, applier, memory schema,
    **persisted links**, `WORKING` / `TOOLS` hot tier; the AQL conformance suite keeps
    passing (116/116 today).
+   **Subscriptions** ship here: `SUBSCRIBE` / `PUBLISH` / `ACK`, matcher in apply,
+   durable registrations and cursors, in-process gateway (§11.7).
 3. **Recall:** vector / FTS / scalar indexes, brute-force threshold, hybrid ranking.
+   **Continuous queries v1** follow (they depend on the recall indexes): classifier,
+   static watch sets, incremental classes, timer wheel, scheduled wakes; v1.1 adds
+   traversal re-run, top-k buffer, hybrid re-run, metering.
 4. **Replication:** openraft replica set (one group), owner forwarding, epochs and
    claims, offset guard, archiver, recovery, membership, Jepsen-style tests; the
    object-store commit mode alongside.
 5. **Control plane:** routing map + overrides, leases, hibernation and wake, tiers.
-6. **Multi-node:** ownership balancing, cross-set handoff, bucket spreading.
+6. **Multi-node:** ownership balancing, cross-set handoff, bucket spreading; the
+   gateway tier with resume across failover; cross-partition continuous queries on a
+   watcher tier (v2).
 
 **Day-one rules**
 - Every mutation goes through the ADB log; the table is a materialized view of it.
@@ -605,21 +952,29 @@ Worked through, with experiments, exit criteria and fallbacks, in
 
 | Item | Type | Why it matters | Next step |
 |---|---|---|---|
-| MemWAL writer API availability | **Risk** | Not in Lance 2.0.0; option A depends on it | Spike step 0; fall back to B |
-| Atomic commit with `_meta` | Unknown | Crash-safe apply depends on it | Kill mid-apply in the spike |
-| Offset guard inside a Lance commit | Unknown | Prevents stale-applier reverts | Race test in the spike |
+| MemWAL writer API availability | ☑ Resolved (B2) | Shipped in Lance 12.0.0, with epoch fencing | Benchmark A vs B on Hetzner (S3, S4, S6) |
+| Atomic commit with `_meta` | ☑ Resolved (S1, R11) | Crash-safe apply depends on it | 1,000 kills on fsn1 + 400 MemWAL kills, 0 inconsistent |
+| Offset guard inside a Lance commit | ☑ Resolved (S2) | A read check alone lets Lance's retries revert rows | `conflict_retries(0)` + `UpdateIf` on `log_offset` (§9.3) |
 | Object-store conditional writes (Hetzner) | ☑ Resolved (B1) | Create-only is atomic (Lance's commit path works); `If-Match` replace is broken | Design rule: create-only objects; open issue B1a (three gateways reject the key) |
-| openraft 0.9 vs 0.10 | Decision | API churn vs features | Prototype on one, pin it |
+| openraft 0.9 vs 0.10 | ☑ Decided (R1) | API churn vs features | Pinned `=0.10.0-alpha.36` — only line with parallel leader fsync |
 | One Raft group per replica set | Decision | One leader carries all of the set's appends and replication | Benchmark leader throughput; multi-Raft only if it saturates |
 | Commit mode per tier | Decision | Raft (~1 ms, NVMe replica sets) vs object-store commit (10–100 ms, stateless nodes) | Choose per tier; both behind the log trait |
-| openraft async leader flush | Unknown | Parallel leader fsync needs append completion reported asynchronously | Verify on the pinned version |
-| Replicated group-commit latency | Unknown | Sets the `remember()` budget | 3 nodes, 1–4 KB txns, 2–5 ms window, fsync on |
+| openraft async leader flush | ☑ Resolved (R2) | Tested on 0.10: +20 ms on the leader's fsync leaves commits unchanged | — |
+| Replicated group-commit latency | ◐ Indicative | Sets the `remember()` budget | One box: p50 0.45 ms (1 client), ~21.9k commits/s; confirm on three servers (R3/R4) |
 | Partition count (4,096) | Decision | Hard to change later | Confirm against target node count and largest tenant |
-| Hetzner 750 req/s per bucket | Risk | Caps active partitions per bucket | Bucket per partition group; checkpoint-style flushing |
-| Encryption vs search (§14.3) | Decision | Plaintext needed for FTS/constraints | Adopt split rule; confirm SSE per prefix |
+| Hetzner 750 req/s per bucket | Risk | Caps writes, reads and table opens per bucket (S7: ~45 opens/s) | Many buckets per cluster; writes only at seals (§9.2); cache manifests (§10.1) |
+| Encryption vs search (§14.3) | Decision | Plaintext needed for FTS/constraints | Split rule adopted; S12: SSE-C per table only → per-tenant at-rest keys in the dedicated tier |
 | Cross-partition operations | Decision | Shared scopes on other partitions | Sagas/outbox first; 2PC only on demand |
-| FlowR state as an ADB table family | Decision | Basis for FlowR cluster mode | Decide after single-node milestone |
-| **ADB licence** | Decision | README says ELv2; workspace `Cargo.toml` says Apache-2.0; no LICENSE file. ELv2 suits a hosted product (it stops others offering ADB as a managed service), but it conflicts with the "ADB-CE" open-source naming used in FlowR | Pick one, add LICENSE, align `Cargo.toml` and README |
+| FlowR state as an ADB table family | ☑ Decided (24 Oct) | Basis for FlowR cluster mode | Platform tables for hosted A3T (§15.1); local dev and CE keep embedded LanceDB. Next: wire-protocol spike |
+| **ADB licence** | ☑ Decided (9 Oct) | SaaS-only; the dev build ships under the **same business support licence as FlowR** | Add the LICENSE text once FlowR's exists (FlowR's `Cargo.toml` still says Apache-2.0; no LICENSE file in either repo); align `Cargo.toml` and README; drop "ADB-CE" |
+| **Node hibernation vs PLP dedicated servers** | Risk, deferred | Dedicated servers are billed monthly, so releasing them saves nothing; a woken set is a fresh bootstrap (§14.1) | Start hibernated mode as partition hibernation on an always-on pool (§14.1); revisit with pricing
+| **Wake throughput per bucket** | Risk | ~14 requests per open, ~45 opens/s per bucket (S7); a mass wake is bucket-bound | Spread over ~20 buckets (~900 opens/s, all partitions in ~5 s); lazy wake; local manifest cache (§14.1) |
+| **Temporal results on hibernated partitions** | Risk | `valid_to` / TTL boundaries change results with no write; without a scheduled wake they go stale silently (§14.1) | Timer wheel + scheduled wakes in the control plane; gate test on wake tolerance |
+| **Continuous-query matcher budget** | Unknown | Up to 2,000 CQs per partition must not slow apply | Benchmark matcher cost per batch; demote slow CQs to periodic re-run |
+| **Subscription catch-up beyond log retention** | Behaviour to document | A table scan sees only current row versions, so old cursors get a `reset`, not a replay (§11.7) | Publish the replay-retention promise per tier |
+| **Cursor write volume** | Unknown | `UpdateSubCursor` per ack batch adds log records | Batch cursors across subscribers; decide on gateway-held cursors |
+| **Hot-scope single-sequencer ceiling** | Risk | One scope = one partition = one core; no single scope can scale writes past one sequencer (§6.2) | Measure the ceiling with `id` + `subject_id`; fine keys, move or split hot scopes |
+| **`volatile` WORKING lost on hibernate** | Behaviour to document | Unlogged working memory cannot be rebuilt on wake (§14.1) | State it in the AQL docs; default scopes log WORKING |
 | Crowded memory market | Market | Differentiation | Lead with cost model, temporal/provenance memory, verifiable forget |
 
 ## 20. Changes from the 5 Oct drafts
@@ -659,3 +1014,22 @@ Worked through, with experiments, exit criteria and fallbacks, in
 16. **Raft operations added (v1.1):** snapshots as pointers, owner-only apply and
     reads (ReadIndex for linearizable reads), learner-based membership changes,
     bootstrap, timing, Jepsen-style testing (§11.6).
+17. **Spike results (v1.2, 6 Oct):** MemWAL writer found in Lance 12.0.0 (§9.2);
+    offset guard redefined as `conflict_retries(0)` + per-row `UpdateIf` after the
+    read-check version failed the race test (§9.3); parallel leader fsync needs
+    openraft 0.10 (§11.2).
+18. **Architecture review (v1.3, 7 Oct):** the sequencer is per-partition state on a
+    core's executor, never a thread (§8); scaling by adding replica sets and moving
+    ownership by claim (§6.1); the hot-scope single-sequencer limit (§6.2); the local
+    memory + NVMe cache is mandatory (§10.1); change feed and continuous queries
+    (§11.7); two-level hibernation with an explicit wake sequence, the never-unowned
+    invariant and a wake budget (§14.1); SaaS-only profiles (§13); new risks (§19).
+19. **Subscriptions and continuous queries (v1.4, 9 Oct):** adopted the spec as §11.7 —
+    owner-local matcher after the apply `put`, always-on gateway, snapshot-then-tail
+    CQs, the v1 `WATCH` subset; registrations and cursors as table rows (`kind = sub |
+    cq | event`, §7); subscriptions no longer block hibernation, scheduled wakes cover
+    temporal boundaries (§14.1); new components and crates (§8, §16); delivery
+    milestones (§18); new risks (§19).
+20. **Platform tables (v1.5, 24 Oct):** hosted A3T's platform data moves into ADB as a
+    second table family with `call:lancedb`'s six operations, over Arrow Flight; local
+    dev and CE keep embedded LanceDB (§3, §15.1, §19).

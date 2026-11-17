@@ -35,6 +35,9 @@ pub enum ResultSet {
         sources: Vec<SourceResult>,
         links: Vec<Link>,
     },
+    /// A subscription statement's answer (stage E): `{subscription, …}` or
+    /// `{id, offset}` for PUBLISH.
+    Subscription { value: serde_json::Value },
     /// Empty result
     Empty,
 }
@@ -59,6 +62,9 @@ pub struct ResultMetadata {
     pub records_returned: Option<u64>,
     /// Pipeline step timings
     pub step_timings: Option<Vec<u64>>,
+    /// A pipeline (or its stage) ran out of its `TIMEOUT` budget (W9)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
 }
 
 impl QueryResult {
@@ -106,6 +112,18 @@ impl QueryResult {
         Self {
             success: true,
             data: ResultSet::Aggregation { values },
+            metadata: ResultMetadata {
+                execution_time_ms,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A subscription statement's answer (stage E).
+    pub fn subscription(value: serde_json::Value, execution_time_ms: u64) -> Self {
+        Self {
+            success: true,
+            data: ResultSet::Subscription { value },
             metadata: ResultMetadata {
                 execution_time_ms,
                 ..Default::default()

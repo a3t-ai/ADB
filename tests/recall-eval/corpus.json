@@ -1,0 +1,374 @@
+[
+ {
+  "key": "acme-renewal",
+  "content": "Acme's annual contract renews on the first of November"
+ },
+ {
+  "key": "acme-owner",
+  "content": "Priya Shah is the account owner for Acme"
+ },
+ {
+  "key": "acme-plan",
+  "content": "Acme is on the Enterprise plan with 250 seats"
+ },
+ {
+  "key": "acme-churn-risk",
+  "content": "Acme complained twice about slow report exports this quarter"
+ },
+ {
+  "key": "beta-renewal",
+  "content": "Beta Logistics renews its subscription on 15 December"
+ },
+ {
+  "key": "beta-owner",
+  "content": "Marco Rossi manages the Beta Logistics account"
+ },
+ {
+  "key": "beta-discount",
+  "content": "Beta Logistics was promised a 12 percent discount at renewal"
+ },
+ {
+  "key": "globex-trial",
+  "content": "Globex started a 30 day trial on 3 October"
+ },
+ {
+  "key": "globex-contact",
+  "content": "The main contact at Globex is the head of data, Dana Lee"
+ },
+ {
+  "key": "initech-invoice",
+  "content": "Initech has an overdue invoice of 8,400 euros from September"
+ },
+ {
+  "key": "initech-sso",
+  "content": "Initech requires single sign-on through Okta before rollout"
+ },
+ {
+  "key": "umbrella-legal",
+  "content": "Umbrella Corp's legal team must approve any data processing agreement changes"
+ },
+ {
+  "key": "umbrella-region",
+  "content": "Umbrella Corp's data has to stay in the EU Frankfurt region"
+ },
+ {
+  "key": "hooli-expansion",
+  "content": "Hooli plans to expand from 40 to 400 users next year"
+ },
+ {
+  "key": "hooli-champion",
+  "content": "Hooli's internal champion is the VP of engineering, Gavin"
+ },
+ {
+  "key": "stark-poc",
+  "content": "Stark Industries wants a proof of concept limited to the robotics team"
+ },
+ {
+  "key": "wayne-security",
+  "content": "Wayne Enterprises asked for our SOC 2 Type II report"
+ },
+ {
+  "key": "wonka-billing",
+  "content": "Wonka pays annually by bank transfer, not by card"
+ },
+ {
+  "key": "inc-4471",
+  "content": "Incident INC-4471: the payments service ran out of memory after the 2.3 release"
+ },
+ {
+  "key": "inc-4471-fix",
+  "content": "INC-4471 was fixed by raising the payments pod memory limit to 2 GiB"
+ },
+ {
+  "key": "inc-4502",
+  "content": "Incident INC-4502: checkout latency spiked because the Redis cache was evicting keys"
+ },
+ {
+  "key": "inc-4502-fix",
+  "content": "INC-4502 was resolved by doubling the Redis maxmemory and using allkeys-lru"
+ },
+ {
+  "key": "inc-4519",
+  "content": "Incident INC-4519: login failures caused by an expired TLS certificate on auth.example.com"
+ },
+ {
+  "key": "inc-4519-fix",
+  "content": "Certificates are now renewed automatically by cert-manager 30 days before expiry"
+ },
+ {
+  "key": "runbook-db-failover",
+  "content": "To fail over the primary database, promote the replica with pg_ctl promote and update the DNS record"
+ },
+ {
+  "key": "runbook-rollback",
+  "content": "Roll back a bad deploy with helm rollback to the previous revision"
+ },
+ {
+  "key": "oncall-rotation",
+  "content": "The on-call rotation changes every Monday at 9am"
+ },
+ {
+  "key": "oncall-escalation",
+  "content": "If the on-call engineer does not answer in 15 minutes, page the engineering manager"
+ },
+ {
+  "key": "monitor-disk",
+  "content": "Disk usage alerts fire at 80 percent on any node"
+ },
+ {
+  "key": "backup-schedule",
+  "content": "Database backups run every night at 2am and are kept for 30 days"
+ },
+ {
+  "key": "kafka-lag",
+  "content": "Kafka consumer lag above 10,000 messages means the indexer is falling behind"
+ },
+ {
+  "key": "dns-provider",
+  "content": "Our DNS is hosted on Cloudflare"
+ },
+ {
+  "key": "k8s-version",
+  "content": "Production Kubernetes runs version 1.34 on Hetzner"
+ },
+ {
+  "key": "cdn-cache",
+  "content": "Static assets are cached on the CDN for one hour"
+ },
+ {
+  "key": "status-page",
+  "content": "Customer-facing incidents are posted on status.example.com"
+ },
+ {
+  "key": "vacation-days",
+  "content": "Employees get 28 days of paid vacation per year"
+ },
+ {
+  "key": "vacation-carry",
+  "content": "Up to 5 unused vacation days can be carried over to the next year"
+ },
+ {
+  "key": "sick-leave",
+  "content": "Sick leave longer than three days needs a doctor's note"
+ },
+ {
+  "key": "parental-leave",
+  "content": "Parental leave is 16 weeks fully paid"
+ },
+ {
+  "key": "remote-policy",
+  "content": "Staff may work remotely up to three days a week"
+ },
+ {
+  "key": "expense-limit",
+  "content": "Expenses above 500 euros need a manager's approval before purchase"
+ },
+ {
+  "key": "expense-tool",
+  "content": "Expenses are submitted in Pleo within 30 days"
+ },
+ {
+  "key": "travel-class",
+  "content": "Flights under six hours are booked in economy"
+ },
+ {
+  "key": "hotel-cap",
+  "content": "Hotel stays are capped at 180 euros per night"
+ },
+ {
+  "key": "laptop-refresh",
+  "content": "Laptops are replaced every three years"
+ },
+ {
+  "key": "equipment-budget",
+  "content": "Each employee has a 600 euro home office equipment budget"
+ },
+ {
+  "key": "probation",
+  "content": "The probation period for new hires is six months"
+ },
+ {
+  "key": "performance-review",
+  "content": "Performance reviews happen twice a year, in March and September"
+ },
+ {
+  "key": "training-budget",
+  "content": "Every employee has 1,500 euros a year for courses and conferences"
+ },
+ {
+  "key": "payday",
+  "content": "Salaries are paid on the 25th of each month"
+ },
+ {
+  "key": "pension",
+  "content": "The company matches pension contributions up to 4 percent of salary"
+ },
+ {
+  "key": "feature-export-csv",
+  "content": "Reports can be exported as CSV or PDF from the report menu"
+ },
+ {
+  "key": "feature-api-limit",
+  "content": "The public API allows 600 requests per minute per key"
+ },
+ {
+  "key": "feature-webhooks",
+  "content": "Webhooks retry failed deliveries five times with exponential backoff"
+ },
+ {
+  "key": "feature-sso",
+  "content": "SAML single sign-on is available on the Enterprise plan only"
+ },
+ {
+  "key": "feature-audit-log",
+  "content": "The audit log keeps every admin action for one year"
+ },
+ {
+  "key": "feature-dark-mode",
+  "content": "Dark mode shipped in release 2.1"
+ },
+ {
+  "key": "release-2-3",
+  "content": "Release 2.3 added bulk editing and a new search index"
+ },
+ {
+  "key": "release-2-4",
+  "content": "Release 2.4 is planned for the end of November with role-based dashboards"
+ },
+ {
+  "key": "sku-889",
+  "content": "SKU-889 is the add-on for extra storage, 100 GB per unit"
+ },
+ {
+  "key": "sku-912",
+  "content": "SKU-912 is the premium support add-on with a four hour response time"
+ },
+ {
+  "key": "pricing-pro",
+  "content": "The Pro plan costs 29 euros per user per month"
+ },
+ {
+  "key": "pricing-ent",
+  "content": "Enterprise pricing is negotiated, starting at 100 seats"
+ },
+ {
+  "key": "data-retention",
+  "content": "Deleted projects are kept for 30 days before they are purged"
+ },
+ {
+  "key": "mobile-app",
+  "content": "The mobile app supports offline mode on iOS and Android"
+ },
+ {
+  "key": "integrations-slack",
+  "content": "The Slack integration posts alerts to a channel of your choice"
+ },
+ {
+  "key": "integrations-jira",
+  "content": "Issues can be synced two ways with Jira Cloud"
+ },
+ {
+  "key": "roadmap-ai",
+  "content": "An AI assistant for writing reports is on the roadmap for next year"
+ },
+ {
+  "key": "office-wifi",
+  "content": "The office Wi-Fi network is called Atlas and the password is on the kitchen board"
+ },
+ {
+  "key": "office-hours",
+  "content": "The Berlin office is open from 7am to 8pm on weekdays"
+ },
+ {
+  "key": "office-address",
+  "content": "The Berlin office is at Torstrasse 140"
+ },
+ {
+  "key": "parking",
+  "content": "Visitor parking is in the garage under the building, level -2"
+ },
+ {
+  "key": "printer",
+  "content": "The printer on the second floor needs a badge to release jobs"
+ },
+ {
+  "key": "lunch",
+  "content": "Lunch is catered on Tuesdays and Thursdays"
+ },
+ {
+  "key": "meeting-rooms",
+  "content": "Meeting rooms are booked through the Google calendar"
+ },
+ {
+  "key": "gym",
+  "content": "Employees get a discounted membership at the gym across the street"
+ },
+ {
+  "key": "bike",
+  "content": "Company bikes can be leased through JobRad"
+ },
+ {
+  "key": "vpn",
+  "content": "To reach internal tools from home, connect to the WireGuard VPN first"
+ },
+ {
+  "key": "password-manager",
+  "content": "Passwords are stored in the team's 1Password vault"
+ },
+ {
+  "key": "it-helpdesk",
+  "content": "IT support requests go to the helpdesk channel or it@example.com"
+ },
+ {
+  "key": "badge-lost",
+  "content": "A lost badge must be reported to reception the same day"
+ },
+ {
+  "key": "fire-drill",
+  "content": "Fire drills take place in the first week of each quarter"
+ },
+ {
+  "key": "first-aid",
+  "content": "First aid kits are next to the elevators on every floor"
+ },
+ {
+  "key": "team-platform",
+  "content": "The platform team owns Kubernetes, CI and the observability stack"
+ },
+ {
+  "key": "team-payments",
+  "content": "The payments team owns checkout, invoicing and refunds"
+ },
+ {
+  "key": "team-growth",
+  "content": "The growth team runs pricing experiments and onboarding"
+ },
+ {
+  "key": "cto",
+  "content": "The CTO is Lena Park"
+ },
+ {
+  "key": "cfo",
+  "content": "Finance is led by the CFO, Tom Becker"
+ },
+ {
+  "key": "designer",
+  "content": "Aisha leads product design for the mobile app"
+ },
+ {
+  "key": "hiring-backend",
+  "content": "We are hiring two senior backend engineers in Berlin"
+ },
+ {
+  "key": "interview-process",
+  "content": "Engineering interviews have a screening call, a take-home task and a final panel"
+ },
+ {
+  "key": "allhands",
+  "content": "The company all-hands is on the last Friday of every month"
+ },
+ {
+  "key": "okrs",
+  "content": "OKRs are set every quarter and reviewed in the all-hands"
+ }
+]

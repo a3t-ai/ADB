@@ -11,12 +11,50 @@ use adb_core::{MemoryType, Modifiers, Predicate, Scope};
 pub enum ExecutionPlan {
     /// Single operation
     Single(StepPlan),
+    /// Subscriptions (AQL v0.6, stage E): SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH
+    Subscription(SubscriptionPlan),
     /// Pipeline of operations
     Pipeline(PipelinePlan),
     /// Reflect (multi-source query with optional link traversal)
     Reflect(ReflectPlan),
     /// Fan-out operation across ALL memory types
     FanOut(FanOutPlan),
+}
+
+/// A subscription statement, planned (E_SUBSCRIPTIONS.md).
+#[derive(Debug, Clone)]
+pub enum SubscriptionPlan {
+    /// Register a cursor on a scope or topic; `from` = first offset wanted (`None` =
+    /// from now).
+    Subscribe {
+        target: SubscriptionTarget,
+        /// Row kinds (`entity`, `fact`, `edge`, `episode`, `tool`, `event`); empty = all.
+        kinds: Vec<String>,
+        filter: Option<Vec<adb_core::Condition>>,
+        from: Option<u64>,
+    },
+    /// `namespace`: the subscription must be on a topic of that namespace (AQL v0.12).
+    Unsubscribe { subscription: String, namespace: Option<String> },
+    Ack { subscription: String, offset: u64, namespace: Option<String> },
+    /// A committed `event` row on `topic`.
+    Publish { topic: String, payload: serde_json::Value, ttl: Option<Duration> },
+}
+
+/// A topic within a namespace (AQL v0.12 `… TOPIC "t" NAMESPACE "ns"`): `ns/t`. The
+/// namespaces' topics are apart from one another and from the org-wide ones.
+pub fn namespaced_topic(namespace: Option<&str>, topic: &str) -> String {
+    match namespace {
+        Some(ns) => format!("{ns}/{topic}"),
+        None => topic.to_string(),
+    }
+}
+
+/// What a subscription follows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionTarget {
+    Scope(String),
+    Topic(String),
 }
 
 /// A pipeline execution plan
@@ -73,6 +111,12 @@ pub enum Operation {
     Forget,
     /// Create a link between records
     Link,
+    /// Change the weight / type of existing links (AQL v0.7 UPDATE LINK)
+    UpdateLink,
+    /// Remove links (AQL v0.7 UNLINK)
+    Unlink,
+    /// Merge one SEMANTIC entity into another (AQL v0.10 MERGE ENTITY)
+    Merge,
 }
 
 impl std::fmt::Display for Operation {
@@ -86,6 +130,9 @@ impl std::fmt::Display for Operation {
             Self::Update => write!(f, "UPDATE"),
             Self::Forget => write!(f, "FORGET"),
             Self::Link => write!(f, "LINK"),
+            Self::UpdateLink => write!(f, "UPDATE LINK"),
+            Self::Unlink => write!(f, "UNLINK"),
+            Self::Merge => write!(f, "MERGE ENTITY"),
         }
     }
 }
@@ -130,8 +177,8 @@ pub struct ReflectSourcePlan {
 pub struct LinkOptions {
     /// Include links with results
     pub with_links: bool,
-    /// Link type filter
-    pub link_type: Option<String>,
+    /// Which links (types, direction, minimum weight)
+    pub select: adb_core::LinkSelect,
     /// Follow links to related records
     pub follow: bool,
     /// Max depth when following
@@ -149,8 +196,19 @@ pub struct StoreData {
     pub scope: Scope,
     /// Namespace
     pub namespace: Option<String>,
+    /// Named scope (`IN SCOPE`)
+    pub in_scope: Option<String>,
     /// TTL
     pub ttl: Option<Duration>,
+    /// AQL v0.8 `FACT [MULTI]`: the payload is a fact (P1_GRAPH D2)
+    pub fact: Option<FactPlan>,
+}
+
+/// `STORE … FACT [MULTI]`.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct FactPlan {
+    /// One current fact per (subject, predicate, object) rather than per (subject, predicate)
+    pub multi: bool,
 }
 
 /// Link operation data
@@ -168,6 +226,12 @@ pub struct LinkData {
     pub link_type: String,
     /// Link weight
     pub weight: f32,
+    /// UPDATE LINK / UNLINK: only links of this type (`None`: every type)
+    pub type_filter: Option<String>,
+    /// UPDATE LINK: the new weight; LINK: the weight as written (`None`: no WEIGHT)
+    pub set_weight: Option<f32>,
+    /// UPDATE LINK: the new type
+    pub set_type: Option<String>,
 }
 
 impl StepPlan {
@@ -253,6 +317,22 @@ impl StepPlan {
         }
     }
 
+    /// UPDATE LINK (`unlink` false) or UNLINK (`unlink` true) over `link_data`'s ends.
+    pub fn link_edit(link_data: LinkData, unlink: bool) -> Self {
+        Self { operation: if unlink { Operation::Unlink } else { Operation::UpdateLink }, ..Self::link(link_data) }
+    }
+
+    /// MERGE ENTITY `from` INTO `into` (SEMANTIC)
+    pub fn merge(from: &str, into: &str) -> Self {
+        Self {
+            operation: Operation::Merge,
+            memory_type: MemoryType::Semantic,
+            predicate: Predicate::All,
+            modifiers: Modifiers::default(),
+            data: Some(serde_json::json!({ "from": from, "into": into })),
+        }
+    }
+
     /// Create a new link plan
     pub fn link(link_data: LinkData) -> Self {
         Self {
@@ -272,12 +352,14 @@ impl serde::Serialize for StoreData {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StoreData", 5)?;
+        let mut state = serializer.serialize_struct("StoreData", 7)?;
         state.serialize_field("key", &self.key)?;
         state.serialize_field("payload", &self.payload)?;
         state.serialize_field("scope", &format!("{:?}", self.scope))?;
         state.serialize_field("namespace", &self.namespace)?;
+        state.serialize_field("in_scope", &self.in_scope)?;
         state.serialize_field("ttl_ms", &self.ttl.map(|d| d.as_millis() as u64))?;
+        state.serialize_field("fact", &self.fact)?;
         state.end()
     }
 }
@@ -288,7 +370,7 @@ impl serde::Serialize for LinkData {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("LinkData", 6)?;
+        let mut state = serializer.serialize_struct("LinkData", 9)?;
         state.serialize_field("from_type", &format!("{:?}", self.from_type))?;
         // Serialize from_predicate conditions as structured data
         state.serialize_field("from_conditions", &predicate_to_conditions(&self.from_predicate))?;
@@ -297,6 +379,9 @@ impl serde::Serialize for LinkData {
         state.serialize_field("to_conditions", &predicate_to_conditions(&self.to_predicate))?;
         state.serialize_field("link_type", &self.link_type)?;
         state.serialize_field("weight", &self.weight)?;
+        state.serialize_field("type_filter", &self.type_filter)?;
+        state.serialize_field("set_weight", &self.set_weight)?;
+        state.serialize_field("set_type", &self.set_type)?;
         state.end()
     }
 }

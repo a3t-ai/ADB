@@ -1,0 +1,110 @@
+# ADB single node for A3T (vc-dev, namespace a3t). Stage C: durable — every write goes
+# to a write-ahead log on the node (/data/a3t-dev/adb, like FlowR's /data/a3t-dev/*)
+# and is replayed on start, so memory survives pod restarts and crashes.
+#
+#   kubectl apply -f adb.yaml
+#   # A3T resource a3t/agent-memory-mcp → url: http://adb.a3t.svc.cluster.local:3000/mcp/sse
+#
+# New image: flowr-system/deploy.sh release adb && deploy.sh roll adb <tag>
+#
+# One writer per log: `Recreate`, never a rolling update (the old pod must stop before
+# the new one opens the log; ADB also refuses a log another process holds).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adb
+  namespace: a3t
+  labels:
+    app: adb
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: adb
+  template:
+    metadata:
+      labels:
+        app: adb
+    spec:
+      imagePullSecrets:
+        - name: registry-credentials
+      # ADB exits at once on SIGTERM (acknowledged writes are already synced).
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: adb
+          image: ghcr.io/srirammails/adb:2026-10-24-c
+          args: ["adb", "serve-http", "--host", "0.0.0.0", "--port", "3000", "--flight-port", "3001"]
+          ports:
+            - name: http
+              containerPort: 3000
+            # Arrow Flight: FlowR's call:adb and ADB platform tables (stage G)
+            - name: flight
+              containerPort: 3001
+          env:
+            - name: RUST_LOG
+              value: info,lance=warn
+            - name: ADB_DATA_DIR
+              value: /data/adb
+            # W3: with a token, HTTP (all but /health) and Flight need
+            # Authorization: Bearer. Create it once:
+            #   kubectl -n a3t create secret generic adb-auth --from-literal=token=$(openssl rand -hex 32)
+            # FlowR gets the same Secret as ADB_AUTH_TOKEN (+ ADB_AUTH_URLS).
+            - name: ADB_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: adb-auth
+                  key: token
+                  optional: true
+          volumeMounts:
+            - name: adb-data
+              mountPath: /data/adb
+          # Replaying a long log takes time before /health answers.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # W4: the embedding model and ONNX Runtime (~550 MB idle, ~700 MB peak
+              # measured on the debug build) plus Lance's cache.
+              memory: 2Gi
+      volumes:
+        - name: adb-data
+          hostPath:
+            path: /data/a3t-dev/adb
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adb
+  namespace: a3t
+  labels:
+    app: adb
+spec:
+  selector:
+    app: adb
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+    - name: flight
+      port: 3001
+      targetPort: flight

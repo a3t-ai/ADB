@@ -1,588 +1,486 @@
-//! MCP Server implementation
+//! MCP request handling, independent of transport.
 //!
-//! Handles JSON-RPC communication for MCP protocol.
+//! [`McpServer::handle`] serves stdio (`adb serve`), streamable HTTP (`POST /mcp`) and
+//! SSE (`/mcp/sse` + `/mcp/message`, what A3T uses) alike.
 
-use std::io::{BufRead, Write};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use adb_backends::Adb;
-use adb_executor::Executor;
-use serde_json::Value;
+use adb_executor::Engine;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::protocol::{
-    InitializeParams, InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities,
-    ServerInfo, Tool, ToolCallParams, ToolCallResult, ToolsCapability, ToolsListResult,
-};
-use crate::tools::get_tools;
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolCallResult};
+use crate::tools::{self, literal, memory_type, payload, quote, where_eq};
 
-/// Convert serde_json::Value to adb_core::Value
-fn json_to_core_value(json: &serde_json::Value) -> adb_core::Value {
-    match json {
-        serde_json::Value::Null => adb_core::Value::Null,
-        serde_json::Value::Bool(b) => adb_core::Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                adb_core::Value::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                adb_core::Value::Float(f)
-            } else {
-                adb_core::Value::Null
-            }
-        }
-        serde_json::Value::String(s) => adb_core::Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            adb_core::Value::Array(arr.iter().map(json_to_core_value).collect())
-        }
-        serde_json::Value::Object(_) => {
-            // Objects are converted to their string representation
-            adb_core::Value::String(json.to_string())
-        }
-    }
-}
+/// MCP protocol versions this server speaks; the client's choice wins if listed.
+const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// MCP Server for ADB
+const GUIDE_URI: &str = "adb://guide/memory";
+const GRAMMAR_URI: &str = "adb://aql/grammar";
+const GUIDE: &str = include_str!("guide.md");
+
+/// The MCP server: protocol handling over an [`Engine`].
+#[derive(Clone)]
 pub struct McpServer {
-    /// The ADB instance
-    adb: Arc<Adb>,
-    /// The executor
-    executor: Executor,
+    engine: Arc<dyn Engine>,
 }
 
 impl McpServer {
-    /// Create a new MCP server
-    pub fn new(adb: Arc<Adb>) -> Self {
-        let executor = Executor::new(Arc::clone(&adb));
-        Self { adb, executor }
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
+        Self { engine }
     }
 
-    /// Get a reference to the ADB instance
-    pub fn adb(&self) -> &Arc<Adb> {
-        &self.adb
+    pub fn engine(&self) -> &Arc<dyn Engine> {
+        &self.engine
     }
 
-    /// Run the MCP server on stdio
-    pub async fn run_stdio(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut stdout = stdout.lock();
+    /// Handle one JSON-RPC message. Notifications (no `id`) get no response.
+    pub async fn handle(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        if req.id.is_none() {
+            // Notifications (`notifications/initialized`, `notifications/cancelled`, …)
+            return None;
+        }
+        let id = req.id.clone();
+        Some(match req.method.as_str() {
+            "initialize" => JsonRpcResponse::success(id, initialize(req.params.as_ref())),
+            "ping" => JsonRpcResponse::success(id, json!({})),
+            "tools/list" => JsonRpcResponse::success(id, tools::tool_list()),
+            "tools/call" => match self.call_tool(req.params).await {
+                Ok(result) => JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or_default()),
+                Err((code, msg)) => JsonRpcResponse::error(id, code, msg),
+            },
+            "resources/list" => JsonRpcResponse::success(id, resource_list()),
+            "resources/read" => match read_resource(req.params.as_ref()) {
+                Ok(v) => JsonRpcResponse::success(id, v),
+                Err(msg) => JsonRpcResponse::error(id, -32602, msg),
+            },
+            "prompts/list" => JsonRpcResponse::success(id, prompt_list()),
+            "prompts/get" => match get_prompt(req.params.as_ref()) {
+                Ok(v) => JsonRpcResponse::success(id, v),
+                Err(msg) => JsonRpcResponse::error(id, -32602, msg),
+            },
+            "shutdown" => JsonRpcResponse::success(id, Value::Null),
+            m => JsonRpcResponse::error(id, -32601, format!("Method not found: {m}")),
+        })
+    }
 
-        for line in stdin.lock().lines() {
-            let line = line?;
-            if line.is_empty() {
+    /// Back-compat: handle a request and always return a response object.
+    pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        let id = req.id.clone();
+        self.handle(req).await.unwrap_or_else(|| JsonRpcResponse::success(id, json!({})))
+    }
+
+    /// Serve MCP over stdio: one JSON-RPC message per line.
+    pub async fn run_stdio(&self) -> std::io::Result<()> {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut out = tokio::io::stdout();
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
                 continue;
             }
-
-            match serde_json::from_str::<JsonRpcRequest>(&line) {
-                Ok(request) => {
-                    let response = self.handle_request(request).await;
-                    let response_json = serde_json::to_string(&response)?;
-                    writeln!(stdout, "{}", response_json)?;
-                    stdout.flush()?;
-                }
-                Err(e) => {
-                    let error_response = JsonRpcResponse::error(
-                        None,
-                        -32700, // Parse error
-                        format!("Parse error: {}", e),
-                    );
-                    let response_json = serde_json::to_string(&error_response)?;
-                    writeln!(stdout, "{}", response_json)?;
-                    stdout.flush()?;
-                }
+            let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
+                Ok(req) => self.handle(req).await,
+                Err(e) => Some(JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"))),
+            };
+            if let Some(resp) = response {
+                let mut text = serde_json::to_string(&resp).unwrap_or_default();
+                text.push('\n');
+                out.write_all(text.as_bytes()).await?;
+                out.flush().await?;
             }
         }
-
         Ok(())
     }
 
-    /// Handle a JSON-RPC request
-    pub async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
-        match request.method.as_str() {
-            "initialize" => self.handle_initialize(request.id, request.params).await,
-            "initialized" => {
-                // Notification, no response needed
-                JsonRpcResponse::success(request.id, serde_json::json!({}))
-            }
-            "tools/list" => self.handle_tools_list(request.id).await,
-            "tools/call" => self.handle_tools_call(request.id, request.params).await,
-            "shutdown" => JsonRpcResponse::success(request.id, serde_json::json!(null)),
-            _ => JsonRpcResponse::error(
-                request.id,
-                -32601, // Method not found
-                format!("Method not found: {}", request.method),
-            ),
-        }
-    }
-
-    async fn handle_initialize(
-        &self,
-        id: Option<Value>,
-        params: Option<Value>,
-    ) -> JsonRpcResponse {
-        // Parse params if present (for validation)
-        if let Some(params) = params {
-            if let Err(e) = serde_json::from_value::<InitializeParams>(params) {
-                tracing::warn!("Invalid initialize params: {}", e);
-            }
-        }
-
-        let result = InitializeResult {
-            protocol_version: "2024-11-05".to_string(),
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
+    async fn call_tool(&self, params: Option<Value>) -> Result<ToolCallResult, (i32, String)> {
+        let params = params.ok_or((-32602, "Missing params".to_string()))?;
+        let name = params.get("name").and_then(Value::as_str).ok_or((-32602, "Missing tool name".to_string()))?;
+        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let result = match name {
+            // `query`, `store` and `stats` are the names A3T's agent-memory-mcp resource lists.
+            "aql_query" | "query" => self.aql_query(&args).await,
+            "store_memory" | "store" => self.run(store_memory(&args)).await,
+            "recall_memory" => self.run(recall_memory(&args)).await,
+            "get_stats" | "stats" => match self.engine.stats().await {
+                Ok(s) => Ok(s),
+                Err(e) => Err(format!("Stats failed: {e}")),
             },
-            server_info: ServerInfo {
-                name: "adb-mcp".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
+            "remember" => self.remember(&args).await,
+            "recall" => self.recall(&args).await,
+            "forget" => self.run(forget(&args)).await,
+            "link" => self.run(link(&args)).await,
+            "unlink" => self.run(unlink(&args)).await,
+            "subscribe" => self.run(subscribe(&args)).await,
+            "publish" => self.run(publish(&args)).await,
+            "ack" => self.run(ack(&args)).await,
+            "unsubscribe" => self.run(unsubscribe(&args)).await,
+            "next_events" => self.next_events(&args).await,
+            "watch" => self.watch(&args).await,
+            "watch_changes" => self.watch_changes(&args).await,
+            "unwatch" => self.run(tools::unwatch(&args)).await,
+            other => Err(format!("Unknown tool: {other}")),
         };
-
-        JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+        Ok(match result {
+            Ok(v) => ToolCallResult::json(&v),
+            Err(e) => ToolCallResult::error(e),
+        })
     }
 
-    async fn handle_tools_list(&self, id: Option<Value>) -> JsonRpcResponse {
-        let tool_defs = get_tools();
-        let tools: Vec<Tool> = tool_defs
-            .into_iter()
-            .map(|t| Tool {
-                name: t.name,
-                description: t.description,
-                input_schema: t.input_schema,
-            })
-            .collect();
-
-        let result = ToolsListResult { tools };
-        JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+    async fn aql_query(&self, args: &Value) -> Result<Value, String> {
+        let query = args.get("query").and_then(Value::as_str).ok_or("Missing required parameter: query")?;
+        let vars: Option<HashMap<String, Value>> = args
+            .get("variables")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        self.engine.query(query, vars.as_ref()).await.map_err(|e| format!("Query failed: {e}"))
     }
 
-    async fn handle_tools_call(
-        &self,
-        id: Option<Value>,
-        params: Option<Value>,
-    ) -> JsonRpcResponse {
-        let params = match params {
-            Some(p) => match serde_json::from_value::<ToolCallParams>(p) {
-                Ok(p) => p,
-                Err(e) => {
-                    return JsonRpcResponse::error(
-                        id,
-                        -32602, // Invalid params
-                        format!("Invalid params: {}", e),
-                    );
+    /// A subscription's next deliveries through the gateway (stage E).
+    async fn next_events(&self, args: &Value) -> Result<Value, String> {
+        let sub = args.get("subscription").and_then(Value::as_str).ok_or("Missing required: subscription")?;
+        let from = args.get("from").and_then(Value::as_u64);
+        let max = args.get("max").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+        let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
+        // Any node of a cluster: the engine reaches the gateway where it lives.
+        self.engine.next_events(sub, from, max, std::time::Duration::from_secs(wait)).await
+    }
+
+    /// `watch`: `WATCH <query>` (MVP W6) — the snapshot frame `{cq_id, offset, result}`.
+    async fn watch(&self, args: &Value) -> Result<Value, String> {
+        let aql = tools::watch(args)?;
+        let vars: Option<HashMap<String, Value>> = args
+            .get("variables")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        let r = self.engine.query(&aql, vars.as_ref()).await.map_err(|e| format!("Query failed: {e}\nAQL: {aql}"))?;
+        Ok(r["data"].clone())
+    }
+
+    /// A watch's next frames (W6), waiting up to `wait_seconds` for one.
+    async fn watch_changes(&self, args: &Value) -> Result<Value, String> {
+        let id = args.get("cq_id").and_then(Value::as_str).ok_or("Missing required: cq_id")?;
+        let from = args.get("from").and_then(Value::as_u64);
+        let max = args.get("max").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+        let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(10).min(30);
+        // Any node of a cluster: the engine reaches the watch's partition.
+        let frames = self.engine.watch_frames(id, from, max, std::time::Duration::from_secs(wait)).await?;
+        let next = frames.as_array().and_then(|f| f.last()).and_then(|f| f["offset"].as_u64()).or(from);
+        Ok(json!({ "frames": frames, "from": next }))
+    }
+
+    /// Run AQL built by a shortcut tool.
+    /// `remember` sets a fact: a new key is stored, a key in use is updated (a new
+    /// version, history kept) — unlike `STORE` / `store_memory`, which refuse a key
+    /// in use (D3 S4).
+    async fn remember(&self, args: &Value) -> Result<Value, String> {
+        let aql = remember(args)?;
+        // A fact has its own key (subject, predicate) and supersedes by itself.
+        let fact = args.get("subject").is_some() && args.get("predicate").is_some();
+        let Some(key) = args.get("key").and_then(Value::as_str).filter(|_| !fact) else {
+            return self.run(Ok(aql)).await;
+        };
+        match self.engine.query(&aql, None).await {
+            Err(e) if e.to_string().contains("key_exists") => {
+                let mut v = self.run(remember_update(args, key)).await?;
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("updated_existing_key".into(), json!(key));
                 }
-            },
-            None => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    "Missing params for tools/call".to_string(),
-                );
+                Ok(v)
             }
-        };
-
-        let result = match params.name.as_str() {
-            "aql_query" => self.handle_aql_query(params.arguments).await,
-            "store_working" => self.handle_store_working(params.arguments).await,
-            "recall_working" => self.handle_recall_working(params.arguments).await,
-            "recall_episodic" => self.handle_recall_episodic(params.arguments).await,
-            "get_context" => self.handle_get_context(params.arguments).await,
-            _ => ToolCallResult::error(format!("Unknown tool: {}", params.name)),
-        };
-
-        JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
-    }
-
-    async fn handle_aql_query(&self, args: Option<Value>) -> ToolCallResult {
-        let query = match args.and_then(|a| a.get("query").and_then(|q| q.as_str()).map(String::from))
-        {
-            Some(q) => q,
-            None => return ToolCallResult::error("Missing required parameter: query".to_string()),
-        };
-
-        match self.executor.execute(&query).await {
-            Ok(result) => {
-                let json = serde_json::to_value(&result).unwrap_or_default();
-                ToolCallResult::json(&json)
-            }
-            Err(e) => ToolCallResult::error(format!("Query execution failed: {}", e)),
+            other => other.map_err(|e| format!("Query failed: {e}\nAQL: {aql}")),
         }
     }
 
-    async fn handle_store_working(&self, args: Option<Value>) -> ToolCallResult {
-        let args = match args {
-            Some(a) => a,
-            None => return ToolCallResult::error("Missing arguments".to_string()),
-        };
-
-        let key = match args.get("key").and_then(|k| k.as_str()) {
-            Some(k) => k,
-            None => return ToolCallResult::error("Missing required parameter: key".to_string()),
-        };
-
-        let data = match args.get("data") {
-            Some(d) => d.clone(),
-            None => return ToolCallResult::error("Missing required parameter: data".to_string()),
-        };
-
-        match self
-            .adb
-            .store(adb_core::MemoryType::Working, key, data)
-            .await
-        {
-            Ok(record) => {
-                let json = serde_json::to_value(&record).unwrap_or_default();
-                ToolCallResult::json(&json)
-            }
-            Err(e) => ToolCallResult::error(format!("Store failed: {}", e)),
-        }
+    /// `recall`: with `like`, relevance recall (`RECALL … LIKE $q`, the text passed
+    /// as a variable, MVP W4); otherwise filters and `contains`.
+    async fn recall(&self, args: &Value) -> Result<Value, String> {
+        let aql = recall(args)?;
+        let Some(like) = args.get("like").and_then(Value::as_str) else { return self.run(Ok(aql)).await };
+        let vars: HashMap<String, Value> = [("q".to_string(), json!(like))].into();
+        self.engine.query(&aql, Some(&vars)).await.map_err(|e| format!("Query failed: {e}\nAQL: {aql}"))
     }
 
-    async fn handle_recall_working(&self, args: Option<Value>) -> ToolCallResult {
-        let predicate = if let Some(args) = args {
-            if let Some(key) = args.get("key").and_then(|k| k.as_str()) {
-                adb_core::Predicate::key("id", key)
-            } else if let (Some(field), Some(value)) = (
-                args.get("field").and_then(|f| f.as_str()),
-                args.get("value"),
-            ) {
-                // Convert serde_json::Value to adb_core::Value
-                let core_value = json_to_core_value(value);
-                adb_core::Predicate::where_eq(field, core_value)
-            } else {
-                adb_core::Predicate::All
-            }
-        } else {
-            adb_core::Predicate::All
-        };
-
-        match self
-            .adb
-            .recall(adb_core::MemoryType::Working, &predicate)
-            .await
-        {
-            Ok(records) => {
-                let json = serde_json::to_value(&records).unwrap_or_default();
-                ToolCallResult::json(&json)
-            }
-            Err(e) => ToolCallResult::error(format!("Recall failed: {}", e)),
-        }
-    }
-
-    async fn handle_recall_episodic(&self, args: Option<Value>) -> ToolCallResult {
-        let window_minutes = args
-            .as_ref()
-            .and_then(|a| a.get("window_minutes"))
-            .and_then(|w| w.as_i64())
-            .unwrap_or(60) as i32;
-
-        let limit = args
-            .as_ref()
-            .and_then(|a| a.get("limit"))
-            .and_then(|l| l.as_u64())
-            .map(|l| l as usize);
-
-        let mut modifiers = adb_core::Modifiers::default();
-        modifiers.window = Some(adb_core::Window::last_duration(Duration::from_secs(
-            window_minutes as u64 * 60,
-        )));
-        if let Some(l) = limit {
-            modifiers.limit = Some(l);
-        }
-
-        let predicate = if let Some(event_type) = args
-            .as_ref()
-            .and_then(|a| a.get("event_type"))
-            .and_then(|e| e.as_str())
-        {
-            adb_core::Predicate::where_eq("event_type", event_type)
-        } else {
-            adb_core::Predicate::All
-        };
-
-        match self
-            .adb
-            .recall_with_modifiers(adb_core::MemoryType::Episodic, &predicate, &modifiers)
-            .await
-        {
-            Ok(records) => {
-                let json = serde_json::to_value(&records).unwrap_or_default();
-                ToolCallResult::json(&json)
-            }
-            Err(e) => ToolCallResult::error(format!("Recall failed: {}", e)),
-        }
-    }
-
-    async fn handle_get_context(&self, args: Option<Value>) -> ToolCallResult {
-        let include_working = args
-            .as_ref()
-            .and_then(|a| a.get("include_working"))
-            .and_then(|w| w.as_bool())
-            .unwrap_or(true);
-
-        let include_episodic = args
-            .as_ref()
-            .and_then(|a| a.get("include_episodic"))
-            .and_then(|e| e.as_bool())
-            .unwrap_or(true);
-
-        let window_minutes = args
-            .as_ref()
-            .and_then(|a| a.get("window_minutes"))
-            .and_then(|w| w.as_i64())
-            .unwrap_or(30) as i32;
-
-        let mut context = serde_json::Map::new();
-
-        if include_working {
-            match self.adb.scan().await {
-                Ok(records) => {
-                    context.insert(
-                        "working".to_string(),
-                        serde_json::to_value(&records).unwrap_or_default(),
-                    );
-                }
-                Err(e) => {
-                    context.insert(
-                        "working_error".to_string(),
-                        serde_json::Value::String(e.to_string()),
-                    );
-                }
-            }
-        }
-
-        if include_episodic {
-            let mut modifiers = adb_core::Modifiers::default();
-            modifiers.window = Some(adb_core::Window::last_duration(Duration::from_secs(
-                window_minutes as u64 * 60,
-            )));
-            modifiers.limit = Some(50); // Reasonable default limit
-
-            match self
-                .adb
-                .recall_with_modifiers(
-                    adb_core::MemoryType::Episodic,
-                    &adb_core::Predicate::All,
-                    &modifiers,
-                )
-                .await
-            {
-                Ok(records) => {
-                    context.insert(
-                        "episodic".to_string(),
-                        serde_json::to_value(&records).unwrap_or_default(),
-                    );
-                }
-                Err(e) => {
-                    context.insert(
-                        "episodic_error".to_string(),
-                        serde_json::Value::String(e.to_string()),
-                    );
-                }
-            }
-        }
-
-        ToolCallResult::json(&serde_json::Value::Object(context))
+    async fn run(&self, aql: Result<String, String>) -> Result<Value, String> {
+        let aql = aql?;
+        self.engine.query(&aql, None).await.map_err(|e| format!("Query failed: {e}\nAQL: {aql}"))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+fn initialize(params: Option<&Value>) -> Value {
+    let requested = params.and_then(|p| p.get("protocolVersion")).and_then(Value::as_str);
+    let version = requested
+        .filter(|v| PROTOCOL_VERSIONS.contains(v))
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    json!({
+        "protocolVersion": version,
+        "capabilities": {
+            "tools": { "listChanged": false },
+            "resources": { "listChanged": false },
+            "prompts": { "listChanged": false }
+        },
+        "serverInfo": { "name": "adb", "version": env!("CARGO_PKG_VERSION") },
+        "instructions": "ADB is agent memory. Use remember / recall / forget / link for everyday memory, subscribe / publish / next_events / ack for topics shared between agents, watch / watch_changes to keep a query's result current, or aql_query for anything in AQL. Read adb://guide/memory first."
+    })
+}
 
-    fn create_server() -> McpServer {
-        McpServer::new(Arc::new(Adb::new()))
+fn obj(args: &Value, name: &str) -> serde_json::Map<String, Value> {
+    args.get(name).and_then(Value::as_object).cloned().unwrap_or_default()
+}
+
+/// ClawDB `store_memory`: `STORE INTO <type> (fields) [SCOPE s] [NAMESPACE "ns"]`.
+fn store_memory(args: &Value) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", None)?;
+    let data = args.get("data").and_then(Value::as_object).ok_or("Missing or invalid: data (must be object)")?;
+    if data.is_empty() {
+        return Err("data must not be empty".into());
     }
-
-    #[tokio::test]
-    async fn test_handle_initialize() {
-        let server = create_server();
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "initialize".to_string(),
-            params: Some(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "test",
-                    "version": "1.0"
-                }
-            })),
-        };
-
-        let response = server.handle_request(request).await;
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
+    let mut q = format!("STORE INTO {mt} {}", payload(data)?);
+    if let Some(scope) = args.get("scope").and_then(Value::as_str) {
+        match scope {
+            "private" | "shared" | "cluster" => q.push_str(&format!(" SCOPE {scope}")),
+            other => return Err(format!("Invalid scope: {other}")),
+        }
     }
-
-    #[tokio::test]
-    async fn test_handle_tools_list() {
-        let server = create_server();
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "tools/list".to_string(),
-            params: None,
-        };
-
-        let response = server.handle_request(request).await;
-        assert!(response.result.is_some());
-
-        let result = response.result.unwrap();
-        let tools = result.get("tools").unwrap().as_array().unwrap();
-        assert!(!tools.is_empty());
-
-        // Check aql_query tool exists
-        let has_aql_query = tools.iter().any(|t| t.get("name").unwrap() == "aql_query");
-        assert!(has_aql_query);
+    if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
+        q.push_str(&format!(" NAMESPACE {}", quote(ns)));
     }
+    Ok(q)
+}
 
-    #[tokio::test]
-    async fn test_aql_query_tool() {
-        let server = create_server();
-
-        // First store some data
-        server
-            .adb
-            .store(
-                adb_core::MemoryType::Working,
-                "test-key",
-                json!({"value": "hello"}),
-            )
-            .await
-            .unwrap();
-
-        // Now query via MCP
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "tools/call".to_string(),
-            params: Some(json!({
-                "name": "aql_query",
-                "arguments": {
-                    "query": "SCAN FROM WORKING"
-                }
-            })),
-        };
-
-        let response = server.handle_request(request).await;
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
-
-        let result = response.result.unwrap();
-        let content = result.get("content").unwrap().as_array().unwrap();
-        assert!(!content.is_empty());
+/// ClawDB `recall_memory`: `RECALL FROM <type> [WHERE …] [ORDER BY …] [LIMIT n]`.
+fn recall_memory(args: &Value) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", None)?;
+    let mut q = format!("RECALL FROM {mt}{}", where_eq(&obj(args, "filter"))?);
+    if let Some(order) = args.get("order_by").and_then(Value::as_str) {
+        let desc = args.get("order_desc").and_then(Value::as_bool).unwrap_or(false);
+        q.push_str(&format!(" ORDER BY {} {}", tools::field(order)?, if desc { "DESC" } else { "ASC" }));
     }
-
-    #[tokio::test]
-    async fn test_store_working_tool() {
-        let server = create_server();
-
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "tools/call".to_string(),
-            params: Some(json!({
-                "name": "store_working",
-                "arguments": {
-                    "key": "task-1",
-                    "data": {
-                        "status": "pending",
-                        "description": "Test task"
-                    }
-                }
-            })),
-        };
-
-        let response = server.handle_request(request).await;
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
-
-        // Verify it was stored
-        assert_eq!(server.adb.count(adb_core::MemoryType::Working).await, 1);
+    if let Some(limit) = args.get("limit").and_then(Value::as_u64) {
+        q.push_str(&format!(" LIMIT {limit}"));
     }
+    Ok(q)
+}
 
-    #[tokio::test]
-    async fn test_recall_working_tool() {
-        let server = create_server();
+fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
+    args.get(name).and_then(Value::as_str).ok_or(format!("Missing required: {name}"))
+}
 
-        // Store some data first
-        server
-            .adb
-            .store(
-                adb_core::MemoryType::Working,
-                "task-1",
-                json!({"status": "active"}),
-            )
-            .await
-            .unwrap();
-
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "tools/call".to_string(),
-            params: Some(json!({
-                "name": "recall_working",
-                "arguments": {
-                    "key": "task-1"
-                }
-            })),
-        };
-
-        let response = server.handle_request(request).await;
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
+/// `SUBSCRIBE TOPIC "t" | SCOPE "s" [KINDS …] [WHERE …] [FROM OFFSET n]`.
+fn subscribe(args: &Value) -> Result<String, String> {
+    let mut q = match (args.get("topic").and_then(Value::as_str), args.get("scope").and_then(Value::as_str)) {
+        (Some(t), None) => format!("SUBSCRIBE TOPIC {}", quote(t)),
+        (None, Some(s)) => format!("SUBSCRIBE SCOPE {}", quote(s)),
+        _ => return Err("subscribe needs exactly one of topic or scope".into()),
+    };
+    if let Some(kinds) = args.get("kinds").and_then(Value::as_array).filter(|k| !k.is_empty()) {
+        let kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
+        if let Some(bad) = kinds.iter().find(|k| !["entity", "fact", "edge", "episode", "tool", "event"].contains(k)) {
+            return Err(format!("unknown kind {bad}"));
+        }
+        q.push_str(&format!(" KINDS {}", kinds.join(", ")));
     }
-
-    #[tokio::test]
-    async fn test_get_context_tool() {
-        let server = create_server();
-
-        // Store some working memory data
-        server
-            .adb
-            .store(
-                adb_core::MemoryType::Working,
-                "current-task",
-                json!({"description": "Processing request"}),
-            )
-            .await
-            .unwrap();
-
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "tools/call".to_string(),
-            params: Some(json!({
-                "name": "get_context",
-                "arguments": {
-                    "include_working": true,
-                    "include_episodic": true
-                }
-            })),
-        };
-
-        let response = server.handle_request(request).await;
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
+    let conds: Vec<String> = obj(args, "filter")
+        .iter()
+        .map(|(k, v)| Ok(format!("{} = {}", tools::field(k)?, literal(v))))
+        .collect::<Result<_, String>>()?;
+    if !conds.is_empty() {
+        q.push_str(&format!(" WHERE {}", conds.join(" AND ")));
     }
+    if let Some(n) = args.get("from_offset").and_then(Value::as_u64) {
+        q.push_str(&format!(" FROM OFFSET {n}"));
+    }
+    Ok(q)
+}
 
-    #[tokio::test]
-    async fn test_method_not_found() {
-        let server = create_server();
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(json!(1)),
-            method: "unknown/method".to_string(),
-            params: None,
-        };
+/// `PUBLISH TOPIC "t" (fields) [TTL d]`.
+fn publish(args: &Value) -> Result<String, String> {
+    let topic = str_arg(args, "topic")?;
+    let fields = obj(args, "fields");
+    if fields.is_empty() {
+        return Err("publish needs non-empty fields".into());
+    }
+    let mut q = format!("PUBLISH TOPIC {} {}", quote(topic), payload(&fields)?);
+    if let Some(ttl) = args.get("ttl").and_then(Value::as_str) {
+        let ok = ttl.len() > 1 && ttl[..ttl.len() - 1].chars().all(|c| c.is_ascii_digit()) && ttl.ends_with(['s', 'm', 'h', 'd']);
+        if !ok {
+            return Err(format!("ttl must look like 30s, 15m, 1h or 7d, not {ttl:?}"));
+        }
+        q.push_str(&format!(" TTL {ttl}"));
+    }
+    Ok(q)
+}
 
-        let response = server.handle_request(request).await;
-        assert!(response.error.is_some());
-        assert_eq!(response.error.unwrap().code, -32601);
+fn ack(args: &Value) -> Result<String, String> {
+    let offset = args.get("offset").and_then(Value::as_u64).ok_or("Missing required: offset")?;
+    Ok(format!("ACK {} OFFSET {offset}", quote(str_arg(args, "subscription")?)))
+}
+
+fn unsubscribe(args: &Value) -> Result<String, String> {
+    Ok(format!("UNSUBSCRIBE {}", quote(str_arg(args, "subscription")?)))
+}
+
+fn remember(args: &Value) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", Some("SEMANTIC"))?;
+    let content = args.get("content").and_then(Value::as_str).ok_or("Missing required: content")?;
+    let mut fields = obj(args, "fields");
+    fields.insert("content".into(), json!(content));
+    // With subject + predicate: a fact (AQL v0.8 STORE … FACT, P1.4).
+    if let (Some(subject), Some(predicate)) = (args.get("subject"), args.get("predicate")) {
+        if mt != "SEMANTIC" {
+            return Err("A fact (subject + predicate) is SEMANTIC".into());
+        }
+        fields.insert("subject".into(), subject.clone());
+        fields.insert("predicate".into(), predicate.clone());
+        for f in ["object", "value", "confidence", "valid_from", "valid_to"] {
+            if let Some(v) = args.get(f) {
+                fields.insert(f.into(), v.clone());
+            }
+        }
+        let multi = if args.get("multi").and_then(Value::as_bool).unwrap_or(false) { " MULTI" } else { "" };
+        let mut q = format!("STORE INTO SEMANTIC FACT{multi} {}", payload(&fields)?);
+        if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
+            q.push_str(&format!(" NAMESPACE {}", quote(ns)));
+        }
+        q.push_str(&in_scope(args));
+        return Ok(q);
+    }
+    if let Some(key) = args.get("key").and_then(Value::as_str) {
+        fields.insert("key".into(), json!(key));
+    }
+    let mut q = format!("STORE INTO {mt} {}", payload(&fields)?);
+    if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
+        q.push_str(&format!(" NAMESPACE {}", quote(ns)));
+    }
+    q.push_str(&in_scope(args));
+    Ok(q)
+}
+
+/// ` IN SCOPE "…"` from an optional `scope` argument (a named scope, AQL v0.6).
+fn in_scope(args: &Value) -> String {
+    args.get("scope").and_then(Value::as_str).map(|s| format!(" IN SCOPE {}", quote(s))).unwrap_or_default()
+}
+
+/// `remember` on a key in use: `UPDATE INTO <type> WHERE key = … (content, fields)`.
+fn remember_update(args: &Value, key: &str) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", Some("SEMANTIC"))?;
+    let content = args.get("content").and_then(Value::as_str).ok_or("Missing required: content")?;
+    let mut fields = obj(args, "fields");
+    fields.insert("content".into(), json!(content));
+    Ok(format!("UPDATE INTO {mt} WHERE key = {} {}{}", quote(key), payload(&fields)?, in_scope(args)))
+}
+
+fn recall(args: &Value) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", Some("SEMANTIC"))?;
+    let mut conds: Vec<String> = Vec::new();
+    if let Some(text) = args.get("contains").and_then(Value::as_str) {
+        conds.push(format!("content CONTAINS {}", quote(text)));
+    }
+    for (k, v) in obj(args, "filter") {
+        conds.push(format!("{} = {}", tools::field(&k)?, literal(&v)));
+    }
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10);
+    if args.get("like").and_then(Value::as_str).is_some() {
+        // Relevance (AQL v0.5 §6 / §14): LIKE ranks, MIN_CONFIDENCE and LIMIT cut;
+        // `contains` and `filter` don't combine with it (one predicate per statement).
+        if !conds.is_empty() {
+            return Err("recall: `like` ranks by relevance and can't be combined with `contains` / `filter`".into());
+        }
+        let mut q = format!("RECALL FROM {mt} LIKE $q");
+        if let Some(c) = args.get("min_confidence").and_then(Value::as_f64) {
+            q.push_str(&format!(" MIN_CONFIDENCE {c:?}"));
+        }
+        if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
+            q.push_str(&format!(" NAMESPACE {}", quote(ns)));
+        }
+        return Ok(format!("{q} LIMIT {limit}{}", in_scope(args)));
+    }
+    let filter = if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) };
+    Ok(format!("RECALL FROM {mt}{filter} LIMIT {limit}{}", in_scope(args)))
+}
+
+fn forget(args: &Value) -> Result<String, String> {
+    let mt = memory_type(args, "memory_type", None)?;
+    let mut filter = obj(args, "filter");
+    if let Some(key) = args.get("key").and_then(Value::as_str) {
+        filter.insert("key".into(), json!(key));
+    }
+    if filter.is_empty() {
+        return Err("forget needs a key or a filter (refusing to forget everything)".into());
+    }
+    Ok(format!("FORGET FROM {mt}{}{}", where_eq(&filter)?, in_scope(args)))
+}
+
+fn link(args: &Value) -> Result<String, String> {
+    let from_t = memory_type(args, "from_type", None)?;
+    let to_t = memory_type(args, "to_type", None)?;
+    let s = |n: &str| args.get(n).and_then(Value::as_str).ok_or(format!("Missing required: {n}"));
+    let mut q = format!(
+        "LINK FROM {from_t} WHERE key = {} TO {to_t} WHERE key = {} TYPE {}",
+        quote(s("from_key")?),
+        quote(s("to_key")?),
+        quote(s("link_type")?)
+    );
+    if let Some(w) = args.get("weight").and_then(Value::as_f64) {
+        q.push_str(&format!(" WEIGHT {w:?}"));
+    }
+    Ok(q)
+}
+
+/// `UNLINK FROM <t> WHERE key = … TO <t> WHERE key = … [TYPE …]` (AQL v0.7).
+fn unlink(args: &Value) -> Result<String, String> {
+    let from_t = memory_type(args, "from_type", None)?;
+    let to_t = memory_type(args, "to_type", None)?;
+    let s = |n: &str| args.get(n).and_then(Value::as_str).ok_or(format!("Missing required: {n}"));
+    let mut q = format!("UNLINK FROM {from_t} WHERE key = {} TO {to_t} WHERE key = {}", quote(s("from_key")?), quote(s("to_key")?));
+    if let Some(t) = args.get("link_type").and_then(Value::as_str) {
+        q.push_str(&format!(" TYPE {}", quote(t)));
+    }
+    Ok(q)
+}
+
+fn resource_list() -> Value {
+    json!({ "resources": [
+        { "uri": GUIDE_URI, "name": "How to use ADB memory", "mimeType": "text/markdown",
+          "description": "Memory types, tools and AQL in brief — read this first" },
+        { "uri": GRAMMAR_URI, "name": "AQL grammar", "mimeType": "text/plain",
+          "description": "The full AQL grammar (pest), v0.5 plus the v0.6 / v0.7 drafts" }
+    ]})
+}
+
+fn read_resource(params: Option<&Value>) -> Result<Value, String> {
+    let uri = params.and_then(|p| p.get("uri")).and_then(Value::as_str).ok_or("Missing uri")?;
+    let (mime, text) = match uri {
+        GUIDE_URI => ("text/markdown", GUIDE),
+        GRAMMAR_URI => ("text/plain", aql_parser::GRAMMAR),
+        other => return Err(format!("Unknown resource: {other}")),
+    };
+    Ok(json!({ "contents": [{ "uri": uri, "mimeType": mime, "text": text }] }))
+}
+
+fn prompt_list() -> Value {
+    json!({ "prompts": [{
+        "name": "memory_smoke_test",
+        "description": "Walk through remember → recall → link → forget to check ADB end to end"
+    }]})
+}
+
+fn get_prompt(params: Option<&Value>) -> Result<Value, String> {
+    match params.and_then(|p| p.get("name")).and_then(Value::as_str) {
+        Some("memory_smoke_test") => Ok(json!({
+            "description": "ADB memory smoke test",
+            "messages": [{ "role": "user", "content": { "type": "text", "text":
+                "Test the ADB memory server step by step and report each result:\n\
+                 1. remember the fact \"Acme renews on 1 Nov\" with key \"acme-renewal\" and field account = \"acme\".\n\
+                 2. remember the event \"Called Acme about renewal\" in EPISODIC with key \"acme-call-1\".\n\
+                 3. recall SEMANTIC memories containing \"renews\".\n\
+                 4. link the fact to the event with link_type \"discussed_in\".\n\
+                 5. run aql_query: RECALL FROM SEMANTIC WHERE key = \"acme-renewal\" WITH LINKS ALL\n\
+                 6. forget the fact by key, then recall again and confirm it is gone.\n\
+                 7. call get_stats." } }]
+        })),
+        Some(other) => Err(format!("Unknown prompt: {other}")),
+        None => Err("Missing prompt name".into()),
     }
 }

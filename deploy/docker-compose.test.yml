@@ -1,0 +1,28 @@
+# ADB + FlowR-CE integration test in containers. Expects AQL and flowr-system checked out
+# next to ADB (../AQL, ../flowr-system).
+#
+#   docker compose -f deploy/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test
+#
+# Without containers, the same test spawns both binaries:
+#   node tests/flowr-integration.mjs --adb target/release/adb --flowr <flowr-ce binary>
+services:
+  adb:
+    build:
+      context: ..
+      additional_contexts:
+        aql: ../../AQL
+    ports: ["3000:3000"]
+
+  flowr:
+    build:
+      context: ../../flowr-system
+      dockerfile: ../ADB/deploy/flowr-ce.Dockerfile
+      additional_contexts:
+        aql: ../../AQL
+    ports: ["3002:3002"]
+
+  test:
+    image: node:22-slim
+    depends_on: [adb, flowr]
+    volumes: ["../tests:/tests:ro"]
+    command: ["node", "/tests/flowr-integration.mjs", "--adb-url", "http://adb:3000", "--flowr-url", "http://flowr:3002"]

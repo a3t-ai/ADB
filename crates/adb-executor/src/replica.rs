@@ -1,0 +1,415 @@
+//! A follower's copy of the data (M3, `.ai/M3_RAFT.md`).
+//!
+//! In a replica set only the Raft leader runs an engine. A follower's state
+//! machine appends each committed record to its own WAL; the [`Replica`] applies
+//! that WAL to the follower's Lance table, platform tables and FlowR engine
+//! spaces as it grows — the same catch-up a restarting node does at open — and
+//! trims the WAL below what all three hold, as the leader does. When the node
+//! becomes leader, the replica is dropped and an engine opens on the same
+//! directory with almost nothing left to catch up.
+
+use std::sync::Arc;
+
+use adb_core::log::{Effect, LogOffset};
+use adb_log::{Log, LogError};
+use adb_store::PartitionStore;
+
+use crate::engine::EngineLog;
+use crate::writes::{catch_up, forgotten_rows, redact_record, retain_max};
+
+pub struct Replica {
+    log: EngineLog,
+    store: Arc<PartitionStore>,
+    embedder: Option<Arc<adb_embed::Embedder>>,
+    /// `None`: a memory partition's reader (step 6: no platform tables, no engine store).
+    platform: Option<Arc<adb_platform::PlatformStore>>,
+    engine: Option<adb_engine::EngineHost>,
+    platform_next: LogOffset,
+    engine_next: LogOffset,
+    retain_max: u64,
+    /// When [`Self::maintain`] last ran.
+    maintained: std::time::Instant,
+    /// Lineages forgotten (FORGET records seen) and not yet erased from this node.
+    forgotten: std::collections::HashSet<(adb_core::log::Memory, String)>,
+    /// The leader's erasure marker has arrived: erase [`Self::forgotten`] here too.
+    erase_due: bool,
+    /// Branches, tags, layers and quotas, followed from the log (follower reads, C-16).
+    branches: Arc<crate::branches::Branches>,
+    /// Entity aliases (GR-12), for follower reads; rebuilt when a record carries any.
+    aliases: crate::follower::Aliases,
+    aliases_stale: bool,
+    /// Every record up to this offset is in the table and the platform tables.
+    applied: tokio::sync::watch::Sender<u64>,
+    /// A follower read waiting for an offset asks for an apply now.
+    wake: Arc<tokio::sync::Notify>,
+    /// Compaction runs beside the applies, so reads don't wait for it.
+    compacting: Arc<std::sync::atomic::AtomicBool>,
+    /// A reader (step 6): a cache of the owner's log and object storage, so its table
+    /// needn't reach disk before its log is trimmed (no `syncfs`).
+    cache_only: bool,
+}
+
+/// A reader's table is folded only past `ADB_REPLICA_COMPACT_GENERATIONS` unmerged
+/// layers (default 12): it is a cache of the owner's, moved to newer checkpoints; folding
+/// it on every 500 writes doubled the node's compaction work (Hetzner round 5).
+async fn replica_compaction_due(store: &adb_store::PartitionStore) -> bool {
+    let max = std::env::var("ADB_REPLICA_COMPACT_GENERATIONS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(12);
+    store.generation_count().await.is_ok_and(|n| n > max)
+}
+
+/// How often a follower checks whether its tables need compacting.
+const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A follower keeps every version it holds: history windows and branch pins are the
+/// leader's to apply, and a follower that applied its own could drop a version the
+/// leader still serves. The next leader's compaction trims history as usual.
+const FOLLOWER_HISTORY: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 86_400);
+
+fn s<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
+    move |e| format!("{what}: {e}")
+}
+
+impl Replica {
+    /// Open `dir`'s table, platform tables and engine spaces, and catch up with `log`.
+    pub async fn open(dir: impl AsRef<std::path::Path>, log: EngineLog) -> Result<Self, String> {
+        Self::open_role(dir, crate::engine::PartitionRole::SINGLE, log).await
+    }
+
+    /// As [`Self::open`], for one partition of a cluster node: a memory partition's
+    /// reader (step 6) holds its table only.
+    pub async fn open_role(dir: impl AsRef<std::path::Path>, role: crate::engine::PartitionRole, log: EngineLog) -> Result<Self, String> {
+        let dir = dir.as_ref();
+        let (store, embedder) = crate::engine::open_store(dir, role.id).await?;
+        // The hot cache, kept by every apply, so a takeover doesn't refill it (C-19).
+        store.set_cache(crate::engine::hot_cache(crate::engine::cache_config(dir)?)).await.map_err(s("store"))?;
+        // The live keys a takeover hands over, and the field indexes (PF-38, PF-40).
+        store.warm(true);
+        let (platform, platform_next) = if role.platform {
+            let p = Arc::new(adb_platform::PlatformStore::open(dir.join("platform")).await.map_err(s("platform"))?);
+            let next = LogOffset(p.applied_offset().await + 1);
+            (Some(p), next)
+        } else {
+            // Records are still read from here for branches, tags, layers and FORGETs.
+            (None, LogOffset(store.applied_offset().await.map_err(s("store"))?.0 + 1))
+        };
+        let (engine, engine_next) = if role.engine {
+            let e = adb_engine::EngineHost::open(dir.join("engine")).await.map_err(s("engine"))?;
+            let next = e.replay_from().await.map_err(s("engine"))?;
+            (Some(e), next)
+        } else {
+            (None, LogOffset(u64::MAX))
+        };
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let branches = Arc::new(crate::branches::Branches::load(&store, now).await?);
+        let aliases = Arc::new(std::sync::RwLock::new(crate::writes::load_aliases(&store).await.map_err(s("store"))?));
+        let mut r = Self {
+            log,
+            store,
+            embedder,
+            platform,
+            engine,
+            platform_next,
+            engine_next,
+            retain_max: retain_max(),
+            maintained: std::time::Instant::now(),
+            forgotten: Default::default(),
+            erase_due: false,
+            branches,
+            aliases,
+            aliases_stale: false,
+            applied: tokio::sync::watch::Sender::new(0),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            compacting: Default::default(),
+            cache_only: false,
+        };
+        let n = r.step().await?;
+        tracing::info!(records = n, offset = r.log.last_offset().0, "replica caught up");
+        // The table's schema migrations, as the leader's engine runs them on open
+        // (`DurableWrites::open`): a follower applies the leader's new-format records,
+        // so its own rows must be in that format too (v4 scoped ids, v5 namespace ids).
+        if r.store.schema_version() < 4 {
+            let n = r.store.scope_row_ids().await.map_err(s("store"))?;
+            tracing::info!(rows = n, "schema v4: record ids in named scopes carry the scope");
+        }
+        if r.store.schema_version() < 5 {
+            let n = r.store.namespace_row_ids().await.map_err(s("store"))?;
+            tracing::info!(rows = n, "schema v5: record ids in a namespace carry the namespace");
+        }
+        Ok(r)
+    }
+
+    /// Reads on this replica's data (C-16); valid while the replica steps.
+    pub fn reader(&self, log: EngineLog) -> crate::follower::FollowerReads {
+        crate::follower::FollowerReads::new(
+            Arc::clone(&self.store),
+            self.platform.clone(),
+            self.embedder.clone(),
+            Arc::clone(&self.branches),
+            Arc::clone(&self.aliases),
+            log,
+            self.applied.subscribe(),
+            Arc::clone(&self.wake),
+        )
+    }
+
+    /// Notified when a follower read waits for an offset not yet applied.
+    pub fn wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.wake)
+    }
+
+    /// The follower's own table (status, tests).
+    pub fn store(&self) -> &Arc<PartitionStore> {
+        &self.store
+    }
+
+    /// Records from `from` on, skipping a purged stretch (its records were
+    /// applied: the log is purged only below what everything holds).
+    async fn read(&self, from: &mut LogOffset) -> Result<Vec<adb_core::log::LogRecord>, String> {
+        loop {
+            match self.log.read(*from, 1024).await {
+                Ok(b) => return Ok(b),
+                Err(LogError::Purged { oldest, .. }) if oldest.0 > from.0 => *from = oldest,
+                Err(LogError::Purged { .. }) => return Ok(Vec::new()),
+                Err(e) => return Err(format!("log: {e}")),
+            }
+        }
+    }
+
+    /// Mark this as a reader's copy (see `cache_only`).
+    pub fn cache_only(&mut self) {
+        self.cache_only = true;
+        self.store.mark_replica_copy();
+    }
+
+    /// Apply what the WAL gained since the last step; trim it. Returns the
+    /// records applied to the table.
+    pub async fn step(&mut self) -> Result<u64, String> {
+        let _all = crate::steps::timer("follower.step (all)");
+        let mut ft = std::time::Instant::now();
+        let applied = catch_up(&self.store, &self.log).await.map_err(s("store"))?;
+        crate::steps::lap("follower.1 memory records applied", &mut ft);
+        crate::steps::value("follower records per step", applied);
+        loop {
+            let mut from = self.platform_next;
+            let batch = self.read(&mut from).await?;
+            let Some(last) = batch.last().map(|r| r.offset) else { break };
+            // One Lance commit for a run of upserts into one table (PF-4), as the leader.
+            // Boxed (once per 1,024 records): its future, a Lance write inside, would nest in
+            // every caller's — open's grew past rustc's layout depth limit.
+            if let Some(p) = &self.platform {
+                for r in Box::pin(p.apply_batch(&batch)).await {
+                    r.map_err(s("platform"))?;
+                }
+            }
+            for r in &batch {
+                self.note_forgets(r);
+                self.note_reads(r);
+            }
+            self.platform_next = last.next();
+        }
+        if self.aliases_stale {
+            self.aliases_stale = false;
+            match crate::writes::load_aliases(&self.store).await {
+                Ok(a) => *self.aliases.write().unwrap() = a,
+                Err(e) => {
+                    self.aliases_stale = true;
+                    tracing::warn!(error = %e, "follower could not reload entity aliases; retrying");
+                }
+            }
+        }
+        // Follower reads (C-16) wait for this.
+        let table = self.store.applied_offset().await.map_err(s("store"))?.0;
+        let through = table.min(self.platform_next.0.saturating_sub(1));
+        self.applied.send_if_modified(|a| {
+            let moved = through > *a;
+            *a = (*a).max(through);
+            moved
+        });
+        crate::steps::lap("follower.2 platform + aliases", &mut ft);
+        // PF-5: the memtable to Lance when due (the log is purged only below that).
+        if let Some(p) = &self.platform {
+            p.flush_due().await.map_err(s("platform"))?;
+        }
+        crate::steps::lap("follower.3 platform flush", &mut ft);
+        // Taken out for the step (its calls need it alone), put back however it ends.
+        if let Some(mut engine) = self.engine.take() {
+            let r = async {
+                loop {
+                    let mut from = self.engine_next;
+                    let batch = self.read(&mut from).await?;
+                    let Some(last) = batch.last().map(|r| r.offset) else { break };
+                    for r in &batch {
+                        if r.effects.iter().any(|e| matches!(e, Effect::Engine { .. })) {
+                            engine.replay(r).await.map_err(s("engine"))?;
+                        }
+                    }
+                    self.engine_next = last.next();
+                }
+                engine.snapshot_due(false).await.map_err(s("engine"))?;
+                Ok::<(), String>(())
+            }
+            .await;
+            self.engine = Some(engine);
+            r?;
+        }
+        crate::steps::lap("follower.4 engine replay", &mut ft);
+        crate::steps::lap("follower.5 engine snapshot", &mut ft);
+        if self.erase_due {
+            self.erase_due = false;
+            if let Err(e) = self.erase().await {
+                tracing::warn!(error = %e, "follower erasure failed; retrying at the next check");
+            }
+        }
+        crate::steps::lap("follower.6 erase", &mut ft);
+        self.purge().await?;
+        crate::steps::lap("follower.7 purge", &mut ft);
+        if self.maintained.elapsed() >= MAINTAIN_EVERY {
+            self.maintained = std::time::Instant::now();
+            Box::pin(self.maintain()).await;
+            crate::steps::lap("follower.8 maintain", &mut ft);
+        }
+        Ok(applied)
+    }
+
+    /// What follower reads need from a record: branch registrations and entity aliases.
+    fn note_reads(&mut self, r: &adb_core::log::LogRecord) {
+        self.branches.apply(r);
+        for e in &r.effects {
+            match e {
+                Effect::PutEntity(n) | Effect::Supersede { new: n, .. } if n.data.value.get("aliases").is_some() => self.aliases_stale = true,
+                Effect::Patch { fields, .. } if fields.contains_key("aliases") => self.aliases_stale = true,
+                Effect::Forget { memory: adb_core::log::Memory::Semantic, lineage_id } | Effect::Expire { memory: adb_core::log::Memory::Semantic, lineage_id } => {
+                    let mut a = self.aliases.write().unwrap();
+                    if !a.is_empty() {
+                        a.retain(|_, to| *to != lineage_id.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Compaction on the leader's thresholds. Without it a follower's sealed memtables,
+    /// journal generations and table versions pile up until it leads: each flush then
+    /// rewrites a longer manifest, and forgotten rows stay on its disk. Failures are
+    /// logged and retried at the next check.
+    pub async fn maintain(&mut self) {
+        if !self.forgotten.is_empty() && !self.erase_due {
+            // An erasure that failed, or FORGETs whose marker was before this replica
+            // opened: try (again) now.
+            if let Err(e) = self.erase().await {
+                tracing::warn!(error = %e, "follower erasure failed; retrying at the next check");
+            }
+        }
+        // Beside the applies (C-16): follower reads wait for applies, and a compaction
+        // held them for its whole run. The table's compaction runs with writes going
+        // on; the platform tables' holds their applies itself.
+        if self.compacting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let jobs = match &self.engine {
+            Some(e) => e.journals_to_compact().await,
+            None => Vec::new(),
+        };
+        let (store, platform, compacting) = (Arc::clone(&self.store), self.platform.clone(), Arc::clone(&self.compacting));
+        let cache_only = self.cache_only;
+        tokio::spawn(async move {
+            let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+            // A reader (a cache of the owner, rebuilt from newer checkpoints) folds only
+            // when its layers would slow its reads; owners fold on their writes.
+            let due = match cache_only {
+                true => replica_compaction_due(&store).await,
+                false => crate::writes::compaction_due_for(&store).await,
+            };
+            if due {
+                let st = Arc::clone(&store);
+                match adb_store::budget::run(async move { st.compact(FOLLOWER_HISTORY, now).await }).await {
+                    Ok(st) => tracing::info!(kept = st.kept, of = st.total, took = ?st.took, "follower table compacted"),
+                    Err(e) => tracing::warn!(error = %e, "follower compaction failed; retrying later"),
+                }
+            }
+            for j in jobs {
+                if let Err(e) = j.run().await {
+                    tracing::warn!(space = %j.space, error = %e, "follower journal compaction failed");
+                }
+            }
+            if let Some(platform) = platform {
+                if platform.compaction_due().await {
+                    if let Err(e) = platform.compact().await {
+                        tracing::warn!(error = %e, "follower platform compaction failed");
+                    }
+                }
+            }
+            compacting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// Note a record's FORGETs; the leader's erasure marker (the one record with no
+    /// effects, on a new segment) means everything up to it is in closed segments.
+    fn note_forgets(&mut self, r: &adb_core::log::LogRecord) {
+        if r.effects.is_empty() {
+            self.erase_due |= !self.forgotten.is_empty();
+            return;
+        }
+        for e in &r.effects {
+            if let Effect::Forget { memory, lineage_id } = e {
+                self.forgotten.insert((*memory, lineage_id.0.clone()));
+            }
+        }
+    }
+
+    /// W5 on a follower, as the leader does it after a FORGET: the table without the
+    /// forgotten rows, then the log's closed segments and openraft's own log (for a
+    /// replica set's [`EngineLog`]) without their payloads. On failure the lineages
+    /// stay noted for the next try.
+    async fn erase(&mut self) -> Result<(), String> {
+        let forgotten = std::mem::take(&mut self.forgotten);
+        let r = self.erase_these(&forgotten).await;
+        if r.is_err() {
+            self.forgotten.extend(forgotten);
+        }
+        r
+    }
+
+    async fn erase_these(&self, forgotten: &std::collections::HashSet<(adb_core::log::Memory, String)>) -> Result<(), String> {
+        // The table must hold the FORGETs before it is compacted.
+        catch_up(&self.store, &self.log).await.map_err(s("store"))?;
+        let rows = forgotten_rows(&self.store, forgotten.clone()).await.map_err(s("store"))?;
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let store = Arc::clone(&self.store);
+        let st = adb_store::budget::run(async move { store.compact(FOLLOWER_HISTORY, now).await }).await.map_err(s("compaction"))?;
+        let redact = |r: &mut adb_core::log::LogRecord| redact_record(r, &rows);
+        let n = self.log.rewrite_closed(&redact).await.map_err(s("log redaction"))?;
+        tracing::info!(lineages = forgotten.len(), kept = st.kept, of = st.total, log_records_redacted = n, "follower erased forgotten records");
+        Ok(())
+    }
+
+    /// Trim the WAL below what the table (on disk), the platform tables and the
+    /// engine spaces hold, keeping `ADB_LOG_RETAIN` records for subscribers that
+    /// resume on the next leader.
+    async fn purge(&self) -> Result<(), String> {
+        let tip = self.log.last_offset().0;
+        let durable = self.store.durable_offset().await.map_err(s("store"))?;
+        if durable.0 == 0 {
+            return Ok(());
+        }
+        if !self.cache_only {
+            self.store.sync_to_disk().await.map_err(s("store"))?;
+        }
+        let mut floor = durable.0 + 1;
+        // Below what the platform tables hold in Lance, not in memory (PF-5).
+        if let Some(p) = &self.platform {
+            floor = floor.min(p.applied_offset().await + 1);
+        }
+        if let Some(e) = &self.engine {
+            if let Some(f) = e.floor().await {
+                floor = floor.min(f.0);
+            }
+        }
+        floor = floor.min(tip.saturating_sub(self.retain_max) + 1);
+        if floor > 1 {
+            self.log.purge_below(LogOffset(floor)).await.map_err(s("log purge"))?;
+        }
+        Ok(())
+    }
+}
