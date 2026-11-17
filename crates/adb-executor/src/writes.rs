@@ -201,6 +201,11 @@ pub trait Writes: Send + Sync {
         Err(needs_log())
     }
 
+    /// The topic a subscription follows (`None`: unknown, or a scope subscription).
+    async fn subscription_topic(&self, _subscription: &str) -> AdbResult<Option<String>> {
+        Err(needs_log())
+    }
+
     /// A platform-table write (stage G): one `Table*` effect, committed and applied
     /// before it returns. Returns its log offset.
     async fn platform(&self, _effect: Effect) -> AdbResult<u64> {
@@ -3649,6 +3654,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.subs.apply(&record);
         self.to_store(&record).await;
         Ok(offset)
+    }
+
+    async fn subscription_topic(&self, subscription: &str) -> AdbResult<Option<String>> {
+        Ok(self.subs.get(subscription).and_then(|s| match s.spec.target {
+            adb_gateway::Target::Topic(t) => Some(t),
+            adb_gateway::Target::Scope(_) => None,
+        }))
     }
 
     async fn unsubscribe(&self, subscription: &str) -> AdbResult<bool> {

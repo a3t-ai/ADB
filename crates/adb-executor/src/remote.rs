@@ -238,6 +238,7 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "w_subscribe" => val(e.io().0.subscribe(arg(&a, "spec")?, arg(&a, "from")?).await.map_err(|x| x.to_string())?),
         "w_ack" => val(e.io().0.ack(&s("subscription")?, arg(&a, "offset")?).await.map_err(|x| x.to_string())?),
         "w_unsubscribe" => val(e.io().0.unsubscribe(&s("subscription")?).await.map_err(|x| x.to_string())?),
+        "w_sub_topic" => val(e.io().0.subscription_topic(&s("subscription")?).await.map_err(|x| x.to_string())?),
         "w_platform" => val(e.io().0.platform(arg(&a, "effect")?).await.map_err(|x| x.to_string())?),
         "w_platform_many" => val(e.io().0.platform_many(arg(&a, "effects")?).await.map_err(|x| x.to_string())?),
         "w_merge" => val(e.io().0.merge(&s("from")?, &s("into")?).await.map_err(|x| x.to_string())?),
@@ -402,6 +403,10 @@ impl Writes for RemotePartition {
 
     async fn unsubscribe(&self, subscription: &str) -> AdbResult<bool> {
         self.op_typed("w_unsubscribe", serde_json::json!({ "subscription": subscription })).await
+    }
+
+    async fn subscription_topic(&self, subscription: &str) -> AdbResult<Option<String>> {
+        self.op_typed("w_sub_topic", serde_json::json!({ "subscription": subscription })).await
     }
 
     async fn platform(&self, effect: adb_core::log::Effect) -> AdbResult<u64> {

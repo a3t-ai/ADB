@@ -449,3 +449,50 @@ async fn a_merged_key_resolves_across_partitions() {
         assert_eq!(got, want, "through node {}", i + 1);
     }
 }
+
+/// AQL v0.12 on a cluster: a LINK naming its namespace runs on that namespace's
+/// partition from any node; a namespace's topics and subscriptions work from any
+/// node, and a scoped call reaches only its own namespace's.
+#[tokio::test(flavor = "multi_thread")]
+async fn links_and_topics_with_a_namespace_on_a_cluster() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let peers = LocalPeers::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for n in 1..=3u64 {
+        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{n}"), &node);
+        nodes.push(node);
+    }
+    let ns = "demo--y";
+    let owner = (u64::from(nodes[0].partition_of(ns)) % 3) as usize; // index of the owner
+    let other = (owner + 1) % 3;
+    let q = |i: usize, s: String| {
+        let n = Arc::clone(&nodes[i]);
+        async move { n.query(&s, None).await.unwrap_or_else(|e| panic!("{s}: {e}")) }
+    };
+    q(other, format!(r#"STORE INTO SEMANTIC (key = "a", n = 1) NAMESPACE "{ns}""#)).await;
+    q(other, format!(r#"STORE INTO SEMANTIC (key = "b", n = 2) NAMESPACE "{ns}""#)).await;
+    let l = q(other, format!(r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "rel" NAMESPACE "{ns}""#)).await;
+    assert_eq!(l["data"]["count"], 1, "{l}");
+    let r = q((owner + 2) % 3, format!(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL NAMESPACE "{ns}""#)).await;
+    assert_eq!(r["data"]["records"][0]["data"]["links"].as_array().map(|a| a.len()), Some(1), "{r}");
+
+    // Topics: subscribe through one node, publish through another, ack through a third.
+    let scope = Reach::Only(vec![ns.into()]);
+    let s = nodes[0].query_in(&format!(r#"SUBSCRIBE TOPIC "t" NAMESPACE "{ns}""#), None, &scope).await.unwrap();
+    let sub = s["data"]["subscription"].as_str().unwrap().to_string();
+    let p = nodes[1].query_in(&format!(r#"PUBLISH TOPIC "t" (n = 1) NAMESPACE "{ns}""#), None, &scope).await.unwrap();
+    assert_eq!(p["data"]["topic"], format!("{ns}/t"), "{p}");
+    let batch = nodes[2].next_events(&sub, None, 10, std::time::Duration::from_secs(2)).await.unwrap();
+    assert_eq!(batch["deliveries"].as_array().map(|d| d.len()), Some(1), "{batch}");
+    let next = batch["next"].as_u64().unwrap();
+    nodes[2].query_in(&format!(r#"ACK "{sub}" OFFSET {next} NAMESPACE "{ns}""#), None, &scope).await.unwrap();
+    // The scope holds: another namespace's topic is out of reach.
+    let e = nodes[0].query_in(r#"PUBLISH TOPIC "t" (n = 2) NAMESPACE "a3t-shared--bot""#, None, &scope).await.unwrap_err();
+    assert!(e.contains("outside this call's scope"), "{e}");
+    let u = nodes[1].query_in(&format!(r#"UNSUBSCRIBE "{sub}" NAMESPACE "{ns}""#), None, &scope).await.unwrap();
+    assert_eq!(u["data"]["unsubscribed"], true, "{u}");
+}

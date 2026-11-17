@@ -1343,6 +1343,12 @@ fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), 
             }
         }
     }
+    // A namespace's topics (AQL v0.12) are on the system partition, within the scope.
+    if let Some(ns) = topic_namespace(aql) {
+        if !reach.allows(&ns) {
+            return Err(out_of_reach(&ns).to_string());
+        }
+    }
     let names: BTreeSet<Option<&str>> = touches.iter().map(|(ns, _)| ns.as_deref()).collect();
     let writes_any = touches.iter().any(|(_, w)| *w);
     match (names.len(), names.iter().next()) {
@@ -1365,6 +1371,18 @@ fn touches(aql: &str) -> Vec<(Option<String>, bool)> {
     }
 }
 
+/// The NAMESPACE a topic statement names (SUBSCRIBE, PUBLISH, ACK, UNSUBSCRIBE).
+fn topic_namespace(aql: &str) -> Option<String> {
+    use aql_parser::Statement as S;
+    match aql_parser::parse(aql).ok()? {
+        S::Subscribe(x) => x.namespace,
+        S::Publish(x) => x.modifiers.namespace,
+        S::Ack(x) => x.namespace,
+        S::Unsubscribe(x) => x.namespace,
+        _ => None,
+    }
+}
+
 /// One statement's `NAMESPACE` and whether it writes ([`touches`]).
 fn touches_of(s: &aql_parser::Statement) -> (Option<String>, bool) {
     use aql_parser::Statement as S;
@@ -1380,6 +1398,10 @@ fn touches_of(s: &aql_parser::Statement) -> (Option<String>, bool) {
             // A watch is on its query's namespace (its partition registers it); the
             // owner runs it — WATCH isn't a read a reader answers.
             S::Watch(w) => (touches_of(&w.query).0, false),
+            // A link's two ends are in its NAMESPACE (AQL v0.12): one partition.
+            S::Link(x) => (x.namespace.clone(), true),
+            S::UpdateLink(x) => (x.namespace.clone(), true),
+            S::Unlink(x) => (x.namespace.clone(), true),
             _ => (None, true),
         }
     }
@@ -1674,6 +1696,10 @@ impl Writes for Routed {
 
     async fn unsubscribe(&self, subscription: &str) -> AdbResult<bool> {
         self.system().await?.unsubscribe(subscription).await
+    }
+
+    async fn subscription_topic(&self, subscription: &str) -> AdbResult<Option<String>> {
+        self.system().await?.subscription_topic(subscription).await
     }
 
     async fn platform(&self, effect: adb_core::log::Effect) -> AdbResult<u64> {

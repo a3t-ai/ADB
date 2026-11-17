@@ -33,10 +33,20 @@ pub enum SubscriptionPlan {
         filter: Option<Vec<adb_core::Condition>>,
         from: Option<u64>,
     },
-    Unsubscribe { subscription: String },
-    Ack { subscription: String, offset: u64 },
+    /// `namespace`: the subscription must be on a topic of that namespace (AQL v0.12).
+    Unsubscribe { subscription: String, namespace: Option<String> },
+    Ack { subscription: String, offset: u64, namespace: Option<String> },
     /// A committed `event` row on `topic`.
     Publish { topic: String, payload: serde_json::Value, ttl: Option<Duration> },
+}
+
+/// A topic within a namespace (AQL v0.12 `… TOPIC "t" NAMESPACE "ns"`): `ns/t`. The
+/// namespaces' topics are apart from one another and from the org-wide ones.
+pub fn namespaced_topic(namespace: Option<&str>, topic: &str) -> String {
+    match namespace {
+        Some(ns) => format!("{ns}/{topic}"),
+        None => topic.to_string(),
+    }
 }
 
 /// What a subscription follows.

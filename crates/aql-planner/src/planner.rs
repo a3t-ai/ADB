@@ -58,27 +58,38 @@ impl Planner {
             Statement::Store(s) => Ok(ExecutionPlan::Single(self.plan_store(s)?)),
             Statement::Update(u) => Ok(ExecutionPlan::Single(self.plan_update(u)?)),
             Statement::Forget(f) => self.plan_forget(f),
-            Statement::Link(l) => Ok(ExecutionPlan::Single(self.plan_link(l)?)),
+            Statement::Link(l) => {
+                let mut step = self.plan_link(l)?;
+                step.modifiers.namespace = l.namespace.clone();
+                Ok(ExecutionPlan::Single(step))
+            }
             // AQL v0.7 — change or remove existing links
             Statement::UpdateLink(u) => {
                 let mut d = self.link_ends(u.from_type, &u.from_conditions, u.to_type, &u.to_conditions, "UPDATE LINK")?;
                 d.type_filter = u.link_type.clone();
                 d.set_weight = u.weight;
                 d.set_type = u.new_type.clone();
-                Ok(ExecutionPlan::Single(StepPlan::link_edit(d, false)))
+                let mut step = StepPlan::link_edit(d, false);
+                step.modifiers.namespace = u.namespace.clone();
+                Ok(ExecutionPlan::Single(step))
             }
             Statement::Unlink(u) => {
                 let mut d = self.link_ends(u.from_type, &u.from_conditions, u.to_type, &u.to_conditions, "UNLINK")?;
                 d.type_filter = u.link_type.clone();
-                Ok(ExecutionPlan::Single(StepPlan::link_edit(d, true)))
+                let mut step = StepPlan::link_edit(d, true);
+                step.modifiers.namespace = u.namespace.clone();
+                Ok(ExecutionPlan::Single(step))
             }
             // AQL v0.10 — entity resolution (GR-12)
             Statement::Merge(m) => Ok(ExecutionPlan::Single(StepPlan::merge(&m.from, &m.into))),
             // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
             Statement::Subscribe(s) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
-                target: match &s.target {
-                    aql_parser::ast::SubscribeTarget::Scope(v) => SubscriptionTarget::Scope(v.clone()),
-                    aql_parser::ast::SubscribeTarget::Topic(v) => SubscriptionTarget::Topic(v.clone()),
+                target: match (&s.target, &s.namespace) {
+                    (aql_parser::ast::SubscribeTarget::Scope(_), Some(_)) => {
+                        return Err(PlanError::NotImplemented("SUBSCRIBE SCOPE … NAMESPACE (a namespace's topics are subscribed with SUBSCRIBE TOPIC … NAMESPACE)"))
+                    }
+                    (aql_parser::ast::SubscribeTarget::Scope(v), None) => SubscriptionTarget::Scope(v.clone()),
+                    (aql_parser::ast::SubscribeTarget::Topic(v), ns) => SubscriptionTarget::Topic(crate::plan::namespaced_topic(ns.as_deref(), v)),
                 },
                 kinds: s.kinds.iter().map(|k| k.to_lowercase()).collect(),
                 filter: s.filter.as_ref().map(|c| c.iter().map(convert_condition).collect::<PlanResult<Vec<_>>>()).transpose()?,
@@ -88,14 +99,15 @@ impl Planner {
                 },
             })),
             Statement::Unsubscribe(u) => {
-                Ok(ExecutionPlan::Subscription(SubscriptionPlan::Unsubscribe { subscription: u.subscription.clone() }))
+                Ok(ExecutionPlan::Subscription(SubscriptionPlan::Unsubscribe { subscription: u.subscription.clone(), namespace: u.namespace.clone() }))
             }
             Statement::Ack(a) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Ack {
                 subscription: a.subscription.clone(),
                 offset: a.offset,
+                namespace: a.namespace.clone(),
             })),
             Statement::Publish(p) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Publish {
-                topic: p.topic.clone(),
+                topic: crate::plan::namespaced_topic(p.modifiers.namespace.as_deref(), &p.topic),
                 payload: assignments_to_json(&p.payload),
                 ttl: p.modifiers.ttl,
             })),

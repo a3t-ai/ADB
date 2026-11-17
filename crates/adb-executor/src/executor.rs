@@ -831,11 +831,17 @@ impl Executor {
                 let (id, start_offset) = self.writes.subscribe(spec, *from).await?;
                 serde_json::json!({ "subscription": id, "start_offset": start_offset })
             }
-            SubscriptionPlan::Unsubscribe { subscription } => {
+            SubscriptionPlan::Unsubscribe { subscription, namespace } => {
+                if !self.subscription_in(subscription, namespace.as_deref()).await? {
+                    return Ok(QueryResult::subscription(serde_json::json!({ "subscription": subscription, "unsubscribed": false }), start.elapsed().as_millis() as u64));
+                }
                 let existed = self.writes.unsubscribe(subscription).await?;
                 serde_json::json!({ "subscription": subscription, "unsubscribed": existed })
             }
-            SubscriptionPlan::Ack { subscription, offset } => {
+            SubscriptionPlan::Ack { subscription, offset, namespace } => {
+                if !self.subscription_in(subscription, namespace.as_deref()).await? {
+                    return Err(adb_core::AdbError::NotFound { memory_type: "subscription".into(), id: subscription.clone() }.into());
+                }
                 let cursor = self.writes.ack(subscription, *offset).await?;
                 serde_json::json!({ "subscription": subscription, "cursor": cursor })
             }
@@ -925,6 +931,14 @@ impl Executor {
         Ok(QueryResult::count(count, start.elapsed().as_millis() as u64))
     }
 
+    /// Whether `subscription` may be acked or ended within `namespace` (AQL v0.12):
+    /// with no namespace, any; with one, only a subscription on that namespace's topics.
+    async fn subscription_in(&self, subscription: &str, namespace: Option<&str>) -> ExecutorResult<bool> {
+        let Some(ns) = namespace else { return Ok(true) };
+        let topic = self.writes.subscription_topic(subscription).await?;
+        Ok(topic.is_some_and(|t| t.strip_prefix(ns).is_some_and(|rest| rest.starts_with('/'))))
+    }
+
     async fn execute_link(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
 
@@ -962,10 +976,12 @@ impl Executor {
         // Build target predicate from to_conditions
         let to_predicate = self.build_predicate_from_conditions(data.get("to_conditions"))?;
 
-        // Look up source records using step.memory_type and step.predicate
+        // Look up source records using step.memory_type and step.predicate (within
+        // the statement's NAMESPACE, AQL v0.12).
+        let within = link_scope(step);
         let source_records = self
             .reads
-            .lookup(step.memory_type, &step.predicate)
+            .lookup_with_modifiers(step.memory_type, &step.predicate, &within)
             .await?;
 
         if source_records.is_empty() {
@@ -977,7 +993,7 @@ impl Executor {
         // Look up target records
         let target_records = self
             .reads
-            .lookup(to_type, &to_predicate)
+            .lookup_with_modifiers(to_type, &to_predicate, &within)
             .await?;
 
         if target_records.is_empty() {
@@ -1017,8 +1033,9 @@ impl Executor {
         let to_predicate = self.build_predicate_from_conditions(data.get("to_conditions"))?;
         let type_filter = data.get("type_filter").and_then(|v| v.as_str());
         let ids = |records: Vec<adb_core::MemoryRecord>| records.into_iter().map(|r| r.id).collect::<Vec<_>>();
-        let from_ids = ids(self.reads.lookup(step.memory_type, &step.predicate).await?);
-        let to_ids = ids(self.reads.lookup(to_type, &to_predicate).await?);
+        let within = link_scope(step);
+        let from_ids = ids(self.reads.lookup_with_modifiers(step.memory_type, &step.predicate, &within).await?);
+        let to_ids = ids(self.reads.lookup_with_modifiers(to_type, &to_predicate, &within).await?);
         let n = if from_ids.is_empty() || to_ids.is_empty() {
             0
         } else if unlink {
@@ -1123,4 +1140,9 @@ fn link_json(l: &adb_core::Link, select: &adb_core::LinkSelect) -> serde_json::V
         j["from_id"] = serde_json::json!(l.from_id);
     }
     j
+}
+
+/// The lookups of a LINK, UPDATE LINK or UNLINK: within its NAMESPACE, if it names one.
+fn link_scope(step: &StepPlan) -> adb_core::Modifiers {
+    adb_core::Modifiers { namespace: step.modifiers.namespace.clone(), ..Default::default() }
 }
