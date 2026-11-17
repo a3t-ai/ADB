@@ -80,6 +80,7 @@ pub fn routes(node: Arc<PartitionedEngine>) -> Router {
         .route("/internal/partition/:p", post(partition))
         .route("/internal/replicate/:p", post(replicate))
         .layer(axum::extract::DefaultBodyLimit::max(INTERNAL_BODY_MAX))
+        .layer(axum::middleware::from_fn(adb_cluster::identity::guard))
         .with_state(node)
 }
 
@@ -96,7 +97,7 @@ impl HttpPeers {
     }
 
     async fn post<T: serde::de::DeserializeOwned>(&self, url: String, body: &impl Serialize) -> Result<T, String> {
-        let mut req = self.http.post(&url).json(body);
+        let mut req = adb_cluster::identity::tag(self.http.post(&url)).json(body);
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
@@ -129,7 +130,7 @@ impl Peers for HttpPeers {
     async fn replicate(&self, addr: &str, partition: Partition, req: adb_executor::replication::ReplicateReq) -> Result<adb_executor::replication::ReplicateAck, String> {
         let url = format!("{}/internal/replicate/{partition}", addr.trim_end_matches('/'));
         let body = rmp_serde::to_vec_named(&req).map_err(|e| e.to_string())?;
-        let mut r = self.http.post(&url).header("content-type", "application/msgpack").body(body);
+        let mut r = adb_cluster::identity::tag(self.http.post(&url)).header("content-type", "application/msgpack").body(body);
         if let Some(t) = &self.token {
             r = r.bearer_auth(t);
         }

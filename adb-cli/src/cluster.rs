@@ -110,6 +110,8 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
     let first = config.voters.keys().next() == Some(&config.id);
     if let Some(mark) = crate::cluster_mark::settle(dir, &cold, first, adb_cluster::control::partitions()).await? {
         tracing::info!(node = config.id, cluster = %mark.id, "ADB cluster");
+        // Sent on every call to another node; another cluster's calls are refused.
+        adb_cluster::identity::set(&mark.id);
     }
     let token = adb_server::auth::token_from_env();
     // The control group, on a voter: on the control plane's own runtime (its threads,
