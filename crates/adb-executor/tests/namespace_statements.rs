@@ -80,3 +80,26 @@ async fn a_namespace_has_its_own_topics_and_subscriptions() {
     // A scope subscription can't name a namespace (yet).
     assert!(engine.query(r#"SUBSCRIBE SCOPE "agent:1" NAMESPACE "p""#, None).await.is_err());
 }
+
+#[tokio::test]
+async fn a_link_on_a_branch_stays_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    q(&engine, r#"STORE INTO SEMANTIC (key = "a", n = 1) NAMESPACE "p""#).await;
+    q(&engine, r#"STORE INTO SEMANTIC (key = "b", n = 2) NAMESPACE "p""#).await;
+    engine.branch_create("p", "b1", None, None).await.unwrap();
+    let l = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "rel" NAMESPACE "p" BRANCH "b1""#).await;
+    assert_eq!(count(&l), 1, "{l}");
+    let links = |aql: &'static str| {
+        let e = &engine;
+        async move { q(e, aql).await["data"]["records"][0]["data"]["links"].as_array().map_or(0, |a| a.len()) }
+    };
+    // (WITH LINKS isn't read on a branch yet: main shows none, UNLINK finds it there.)
+    assert_eq!(links(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL NAMESPACE "p""#).await, 0, "not on main");
+    let u = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" NAMESPACE "p" BRANCH "b1""#).await;
+    assert_eq!(count(&u), 1, "the link is on the branch: {u}");
+    let u = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" NAMESPACE "p" BRANCH "b1""#).await;
+    assert_eq!(count(&u), 0, "and gone: {u}");
+    // BRANCH needs the NAMESPACE it belongs to.
+    assert!(engine.query(r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "rel" BRANCH "b1""#, None).await.is_err());
+}

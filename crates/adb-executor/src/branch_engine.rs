@@ -176,6 +176,10 @@ pub fn statement_branch(aql: &str) -> Result<Option<(String, Option<String>)>, S
             S::Update(x) => &x.modifiers,
             S::Forget(x) => &x.modifiers,
             S::Scan(x) => &x.modifiers,
+            // Links name their branch after their NAMESPACE (AQL v0.12).
+            S::Link(x) => return Some((x.branch.clone().filter(|b| b != MAIN), x.namespace.clone())),
+            S::UpdateLink(x) => return Some((x.branch.clone().filter(|b| b != MAIN), x.namespace.clone())),
+            S::Unlink(x) => return Some((x.branch.clone().filter(|b| b != MAIN), x.namespace.clone())),
             _ => return None,
         };
         Some((m.branch.clone().filter(|b| b != MAIN), m.namespace.clone()))

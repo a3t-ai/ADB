@@ -3920,7 +3920,14 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
             for (end, memory, id) in [("source", from_type, from_id), ("target", to_type, to_id)].into_iter().filter(|(end, _, _)| check_target || *end == "source") {
                 let key = adb_core::Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.to_string()) };
-                if crate::query::read(store, memory, &key, &Default::default(), ts).await?.is_empty() {
+                // On a branch engine: the branch's view (the parent at the branch point
+                // and the branch's own rows), as its reads see the ends.
+                let missing = if self.parent.is_some() {
+                    self.branch_targets(memory, &key, None, ts).await?.is_empty()
+                } else {
+                    crate::query::read(store, memory, &key, &Default::default(), ts).await?.is_empty()
+                };
+                if missing {
                     return Err(AdbError::QueryError(format!("LINK: the {end} record {memory:?} {id:?} doesn't exist (any more)")));
                 }
             }
