@@ -1402,6 +1402,7 @@ fn touches_of(s: &aql_parser::Statement) -> (Option<String>, bool) {
             S::Link(x) => (x.namespace.clone(), true),
             S::UpdateLink(x) => (x.namespace.clone(), true),
             S::Unlink(x) => (x.namespace.clone(), true),
+            S::Merge(x) => (x.namespace.clone(), true),
             _ => (None, true),
         }
     }
@@ -1717,9 +1718,10 @@ impl Writes for Routed {
         Ok(found.into_iter().flatten().next())
     }
 
-    /// MERGE ENTITY without a namespace: the entities without one, in their partition.
-    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
-        self.write_target(None).await?.writes.merge(from, into).await
+    /// MERGE ENTITY: in the namespace's partition (without one: the entities without
+    /// one, in their partition).
+    async fn merge(&self, from: &str, into: &str, namespace: Option<&str>) -> AdbResult<u64> {
+        self.write_target(namespace).await?.writes.merge(from, into, namespace).await
     }
 }
 

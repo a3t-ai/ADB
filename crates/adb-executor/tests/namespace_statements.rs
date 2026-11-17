@@ -103,3 +103,62 @@ async fn a_link_on_a_branch_stays_on_it() {
     // BRANCH needs the NAMESPACE it belongs to.
     assert!(engine.query(r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "rel" BRANCH "b1""#, None).await.is_err());
 }
+
+/// AQL v0.13: MERGE ENTITY within a NAMESPACE merges that namespace's entities only;
+/// the merged key finds the survivor in that namespace (also after a restart), and
+/// another namespace's entity of the same key is untouched.
+#[tokio::test]
+async fn a_merge_with_a_namespace_stays_in_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let facts = |ns: &str| {
+        [
+            format!(r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:acme") NAMESPACE "{ns}""#),
+            format!(r#"STORE INTO SEMANTIC FACT (subject = "person:ada-l", predicate = "born_in", object = "place:london") NAMESPACE "{ns}""#),
+        ]
+    };
+    {
+        let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+        for ns in ["p", "q"] {
+            for f in facts(ns) {
+                q(&engine, &f).await;
+            }
+        }
+        let m = q(&engine, r#"MERGE ENTITY "person:ada-l" INTO "person:ada" NAMESPACE "p""#).await;
+        assert_eq!(count(&m), 1, "one fact moved: {m}");
+        // p: ada holds both facts; the merged key finds ada.
+        let about = |ns: &'static str, subject: &'static str| {
+            let e = &engine;
+            async move {
+                let r = q(e, &format!(r#"RECALL FROM SEMANTIC WHERE subject = "{subject}" NAMESPACE "{ns}""#)).await;
+                let mut p: Vec<String> = r["data"]["records"].as_array().unwrap().iter().filter_map(|r| r["data"]["predicate"].as_str().map(String::from)).collect();
+                p.sort();
+                p
+            }
+        };
+        assert_eq!(about("p", "person:ada").await, vec!["born_in", "works_at"]);
+        assert!(about("p", "person:ada-l").await.is_empty());
+        // q untouched.
+        assert_eq!(about("q", "person:ada").await, vec!["works_at"]);
+        assert_eq!(about("q", "person:ada-l").await, vec!["born_in"]);
+        // A FACT about the merged key in p lands on the survivor; in q on its own entity.
+        q(&engine, r#"STORE INTO SEMANTIC FACT (subject = "person:ada-l", predicate = "likes", object = "thing:maths") NAMESPACE "p""#).await;
+        assert_eq!(about("p", "person:ada").await, vec!["born_in", "likes", "works_at"]);
+        // MERGE of a key the namespace doesn't have: refused, naming it.
+        let e = engine.query(r#"MERGE ENTITY "person:nobody" INTO "person:ada" NAMESPACE "p""#, None).await.unwrap_err();
+        assert!(e.contains("no entity person:nobody") && e.contains("\"p\""), "{e}");
+        // Merged again: refused.
+        let e = engine.query(r#"MERGE ENTITY "person:ada-l" INTO "person:ada" NAMESPACE "p""#, None).await.unwrap_err();
+        assert!(e.contains("already merged"), "{e}");
+    }
+    // After a restart the aliases are rebuilt per namespace.
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let found = |ns: &'static str| {
+        let e = &engine;
+        async move {
+            let r = q(e, &format!(r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-l" NAMESPACE "{ns}""#)).await;
+            r["data"]["records"][0]["data"]["key"].as_str().map(String::from)
+        }
+    };
+    assert_eq!(found("p").await.as_deref(), Some("person:ada"), "the merged key finds the survivor in p");
+    assert_eq!(found("q").await.as_deref(), Some("person:ada-l"), "q's own entity");
+}

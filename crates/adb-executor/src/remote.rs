@@ -241,7 +241,7 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "w_sub_topic" => val(e.io().0.subscription_topic(&s("subscription")?).await.map_err(|x| x.to_string())?),
         "w_platform" => val(e.io().0.platform(arg(&a, "effect")?).await.map_err(|x| x.to_string())?),
         "w_platform_many" => val(e.io().0.platform_many(arg(&a, "effects")?).await.map_err(|x| x.to_string())?),
-        "w_merge" => val(e.io().0.merge(&s("from")?, &s("into")?).await.map_err(|x| x.to_string())?),
+        "w_merge" => val(e.io().0.merge(&s("from")?, &s("into")?, a.get("namespace").and_then(|v| v.as_str())).await.map_err(|x| x.to_string())?),
         // A watch's next frames, from this partition's watcher.
         "watch_frames" => {
             let wait = Duration::from_millis(arg::<u64>(&a, "wait_ms")?.min(30_000));
@@ -385,8 +385,8 @@ impl Writes for RemotePartition {
 
     // Topics, subscriptions, platform tables and entity merges: run by the owner.
 
-    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
-        self.op_typed("w_merge", serde_json::json!({ "from": from, "into": into })).await
+    async fn merge(&self, from: &str, into: &str, namespace: Option<&str>) -> AdbResult<u64> {
+        self.op_typed("w_merge", serde_json::json!({ "from": from, "into": into, "namespace": namespace })).await
     }
 
     async fn publish(&self, topic: &str, payload: Value, ttl: Option<Duration>) -> AdbResult<(String, u64)> {

@@ -81,7 +81,12 @@ impl Planner {
                 Ok(ExecutionPlan::Single(step))
             }
             // AQL v0.10 — entity resolution (GR-12)
-            Statement::Merge(m) => Ok(ExecutionPlan::Single(StepPlan::merge(&m.from, &m.into))),
+            Statement::Merge(m) => {
+                // v0.13: both entities in the statement's NAMESPACE.
+                let mut step = StepPlan::merge(&m.from, &m.into);
+                step.modifiers.namespace = m.namespace.clone();
+                Ok(ExecutionPlan::Single(step))
+            }
             // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
             Statement::Subscribe(s) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
                 target: match (&s.target, &s.namespace) {

@@ -177,10 +177,9 @@ impl Executor {
                 let start = Instant::now();
                 let data = step.data.as_ref().ok_or_else(|| ExecutorError::MissingData("merge data".to_string()))?;
                 let key = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                if let Some(ns) = &step.modifiers.namespace {
-                    return Err(ExecutorError::InvalidOperation(format!("MERGE in NAMESPACE {ns:?} isn't supported yet (NS-L1): MERGE works on records without a namespace")));
-                }
-                let n = self.writes.merge(&key("from"), &key("into")).await?;
+                // AQL v0.13: both entities are the NAMESPACE's (without one: records
+                // without a namespace).
+                let n = self.writes.merge(&key("from"), &key("into"), step.modifiers.namespace.as_deref()).await?;
                 QueryResult::count(n, start.elapsed().as_millis() as u64)
             }
         };
@@ -751,7 +750,10 @@ impl Executor {
         let resolved;
         let step = match (&step.memory_type, &step.predicate) {
             (MemoryType::Semantic, Predicate::Key { field, value: adb_core::Value::String(k) }) if matches!(field.as_str(), "id" | "key") => {
-                match self.writes.alias_resolve(k).await? {
+                // Aliases are kept by record id: the key in the statement's namespace
+                // (the planner has qualified it already; the survivor's id is too).
+                let id = adb_store::namespaced(step.modifiers.namespace.as_deref(), k);
+                match self.writes.alias_resolve(&id).await? {
                     Some(to) => {
                         resolved = StepPlan { predicate: Predicate::Key { field: field.clone(), value: adb_core::Value::String(to) }, ..step.clone() };
                         &resolved

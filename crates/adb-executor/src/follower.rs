@@ -175,7 +175,7 @@ impl Writes for ReadOnlyWrites {
     async fn unlink(&self, _: MemoryType, _: &[String], _: MemoryType, _: &[String], _: Option<&str>) -> AdbResult<u64> {
         not_leader()
     }
-    async fn merge(&self, _: &str, _: &str) -> AdbResult<u64> {
+    async fn merge(&self, _: &str, _: &str, _: Option<&str>) -> AdbResult<u64> {
         not_leader()
     }
     fn alias_of(&self, key: &str) -> Option<String> {

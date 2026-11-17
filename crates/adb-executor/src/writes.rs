@@ -163,13 +163,15 @@ pub trait Writes: Send + Sync {
         link_type: Option<&str>,
     ) -> AdbResult<u64>;
 
-    /// AQL v0.10 MERGE ENTITY (GR-12): SEMANTIC entity `from` merges into `into`.
-    /// Returns how many facts and links moved.
-    async fn merge(&self, _from: &str, _into: &str) -> AdbResult<u64> {
+    /// AQL v0.10 MERGE ENTITY (GR-12): SEMANTIC entity `from` merges into `into`,
+    /// both in `namespace` (v0.13; `None`: records without a namespace). Returns how
+    /// many facts and links moved.
+    async fn merge(&self, _from: &str, _into: &str, _namespace: Option<&str>) -> AdbResult<u64> {
         Err(needs_table("MERGE"))
     }
 
-    /// The entity a merged entity's key is now an alias of (GR-12).
+    /// The entity a merged entity's record id (its key, with its namespace) is now an
+    /// alias of (GR-12).
     fn alias_of(&self, _key: &str) -> Option<String> {
         None
     }
@@ -3401,11 +3403,15 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         aliases.get(key).cloned()
     }
 
-    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
+    async fn merge(&self, from_key: &str, into_key: &str, namespace: Option<&str>) -> AdbResult<u64> {
         let Some(store) = &self.store else { return Err(needs_table("MERGE")) };
-        if [from, into].iter().any(|k| k.contains(adb_store::SCOPE_SEP)) {
+        if [from_key, into_key].iter().any(|k| k.contains(adb_store::SCOPE_SEP)) {
             return Err(AdbError::UnsupportedOperation("MERGE of entities in a named scope (E-L12-a): MERGE works in the default scope".into()));
         }
+        // The entities' record ids: their keys in the namespace (v0.13).
+        let from_id = scoped_key(namespace, None, from_key)?;
+        let from = from_id.as_str();
+        let into = scoped_key(namespace, None, into_key)?;
         let memory = Memory::Semantic;
         let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
         let mut seq = seq_lock!(self);
@@ -3415,16 +3421,16 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             b.wait_for_committed().await;
         }
         if let Some(to) = self.alias_of(from) {
-            return Err(AdbError::QueryError(format!("MERGE: {from} was already merged into {to}")));
+            return Err(AdbError::QueryError(format!("MERGE: {from_key} was already merged into {}", adb_store::unscoped(&to))));
         }
-        let into = self.alias_of(into).unwrap_or_else(|| into.to_string());
+        let into = self.alias_of(&into).unwrap_or(into);
         if from == into {
-            return Err(AdbError::QueryError(format!("MERGE: {from} is {into}")));
+            return Err(AdbError::QueryError(format!("MERGE: {from_key} is {}", adb_store::unscoped(&into))));
         }
         let entity = |key: String| async move {
             match store.current_version(memory, &key, ts).await {
                 Ok(Some(r)) if r.data.kind == Kind::Entity => Ok(r),
-                Ok(_) => Err(AdbError::QueryError(format!("MERGE: no entity {key}"))),
+                Ok(_) => Err(AdbError::QueryError(format!("MERGE: no entity {}{}", adb_store::unscoped(&key), namespace.map(|n| format!(" in namespace {n:?}")).unwrap_or_default()))),
                 Err(e) => Err(err(e)),
             }
         };
@@ -3442,7 +3448,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         // version; the others move to a new key, and their old one is forgotten.
         let mut moved: Vec<(String, RowData, CommitTs)> = Vec::new();
         for f in &facts {
-            let (key, d) = moved_fact(&f.data, f.key(), from, &into);
+            let (key, d) = moved_fact(&f.data, f.key(), from, &into, namespace);
             if key != f.key() {
                 effects.push(Effect::Forget { memory, lineage_id: RecordId(f.key().to_string()) });
             }
@@ -3477,7 +3483,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         // The survivor takes the duplicate's key (and aliases) as aliases, and the
         // fields it doesn't have.
         let mut aliases = aliases_of(&survivor.data.value);
-        for a in std::iter::once(from.to_string()).chain(aliases_of(&dup.data.value)) {
+        // (Bare keys, as the caller wrote them; the namespace is the entity's.)
+        for a in std::iter::once(from_key.to_string()).chain(aliases_of(&dup.data.value)) {
             if !aliases.contains(&a) {
                 aliases.push(a);
             }
@@ -3531,7 +3538,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                 *to = into.clone();
             }
             for alias in &aliases {
-                a.insert(alias.clone(), into.clone());
+                a.insert(adb_store::namespaced(namespace, alias), into.clone());
             }
         }
         let gone = effects.iter().filter_map(|e| match e {
@@ -3824,7 +3831,8 @@ pub(crate) async fn load_aliases(store: &PartitionStore) -> AdbResult<std::colle
         .await
         .map_err(|e| AdbError::Internal(format!("store: {e}")))?
         .iter()
-        .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
+        // By record id: the alias in its entity's namespace.
+        .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (adb_store::namespaced(adb_store::namespace_of(r.key()), &a), r.key().to_string())))
         .collect())
 }
 
@@ -3832,19 +3840,27 @@ fn aliases_of(value: &serde_json::Value) -> Vec<String> {
     value.get("aliases").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
-/// `d`, a fact about entity `from` as the table holds it, as a fact about `into`:
-/// bare ends with `from` replaced, its payload and default `content` to match.
-/// Returns its key (one per (subject, predicate) unless the old key had the object).
-fn moved_fact(d: &RowData, key: &str, from: &str, into: &str) -> (String, RowData) {
+/// `d`, a fact about entity `from` as the table holds it, as a fact about `into`
+/// (both record ids, in `namespace`): its ends with `from` replaced, its payload and
+/// default `content` to match (bare keys, as a FACT writes them). Returns its record
+/// id (one per (subject, predicate) unless the old key had the object).
+fn moved_fact(d: &RowData, key: &str, from: &str, into: &str, namespace: Option<&str>) -> (String, RowData) {
     let mut d = d.clone();
-    let bare = |id: &Option<String>| id.as_deref().map(|i| adb_store::key_of(i).to_string());
+    // The ends' record ids (the table's, without the memory type).
+    let ids = |id: &Option<String>| id.as_deref().map(|i| adb_store::key_of(i).to_string());
     let swap = |id: Option<String>| id.map(|i| if i == from { into.to_string() } else { i });
-    let (old_s, old_o) = (bare(&d.subject_id).unwrap_or_default(), bare(&d.object_id));
-    let (subject, object) = (swap(Some(old_s.clone())).unwrap_or_default(), swap(old_o.clone()));
+    let (old_s_id, old_o_id) = (ids(&d.subject_id).unwrap_or_default(), ids(&d.object_id));
+    let (subject_id, object_id) = (swap(Some(old_s_id.clone())).unwrap_or_default(), swap(old_o_id.clone()));
+    // Their bare keys, as the payload and the fact's key carry them.
+    let bare = |i: &str| adb_store::unscoped(i).to_string();
+    let (old_s, old_o) = (bare(&old_s_id), old_o_id.as_deref().map(bare));
+    let (subject, object) = (bare(&subject_id), object_id.as_deref().map(bare));
     let predicate = d.predicate.clone().unwrap_or_default();
     let shown = |o: &Option<String>| o.clone().unwrap_or_else(|| d.value.get("value").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).unwrap_or_default());
-    let multi = key != fact_key(&old_s, &predicate, None);
-    let new_key = fact_key(&subject, &predicate, multi.then(|| shown(&object)).as_deref());
+    let in_ns = |k: &str| adb_store::space_id(namespace, adb_store::DEFAULT_SCOPE, k);
+    let multi = key != in_ns(&fact_key(&old_s, &predicate, None));
+    let bare_key = fact_key(&subject, &predicate, multi.then(|| shown(&object)).as_deref());
+    let new_key = in_ns(&bare_key);
     let old_content = format!("{old_s} {predicate} {}", shown(&old_o));
     let new_content = format!("{subject} {predicate} {}", shown(&object));
     if let Some(v) = d.value.as_object_mut() {
@@ -3852,7 +3868,7 @@ fn moved_fact(d: &RowData, key: &str, from: &str, into: &str) -> (String, RowDat
         if let Some(o) = &object {
             v.insert("object".into(), serde_json::json!(o));
         }
-        v.insert("key".into(), serde_json::json!(new_key));
+        v.insert("key".into(), serde_json::json!(bare_key));
         if v.get("content").and_then(|c| c.as_str()) == Some(old_content.as_str()) {
             v.insert("content".into(), serde_json::json!(new_content));
             d.text = Some(new_content);
@@ -3860,8 +3876,8 @@ fn moved_fact(d: &RowData, key: &str, from: &str, into: &str) -> (String, RowDat
             d.embedding = None;
         }
     }
-    d.subject_id = Some(subject);
-    d.object_id = object;
+    d.subject_id = Some(subject_id);
+    d.object_id = object_id;
     (new_key, d)
 }
 
