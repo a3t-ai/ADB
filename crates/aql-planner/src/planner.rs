@@ -1,6 +1,9 @@
-//! AQL Query Planner
+//! AQL v0.13 query planner: parsed statements into executable plans.
 //!
-//! Converts parsed AST statements into executable plans.
+//! RECALL is the only read verb; the plan picks the access path from what is asked
+//! (`spec/AQL_SPEC_v0.13.md` §1): FROM WORKING is the session's state (scan), FROM
+//! TOOLS ranks tools (load), `WHERE key = v` alone is an exact lookup, `LIKE "text"`
+//! on PROCEDURAL matches procedures, anything else a filtered or similarity read.
 
 use adb_core::{
     Condition as CoreCondition, LogicalOp as CoreLogicalOp, MemoryType as CoreMemoryType,
@@ -9,15 +12,14 @@ use adb_core::{
     AggregateFunc as CoreAggregateFunc, AggregateFuncType as CoreAggregateFuncType,
 };
 use aql_parser::ast::{
-    AggregateFunc, AggregateFuncType, Condition, FieldAssignment, ForgetStmt, LinkStmt, LoadStmt,
-    LogicalOp, LookupStmt, MemoryType, Modifiers, Operator, PipelineStmt, Predicate, RecallStmt,
-    ReflectSource, ReflectStmt, ScanStmt, Scope, Statement, StoreStmt, UpdateStmt, Value, Window,
+    AggregateFunc, AggregateFuncType, Condition, FieldAssignment, ForgetStmt, LinkStmt, LogicalOp, MemoryType, Modifiers,
+    Operator, PipelineStmt, Predicate, RecallStmt, Statement, StoreStmt, SubscribeTarget, UnlinkStmt, UpdateStmt, Value,
+    Window,
 };
 
 use crate::error::{PlanError, PlanResult};
 use crate::plan::{
-    ExecutionPlan, FanOutPlan, LinkData, LinkOptions, Operation, PipelinePlan, PipelineStage,
-    ReflectPlan, ReflectSourcePlan, StepPlan, StoreData,
+    ExecutionPlan, FanOutPlan, LinkData, NamespacePlan, Operation, PipelinePlan, PipelineStage, StepPlan, StoreData,
     SubscriptionPlan, SubscriptionTarget,
 };
 
@@ -32,358 +34,165 @@ pub struct Planner {
 impl Planner {
     /// Create a new planner with defaults
     pub fn new() -> Self {
-        Self {
-            default_scope: CoreScope::Private,
-            default_namespace: None,
-        }
+        Self { default_scope: CoreScope::Private, default_namespace: None }
     }
 
     /// Create a planner with custom defaults
     pub fn with_defaults(scope: CoreScope, namespace: Option<String>) -> Self {
-        Self {
-            default_scope: scope,
-            default_namespace: namespace,
-        }
+        Self { default_scope: scope, default_namespace: namespace }
     }
 
     /// Plan a statement
     pub fn plan(&self, stmt: &Statement) -> PlanResult<ExecutionPlan> {
         match stmt {
+            // A script's USE is applied by aql_parser::parse_script; alone it plans nothing.
+            Statement::Use(_) => Err(PlanError::NotImplemented("USE outside a script or session (the engine applies it)")),
             Statement::Pipeline(p) => self.plan_pipeline(p),
-            Statement::Reflect(r) => self.plan_reflect(r),
-            Statement::Scan(s) => Ok(ExecutionPlan::Single(self.plan_scan(s)?)),
             Statement::Recall(r) => self.plan_recall(r),
-            Statement::Lookup(l) => Ok(ExecutionPlan::Single(self.plan_lookup(l)?)),
-            Statement::Load(l) => Ok(ExecutionPlan::Single(self.plan_load(l)?)),
             Statement::Store(s) => Ok(ExecutionPlan::Single(self.plan_store(s)?)),
             Statement::Update(u) => Ok(ExecutionPlan::Single(self.plan_update(u)?)),
             Statement::Forget(f) => self.plan_forget(f),
-            Statement::Link(l) => {
-                let mut step = self.plan_link(l)?;
-                step.modifiers.namespace = l.namespace.clone();
-                Ok(ExecutionPlan::Single(step))
-            }
-            // AQL v0.7 — change or remove existing links
-            Statement::UpdateLink(u) => {
-                let mut d = self.link_ends(u.from_type, &u.from_conditions, u.to_type, &u.to_conditions, "UPDATE LINK")?;
-                d.type_filter = u.link_type.clone();
-                d.set_weight = u.weight;
-                d.set_type = u.new_type.clone();
-                let mut step = StepPlan::link_edit(d, false);
-                step.modifiers.namespace = u.namespace.clone();
-                Ok(ExecutionPlan::Single(step))
-            }
-            Statement::Unlink(u) => {
-                let mut d = self.link_ends(u.from_type, &u.from_conditions, u.to_type, &u.to_conditions, "UNLINK")?;
-                d.type_filter = u.link_type.clone();
-                let mut step = StepPlan::link_edit(d, true);
-                step.modifiers.namespace = u.namespace.clone();
-                Ok(ExecutionPlan::Single(step))
-            }
-            // AQL v0.10 — entity resolution (GR-12)
-            Statement::Merge(m) => {
-                // v0.13: both entities in the statement's NAMESPACE.
-                let mut step = StepPlan::merge(&m.from, &m.into);
-                step.modifiers.namespace = m.namespace.clone();
-                Ok(ExecutionPlan::Single(step))
-            }
-            // AQL v0.6 — subscriptions and continuous queries (ARCHITECTURE §11.7)
-            Statement::Subscribe(s) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
-                target: match (&s.target, &s.namespace) {
-                    (aql_parser::ast::SubscribeTarget::Scope(_), Some(_)) => {
-                        return Err(PlanError::NotImplemented("SUBSCRIBE SCOPE … NAMESPACE (a namespace's topics are subscribed with SUBSCRIBE TOPIC … NAMESPACE)"))
-                    }
-                    (aql_parser::ast::SubscribeTarget::Scope(v), None) => SubscriptionTarget::Scope(v.clone()),
-                    (aql_parser::ast::SubscribeTarget::Topic(v), ns) => SubscriptionTarget::Topic(crate::plan::namespaced_topic(ns.as_deref(), v)),
-                },
-                kinds: s.kinds.iter().map(|k| k.to_lowercase()).collect(),
-                filter: s.filter.as_ref().map(|c| c.iter().map(convert_condition).collect::<PlanResult<Vec<_>>>()).transpose()?,
-                from: match s.start {
-                    aql_parser::ast::StartPosition::Now => None,
-                    aql_parser::ast::StartPosition::Offset(n) => Some(n),
-                },
+            Statement::Link(l) => Ok(ExecutionPlan::Single(self.plan_link(l)?)),
+            Statement::Unlink(u) => Ok(ExecutionPlan::Single(self.plan_unlink(u)?)),
+            Statement::Branch(n) => Ok(ExecutionPlan::Namespace(NamespacePlan::Branch {
+                from: n.from.clone(),
+                into: n.into.clone(),
+                as_of: n.as_of.as_ref().map(convert_time_point),
             })),
+            Statement::Fork(n) => Ok(ExecutionPlan::Namespace(NamespacePlan::Fork {
+                from: n.from.clone(),
+                into: n.into.clone(),
+                as_of: n.as_of.as_ref().map(convert_time_point),
+            })),
+            Statement::Merge(m) => Ok(ExecutionPlan::Namespace(NamespacePlan::Merge {
+                from: m.from.clone(),
+                into: m.into.clone(),
+                prefer: m.prefer.map(|p| matches!(p, aql_parser::ast::Prefer::Source)),
+            })),
+            Statement::Subscribe(s) => match &s.target {
+                SubscribeTarget::Topic(t) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Subscribe {
+                    target: SubscriptionTarget::Topic(crate::plan::namespaced_topic(s.namespace.as_deref(), t)),
+                    kinds: Vec::new(),
+                    filter: s.filter.as_ref().map(|c| convert_conditions(c)).transpose()?,
+                    from: None,
+                })),
+                // A live query is registered by the engine (its continuous queries).
+                SubscribeTarget::Query(_) => Err(PlanError::NotImplemented("SUBSCRIBE RECALL (the engine registers live queries)")),
+            },
             Statement::Unsubscribe(u) => {
                 Ok(ExecutionPlan::Subscription(SubscriptionPlan::Unsubscribe { subscription: u.subscription.clone(), namespace: u.namespace.clone() }))
             }
-            Statement::Ack(a) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Ack {
-                subscription: a.subscription.clone(),
-                offset: a.offset,
-                namespace: a.namespace.clone(),
-            })),
             Statement::Publish(p) => Ok(ExecutionPlan::Subscription(SubscriptionPlan::Publish {
                 topic: crate::plan::namespaced_topic(p.modifiers.namespace.as_deref(), &p.topic),
                 payload: assignments_to_json(&p.payload),
                 ttl: p.modifiers.ttl,
             })),
-            Statement::Watch(_) | Statement::Unwatch(_) => {
-                Err(PlanError::NotImplemented("Continuous queries (WATCH / UNWATCH)"))
-            }
         }
     }
 
-    /// Plan a pipeline
+    /// Plan a pipeline: RECALL stages, a write last.
     fn plan_pipeline(&self, stmt: &PipelineStmt) -> PlanResult<ExecutionPlan> {
         if stmt.stages.is_empty() {
             return Err(PlanError::EmptyPipeline);
         }
-
         let mut stages = Vec::new();
         for stage in &stmt.stages {
             match self.plan(stage)? {
                 ExecutionPlan::Single(step) => stages.push(PipelineStage::Step(step)),
                 ExecutionPlan::Pipeline(p) => stages.extend(p.stages),
-                ExecutionPlan::Reflect(r) => {
-                    // Support REFLECT as a pipeline stage
-                    stages.push(PipelineStage::Reflect(r));
-                }
-                ExecutionPlan::Subscription(_) => {
-                    return Err(PlanError::UnsupportedOperation {
-                        op: "SUBSCRIBE / UNSUBSCRIBE / ACK / PUBLISH in PIPELINE".to_string(),
-                        memory_type: "-".to_string(),
-                    });
-                }
                 ExecutionPlan::FanOut(_) => {
-                    // FanOut in pipeline requires special handling
-                    return Err(PlanError::UnsupportedOperation {
-                        op: "FROM ALL in PIPELINE".to_string(),
-                        memory_type: "ALL".to_string(),
-                    });
+                    return Err(PlanError::UnsupportedOperation { op: "RECALL FROM ALL in PIPELINE".to_string(), memory_type: "ALL".to_string() })
                 }
+                _ => return Err(PlanError::UnsupportedOperation { op: "this statement in PIPELINE".to_string(), memory_type: "-".to_string() }),
             }
         }
-
-        Ok(ExecutionPlan::Pipeline(PipelinePlan {
-            name: stmt.name.clone(),
-            timeout: stmt.timeout,
-            stages,
-        }))
+        Ok(ExecutionPlan::Pipeline(PipelinePlan { name: stmt.name.clone(), timeout: stmt.timeout, stages }))
     }
 
-    /// Plan a reflect statement
-    fn plan_reflect(&self, stmt: &ReflectStmt) -> PlanResult<ExecutionPlan> {
-        let mut sources = Vec::new();
-
-        for source in &stmt.sources {
-            // Handle FROM ALL by expanding to all memory types
-            if source.memory_type == MemoryType::All {
-                let predicate = source
-                    .predicate
-                    .as_ref()
-                    .map(|p| convert_predicate(p))
-                    .transpose()?
-                    .unwrap_or(CorePredicate::All);
-
-                for mem_type in CoreMemoryType::all() {
-                    sources.push(ReflectSourcePlan {
-                        memory_type: *mem_type,
-                        predicate: predicate.clone(),
-                        modifiers: CoreModifiers::default(),
-                    });
-                }
-            } else {
-                sources.push(self.plan_reflect_source(source)?);
-            }
-        }
-
-        let link_options = if stmt.with_links.is_some() || stmt.follow_links.is_some() {
-            Some(LinkOptions {
-                with_links: stmt.with_links.is_some(),
-                // FOLLOW's selection when there is one, else WITH's.
-                select: match (&stmt.follow_links, &stmt.with_links) {
-                    (Some(f), _) => convert_follow_links(f).select,
-                    (None, Some(w)) => convert_with_links(w),
-                    (None, None) => adb_core::LinkSelect::default(),
-                },
-                follow: stmt.follow_links.is_some(),
-                depth: stmt.follow_links.as_ref().and_then(|f| f.depth).unwrap_or(1),
-            })
-        } else {
-            None
-        };
-
-        let then_step = match &stmt.then_clause {
-            Some(then_stmt) => match self.plan(then_stmt)? {
-                ExecutionPlan::Single(step) => Some(Box::new(step)),
-                _ => None,
-            },
-            None => None,
-        };
-
-        Ok(ExecutionPlan::Reflect(ReflectPlan {
-            sources,
-            link_options,
-            then_step,
-        }))
-    }
-
-    fn plan_reflect_source(&self, source: &ReflectSource) -> PlanResult<ReflectSourcePlan> {
-        Ok(ReflectSourcePlan {
-            memory_type: convert_memory_type(source.memory_type)?,
-            predicate: source
-                .predicate
-                .as_ref()
-                .map(|p| convert_predicate(p))
-                .transpose()?
-                .unwrap_or(CorePredicate::All),
-            modifiers: CoreModifiers::default(),
-        })
-    }
-
-    /// Plan a scan statement
-    fn plan_scan(&self, stmt: &ScanStmt) -> PlanResult<StepPlan> {
-        let mut modifiers = convert_modifiers(&stmt.modifiers)?;
-        modifiers.window = stmt.window.as_ref().map(convert_window).transpose()?;
-
-        Ok(StepPlan::scan(modifiers))
-    }
-
-    /// Plan a recall statement
+    /// RECALL: the access path from what is asked.
     fn plan_recall(&self, stmt: &RecallStmt) -> PlanResult<ExecutionPlan> {
-        // Handle FROM ALL with fan-out
+        if !stmt.modifiers.namespaces.is_empty() {
+            return Err(PlanError::NotImplemented("NAMESPACE (…) — a read across namespaces runs on the server's router"));
+        }
+        if stmt.modifiers.with_history.as_ref().is_some_and(|h| h.between.is_some()) {
+            return Err(PlanError::NotImplemented("WITH HISTORY BETWEEN"));
+        }
+        let modifiers = convert_modifiers(&stmt.modifiers)?;
+        let predicate = convert_predicate(&stmt.predicate, stmt.memory_type, stmt.modifiers.confidence)?;
         if stmt.memory_type == MemoryType::All {
-            let predicate = convert_predicate(&stmt.predicate)?;
-            let modifiers = convert_modifiers(&stmt.modifiers)?;
-            return Ok(ExecutionPlan::FanOut(FanOutPlan {
-                operation: Operation::Recall,
-                predicate,
-                modifiers,
-                data: None,
-            }));
+            return Ok(ExecutionPlan::FanOut(FanOutPlan { operation: Operation::Recall, predicate, modifiers, data: None }));
         }
-
-        let memory_type = convert_memory_type(stmt.memory_type)?;
-        let predicate = convert_predicate(&stmt.predicate)?;
-        let modifiers = convert_modifiers(&stmt.modifiers)?;
-
-        Ok(ExecutionPlan::Single(StepPlan::recall(memory_type, predicate, modifiers)))
-    }
-
-    /// Plan a lookup statement
-    /// LOOKUP is only valid on PROCEDURAL, TOOLS, and SEMANTIC (§5 of spec)
-    fn plan_lookup(&self, stmt: &LookupStmt) -> PlanResult<StepPlan> {
-        // Validate memory type - LOOKUP not allowed on WORKING or EPISODIC
-        match stmt.memory_type {
-            MemoryType::Working => {
-                return Err(PlanError::InvalidMemoryType(
-                    "LOOKUP is not valid on WORKING memory. Use SCAN or RECALL instead.".to_string()
-                ));
-            }
-            MemoryType::Episodic => {
-                return Err(PlanError::InvalidMemoryType(
-                    "LOOKUP is not valid on EPISODIC memory. Use RECALL instead.".to_string()
-                ));
-            }
-            _ => {}
+        let memory = convert_memory_type(stmt.memory_type)?;
+        let history = modifiers.as_of.is_some() || modifiers.with_history;
+        let key = match &predicate {
+            CorePredicate::Where { conditions } if modifiers.aggregate.is_none() => exact_key(conditions),
+            _ => None,
+        };
+        if let Some((field, value)) = key.filter(|_| !(stmt.memory_type == MemoryType::Tools && !history)) {
+            return Ok(ExecutionPlan::Single(StepPlan::lookup(memory, CorePredicate::Key { field, value }, modifiers)));
         }
-
-        let memory_type = convert_memory_type(stmt.memory_type)?;
-        let predicate = convert_predicate(&stmt.predicate)?;
-        let modifiers = convert_modifiers(&stmt.modifiers)?;
-
-        Ok(StepPlan::lookup(memory_type, predicate, modifiers))
+        Ok(ExecutionPlan::Single(match (stmt.memory_type, &predicate) {
+            // The session's state, newest first, over an optional window.
+            (MemoryType::Working, CorePredicate::All) if !history => StepPlan::scan(modifiers),
+            // Tools ranked for the task.
+            (MemoryType::Tools, CorePredicate::Where { .. } | CorePredicate::All) if !history && modifiers.aggregate.is_none() => {
+                StepPlan::load(predicate, modifiers)
+            }
+            (_, CorePredicate::Pattern { .. }) => StepPlan::lookup(memory, predicate, modifiers),
+            _ => StepPlan::recall(memory, predicate, modifiers),
+        }))
     }
 
-    /// Plan a load statement
-    fn plan_load(&self, stmt: &LoadStmt) -> PlanResult<StepPlan> {
-        let predicate = convert_predicate(&stmt.predicate)?;
-        let modifiers = convert_modifiers(&stmt.modifiers)?;
-
-        Ok(StepPlan::load(predicate, modifiers))
-    }
-
-    /// Plan a store statement
     fn plan_store(&self, stmt: &StoreStmt) -> PlanResult<StepPlan> {
         let memory_type = convert_memory_type(stmt.memory_type)?;
         let modifiers = convert_modifiers(&stmt.modifiers)?;
-
-        // Extract key from payload
         let key = stmt
             .payload
             .iter()
             .find(|f| f.field == "key" || f.field == "id")
             .map(|f| value_to_string(&f.value))
             .unwrap_or_else(|| ulid::Ulid::new().to_string()); // D3 S1
-
-        // Convert payload to JSON
-        let payload = assignments_to_json(&stmt.payload);
-
         let store_data = StoreData {
             key,
-            payload,
+            payload: assignments_to_json(&stmt.payload),
             scope: modifiers.scope.unwrap_or(self.default_scope),
             namespace: modifiers.namespace.clone().or_else(|| self.default_namespace.clone()),
             in_scope: modifiers.in_scope.clone(),
             ttl: modifiers.ttl,
-            fact: stmt.fact.map(|f| crate::plan::FactPlan { multi: f.multi }),
+            fact: None,
         };
-
         Ok(StepPlan::store(memory_type, store_data, modifiers))
     }
 
-    /// Plan an update statement
     fn plan_update(&self, stmt: &UpdateStmt) -> PlanResult<StepPlan> {
         let memory_type = convert_memory_type(stmt.memory_type)?;
-        let predicate = CorePredicate::Where {
-            conditions: stmt
-                .conditions
-                .iter()
-                .map(convert_condition)
-                .collect::<PlanResult<Vec<_>>>()?,
-        };
+        let predicate = CorePredicate::Where { conditions: convert_conditions(&stmt.conditions)? };
         let modifiers = convert_modifiers(&stmt.modifiers)?;
-        let payload = assignments_to_json(&stmt.payload);
-
-        Ok(StepPlan::update(memory_type, predicate, payload, modifiers))
+        Ok(StepPlan::update(memory_type, predicate, assignments_to_json(&stmt.payload), modifiers))
     }
 
-    /// Plan a forget statement
     fn plan_forget(&self, stmt: &ForgetStmt) -> PlanResult<ExecutionPlan> {
-        let predicate = CorePredicate::Where {
-            conditions: stmt
-                .conditions
-                .iter()
-                .map(convert_condition)
-                .collect::<PlanResult<Vec<_>>>()?,
+        let predicate = match stmt.conditions.is_empty() {
+            true => CorePredicate::All,
+            false => CorePredicate::Where { conditions: convert_conditions(&stmt.conditions)? },
         };
         let modifiers = convert_modifiers(&stmt.modifiers)?;
-
-        // Handle FROM ALL with fan-out
         if stmt.memory_type == MemoryType::All {
-            return Ok(ExecutionPlan::FanOut(FanOutPlan {
-                operation: Operation::Forget,
-                predicate,
-                modifiers,
-                data: None,
-            }));
+            return Ok(ExecutionPlan::FanOut(FanOutPlan { operation: Operation::Forget, predicate, modifiers, data: None }));
         }
-
         let memory_type = convert_memory_type(stmt.memory_type)?;
         Ok(ExecutionPlan::Single(StepPlan::forget(memory_type, predicate, modifiers)))
     }
 
-    /// Plan a link statement
-    /// The ends UPDATE LINK and UNLINK address, as `LinkData` (no type or weight yet).
-    fn link_ends(
-        &self,
-        from: aql_parser::ast::MemoryType,
-        from_conditions: &[aql_parser::ast::Condition],
-        to: aql_parser::ast::MemoryType,
-        to_conditions: &[aql_parser::ast::Condition],
-        verb: &str,
-    ) -> PlanResult<LinkData> {
-        let from_type = convert_memory_type(from)
-            .map_err(|_| PlanError::InvalidMemoryType(format!("ALL cannot be used as {verb} source memory type")))?;
-        let to_type = convert_memory_type(to)
-            .map_err(|_| PlanError::InvalidMemoryType(format!("ALL cannot be used as {verb} target memory type")))?;
-        let conditions = |c: &[aql_parser::ast::Condition]| -> PlanResult<CorePredicate> {
-            Ok(CorePredicate::Where { conditions: c.iter().map(convert_condition).collect::<PlanResult<Vec<_>>>()? })
-        };
+    /// The two ends of a LINK / UNLINK.
+    fn link_ends(&self, from: MemoryType, from_conditions: &[Condition], to: MemoryType, to_conditions: &[Condition], verb: &str) -> PlanResult<LinkData> {
+        let from_type = convert_memory_type(from).map_err(|_| PlanError::InvalidMemoryType(format!("ALL cannot be used as {verb} source memory type")))?;
+        let to_type = convert_memory_type(to).map_err(|_| PlanError::InvalidMemoryType(format!("ALL cannot be used as {verb} target memory type")))?;
         Ok(LinkData {
             from_type,
-            from_predicate: conditions(from_conditions)?,
+            from_predicate: CorePredicate::Where { conditions: convert_conditions(from_conditions)? },
             to_type,
-            to_predicate: conditions(to_conditions)?,
+            to_predicate: CorePredicate::Where { conditions: convert_conditions(to_conditions)? },
             link_type: String::new(),
             weight: 1.0,
             type_filter: None,
@@ -392,44 +201,34 @@ impl Planner {
         })
     }
 
+    /// LINK: create, or set the weight of the link that exists (a repeated LINK
+    /// without WEIGHT keeps the weight).
     fn plan_link(&self, stmt: &LinkStmt) -> PlanResult<StepPlan> {
-        let from_type = convert_memory_type(stmt.from_type).map_err(|_| {
-            PlanError::InvalidMemoryType("ALL cannot be used as LINK source memory type".to_string())
-        })?;
-        let to_type = convert_memory_type(stmt.to_type).map_err(|_| {
-            PlanError::InvalidMemoryType("ALL cannot be used as LINK target memory type".to_string())
-        })?;
+        let mut d = self.link_ends(stmt.from_type, &stmt.from_conditions, stmt.to_type, &stmt.to_conditions, "LINK")?;
+        d.link_type = stmt.link_type.clone();
+        d.weight = stmt.weight.map(|w| w as f32).unwrap_or(1.0);
+        d.set_weight = stmt.weight.map(|w| w as f32);
+        let mut step = StepPlan::link(d);
+        step.modifiers.namespace = stmt.namespace.clone();
+        Ok(step)
+    }
 
-        let from_predicate = CorePredicate::Where {
-            conditions: stmt
-                .from_conditions
-                .iter()
-                .map(convert_condition)
-                .collect::<PlanResult<Vec<_>>>()?,
-        };
+    fn plan_unlink(&self, stmt: &UnlinkStmt) -> PlanResult<StepPlan> {
+        let mut d = self.link_ends(stmt.from_type, &stmt.from_conditions, stmt.to_type, &stmt.to_conditions, "UNLINK")?;
+        d.type_filter = stmt.link_type.clone();
+        let mut step = StepPlan::link_edit(d, true);
+        step.modifiers.namespace = stmt.namespace.clone();
+        Ok(step)
+    }
+}
 
-        let to_predicate = CorePredicate::Where {
-            conditions: stmt
-                .to_conditions
-                .iter()
-                .map(convert_condition)
-                .collect::<PlanResult<Vec<_>>>()?,
-        };
-
-        let link_data = LinkData {
-            from_type,
-            from_predicate,
-            to_type,
-            to_predicate,
-            link_type: stmt.link_type.clone(),
-            weight: stmt.weight.unwrap_or(1.0),
-            type_filter: None,
-            // As written: a repeated LINK without WEIGHT keeps the link's weight.
-            set_weight: stmt.weight,
-            set_type: None,
-        };
-
-        Ok(StepPlan::link(link_data))
+/// `key = v` or `id = v` as the only condition: the field and value of an exact lookup.
+fn exact_key(conditions: &[CoreCondition]) -> Option<(String, CoreValue)> {
+    match conditions {
+        [CoreCondition::Simple { field, operator: CoreOperator::Eq, value, .. }] if matches!(field.as_str(), "key" | "id") => {
+            Some((field.clone(), value.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -456,32 +255,37 @@ fn convert_memory_type(mt: MemoryType) -> PlanResult<CoreMemoryType> {
     }
 }
 
-fn convert_predicate(pred: &Predicate) -> PlanResult<CorePredicate> {
+/// A RECALL's predicate. `LIKE "text"` on PROCEDURAL is the token-overlap match
+/// (what PATTERN was), its CONFIDENCE the threshold; any other LIKE is similarity.
+fn convert_predicate(pred: &Predicate, memory: MemoryType, confidence: Option<f32>) -> PlanResult<CorePredicate> {
     match pred {
-        Predicate::Where { conditions } => Ok(CorePredicate::Where {
-            conditions: conditions
-                .iter()
-                .map(convert_condition)
-                .collect::<PlanResult<Vec<_>>>()?,
-        }),
-        Predicate::Key { field, value } => Ok(CorePredicate::Key {
-            field: field.clone(),
-            value: convert_value(value)?,
-        }),
-        Predicate::Like { variable } => Ok(CorePredicate::Like {
-            embedding_var: variable.clone(),
-        }),
-        Predicate::Pattern { variable, threshold, text } => Ok(CorePredicate::Pattern {
-            pattern_var: variable.clone(),
-            threshold: *threshold,
-            text: text.clone(),
-        }),
+        Predicate::Where { conditions } => Ok(CorePredicate::Where { conditions: convert_conditions(conditions)? }),
+        Predicate::Like { variable, text: Some(text) } if memory == MemoryType::Procedural => {
+            Ok(CorePredicate::Pattern { pattern_var: variable.clone(), threshold: confidence, text: Some(text.clone()) })
+        }
+        Predicate::Like { variable, .. } => Ok(CorePredicate::Like { embedding_var: variable.clone() }),
         Predicate::All => Ok(CorePredicate::All),
     }
 }
 
+/// `field BETWEEN a AND b` is `(field >= a AND field <= b)`.
+fn convert_conditions(conds: &[Condition]) -> PlanResult<Vec<CoreCondition>> {
+    conds.iter().map(convert_condition).collect()
+}
+
 fn convert_condition(cond: &Condition) -> PlanResult<CoreCondition> {
     match cond {
+        Condition::Simple { field, operator: Operator::Between, value, logical_op } => {
+            let Value::Array(ends) = value else { return Err(PlanError::MissingField("BETWEEN's two ends".into())) };
+            let [low, high] = ends.as_slice() else { return Err(PlanError::MissingField("BETWEEN's two ends".into())) };
+            let side = |op: CoreOperator, v: &Value, join: Option<CoreLogicalOp>| -> PlanResult<CoreCondition> {
+                Ok(CoreCondition::Simple { field: field.clone(), operator: op, value: convert_value(v)?, logical_op: join })
+            };
+            Ok(CoreCondition::Group {
+                conditions: vec![side(CoreOperator::Gte, low, None)?, side(CoreOperator::Lte, high, Some(CoreLogicalOp::And))?],
+                logical_op: logical_op.map(convert_logical_op),
+            })
+        }
         Condition::Simple { field, operator, value, logical_op } => {
             Ok(CoreCondition::Simple {
                 field: field.clone(),
@@ -519,6 +323,8 @@ fn convert_operator(op: Operator) -> CoreOperator {
         Operator::StartsWith => CoreOperator::StartsWith,
         Operator::EndsWith => CoreOperator::EndsWith,
         Operator::In => CoreOperator::In,
+        // Planned as two comparisons (convert_condition).
+        Operator::Between => CoreOperator::Gte,
     }
 }
 
@@ -541,87 +347,32 @@ fn convert_value(val: &Value) -> PlanResult<CoreValue> {
 fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
     Ok(CoreModifiers {
         limit: mods.limit,
-        order_by: mods.order_by.as_ref().map(|o| CoreOrderBy {
-            field: o.field.clone(),
-            ascending: o.ascending,
-        }),
+        order_by: mods.order_by.as_ref().map(|o| CoreOrderBy { field: o.field.clone(), ascending: o.ascending }),
         return_fields: mods.return_fields.clone(),
-        timeout: mods.timeout,
-        min_confidence: mods.min_confidence,
-        scope: mods.scope.map(convert_scope),
+        timeout: None,
+        min_confidence: mods.confidence,
+        scope: None,
         namespace: mods.namespace.clone(),
-        branch: mods.branch.clone(),
+        branch: None,
         in_scope: mods.in_scope.clone(),
         like_query: None,
         ttl: mods.ttl,
-        aggregate: mods.aggregate.as_ref().map(|aggs| {
-            aggs.iter().map(convert_aggregate).collect()
-        }),
+        aggregate: mods.aggregate.as_ref().map(|aggs| aggs.iter().map(convert_aggregate).collect()),
         group_by: mods.group_by.clone(),
-        having: mods.having.as_ref().map(|conds| {
-            conds.iter().filter_map(|c| convert_condition(c).ok()).collect()
-        }),
-        window: mods.window.as_ref().and_then(|w| convert_window(w).ok()),
-        with_links: mods.with_links.as_ref().map(convert_with_links),
-        follow_links: mods.follow_links.as_ref().map(convert_follow_links),
+        having: mods.having.as_ref().map(|c| convert_conditions(c)).transpose()?,
+        window: mods.window.as_ref().map(convert_window),
+        with_links: mods.with_links.as_ref().map(link_select),
+        follow_links: mods.follow_links.as_ref().map(|f| adb_core::FollowLinks { select: link_select(&f.select), depth: f.depth }),
         as_of: mods.as_of.as_ref().map(convert_time_point),
-        valid_at: mods.valid_at.as_ref().map(convert_time_point),
-        with_history: mods.with_history,
+        valid_at: None,
+        with_history: mods.with_history.is_some(),
     })
 }
 
-fn convert_time_point(t: &aql_parser::ast::TimePoint) -> adb_core::TimePoint {
-    use aql_parser::ast::TimePoint as T;
-    match t {
-        T::At { time } => adb_core::TimePoint::At { time: time.clone() },
-        T::Variable { name } => adb_core::TimePoint::Variable { name: name.clone() },
-        T::Ago { duration } => adb_core::TimePoint::Ago { duration: *duration },
-    }
-}
 
-fn link_select(
-    link_types: Vec<String>,
-    direction: aql_parser::ast::LinkDirection,
-    min_weight: Option<f64>,
-) -> adb_core::LinkSelect {
-    adb_core::LinkSelect {
-        types: link_types,
-        direction: match direction {
-            aql_parser::ast::LinkDirection::Outbound => adb_core::LinkDirection::Outbound,
-            aql_parser::ast::LinkDirection::Inbound => adb_core::LinkDirection::Inbound,
-            aql_parser::ast::LinkDirection::Both => adb_core::LinkDirection::Both,
-        },
-        min_weight: min_weight.map(|w| w as f32),
-    }
-}
 
-fn convert_with_links(wl: &aql_parser::ast::WithLinks) -> adb_core::WithLinks {
-    use aql_parser::ast::WithLinks as W;
-    match wl {
-        W::All { direction, min_weight } => link_select(Vec::new(), *direction, *min_weight),
-        W::Type { link_type, direction, min_weight } => link_select(vec![link_type.clone()], *direction, *min_weight),
-        W::Types { link_types, direction, min_weight } => link_select(link_types.clone(), *direction, *min_weight),
-    }
-}
 
-fn convert_follow_links(fl: &aql_parser::ast::FollowLinks) -> adb_core::FollowLinks {
-    let types = match &fl.link_type {
-        Some(t) => vec![t.clone()],
-        None => fl.link_types.clone(),
-    };
-    adb_core::FollowLinks {
-        select: link_select(types, fl.direction, fl.min_weight),
-        depth: fl.depth,
-    }
-}
 
-fn convert_scope(scope: Scope) -> CoreScope {
-    match scope {
-        Scope::Private => CoreScope::Private,
-        Scope::Shared => CoreScope::Shared,
-        Scope::Cluster => CoreScope::Cluster,
-    }
-}
 
 fn convert_aggregate(agg: &AggregateFunc) -> CoreAggregateFunc {
     CoreAggregateFunc {
@@ -641,17 +392,24 @@ fn convert_aggregate_type(func: AggregateFuncType) -> CoreAggregateFuncType {
     }
 }
 
-fn convert_window(window: &Window) -> PlanResult<CoreWindow> {
+
+fn convert_time_point(t: &aql_parser::ast::TimePoint) -> adb_core::TimePoint {
+    use aql_parser::ast::TimePoint as T;
+    match t {
+        T::At { time } => adb_core::TimePoint::At { time: time.clone() },
+        T::Variable { name } => adb_core::TimePoint::Variable { name: name.clone() },
+    }
+}
+
+/// v0.13 links are read both ways; WEIGHT is a minimum.
+fn link_select(s: &aql_parser::ast::LinkSelect) -> adb_core::LinkSelect {
+    adb_core::LinkSelect { types: s.types.clone(), direction: adb_core::LinkDirection::Both, min_weight: s.min_weight.map(|w| w as f32) }
+}
+
+fn convert_window(window: &Window) -> CoreWindow {
     match window {
-        Window::LastN { count } => Ok(CoreWindow::LastN { count: *count }),
-        Window::LastDuration { duration } => Ok(CoreWindow::LastDuration { duration: *duration }),
-        Window::TopBy { count, field } => Ok(CoreWindow::TopBy {
-            count: *count,
-            field: field.clone(),
-        }),
-        Window::Since { condition } => Ok(CoreWindow::Since {
-            condition: convert_condition(condition)?,
-        }),
+        Window::LastN { count } => CoreWindow::LastN { count: *count },
+        Window::LastDuration { duration } => CoreWindow::LastDuration { duration: *duration },
     }
 }
 
@@ -680,118 +438,52 @@ mod tests {
     use super::*;
     use aql_parser::parse;
 
-    #[test]
-    fn test_plan_scan() {
-        let stmt = parse("SCAN FROM WORKING LIMIT 10").unwrap();
-        let planner = Planner::new();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Single(step) => {
-                assert_eq!(step.operation, Operation::Scan);
-                assert_eq!(step.memory_type, CoreMemoryType::Working);
-                assert_eq!(step.modifiers.limit, Some(10));
-            }
-            _ => panic!("Expected single step plan"),
+    fn single(q: &str) -> StepPlan {
+        match Planner::new().plan(&parse(q).unwrap()).unwrap() {
+            ExecutionPlan::Single(s) => s,
+            other => panic!("{q}: {other:?}"),
         }
     }
 
     #[test]
-    fn test_plan_recall() {
-        let stmt = parse(r#"RECALL FROM EPISODIC WHERE pod = "payments" LIMIT 5"#).unwrap();
-        let planner = Planner::new();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Single(step) => {
-                assert_eq!(step.operation, Operation::Recall);
-                assert_eq!(step.memory_type, CoreMemoryType::Episodic);
-                assert_eq!(step.modifiers.limit, Some(5));
-            }
-            _ => panic!("Expected single step plan"),
-        }
+    fn recall_picks_the_access_path() {
+        assert_eq!(single("RECALL FROM WORKING WINDOW LAST 10").operation, Operation::Scan);
+        assert_eq!(single(r#"RECALL FROM TOOLS WHERE task = "bidding" LIMIT 3"#).operation, Operation::Load);
+        let s = single(r#"RECALL FROM SEMANTIC WHERE key = "person:ada""#);
+        assert_eq!(s.operation, Operation::Lookup);
+        assert!(matches!(s.predicate, CorePredicate::Key { ref field, .. } if field == "key"));
+        assert_eq!(single(r#"RECALL FROM SEMANTIC WHERE key = "a" AND n > 1"#).operation, Operation::Recall);
+        let s = single(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.6"#);
+        assert!(matches!(s.predicate, CorePredicate::Pattern { threshold: Some(t), .. } if (t - 0.6).abs() < 1e-6));
+        assert!(matches!(single("RECALL FROM SEMANTIC LIKE $q").predicate, CorePredicate::Like { .. }));
+        assert_eq!(single(r#"RECALL FROM EPISODIC WHERE pod = "p" LIMIT 5"#).operation, Operation::Recall);
     }
 
     #[test]
-    fn test_plan_lookup() {
-        let planner = Planner::new();
-        // AQL v0.5 §19: LOOKUP is not valid on WORKING memory
-        let working = parse(r#"LOOKUP FROM WORKING KEY id = "task-1""#).unwrap();
-        assert!(planner.plan(&working).is_err());
-
-        let stmt = parse(r#"LOOKUP FROM PROCEDURAL KEY id = "oom-fix""#).unwrap();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Single(step) => {
-                assert_eq!(step.operation, Operation::Lookup);
-                assert_eq!(step.memory_type, CoreMemoryType::Procedural);
-            }
-            _ => panic!("Expected single step plan"),
-        }
+    fn between_is_two_comparisons() {
+        let s = single(r#"RECALL FROM EPISODIC WHERE n BETWEEN 1 AND 5"#);
+        let CorePredicate::Where { conditions } = s.predicate else { panic!() };
+        let CoreCondition::Group { conditions: g, .. } = &conditions[0] else { panic!("{conditions:?}") };
+        assert_eq!(g.len(), 2);
     }
 
     #[test]
-    fn test_plan_load() {
-        let stmt = parse(r#"LOAD FROM TOOLS WHERE category = "file" LIMIT 5"#).unwrap();
-        let planner = Planner::new();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Single(step) => {
-                assert_eq!(step.operation, Operation::Load);
-                assert_eq!(step.memory_type, CoreMemoryType::Tools);
-            }
-            _ => panic!("Expected single step plan"),
-        }
+    fn writes_links_and_namespaces() {
+        assert_eq!(single(r#"STORE INTO WORKING (key = "task-1", status = "pending")"#).operation, Operation::Store);
+        assert_eq!(single(r#"FORGET FROM WORKING WHERE status = "done""#).operation, Operation::Forget);
+        let l = single(r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" TYPE "t" NAMESPACE "crm""#);
+        assert_eq!((l.operation, l.modifiers.namespace.as_deref()), (Operation::Link, Some("crm")));
+        assert_eq!(single(r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b""#).operation, Operation::Unlink);
+        assert!(matches!(Planner::new().plan(&parse(r#"BRANCH FROM "a" INTO "b""#).unwrap()).unwrap(), ExecutionPlan::Namespace(NamespacePlan::Branch { .. })));
+        assert!(matches!(
+            Planner::new().plan(&parse(r#"MERGE FROM "b" INTO "a" PREFER SOURCE"#).unwrap()).unwrap(),
+            ExecutionPlan::Namespace(NamespacePlan::Merge { prefer: Some(true), .. })
+        ));
     }
 
     #[test]
-    fn test_plan_store() {
-        let stmt = parse(r#"STORE INTO WORKING (key = "task-1", status = "pending")"#).unwrap();
-        let planner = Planner::new();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Single(step) => {
-                assert_eq!(step.operation, Operation::Store);
-                assert_eq!(step.memory_type, CoreMemoryType::Working);
-                assert!(step.data.is_some());
-            }
-            _ => panic!("Expected single step plan"),
-        }
-    }
-
-    #[test]
-    fn test_plan_forget() {
-        let stmt = parse(r#"FORGET FROM WORKING WHERE status = "completed""#).unwrap();
-        let planner = Planner::new();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Single(step) => {
-                assert_eq!(step.operation, Operation::Forget);
-                assert_eq!(step.memory_type, CoreMemoryType::Working);
-            }
-            _ => panic!("Expected single step plan"),
-        }
-    }
-
-    #[test]
-    fn test_plan_pipeline() {
-        let stmt = parse(
-            r#"PIPELINE error_handler TIMEOUT 30s RECALL FROM EPISODIC WHERE type = "error" LIMIT 10 | RECALL FROM PROCEDURAL PATTERN $error LIMIT 3"#,
-        )
-        .unwrap();
-        let planner = Planner::new();
-        let plan = planner.plan(&stmt).unwrap();
-
-        match plan {
-            ExecutionPlan::Pipeline(p) => {
-                assert_eq!(p.name, "error_handler");
-                assert_eq!(p.stages.len(), 2);
-            }
-            _ => panic!("Expected pipeline plan"),
-        }
+    fn pipeline() {
+        let p = Planner::new().plan(&parse(r#"PIPELINE p TIMEOUT 50ms RECALL FROM WORKING | STORE INTO EPISODIC (a = 1)"#).unwrap()).unwrap();
+        assert!(matches!(p, ExecutionPlan::Pipeline(ref pp) if pp.stages.len() == 2));
     }
 }

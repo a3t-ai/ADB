@@ -162,38 +162,10 @@ pub async fn write_origin(engine: &crate::LocalEngine, b: &Branch) -> Result<(),
     engine.query(&aql, None).await.map(|_| ())
 }
 
-/// The branch a statement names (`BRANCH "b"`, not main) and its NAMESPACE. A
-/// pipeline must name one branch in every stage, or none.
-pub fn statement_branch(aql: &str) -> Result<Option<(String, Option<String>)>, String> {
-    use aql_parser::Statement as S;
-    let Ok(stmt) = aql_parser::parse(aql) else { return Ok(None) };
-    fn of(s: &S) -> Option<(Option<String>, Option<String>)> {
-        let m = match s {
-            S::Recall(x) => &x.modifiers,
-            S::Lookup(x) => &x.modifiers,
-            S::Load(x) => &x.modifiers,
-            S::Store(x) => &x.modifiers,
-            S::Update(x) => &x.modifiers,
-            S::Forget(x) => &x.modifiers,
-            S::Scan(x) => &x.modifiers,
-            // Links name their branch after their NAMESPACE (AQL v0.12).
-            S::Link(x) => return Some((x.branch.clone().filter(|b| b != MAIN), x.namespace.clone())),
-            S::UpdateLink(x) => return Some((x.branch.clone().filter(|b| b != MAIN), x.namespace.clone())),
-            S::Unlink(x) => return Some((x.branch.clone().filter(|b| b != MAIN), x.namespace.clone())),
-            _ => return None,
-        };
-        Some((m.branch.clone().filter(|b| b != MAIN), m.namespace.clone()))
-    }
-    let stages: Vec<&S> = match &stmt {
-        S::Pipeline(p) => p.stages.iter().collect(),
-        other => vec![other],
-    };
-    let named: Vec<(String, Option<String>)> = stages.iter().filter_map(|s| of(s)).filter_map(|(b, ns)| b.map(|b| (b, ns))).collect();
-    let Some(first) = named.first().cloned() else { return Ok(None) };
-    if named.len() != stages.len() || named.iter().any(|(b, _)| *b != first.0) {
-        return Err(format!("every stage of a pipeline on branch {:?} must name it (BRANCH \"{}\")", first.0, first.0));
-    }
-    Ok(Some(first))
+/// Statements no longer name a branch (AQL v0.13: a branch is a namespace); the
+/// branch engines this routed to are being replaced (`.ai/BRANCH_NAMESPACES.md`).
+pub fn statement_branch(_aql: &str) -> Result<Option<(String, Option<String>)>, String> {
+    Ok(None)
 }
 
 /// DB-3: what a statement touches: per stage, its `NAMESPACE` and whether it writes. A kind
@@ -201,15 +173,21 @@ pub fn statement_branch(aql: &str) -> Result<Option<(String, Option<String>)>, S
 pub fn statement_namespaces(aql: &str) -> Result<Vec<(Option<String>, bool)>, String> {
     use aql_parser::Statement as S;
     let stmt = aql_parser::parse(aql).map_err(|_| "a statement that doesn't parse".to_string())?;
-    fn of(s: &S) -> Option<(Option<String>, bool)> {
+    fn of(s: &S) -> Option<Vec<(Option<String>, bool)>> {
+        let read = |m: &aql_parser::ast::Modifiers| match m.namespaces.is_empty() {
+            true => vec![(m.namespace.clone(), false)],
+            false => m.namespaces.iter().map(|n| (Some(n.clone()), false)).collect(),
+        };
         Some(match s {
-            S::Recall(x) => (x.modifiers.namespace.clone(), false),
-            S::Lookup(x) => (x.modifiers.namespace.clone(), false),
-            S::Load(x) => (x.modifiers.namespace.clone(), false),
-            S::Scan(x) => (x.modifiers.namespace.clone(), false),
-            S::Store(x) => (x.modifiers.namespace.clone(), true),
-            S::Update(x) => (x.modifiers.namespace.clone(), true),
-            S::Forget(x) => (x.modifiers.namespace.clone(), true),
+            S::Recall(x) => read(&x.modifiers),
+            S::Store(x) => vec![(x.modifiers.namespace.clone(), true)],
+            S::Update(x) => vec![(x.modifiers.namespace.clone(), true)],
+            S::Forget(x) => vec![(x.modifiers.namespace.clone(), true)],
+            S::Link(x) => vec![(x.namespace.clone(), true)],
+            S::Unlink(x) => vec![(x.namespace.clone(), true)],
+            // Reads the source, writes the destination.
+            S::Branch(n) | S::Fork(n) => vec![(Some(n.from.clone()), false), (Some(n.into.clone()), true)],
+            S::Merge(m) => vec![(Some(m.from.clone()), false), (Some(m.into.clone()), true)],
             _ => return None,
         })
     }
@@ -217,7 +195,11 @@ pub fn statement_namespaces(aql: &str) -> Result<Vec<(Option<String>, bool)>, St
         S::Pipeline(p) => p.stages.iter().collect(),
         other => vec![other],
     };
-    stages.iter().map(|s| of(s).ok_or_else(|| "this kind of statement".to_string())).collect()
+    let mut out = Vec::new();
+    for s in stages {
+        out.extend(of(s).ok_or_else(|| "this kind of statement".to_string())?);
+    }
+    Ok(out)
 }
 
 /// B6: a branch engine in its own ADB process, reached over the network (the

@@ -15,10 +15,22 @@ pub enum ExecutionPlan {
     Subscription(SubscriptionPlan),
     /// Pipeline of operations
     Pipeline(PipelinePlan),
-    /// Reflect (multi-source query with optional link traversal)
-    Reflect(ReflectPlan),
+    /// BRANCH / FORK / MERGE on namespaces (AQL v0.13)
+    Namespace(NamespacePlan),
     /// Fan-out operation across ALL memory types
     FanOut(FanOutPlan),
+}
+
+/// BRANCH / FORK / MERGE (AQL v0.13 §5).
+#[derive(Debug, Clone)]
+pub enum NamespacePlan {
+    /// `into` reads through to `from` as it was at the point (now, or `as_of`).
+    Branch { from: String, into: String, as_of: Option<adb_core::TimePoint> },
+    /// `into` gets a full copy of `from` as it was at the point.
+    Fork { from: String, into: String, as_of: Option<adb_core::TimePoint> },
+    /// `from`'s changes since the two parted, into `into`; `prefer`: Some(true) the
+    /// source wins conflicts, Some(false) the target, None a conflict fails.
+    Merge { from: String, into: String, prefer: Option<bool> },
 }
 
 /// A subscription statement, planned (E_SUBSCRIPTIONS.md).

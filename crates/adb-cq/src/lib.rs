@@ -89,14 +89,12 @@ fn memory_of(t: MemoryType) -> Memory {
 }
 
 impl WatchSet {
-    /// The watch set of a statement `WATCH` may wrap; anything else is refused.
+    /// The watch set of a live query (`SUBSCRIBE RECALL …`, AQL v0.13); anything but
+    /// a RECALL is refused.
     pub fn of(statement: &Statement) -> Result<Self, String> {
         let (memory, modifiers, like): (Option<MemoryType>, &Modifiers, bool) = match statement {
             Statement::Recall(r) => (Some(r.memory_type), &r.modifiers, matches!(r.predicate, aql_parser::ast::Predicate::Like { .. })),
-            Statement::Lookup(l) => (Some(l.memory_type), &l.modifiers, false),
-            Statement::Scan(s) => (Some(MemoryType::Working), &s.modifiers, false),
-            Statement::Load(l) => (Some(MemoryType::Tools), &l.modifiers, false),
-            _ => return Err("WATCH takes RECALL, LOOKUP, SCAN or LOAD".into()),
+            _ => return Err("a live query is a RECALL (SUBSCRIBE RECALL …)".into()),
         };
         let all = matches!(memory, Some(MemoryType::All)) || modifiers.with_links.is_some() || modifiers.follow_links.is_some();
         let memories = (!all).then(|| memory.map(memory_of).into_iter().collect());

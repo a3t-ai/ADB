@@ -1011,21 +1011,24 @@ impl PartitionedEngine {
         }
     }
 
-    /// `WATCH` / `UNWATCH` (W6) on a cluster, `None` for any other statement. A watch
-    /// runs on the owner of its query's namespace's partition, and its id names that
-    /// partition (`<partition>.<id>`), so UNWATCH and its frames (MCP watch_changes,
-    /// SSE) reach it from any node.
+    /// A live query (`SUBSCRIBE RECALL …`) and its UNSUBSCRIBE (W6) on a cluster;
+    /// `None` for any other statement (a topic's UNSUBSCRIBE too). A live query runs
+    /// on the owner of its namespace's partition, and its id names that partition
+    /// (`<partition>.<id>`), so UNSUBSCRIBE and its frames (MCP watch_changes, SSE)
+    /// reach it from any node; one without a namespace, or across several, runs on
+    /// the system partition (`c.<id>`).
     async fn watch_routed(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Option<Result<Value, String>> {
         use aql_parser::ast::Statement;
-        let first = aql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or_default();
-        if !first.eq_ignore_ascii_case("WATCH") && !first.eq_ignore_ascii_case("UNWATCH") {
-            return None;
-        }
         // A statement that doesn't parse: the router's executor reports it.
-        let stmt = aql_parser::parse(aql).ok()?;
+        let stmt = crate::engine::watch_statement(aql)?;
         Some(match stmt {
-            Statement::Watch(w) => {
-                let Some(ns) = touches_of(&w.query).0 else {
+            Statement::Subscribe(_) => {
+                let query = crate::engine::live_query(&stmt)?;
+                let single = match &query {
+                    Statement::Recall(r) if r.modifiers.namespaces.is_empty() => r.modifiers.namespace.clone(),
+                    _ => None,
+                };
+                let Some(ns) = single else {
                     return Some(match self.system_handle().await {
                         Ok(Handle::Local(_)) => Box::pin(self.cluster_watch(aql, variables, reach)).await,
                         Ok(Handle::Remote(r)) => r.op("cluster_watch", json!({ "aql": aql, "variables": variables, "reach": reach })).await,
@@ -1041,18 +1044,17 @@ impl PartitionedEngine {
                     v
                 })
             }
-            Statement::Unwatch(u) => {
-                if let Some(id) = u.query_id.strip_prefix(crate::cluster_watch::PREFIX) {
+            Statement::Unsubscribe(u) => {
+                if let Some(id) = u.subscription.strip_prefix(crate::cluster_watch::PREFIX) {
                     return Some(match self.system_handle().await {
                         Ok(Handle::Local(_)) => self.cluster_unwatch(id).await,
                         Ok(Handle::Remote(r)) => r.op("cluster_unwatch", json!({ "id": id })).await,
                         Err(e) => Err(e),
                     });
                 }
-                let Some((p, id)) = split_cq_id(&u.query_id) else {
-                    return Some(Err(format!("unknown watch {}: a cluster's watch ids are <partition>.<id>", u.query_id)));
-                };
-                let local = format!("UNWATCH {}", serde_json::to_string(id).unwrap_or_default());
+                // Not a live query's id: a topic subscription's, for the planner.
+                let (p, id) = split_cq_id(&u.subscription)?;
+                let local = format!("UNSUBSCRIBE {}", serde_json::to_string(id).unwrap_or_default());
                 Box::pin(self.query_on(p, &local)).await.map(|mut v| {
                     prefix_cq_ids(&mut v, p);
                     v
@@ -1257,13 +1259,10 @@ impl PartitionedEngine {
     /// `WATCH` across partitions (no NAMESPACE, or several), on the system partition's
     /// owner: registered there with the call's scope, its snapshot taken across.
     pub(crate) async fn cluster_watch(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
-        use aql_parser::ast::{StartPosition, Statement};
         let started = std::time::Instant::now();
-        let Statement::Watch(w) = aql_parser::parse(aql).map_err(|e| e.to_string())? else { return Err("not a WATCH".into()) };
-        if let StartPosition::Offset(n) = w.start {
-            return Err(format!("WATCH … FROM OFFSET {n}: a new watch starts now; resume an existing one by its id (GET /watches/{{id}}/events?from=, MCP watch_changes)"));
-        }
-        let mut spec = adb_cq::WatchSpec::new(*w.query, variables.cloned().unwrap_or_default(), w.debounce)?;
+        let stmt = aql_parser::parse(aql).map_err(|e| e.to_string())?;
+        let query = crate::engine::live_query(&stmt).ok_or("not a live query (SUBSCRIBE RECALL …)")?;
+        let mut spec = adb_cq::WatchSpec::new(query, variables.cloned().unwrap_or_default(), None)?;
         spec.across = Some(serde_json::to_value(reach).map_err(|e| e.to_string())?);
         // Refuse a query that fails before anything is committed.
         self.run_across(&spec.statement, &spec.variables, reach).await?;
@@ -1379,7 +1378,6 @@ fn topic_namespace(aql: &str) -> Option<String> {
     match aql_parser::parse(aql).ok()? {
         S::Subscribe(x) => x.namespace,
         S::Publish(x) => x.modifiers.namespace,
-        S::Ack(x) => x.namespace,
         S::Unsubscribe(x) => x.namespace,
         _ => None,
     }
@@ -1391,20 +1389,15 @@ fn touches_of(s: &aql_parser::Statement) -> (Option<String>, bool) {
     {
         match s {
             S::Recall(x) => (x.modifiers.namespace.clone(), false),
-            S::Lookup(x) => (x.modifiers.namespace.clone(), false),
-            S::Load(x) => (x.modifiers.namespace.clone(), false),
-            S::Scan(x) => (x.modifiers.namespace.clone(), false),
             S::Store(x) => (x.modifiers.namespace.clone(), true),
             S::Update(x) => (x.modifiers.namespace.clone(), true),
             S::Forget(x) => (x.modifiers.namespace.clone(), true),
-            // A watch is on its query's namespace (its partition registers it); the
-            // owner runs it — WATCH isn't a read a reader answers.
-            S::Watch(w) => (touches_of(&w.query).0, false),
+            // A live query is on its RECALL's namespace (its partition registers it);
+            // the owner runs it — it isn't a read a reader answers.
+            S::Subscribe(aql_parser::ast::SubscribeStmt { target: aql_parser::ast::SubscribeTarget::Query(r), .. }) => (r.modifiers.namespace.clone(), false),
             // A link's two ends are in its NAMESPACE (AQL v0.12): one partition.
             S::Link(x) => (x.namespace.clone(), true),
-            S::UpdateLink(x) => (x.namespace.clone(), true),
             S::Unlink(x) => (x.namespace.clone(), true),
-            S::Merge(x) => (x.namespace.clone(), true),
             _ => (None, true),
         }
     }

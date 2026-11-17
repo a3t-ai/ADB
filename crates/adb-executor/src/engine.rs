@@ -422,12 +422,28 @@ impl adb_cq::Runner for WatchRunner {
 
 /// `WATCH` / `UNWATCH` (W6) if `aql` is one: they are handled by the engine, which
 /// owns the watcher, not the executor.
-fn watch_statement(aql: &str) -> Option<aql_parser::ast::Statement> {
+/// A live query (`SUBSCRIBE RECALL …`, AQL v0.13) or an UNSUBSCRIBE that may end
+/// one: the engine registers live queries itself (W6), the planner doesn't.
+pub(crate) fn watch_statement(aql: &str) -> Option<aql_parser::ast::Statement> {
     let first = aql.trim_start().split(|c: char| c.is_whitespace()).next()?;
-    if !first.eq_ignore_ascii_case("WATCH") && !first.eq_ignore_ascii_case("UNWATCH") {
+    if !first.eq_ignore_ascii_case("SUBSCRIBE") && !first.eq_ignore_ascii_case("UNSUBSCRIBE") {
         return None;
     }
-    aql_parser::parse(aql).ok()
+    match aql_parser::parse(aql).ok()? {
+        s @ aql_parser::ast::Statement::Subscribe(aql_parser::ast::SubscribeStmt { target: aql_parser::ast::SubscribeTarget::Query(_), .. }) => Some(s),
+        s @ aql_parser::ast::Statement::Unsubscribe(_) => Some(s),
+        _ => None,
+    }
+}
+
+/// A live query's RECALL, as the statement a watch re-runs.
+pub(crate) fn live_query(stmt: &aql_parser::ast::Statement) -> Option<aql_parser::ast::Statement> {
+    match stmt {
+        aql_parser::ast::Statement::Subscribe(aql_parser::ast::SubscribeStmt { target: aql_parser::ast::SubscribeTarget::Query(r), .. }) => {
+            Some(aql_parser::ast::Statement::Recall((**r).clone()))
+        }
+        _ => None,
+    }
 }
 
 /// What one engine holds (S3 option B step 3). A single node holds everything in
@@ -1174,43 +1190,47 @@ impl LocalEngine {
             .collect())
     }
 
-    /// `WATCH` (register, snapshot) and `UNWATCH` (W6).
-    async fn watch(&self, stmt: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
-        use aql_parser::ast::{StartPosition, Statement};
+    /// A live query: `SUBSCRIBE RECALL …` (register, snapshot) and its UNSUBSCRIBE
+    /// (W6). `None`: an UNSUBSCRIBE of something else (a topic subscription), which
+    /// the planner handles.
+    async fn watch(&self, stmt: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Option<Result<Value, String>> {
+        use aql_parser::ast::Statement;
         let started = std::time::Instant::now();
+        let value = match (live_query(&stmt), stmt) {
+            (Some(query), _) => self.watch_add(query, variables).await,
+            (None, Statement::Unsubscribe(u)) => match &self.watcher {
+                Some((watcher, _)) if watcher.contains(&u.subscription) => self.watch_remove(&u.subscription).await,
+                _ => return None,
+            },
+            (None, _) => return None,
+        };
+        Some(value.map(|v| to_wire(&QueryResult::subscription(v, started.elapsed().as_millis() as u64))))
+    }
+
+    async fn watch_add(&self, query: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         let (Some((watcher, _)), Some(durable)) = (&self.watcher, &self.durable) else {
-            return Err("WATCH / UNWATCH need a durable engine (start ADB with --data-dir)".into());
+            return Err("live queries need a durable engine (start ADB with --data-dir)".into());
         };
-        let value = match stmt {
-            Statement::Watch(w) => {
-                if let StartPosition::Offset(n) = w.start {
-                    return Err(format!(
-                        "WATCH … FROM OFFSET {n}: a new watch starts now; resume an existing one by its id (GET /watches/{{id}}/events?from=, MCP watch_changes)"
-                    ));
-                }
-                let spec = adb_cq::WatchSpec::new(*w.query, variables.cloned().unwrap_or_default(), w.debounce)?;
-                // Refuse a query that fails before anything is committed.
-                self.executor.execute_statement(&spec.statement, &spec.variables).await.map_err(|e| e.to_string())?;
-                let (id, _) = durable.register_watch(serde_json::to_value(&spec).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
-                match watcher.add(&id, spec).await {
-                    Ok(frame) => serde_json::to_value(&frame).map_err(|e| e.to_string())?,
-                    Err(e) => {
-                        let _ = durable.unregister_watch(&id).await;
-                        return Err(e.to_string());
-                    }
-                }
+        let spec = adb_cq::WatchSpec::new(query, variables.cloned().unwrap_or_default(), None)?;
+        // Refuse a query that fails before anything is committed.
+        self.executor.execute_statement(&spec.statement, &spec.variables).await.map_err(|e| e.to_string())?;
+        let (id, _) = durable.register_watch(serde_json::to_value(&spec).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
+        match watcher.add(&id, spec).await {
+            Ok(frame) => serde_json::to_value(&frame).map_err(|e| e.to_string()),
+            Err(e) => {
+                let _ = durable.unregister_watch(&id).await;
+                Err(e.to_string())
             }
-            Statement::Unwatch(u) => {
-                let existed = watcher.contains(&u.query_id);
-                if existed {
-                    durable.unregister_watch(&u.query_id).await.map_err(|e| e.to_string())?;
-                    watcher.remove(&u.query_id);
-                }
-                json!({ "cq_id": u.query_id, "unwatched": existed })
-            }
-            _ => unreachable!("watch_statement returns WATCH / UNWATCH only"),
+        }
+    }
+
+    async fn watch_remove(&self, id: &str) -> Result<Value, String> {
+        let (Some((watcher, _)), Some(durable)) = (&self.watcher, &self.durable) else {
+            return Err("live queries need a durable engine (start ADB with --data-dir)".into());
         };
-        Ok(to_wire(&QueryResult::subscription(value, started.elapsed().as_millis() as u64)))
+        durable.unregister_watch(id).await.map_err(|e| e.to_string())?;
+        watcher.remove(id);
+        Ok(json!({ "cq_id": id, "unsubscribed": true }))
     }
 }
 
@@ -2063,7 +2083,9 @@ impl LocalEngine {
             None => {}
         }
         if let Some(stmt) = watch_statement(aql) {
-            return self.watch(stmt, variables).await;
+            if let Some(answer) = self.watch(stmt, variables).await {
+                return answer;
+            }
         }
         let started = std::time::Instant::now();
         let before = match &self.durable {

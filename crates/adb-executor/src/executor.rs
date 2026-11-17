@@ -137,7 +137,9 @@ impl Executor {
                 self.execute_step(&self.bind_variables_in_step(step, &bindings)).await?
             }
             ExecutionPlan::Pipeline(pipeline) => self.execute_pipeline(pipeline, bindings).await?,
-            ExecutionPlan::Reflect(reflect) => self.execute_reflect(reflect).await?,
+            ExecutionPlan::Namespace(_) => {
+                return Err(ExecutorError::InvalidOperation("BRANCH / FORK / MERGE run on the engine (they work across namespaces)".into()))
+            }
             ExecutionPlan::FanOut(fanout) => self.execute_fanout(fanout).await?,
             ExecutionPlan::Subscription(sub) => self.execute_subscription(sub).await?,
         };
