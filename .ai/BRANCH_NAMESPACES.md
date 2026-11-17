@@ -13,6 +13,24 @@ Replaces: branch engines (`BranchHost`, `LocalEngine::durable_branch`,
 `<pdir>/branches/…`), branch pods (B6, `placement`, `BranchRemote`), and commit
 3e66286 (branch places on object storage), which those engines made necessary.
 
+## Scope (user, 17 Nov)
+
+"Branching an agent is not ADB's job, that is A3T. ADB branches the agent's
+namespace. No new infra." ADB keeps only:
+
+- **Branch** a namespace (from main, or from another branch, at a point): `ns@b`.
+- **Merge** a branch into main (DB-19 diff, conflicts, merge; rebase DB-11 if it
+  stays cheap).
+- **Fork** a branch into a new namespace: a **full copy** (the branch's view written
+  into the new namespace), or **shallow** (the new namespace reads through to the
+  branch at its point — the same overlay rule, with the new namespace as the child).
+- Drop a branch.
+
+Dropped from ADB: branch pods (B6: `placement`, `BranchRemote`, `branch_place`,
+pending FORGETs), agent promotion (the `promoted_from` episode, carrying layers,
+the `promoted-*` tag — A3T does that on top of fork). Tags and layers (B7) are
+namespace features and stay as they are.
+
 ## Layout
 
 - `ns@b` is placed by `routing::partition_of` like any namespace. It is not in the
@@ -47,7 +65,9 @@ rows as of the point (`StoreSource` when the parent is in this engine; a remote
   did (callers don't see `@`).
 - FORGET on main of `ns|…k` reaches `ns@*|…k` in each branch namespace's partition (op), as B4.
 - Drop: the branch's rows are forgotten (tombstones, logged), the row unregistered.
-- Promote / clone / merge (DB-19) / rebase (DB-11) / conflicts read `ns@b` and `ns`.
+- Fork / merge (DB-19) / rebase (DB-11) / conflicts read `ns@b` and `ns`. A shallow
+  fork is a namespace with a base ref (parent namespace, branch, point): the same
+  overlay rule as a branch.
 
 ## Steps
 
@@ -56,7 +76,7 @@ rows as of the point (`StoreSource` when the parent is in this engine; a remote
 2. Statement rewrite at entry (single node and cluster): BRANCH → `ns@b`.
 3. Per-namespace parent in writes and reads; overlay by namespace-less id.
 4. Registry lookups from the branch namespace's partition (local / op), FORGET-on-main fan-out,
-   drop, promote, rebase, merge.
-5. Remove branch engines, pods, `BranchHost`; tests: branches.rs, merge.rs,
+   drop, fork (full / shallow), rebase, merge.
+5. Remove branch engines, pods, promote, `BranchHost`; tests: branches.rs, merge.rs,
    namespace_statements (branch links), a cluster test: a branch survives a takeover
    of its partition (rebuilt from S3 like any namespace).
