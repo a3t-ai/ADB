@@ -860,7 +860,9 @@ impl PartitionedEngine {
 
     /// Record `namespace` in the catalog (before its first write commits).
     async fn note(&self, namespace: &str) -> Result<(), String> {
-        if self.catalog.read().unwrap().contains_key(namespace) {
+        // A branch (`ns@b`) is reached by naming it, never by a read across every
+        // namespace: not in the catalog.
+        if namespace.contains(routing::BRANCH_SEP) || self.catalog.read().unwrap().contains_key(namespace) {
             return Ok(());
         }
         let p = self.partition_of(namespace);
