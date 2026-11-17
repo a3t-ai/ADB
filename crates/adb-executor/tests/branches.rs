@@ -300,3 +300,37 @@ async fn a_sealed_layer_pinned_then_mounted() {
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
     assert_eq!(e.layers_get("trading").await.unwrap().len(), 1, "layers survive a restart");
 }
+
+/// PATTERN and LIKE read a branch's view: its own records and its parent's at the
+/// branch point, ranked as on main; main never sees the branch's.
+#[tokio::test]
+async fn pattern_and_like_read_a_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    e.query(r#"STORE INTO PROCEDURAL (pattern = "pod OOMKilled restart", steps = "raise the memory limit") NAMESPACE "ops""#, None).await.unwrap();
+    e.query(r#"STORE INTO SEMANTIC (key = "k1", content = "the deploy failed on memory") NAMESPACE "ops""#, None).await.unwrap();
+    e.branch_create("ops", "b1", None, None).await.unwrap();
+    e.query(r#"STORE INTO PROCEDURAL (pattern = "pod OOMKilled loop", steps = "find the leak") NAMESPACE "ops" BRANCH "b1""#, None).await.unwrap();
+    e.query(r#"STORE INTO SEMANTIC (key = "k2", content = "memory leak found in the cache") NAMESPACE "ops" BRANCH "b1""#, None).await.unwrap();
+
+    let pattern = |branch: &'static str| {
+        let e = &e;
+        async move {
+            let aql = format!(r#"LOOKUP FROM PROCEDURAL PATTERN "pod OOMKilled restart" THRESHOLD 0.4 NAMESPACE "ops"{branch}"#);
+            let r = e.query(&aql, None).await.unwrap_or_else(|x| panic!("{aql}: {x}"));
+            let mut s = values(&r, "pattern");
+            s.sort();
+            s
+        }
+    };
+    assert_eq!(pattern(r#" BRANCH "b1""#).await, ["pod OOMKilled loop", "pod OOMKilled restart"], "the branch's and the inherited one");
+    assert_eq!(pattern("").await, ["pod OOMKilled restart"], "main: its own only");
+
+    let vars: std::collections::HashMap<String, serde_json::Value> = [("q".to_string(), serde_json::json!("memory leak"))].into();
+    let like = e.query(r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "ops" BRANCH "b1" LIMIT 5"#, Some(&vars)).await.unwrap();
+    let mut found = values(&like, "content");
+    found.sort();
+    assert_eq!(found, ["memory leak found in the cache", "the deploy failed on memory"], "{like}");
+    let like = e.query(r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "ops" LIMIT 5"#, Some(&vars)).await.unwrap();
+    assert_eq!(values(&like, "content"), ["the deploy failed on memory"], "main doesn't see the branch: {like}");
+}

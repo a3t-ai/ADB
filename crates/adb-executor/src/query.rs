@@ -1008,30 +1008,7 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
         if c.floor.is_some() {
             return Ok(Answer::Insufficient);
         }
-        // The literal or bound value; an unbound `$name` matches its name (as before).
-        let query = text.as_deref().unwrap_or(pattern_var.trim_start_matches('$'));
-        let threshold = threshold.unwrap_or(0.7);
-        let mut scored: Vec<(f32, Arc<MemoryRecord>)> = c
-            .records
-            .iter()
-            .filter_map(|r| {
-                let s = jaccard(query, r.data["pattern"].as_str().unwrap_or(""));
-                (s >= threshold).then(|| (s, r.clone()))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
-        if let Some(n) = modifiers.limit {
-            scored.truncate(n);
-        }
-        // The overlap score is the match's confidence, as LIKE's similarity is (F-L2).
-        let out = scored
-            .into_iter()
-            .map(|(s, r)| {
-                let mut r = (*r).clone();
-                r.metadata.confidence = Some(s);
-                r
-            })
-            .collect();
+        let out = pattern_match(&c.records, pattern_var, *threshold, text.as_deref(), modifiers.limit);
         return Ok(Answer::of(&c, out));
     }
     let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
@@ -1222,16 +1199,56 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     Ok(records)
 }
 
+/// `PATTERN` (PROCEDURAL): the records whose `pattern` overlaps the query by at
+/// least `threshold` (default 0.7), best first, at most `limit`; the overlap score is
+/// the match's confidence, as LIKE's similarity is (F-L2).
+fn pattern_match(records: &[Arc<MemoryRecord>], pattern_var: &str, threshold: Option<f32>, text: Option<&str>, limit: Option<usize>) -> Vec<MemoryRecord> {
+    // The literal or bound value; an unbound `$name` matches its name (as before).
+    let query = text.unwrap_or(pattern_var.trim_start_matches('$'));
+    let threshold = threshold.unwrap_or(0.7);
+    let mut scored: Vec<(f32, &Arc<MemoryRecord>)> = records
+        .iter()
+        .filter_map(|r| {
+            let s = jaccard(query, r.data["pattern"].as_str().unwrap_or(""));
+            (s >= threshold).then_some((s, r))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
+    if let Some(n) = limit {
+        scored.truncate(n);
+    }
+    scored
+        .into_iter()
+        .map(|(s, r)| {
+            let mut r = (**r).clone();
+            r.metadata.confidence = Some(s);
+            r
+        })
+        .collect()
+}
+
 /// `RECALL` / `LOOKUP` on a branch engine (B2): the branch's view (its rows, then its
 /// parent's as of the point), then the predicate and modifiers as on main.
 pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
     if is_history(modifiers) {
         return Err(AdbError::UnsupportedOperation("AS OF, VALID AT and WITH HISTORY are not read on a branch yet".into()));
     }
-    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
-        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN are not read on a branch yet".into()));
+    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() {
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS and WITH LINKS are not read on a branch yet".into()));
     }
     let in_scope = modifiers.in_scope.as_deref();
+    // PATTERN ranks the branch's view as main ranks its records.
+    if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
+        if memory != MemoryType::Procedural {
+            return Ok(Vec::new());
+        }
+        let records: Vec<Arc<MemoryRecord>> = rows.iter().filter(|r| in_scope.is_none_or(|s| r.data.scope == s)).map(|r| Arc::new(record(r))).collect();
+        let mut out = pattern_match(&records, pattern_var, *threshold, text.as_deref(), modifiers.limit);
+        if let Some(f) = &modifiers.return_fields {
+            project(&mut out, f);
+        }
+        return Ok(out);
+    }
     let mut records: Vec<MemoryRecord> = rows
         .iter()
         .filter(|r| in_scope.is_none_or(|s| r.data.scope == s))

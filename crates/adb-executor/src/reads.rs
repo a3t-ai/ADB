@@ -324,6 +324,13 @@ impl LanceReads {
             b.wait_for_committed().await;
         }
         let now = CommitTs::from_datetime(time::now());
+        // A branch ranks its view (its rows, then the parent's at the branch point).
+        if let Some(p) = &self.parent {
+            let in_scope = modifiers.in_scope.as_deref();
+            let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
+            let rows = rows.into_iter().map(|(r, _)| r).filter(|r| in_scope.is_none_or(|s| r.data.scope == s)).map(Arc::new).collect();
+            return Ok(crate::query::rank_rows(rows, modifiers, query_text.as_deref(), query_vec.as_deref(), now));
+        }
         // B7: a space with layers ranks its merged rows.
         if let Some((ns, layers)) = self.layers_for(memory, modifiers).filter(|_| self.parent.is_none()) {
             let rows = self.layer_rows(memory, &ns, &layers, modifiers.in_scope.as_deref(), now).await?;
@@ -417,9 +424,6 @@ impl Reads for LanceReads {
     async fn recall_with_modifiers(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         if matches!(predicate, Predicate::Like { .. }) {
-            if self.parent.is_some() {
-                return Err(AdbError::UnsupportedOperation("LIKE is not read on a branch yet".into()));
-            }
             if crate::query::is_history(modifiers) {
                 return Err(AdbError::UnsupportedOperation("LIKE doesn't read history (AS OF, VALID AT, WITH HISTORY)".into()));
             }
