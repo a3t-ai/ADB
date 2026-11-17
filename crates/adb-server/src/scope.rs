@@ -97,26 +97,15 @@ impl Scope {
     /// Kinds that belong to no namespace (topics, subscriptions, MERGE ENTITY, WATCH
     /// without NAMESPACE) stay closed to a scoped token.
     pub fn reach_for(&self, aql: &str) -> Result<adb_cluster::routing::Reach, String> {
-        use aql_parser::Statement as S;
-        let stmt = aql_parser::parse(aql).map_err(|_| format!("a statement that doesn't parse is not open to the {} token", self.name))?;
-        let stages: Vec<&S> = match &stmt {
-            S::Pipeline(p) => p.stages.iter().collect(),
-            other => vec![other],
-        };
+        // Per stage (and per namespace a stage reads or writes): its NAMESPACE and
+        // whether it writes. Kinds that name no namespace stay closed.
+        let touched = adb_executor::branch_engine::statement_namespaces(aql).map_err(|what| match what.as_str() {
+            "a statement that doesn't parse" => format!("a statement that doesn't parse is not open to the {} token", self.name),
+            _ => format!("this kind of statement is not open to the {} token", self.name),
+        })?;
         let mut writes = false;
-        for s in stages {
-            let (ns, w) = match s {
-                S::Recall(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Lookup(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Load(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Scan(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Store(x) => (x.modifiers.namespace.as_deref(), true),
-                S::Update(x) => (x.modifiers.namespace.as_deref(), true),
-                S::Forget(x) => (x.modifiers.namespace.as_deref(), true),
-                S::Link(_) | S::UpdateLink(_) | S::Unlink(_) => (None, true),
-                _ => return Err(format!("this kind of statement is not open to the {} token", self.name)),
-            };
-            if let Some(ns) = ns {
+        for (ns, w) in touched {
+            if let Some(ns) = ns.as_deref() {
                 self.check(ns, w)?;
             }
             writes |= w;

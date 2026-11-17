@@ -2040,9 +2040,8 @@ mod watch_routing_tests {
 
     #[test]
     fn a_watch_names_its_query_namespace_and_ids_carry_the_partition() {
-        let stmt = aql_parser::parse(r#"WATCH RECALL FROM SEMANTIC ALL NAMESPACE "demo--w" DEBOUNCE 50ms"#).expect("parses");
-        let aql_parser::ast::Statement::Watch(w) = stmt else { panic!("a WATCH: {stmt:?}") };
-        assert_eq!(touches_of(&w.query).0.as_deref(), Some("demo--w"), "{:?}", w.query);
+        let stmt = aql_parser::parse(r#"SUBSCRIBE RECALL FROM SEMANTIC NAMESPACE "demo--w""#).expect("parses");
+        assert_eq!(touches_of(&stmt).0.as_deref(), Some("demo--w"), "{stmt:?}");
         assert_eq!(split_cq_id("12.abc"), Some((12, "abc")));
         assert_eq!(split_cq_id("abc"), None);
         assert_eq!(split_cq_id("12."), None);
