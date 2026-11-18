@@ -217,6 +217,10 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
             let l = e.local_spaces().ok_or("no table")?;
             val(l.versions(arg(&a, "memory")?, &s("space")?).await.map_err(|e| e.to_string())?)
         }
+        "space_key_versions" => {
+            let l = e.local_spaces().ok_or("no table")?;
+            val(crate::spaces::Spaces::key_versions(&l, arg(&a, "memory")?, &s("space")?, &s("key")?).await.map_err(|e| e.to_string())?)
+        }
         "space_tag" => val(e.local_spaces().ok_or("no table")?.registry.tag(&s("space")?, &s("name")?)),
         "space_layers" => val(e.local_spaces().ok_or("no table")?.registry.layers_of(&s("space")?)),
         "space_base" => val(e.local_spaces().ok_or("no table")?.registry.base_of(&s("space")?)),

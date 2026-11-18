@@ -291,6 +291,13 @@ impl crate::spaces::Spaces for RouterSpaces {
         }
     }
 
+    async fn key_versions(&self, memory: adb_core::log::Memory, space: &str, bare: &str) -> AdbResult<Vec<adb_store::StoredRow>> {
+        match self.handle_of(space).await? {
+            Handle::Local(e) => crate::spaces::Spaces::key_versions(&local_spaces(&e)?, memory, space, bare).await,
+            h => h.op_as("space_key_versions", json!({ "memory": memory, "space": space, "key": bare })).await.map_err(AdbError::Internal),
+        }
+    }
+
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<crate::branches::Tag>> {
         match self.handle_of(space).await? {
             Handle::Local(e) => local_spaces(&e)?.tag(space, name).await,
@@ -319,10 +326,15 @@ impl crate::spaces::Spaces for RouterSpaces {
         if let Some(e) = node.system_local() {
             return local_spaces(&e)?.quotas().await;
         }
-        // Younger than `ADB_CATALOG_TTL_MS` (the background keeps it so): no call.
-        let ttl = Duration::from_millis(std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
-        if let Some((t, q)) = node.quota_rules.read().unwrap().as_ref() {
-            if t.elapsed() < ttl {
+        // The copy here, however old: the background (`quotas_due`) refreshes it every
+        // `ADB_CATALOG_TTL_MS`. A write never waits for a call to the system partition
+        // — a quota change taking effect a second late is fine; a fetch on the write
+        // path whenever the copy aged past the TTL was not. Fetched here only when the
+        // node has no copy yet, or with `ADB_CATALOG_TTL_MS=0` (asking for every
+        // check to see the latest rules).
+        let strict = std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse::<u64>().ok()) == Some(0);
+        if !strict {
+            if let Some((_, q)) = node.quota_rules.read().unwrap().as_ref() {
                 return Ok(q.clone());
             }
         }

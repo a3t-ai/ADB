@@ -3009,9 +3009,11 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let ts = seq.begin();
         let id = RecordId(scoped_key(namespace, in_scope, &store_id(memory_type, key, &payload))?);
         let branch_ns = self.branch_ns(namespace);
-        if (branch_ns.is_some()) && caller_keyed(memory_type, &payload) {
-            let seen = self.branch_targets_in(memory_type, &Predicate::Where { conditions: Vec::new() }, None, ts, branch_ns).await?;
-            if seen.iter().any(|(r, _)| adb_store::key_of(&r.lineage_id) == id.0) {
+        // A key the branch inherits can't be stored again: one keyed lookup through the
+        // branch and its bases (it read every row of the branch's view per STORE).
+        if let (Some(ns), true) = (branch_ns, caller_keyed(memory_type, &payload)) {
+            let bare = adb_store::without_namespace(&id.0);
+            if self.space_view().key_at(memory_type.into(), ns, bare, ts, ts).await?.is_some() {
                 return Err(AdbError::QueryError(format!("{} exists on this branch (from it or its parent): UPDATE it to change it on the branch", id.0)));
             }
         }

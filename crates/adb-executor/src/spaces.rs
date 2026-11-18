@@ -26,6 +26,11 @@ pub trait Spaces: Send + Sync {
     /// Every version of `space`'s rows of `memory`, once its partition has applied
     /// what it committed.
     async fn versions(&self, memory: Memory, space: &str) -> AdbResult<Vec<StoredRow>>;
+    /// Every version of one key (`bare`: without its namespace) of `space` — what a
+    /// keyed check needs, not the whole space.
+    async fn key_versions(&self, memory: Memory, space: &str, bare: &str) -> AdbResult<Vec<StoredRow>> {
+        Ok(self.versions(memory, space).await?.into_iter().filter(|r| adb_store::without_namespace(adb_store::key_of(&r.lineage_id)) == bare).collect())
+    }
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<Tag>>;
     async fn layers_of(&self, space: &str) -> AdbResult<Vec<Layer>>;
     /// AQL v0.13: what `space` was branched or forked from, if it was.
@@ -57,6 +62,15 @@ impl Spaces for LocalSpaces {
             b.wait_for_committed().await;
         }
         store.versions(memory, Some(&format!("namespace = {}", adb_store::sql_str(space)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))
+    }
+
+    async fn key_versions(&self, memory: Memory, space: &str, bare: &str) -> AdbResult<Vec<StoredRow>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
+        let lineage = adb_store::row_id(memory, &adb_store::namespaced(Some(space), bare));
+        store.versions_of(memory, &[lineage]).await.map_err(|e| AdbError::Internal(format!("store: {e}")))
     }
 
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<Tag>> {
@@ -137,6 +151,27 @@ impl SpaceView {
     /// its base's as they were at the branch point (or `at`, if earlier), one per key,
     /// with this space's ids. Forgotten-on-the-branch records (`_branch_deleted`) hide
     /// the base's. `in_scope` narrows to one named scope.
+    /// The current row of key `bare` in `space` as [`Self::rows_at`] would show it
+    /// (its own, else its bases' at their points; a branch's delete marker hides it),
+    /// looked up by key at each level, not by reading the spaces.
+    pub async fn key_at(&self, memory: adb_core::log::Memory, space: &str, bare: &str, at: adb_core::log::CommitTs, now: adb_core::log::CommitTs) -> AdbResult<Option<StoredRow>> {
+        let mut level = space.to_string();
+        let mut point = at;
+        for _ in 0..16 {
+            if let Some(r) = self.source().key_versions(memory, &level, bare).await?.into_iter().find(|r| r.is_current_at(point, now)) {
+                return Ok((!crate::namespaces::branch_deleted(&r)).then_some(r));
+            }
+            match self.base_of(&level).await? {
+                Some(b) if b.kind == crate::branches::BaseKind::Branch => {
+                    point = point.min(b.point());
+                    level = b.from;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Err(AdbError::Internal(format!("namespace {space:?}: its bases go more than 16 deep")))
+    }
+
     pub async fn rows_at(&self, memory: adb_core::log::Memory, space: &str, at: adb_core::log::CommitTs, now: adb_core::log::CommitTs) -> AdbResult<Vec<StoredRow>> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
