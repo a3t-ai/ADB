@@ -690,14 +690,38 @@ fn spawn_shipper<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrite
     })
 }
 
+/// Vectors for records stored without waiting for them (`writes::defer_embedding`):
+/// woken as each is queued, embedding what is queued in batches until none is left.
+/// A weak reference, like the timer's.
+fn spawn_deferred_embedder<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(wake) = writes.upgrade().map(|w| w.embed_wake()) else { return };
+        loop {
+            // Woken by a queued record; the timeout only bounds a missed wake-up.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await;
+            let Some(w) = writes.upgrade() else { return };
+            if w.embeds_queued() == 0 {
+                continue;
+            }
+            match w.embed_deferred().await {
+                Ok(n) => crate::steps::value("embed.deferred records per drain", n),
+                Err(e) => tracing::warn!(error = %e, "deferred embedding stopped; retrying"),
+            }
+        }
+    })
+}
+
 /// The maintenance timer: every tick, `expire_due`, and the embedding backfill
 /// while it finds work (then once a minute), on `writes` while it exists. Holds
 /// only a weak reference, so it never keeps the log (and its directory lock) open.
 fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
     let shipper = spawn_shipper(writes.clone());
+    let embedder = spawn_deferred_embedder(writes.clone());
     tokio::spawn(async move {
         // S3 option B: the WAL segment shipper lives as long as this timer.
         let _shipper = AbortOnDrop(shipper);
+        // Deferred vectors (`writes::defer_embedding`): as long as this timer too.
+        let _embedder = AbortOnDrop(embedder);
         // The first tick after one interval, not at once: a just-opened engine is
         // often closed again right away (tests, `adb import`).
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + EXPIRE_TICK, EXPIRE_TICK);

@@ -564,6 +564,41 @@ fn sub_idle() -> Duration {
     std::env::var("ADB_SUB_IDLE").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(SUB_IDLE)
 }
 
+/// Memory types whose STORE doesn't wait for its vector (`ADB_EMBED_DEFER`: a comma
+/// list of memory types, default `episodic`; `none` waits for every vector). The record
+/// is committed and answered at once; its vector follows within moments
+/// ([`DurableWrites::embed_deferred`]). A LIKE read in between doesn't rank it by
+/// meaning yet; key, time and field reads see it at once. Episodes are recalled on
+/// later turns, so they needn't make the writer wait for the model: waiting capped
+/// STORE EPISODIC at the embedding pool's pace (1.3–2.2k/s on 3 nodes against 16k/s
+/// for WORKING, Hetzner p14).
+pub fn defer_embedding(memory: MemoryType) -> bool {
+    static SET: std::sync::OnceLock<Vec<MemoryType>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let v = std::env::var("ADB_EMBED_DEFER").unwrap_or_else(|_| "episodic".into());
+        v.split(',')
+            .filter_map(|m| match m.trim().to_ascii_lowercase().as_str() {
+                "episodic" => Some(MemoryType::Episodic),
+                "semantic" => Some(MemoryType::Semantic),
+                "procedural" => Some(MemoryType::Procedural),
+                _ => None,
+            })
+            .collect()
+    })
+    .contains(&memory)
+}
+
+/// Records waiting for a deferred vector at most; more wait for the backfill scan.
+const EMBED_SOON_MAX: usize = 200_000;
+/// Texts per embedding call of [`DurableWrites::embed_deferred`] (the model's batch).
+const EMBED_SOON_BATCH: usize = 64;
+
+/// Deferred-embedding calls in flight at once (`ADB_EMBED_DEFER_PARALLEL`, default 4):
+/// a pool's workers each take one.
+fn embed_parallel() -> usize {
+    std::env::var("ADB_EMBED_DEFER_PARALLEL").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(4)
+}
+
 pub(crate) fn retain_max() -> u64 {
     std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
 }
@@ -698,6 +733,11 @@ pub struct DurableWrites<L: Log> {
     key_offsets: std::sync::Mutex<KeyOffsets>,
     /// Records waiting for a vector (PF-51): memory, row id, text.
     backfill_queue: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
+    /// Records stored without waiting for their vector ([`defer_embedding`]): (memory,
+    /// record id, text), embedded by [`DurableWrites::embed_deferred`] as soon as it
+    /// wakes. Bounded: past [`EMBED_SOON_MAX`] a record waits for the backfill scan.
+    embed_soon: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
+    embed_wake: Arc<tokio::sync::Notify>,
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
     poisoned: Arc<std::sync::atomic::AtomicBool>,
@@ -2045,6 +2085,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             return Ok(0);
         }
         let vectors = embedder.embed(todo.iter().map(|(_, _, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+        self.commit_vectors(&todo, vectors).await
+    }
+
+    /// Commit `vectors` for `todo`'s records as one record of `Embed` effects.
+    async fn commit_vectors(&self, todo: &[(Memory, String, String)], vectors: Vec<Vec<f32>>) -> AdbResult<u64> {
         let effects: Vec<Effect> = todo
             .iter()
             .zip(vectors)
@@ -2056,6 +2101,63 @@ impl<L: Log + 'static> DurableWrites<L> {
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         self.to_store(&record).await;
         Ok(n)
+    }
+
+    /// Queue a stored record's text for its vector ([`defer_embedding`]).
+    fn embed_later(&self, memory: Memory, id: String, text: String) {
+        {
+            let mut q = self.embed_soon.lock().unwrap();
+            if q.len() >= EMBED_SOON_MAX {
+                tracing::debug!("deferred embeddings queue full: the backfill scan embeds the rest");
+                return;
+            }
+            q.push_back((memory, id, text));
+        }
+        self.embed_wake.notify_one();
+    }
+
+    /// Woken when a record is queued for its vector.
+    pub fn embed_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.embed_wake)
+    }
+
+    /// Records waiting for a deferred vector.
+    pub fn embeds_queued(&self) -> usize {
+        self.embed_soon.lock().unwrap().len()
+    }
+
+    /// Embed the queued records ([`defer_embedding`]) and commit their vectors, in
+    /// batches of [`EMBED_SOON_BATCH`], up to `ADB_EMBED_DEFER_PARALLEL` at a time.
+    /// Returns how many got a vector. A batch the model fails is left to the backfill
+    /// scan (the rows have no vector, which is what it looks for).
+    pub async fn embed_deferred(&self) -> AdbResult<u64> {
+        let Some(embedder) = &self.embedder else {
+            self.embed_soon.lock().unwrap().clear();
+            return Ok(0);
+        };
+        let mut done = 0;
+        loop {
+            let batches: Vec<Vec<(Memory, String, String)>> = {
+                let mut q = self.embed_soon.lock().unwrap();
+                let mut out = Vec::new();
+                while out.len() < embed_parallel() && !q.is_empty() {
+                    let n = EMBED_SOON_BATCH.min(q.len());
+                    out.push(q.drain(..n).collect());
+                }
+                out
+            };
+            if batches.is_empty() {
+                return Ok(done);
+            }
+            let calls = batches.iter().map(|b| embedder.embed(b.iter().map(|(_, _, t)| t.clone()).collect()));
+            let results = futures::future::join_all(calls).await;
+            for (batch, r) in batches.iter().zip(results) {
+                match r {
+                    Ok(vectors) => done += self.commit_vectors(batch, vectors).await?,
+                    Err(e) => tracing::warn!(error = %e, records = batch.len(), "deferred embedding failed; the backfill scan will retry"),
+                }
+            }
+        }
     }
 
     fn key_taken(&self, memory: Memory, key: &str, now: CommitTs) -> bool {
@@ -2138,7 +2240,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), embed_soon: Default::default(), embed_wake: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2883,10 +2985,16 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     ) -> AdbResult<MemoryRecord> {
         check_scope(memory_type, in_scope)?;
         let mut t = std::time::Instant::now();
-        // Embedded before the sequencer, so the model doesn't serialise writes (T4).
-        let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
-            true => self.vector_of(crate::reads::embed_text(memory_type, &payload)).await,
+        // Embedded before the sequencer, so the model doesn't serialise writes (T4) —
+        // or after the commit, without the writer waiting ([`defer_embedding`]).
+        let text = match crate::reads::lance_owned(memory_type) && self.store.is_some() && self.embedder.is_some() {
+            true => crate::reads::embed_text(memory_type, &payload),
             false => None,
+        };
+        let defer = text.is_some() && defer_embedding(memory_type);
+        let vector = match defer {
+            true => None,
+            false => self.vector_of(text.clone()).await,
         };
         crate::steps::lap("store.1 embed", &mut t);
         let bare = scoped_key(None, in_scope, &store_id(memory_type, key, &payload))?;
@@ -2950,6 +3058,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         crate::steps::lap("store.7 quota note + release", &mut t);
         self.committed(record.offset.0, wait).await?;
         crate::steps::lap("store.8 commit wait", &mut t);
+        if let (true, Some(text)) = (defer, text) {
+            self.embed_later(memory_type.into(), new.lineage_id.0.clone(), text);
+        }
         Ok(stored)
     }
 
