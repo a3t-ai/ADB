@@ -476,3 +476,33 @@ async fn an_alias_resolves_through_every_node() {
         assert!(r.to_string().contains("works_at"), "node {}: the duplicate's link is the survivor's: {r}", i + 1);
     }
 }
+
+/// The same with no NAMESPACE (the default space, across partitions — the router runs
+/// these): the partitions learn the new alias at once (vc-dev parity probe, 18 Nov).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_set_with_no_namespace_resolves_through_every_node() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let peers = LocalPeers::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for n in 1..=3u64 {
+        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{n}"), &node);
+        nodes.push(node);
+    }
+    let q = |i: usize, aql: &'static str| {
+        let node = Arc::clone(&nodes[i % 3]);
+        async move { node.query(aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
+    };
+    q(0, r#"STORE INTO SEMANTIC (key = "ma", n = 1)"#).await;
+    q(1, r#"STORE INTO SEMANTIC (key = "mb", n = 2)"#).await;
+    q(2, r#"UPDATE INTO SEMANTIC WHERE key = "mb" (aliases = ["ma"])"#).await;
+    q(0, r#"FORGET FROM SEMANTIC WHERE key = "ma""#).await;
+    for i in 0..3 {
+        let r = q(i, r#"RECALL FROM SEMANTIC WHERE id = "ma""#).await;
+        let ids: Vec<&str> = r["data"]["records"].as_array().unwrap().iter().filter_map(|x| x["id"].as_str()).collect();
+        assert_eq!(ids, ["mb"], "node {}: the alias reads the survivor: {r}", i + 1);
+    }
+}

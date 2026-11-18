@@ -184,6 +184,11 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "compact" => e.compact().await,
         // A merged entity's key, for a cluster's reads across partitions (GR-12).
         "alias_of" => val(e.io().0.alias_of(&s("key")?)),
+        // A record's `aliases` changed by a statement the router ran (AQL v0.13).
+        "aliases_changed" => {
+            e.io().0.aliases_changed().await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        }
         // A cluster's watches across partitions (the router's).
         "cq_touched" => val(e.cq_touched(arg(&a, "after")?, &arg::<Vec<(String, adb_cq::WatchSpec)>>(&a, "watches")?, Duration::from_millis(arg(&a, "wait_ms")?)).await?),
         "cq_register" => Ok(json!({ "id": e.cq_register(&arg(&a, "spec")?).await? })),
@@ -341,6 +346,10 @@ impl Reads for RemotePartition {
 impl Writes for RemotePartition {
     async fn alias_resolve(&self, key: &str) -> AdbResult<Option<String>> {
         self.op_typed("alias_of", serde_json::json!({ "key": key })).await
+    }
+
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        self.op_typed::<Value>("aliases_changed", serde_json::json!({})).await.map(|_| ())
     }
 
     async fn store(&self, memory_type: MemoryType, key: &str, payload: Value, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {

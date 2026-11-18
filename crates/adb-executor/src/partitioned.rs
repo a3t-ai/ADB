@@ -1956,6 +1956,14 @@ impl Writes for Routed {
         Ok(found.into_iter().flatten().next())
     }
 
+    /// A statement run here (no namespace: across partitions) set a record's `aliases`:
+    /// each partition in reach reloads its own, as an owner does after its own statement.
+    /// Without it a key that became an alias was not found until the partition reopened.
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        self.each(None, |t| async move { t.writes.aliases_changed().await }).await?;
+        Ok(())
+    }
+
 }
 
 #[async_trait]
