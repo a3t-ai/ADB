@@ -67,6 +67,10 @@ function serverDelta(before, after) {
 /** `c` closed-loop clients calling `op(i)` for SECS seconds. */
 async function phase(name, c, op) {
   if (ONLY && !ONLY.test(name)) return { name, c, ops: 0, skipped: true };
+  // Requests the last phase's clients gave up on may still run on the servers: wait
+  // (PERF_SETTLE_MS, default 5 s) so a phase isn't measured against the last one's
+  // queue (18 Nov: mixed at c=512 ran beside leftover FORGETs in every run).
+  await new Promise(r => setTimeout(r, Number(process.env.PERF_SETTLE_MS ?? 5000)));
   const total = c;
   c = share(total);
   if (c === 0) {
