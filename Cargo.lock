@@ -198,6 +198,7 @@ dependencies = [
  "adb-core",
  "adb-executor",
  "aql-parser",
+ "aql-planner",
  "async-trait",
  "serde",
  "serde_json",
