@@ -1786,6 +1786,17 @@ mod tests {
             assert!(scans(scan), "{scan}");
         }
         assert!(!scans(r#"STORE INTO SEMANTIC (key = "k") NAMESPACE "ns""#));
+        // Newest-first episodes within one namespace: the recent-episodes index.
+        assert!(!scans(r#"RECALL FROM EPISODIC LIMIT 10 NAMESPACE "ns""#));
+        for scan in [
+            r#"RECALL FROM EPISODIC LIMIT 10"#,
+            r#"RECALL FROM EPISODIC WHERE kind = "call" LIMIT 10 NAMESPACE "ns""#,
+            r#"RECALL FROM EPISODIC ORDER BY n LIMIT 10 NAMESPACE "ns""#,
+            r#"RECALL FROM EPISODIC LIMIT 100000 NAMESPACE "ns""#,
+            r#"RECALL FROM SEMANTIC LIMIT 10 NAMESPACE "ns""#,
+        ] {
+            assert!(scans(scan), "{scan}");
+        }
     }
 
     #[tokio::test]
@@ -1902,23 +1913,32 @@ impl LocalEngine {
 /// Whether `aql` is a read that scans (RECALL or SCAN without `KEY`): the reads the
 /// permits below bound (C-5, C-20). Writes and keyed reads are not bounded.
 pub(crate) fn scans(aql: &str) -> bool {
-    adb_core::metrics::statement_of(aql).0 == "RECALL" && !keyed_recall(aql)
+    adb_core::metrics::statement_of(aql).0 == "RECALL" && !bounded_recall(aql)
 }
 
-/// A RECALL the planner answers as an exact lookup (AQL v0.13 has no LOOKUP verb:
-/// `RECALL … WHERE key = v` / `id = v` within a NAMESPACE). Decided by the planner's own
-/// rule, so the permit follows the access path actually taken; the text checks only
-/// skip the parse for statements that can't be one.
-fn keyed_recall(aql: &str) -> bool {
+/// A RECALL answered by a bounded number of lookups, not a scan: the planner's exact
+/// lookup (AQL v0.13 has no LOOKUP verb: `RECALL … WHERE key = v` / `id = v` within a
+/// NAMESPACE), or a newest-first EPISODIC read the recent-episodes index answers
+/// (`RECALL FROM EPISODIC LIMIT k NAMESPACE …`). Decided on the plan, so the permit
+/// follows the access path taken; the text checks only skip the parse for statements
+/// that can be neither.
+fn bounded_recall(aql: &str) -> bool {
     let has = |w: &str| aql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|t| t.eq_ignore_ascii_case(w));
-    if !aql.contains('=') || !has("NAMESPACE") || !(has("key") || has("id")) {
+    if !has("NAMESPACE") {
+        return false;
+    }
+    let keyed = aql.contains('=') && (has("key") || has("id"));
+    let newest = has("EPISODIC") && has("LIMIT") && !has("WHERE");
+    if !keyed && !newest {
         return false;
     }
     let Ok(stmt) = aql_parser::parse(aql) else { return false };
-    matches!(
-        aql_planner::Planner::new().plan(&stmt),
-        Ok(aql_planner::ExecutionPlan::Single(ref s)) if matches!(s.predicate, adb_core::predicate::Predicate::Key { .. })
-    )
+    match aql_planner::Planner::new().plan(&stmt) {
+        Ok(aql_planner::ExecutionPlan::Single(s)) => {
+            matches!(s.predicate, adb_core::predicate::Predicate::Key { .. }) || crate::query::is_newest_episodes(s.memory_type, &s.predicate, &s.modifiers)
+        }
+        _ => false,
+    }
 }
 
 /// Reads running at once (C-5): `ADB_MAX_READS`, default twice the CPUs (at least 2).

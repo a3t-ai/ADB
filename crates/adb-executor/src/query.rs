@@ -996,7 +996,49 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
 /// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap, its
 /// score in `metadata.confidence`.
 pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
+    if let Some(records) = newest_episodes(store, memory, predicate, modifiers, now).await? {
+        return Ok(records);
+    }
     served(store, "read", |source| read_from(store, memory, predicate, modifiers, now, source), same_records, show_records).await
+}
+
+/// The read shape the recent-episodes index answers: EPISODIC, newest first (no WHERE,
+/// ORDER BY, window, aggregate or scope), one namespace, LIMIT within what it keeps.
+pub fn is_newest_episodes(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> bool {
+    memory == MemoryType::Episodic
+        && match predicate {
+            Predicate::All => true,
+            Predicate::Where { conditions } => conditions.is_empty(),
+            _ => false,
+        }
+        && modifiers.namespace.is_some()
+        && modifiers.limit.is_some_and(|k| k <= adb_store::recent_index::keep())
+        && modifiers.order_by.is_none()
+        && modifiers.window.is_none()
+        && modifiers.aggregate.is_none()
+        && modifiers.scope.is_none()
+        && modifiers.in_scope.is_none()
+        && !is_history(modifiers)
+}
+
+/// `RECALL FROM EPISODIC … LIMIT k` (newest first) by id from the recent-episodes
+/// index, not by reading and sorting the namespace's episodes; `None` when the read
+/// isn't that shape or the index can't answer it.
+async fn newest_episodes(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<Vec<MemoryRecord>>> {
+    if !is_newest_episodes(memory, predicate, modifiers) {
+        return Ok(None);
+    }
+    let (Some(ns), Some(k)) = (modifiers.namespace.as_deref(), modifiers.limit) else { return Ok(None) };
+    let _t = crate::steps::timer("read.newest episodes (index)");
+    let Some(rows) = store.recent_episodes(ns, k, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? else {
+        crate::steps::add("read.newest episodes (index miss)", std::time::Duration::ZERO);
+        return Ok(None);
+    };
+    let mut records: Vec<MemoryRecord> = rows.iter().map(record).collect();
+    if let Some(f) = &modifiers.return_fields {
+        project(&mut records, f);
+    }
+    Ok(Some(records))
 }
 
 async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
