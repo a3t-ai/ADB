@@ -1737,6 +1737,29 @@ pub fn wire_record(r: &MemoryRecord) -> Value {
 mod tests {
     use super::*;
 
+    /// C-20 under AQL v0.13: a keyed RECALL (the planner's exact lookup) takes no read
+    /// permit; anything that scans does.
+    #[test]
+    fn keyed_recalls_skip_the_read_permit() {
+        for keyed in [
+            r#"RECALL FROM SEMANTIC WHERE id = "f1" NAMESPACE "ns""#,
+            r#"recall from working where key = $k namespace "ns""#,
+            r#"RECALL FROM EPISODIC WHERE key = "e1" NAMESPACE "ns" WITH LINKS"#,
+        ] {
+            assert!(!scans(keyed), "{keyed}");
+        }
+        for scan in [
+            r#"RECALL FROM SEMANTIC WHERE id = "f1""#,
+            r#"RECALL FROM SEMANTIC WHERE topic = "t1" NAMESPACE "ns" LIMIT 10"#,
+            r#"RECALL FROM SEMANTIC WHERE id = "f1" AND topic = "t" NAMESPACE "ns""#,
+            r#"RECALL FROM SEMANTIC WHERE key = "k" NAMESPACE "ns" AGGREGATE COUNT(*) AS n"#,
+            r#"RECALL FROM SEMANTIC NAMESPACE "ns""#,
+        ] {
+            assert!(scans(scan), "{scan}");
+        }
+        assert!(!scans(r#"STORE INTO SEMANTIC (key = "k") NAMESPACE "ns""#));
+    }
+
     #[tokio::test]
     async fn wire_format_matches_flowr_adapter() {
         let engine = LocalEngine::temporary().await.unwrap();
@@ -1851,10 +1874,23 @@ impl LocalEngine {
 /// Whether `aql` is a read that scans (RECALL or SCAN without `KEY`): the reads the
 /// permits below bound (C-5, C-20). Writes and keyed reads are not bounded.
 pub(crate) fn scans(aql: &str) -> bool {
-    match adb_core::metrics::statement_of(aql).0 {
-        "RECALL" | "SCAN" => !aql.split_whitespace().any(|w| w.eq_ignore_ascii_case("KEY")),
-        _ => false,
+    adb_core::metrics::statement_of(aql).0 == "RECALL" && !keyed_recall(aql)
+}
+
+/// A RECALL the planner answers as an exact lookup (AQL v0.13 has no LOOKUP verb:
+/// `RECALL … WHERE key = v` / `id = v` within a NAMESPACE). Decided by the planner's own
+/// rule, so the permit follows the access path actually taken; the text checks only
+/// skip the parse for statements that can't be one.
+fn keyed_recall(aql: &str) -> bool {
+    let has = |w: &str| aql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|t| t.eq_ignore_ascii_case(w));
+    if !aql.contains('=') || !has("NAMESPACE") || !(has("key") || has("id")) {
+        return false;
     }
+    let Ok(stmt) = aql_parser::parse(aql) else { return false };
+    matches!(
+        aql_planner::Planner::new().plan(&stmt),
+        Ok(aql_planner::ExecutionPlan::Single(ref s)) if matches!(s.predicate, adb_core::predicate::Predicate::Key { .. })
+    )
 }
 
 /// Reads running at once (C-5): `ADB_MAX_READS`, default twice the CPUs (at least 2).
