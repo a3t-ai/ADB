@@ -287,19 +287,16 @@ mod tests {
     }
 }
 
-/// `watch`: `WATCH <query> [DEBOUNCE <n>ms]` (MVP W6).
+/// `watch`: a live query, `SUBSCRIBE <RECALL …>` (AQL v0.13; how often it re-runs is
+/// the server's setting).
 pub fn watch(args: &Value) -> Result<String, String> {
     let query = args.get("query").and_then(Value::as_str).ok_or("Missing required: query")?.trim();
-    let query = query.strip_prefix("WATCH ").or_else(|| query.strip_prefix("watch ")).unwrap_or(query);
-    let mut aql = format!("WATCH {query}");
-    if let Some(ms) = args.get("debounce_ms").and_then(Value::as_u64) {
-        aql.push_str(&format!(" DEBOUNCE {ms}ms"));
-    }
-    Ok(aql)
+    let query = query.strip_prefix("SUBSCRIBE ").or_else(|| query.strip_prefix("subscribe ")).unwrap_or(query);
+    Ok(format!("SUBSCRIBE {query}"))
 }
 
-/// `unwatch`: `UNWATCH "<cq_id>"`.
+/// `unwatch`: `UNSUBSCRIBE "<cq_id>"`.
 pub fn unwatch(args: &Value) -> Result<String, String> {
     let id = args.get("cq_id").and_then(Value::as_str).ok_or("Missing required: cq_id")?;
-    Ok(format!("UNWATCH {}", quote(id)))
+    Ok(format!("UNSUBSCRIBE {}", quote(id)))
 }

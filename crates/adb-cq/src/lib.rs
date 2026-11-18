@@ -697,7 +697,7 @@ mod tests {
         let runner = Arc::new(Fake { unwatched: Mutex::new(Vec::new()) });
         let (_tx, rx) = watch::channel(0);
         let w = Watcher::with_idle(log, rx, runner.clone(), 0, Duration::from_millis(50));
-        let spec = WatchSpec::new(aql_parser::parse("RECALL FROM SEMANTIC ALL").unwrap(), HashMap::new(), None).unwrap();
+        let spec = WatchSpec::new(aql_parser::parse("RECALL FROM SEMANTIC").unwrap(), HashMap::new(), None).unwrap();
         w.add("a", spec.clone()).await.unwrap();
         w.add("b", spec).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -713,9 +713,9 @@ mod tests {
         let s = p(r#"RECALL FROM SEMANTIC IN SCOPE "team:a" WHERE topic = "x""#);
         assert_eq!(s.memories, Some([Memory::Semantic].into()));
         assert_eq!(s.scope.as_deref(), Some("team:a"));
-        assert!(p("RECALL FROM SEMANTIC ALL WITH LINKS ALL").memories.is_none(), "links: every memory type");
+        assert!(p("RECALL FROM SEMANTIC WITH LINKS").memories.is_none(), "links: every memory type");
         assert!(p("RECALL FROM SEMANTIC LIKE $q LIMIT 3").like);
-        assert!(p("RECALL FROM SEMANTIC ALL ORDER BY n DESC").ordered);
+        assert!(p("RECALL FROM SEMANTIC ORDER BY n DESC").ordered);
         assert!(!s.ordered);
         assert!(WatchSet::of(&aql_parser::parse(r#"STORE INTO SEMANTIC (key = "a")"#).unwrap()).is_err());
     }

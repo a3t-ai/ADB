@@ -335,7 +335,10 @@ async fn link_update_and_unlink() {
     assert_eq!(q(&engine, r#"RECALL FROM EPISODIC WHERE key = "e""#).await["data"]["count"], 1, "the records stay");
     let gw = engine.gateway().unwrap();
     let ops: Vec<String> = drain(&gw, &sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| c.op.clone())).collect();
-    assert_eq!(ops, ["link", "supersede", "link", "unlink", "link", "unlink", "unlink"], "LINK, re-LINK, LINK, retype (UNLINK + LINK), UNLINK ×2");
+    // The re-LINK's new version of the first link isn't delivered: that link is
+    // UNLINKed later, and an unlinked (forgotten) link's history is redacted from the
+    // log readers see (no read may miss a FORGET) — its `unlink` is.
+    assert_eq!(ops, ["link", "link", "unlink", "link", "unlink", "unlink"], "LINK, (re-LINK, redacted), LINK, retype (UNLINK + LINK), UNLINK ×2");
 
     let mem = LocalEngine::temporary().await.unwrap();
     script(&mem).await;

@@ -1301,7 +1301,7 @@ impl PartitionedEngine {
             self.system_op("cq_unregister", json!({ "id": id })).await?;
             cw.remove(id);
         }
-        let v = json!({ "cq_id": format!("{}{id}", crate::cluster_watch::PREFIX), "unwatched": existed });
+        let v = json!({ "cq_id": format!("{}{id}", crate::cluster_watch::PREFIX), "unsubscribed": existed });
         Ok(to_wire(&crate::QueryResult::subscription(v, started.elapsed().as_millis() as u64)))
     }
 
@@ -1738,6 +1738,13 @@ impl Writes for Routed {
 impl Engine for Arc<PartitionedEngine> {
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         Box::pin(self.query_in(aql, variables, &Reach::All)).await
+    }
+
+    async fn subscription(&self, plan: aql_planner::SubscriptionPlan) -> Result<Value, String> {
+        self.catalog_recent().await?;
+        let io = Arc::new(Routed { node: Arc::clone(self), reach: Reach::All });
+        let executor = Executor::with_io(Arc::clone(&io) as Arc<dyn Writes>, io as Arc<dyn Reads>);
+        executor.execute_plan(&aql_planner::ExecutionPlan::Subscription(plan)).await.map(|r| to_wire(&r)).map_err(|e| e.to_string())
     }
 
     async fn query_reach(&self, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Option<Result<Value, String>> {

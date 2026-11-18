@@ -117,6 +117,9 @@ impl Planner {
         if stmt.modifiers.with_history.as_ref().is_some_and(|h| h.between.is_some()) {
             return Err(PlanError::NotImplemented("WITH HISTORY BETWEEN"));
         }
+        if stmt.memory_type == MemoryType::Working && stmt.modifiers.in_scope.is_some() {
+            return Err(PlanError::InvalidMemoryType("IN SCOPE doesn't apply to WORKING (a session's own state)".to_string()));
+        }
         let modifiers = convert_modifiers(&stmt.modifiers)?;
         let predicate = convert_predicate(&stmt.predicate, stmt.memory_type, stmt.modifiers.confidence)?;
         if stmt.memory_type == MemoryType::All {
@@ -262,6 +265,10 @@ fn convert_predicate(pred: &Predicate, memory: MemoryType, confidence: Option<f3
         Predicate::Where { conditions } => Ok(CorePredicate::Where { conditions: convert_conditions(conditions)? }),
         Predicate::Like { variable, text: Some(text) } if memory == MemoryType::Procedural => {
             Ok(CorePredicate::Pattern { pattern_var: variable.clone(), threshold: confidence, text: Some(text.clone()) })
+        }
+        // `LIKE $p` on PROCEDURAL: the procedures matching the text `$p` holds.
+        Predicate::Like { variable, text: None } if memory == MemoryType::Procedural => {
+            Ok(CorePredicate::Pattern { pattern_var: variable.clone(), threshold: confidence, text: None })
         }
         Predicate::Like { variable, .. } => Ok(CorePredicate::Like { embedding_var: variable.clone() }),
         Predicate::All => Ok(CorePredicate::All),

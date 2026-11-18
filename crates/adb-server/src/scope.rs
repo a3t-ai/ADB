@@ -166,12 +166,12 @@ mod tests {
     fn statements_must_name_an_open_namespace() {
         let s = acme();
         assert!(s.check_aql(r#"STORE INTO SEMANTIC (key = "k") NAMESPACE "acme--bot""#).is_ok());
-        assert!(s.check_aql(r#"RECALL FROM SEMANTIC ALL NAMESPACE "shared""#).is_ok());
+        assert!(s.check_aql(r#"RECALL FROM SEMANTIC NAMESPACE "shared""#).is_ok());
         for refused in [
             r#"STORE INTO SEMANTIC (key = "k") NAMESPACE "shared""#,
-            r#"RECALL FROM SEMANTIC ALL NAMESPACE "globex--bot""#,
+            r#"RECALL FROM SEMANTIC NAMESPACE "globex--bot""#,
             r#"FORGET FROM SEMANTIC WHERE key = "k" NAMESPACE "globex--bot""#,
-            r#"RECALL FROM SEMANTIC ALL"#,
+            r#"RECALL FROM SEMANTIC"#,
             r#"SUBSCRIBE TOPIC "news""#,
             r#"not aql at all"#,
         ] {

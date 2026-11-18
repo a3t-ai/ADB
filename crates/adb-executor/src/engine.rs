@@ -54,6 +54,12 @@ pub trait Engine: Send + Sync {
     /// A subscription's next deliveries (stage E) as JSON — `{deliveries, reset?,
     /// next, tip}` — waiting up to `wait` for one. A cluster answers on any node: the
     /// gateway is on the system partition's owner.
+    /// A subscription operation AQL leaves to the API (AQL v0.13): ACK, a scope's
+    /// change feed, a start offset — planned as before, run without a statement.
+    async fn subscription(&self, _plan: aql_planner::SubscriptionPlan) -> Result<Value, String> {
+        Err("subscriptions need a durable engine (start ADB with --data-dir)".into())
+    }
+
     async fn next_events(&self, subscription: &str, from: Option<u64>, max: usize, wait: std::time::Duration) -> Result<Value, String> {
         let gw = self.gateway().ok_or("subscriptions need a durable engine (start ADB with --data-dir)")?;
         let batch = gw.next(subscription, from, max, wait).await.map_err(|e| e.to_string())?;
@@ -1541,6 +1547,10 @@ impl Engine for LocalEngine {
         d.engine_exec(space, |c| c.restore(changes, first)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
     }
 
+    async fn subscription(&self, plan: aql_planner::SubscriptionPlan) -> Result<Value, String> {
+        self.executor.execute_plan(&aql_planner::ExecutionPlan::Subscription(plan)).await.map(|r| to_wire(&r)).map_err(|e| e.to_string())
+    }
+
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         // AQL v0.13: a script (a USE, or statements separated by `;`) runs statement by
         // statement, each with the USE in force.
@@ -2304,7 +2314,7 @@ mod tests {
     async fn wire_format_matches_flowr_adapter() {
         let engine = LocalEngine::temporary().await.unwrap();
         let stored = engine
-            .query(r#"STORE INTO SEMANTIC (key = "k1", content = "hello") SCOPE private NAMESPACE "ns1""#, None)
+            .query(r#"STORE INTO SEMANTIC (key = "k1", content = "hello") NAMESPACE "ns1""#, None)
             .await
             .unwrap();
         assert_eq!(stored["success"], json!(true));
@@ -2352,7 +2362,7 @@ mod tests {
     async fn errors_are_err() {
         let engine = LocalEngine::temporary().await.unwrap();
         assert!(engine.query("THIS IS NOT AQL", None).await.is_err());
-        assert!(engine.query(r#"UNWATCH "no-such-watch""#, None).await.is_ok(), "unknown watch: unwatched = false");
+        assert!(engine.query(r#"UNSUBSCRIBE "no-such-watch""#, None).await.is_ok(), "unknown: unsubscribed = false");
         assert!(engine.query("RECALL FROM SEMANTIC LIKE $q", None).await.is_err(), "LIKE without a value");
     }
 }
