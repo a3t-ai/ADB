@@ -42,7 +42,13 @@ pub(crate) struct SeqGuard<'a, L: Log> {
     g: tokio::sync::MutexGuard<'a, Sequencer<L>>,
     held: &'static str,
     t: std::time::Instant,
+    holder: &'a SeqHolder,
 }
+
+/// Who holds the sequencer now (its site) and since when: a write path that stalls
+/// says what it is waiting behind ([`DurableWrites::sequencer_holder`]).
+#[derive(Default)]
+pub(crate) struct SeqHolder(std::sync::Mutex<Option<(&'static str, std::time::Instant)>>);
 
 impl<L: Log> std::ops::Deref for SeqGuard<'_, L> {
     type Target = Sequencer<L>;
@@ -59,22 +65,25 @@ impl<L: Log> std::ops::DerefMut for SeqGuard<'_, L> {
 
 impl<L: Log> Drop for SeqGuard<'_, L> {
     fn drop(&mut self) {
+        *self.holder.0.lock().unwrap() = None;
         crate::steps::add(self.held, self.t.elapsed());
         crate::steps::add("seq.held (all sites)", self.t.elapsed());
     }
 }
 
-async fn seq_timed<'a, L: Log>(m: &'a Mutex<Sequencer<L>>, wait: &'static str, held: &'static str) -> SeqGuard<'a, L> {
+async fn seq_timed<'a, L: Log>(m: &'a Mutex<Sequencer<L>>, holder: &'a SeqHolder, wait: &'static str, held: &'static str) -> SeqGuard<'a, L> {
     let t0 = std::time::Instant::now();
     let g = m.lock().await;
     crate::steps::add(wait, t0.elapsed());
     crate::steps::add("seq.wait (all sites)", t0.elapsed());
-    SeqGuard { g, held, t: std::time::Instant::now() }
+    let t = std::time::Instant::now();
+    *holder.0.lock().unwrap() = Some((held, t));
+    SeqGuard { g, held, t, holder }
 }
 
 macro_rules! seq_lock {
     ($self:ident) => {
-        seq_timed(&$self.seq, concat!("seq.wait @", line!()), concat!("seq.held @", line!())).await
+        seq_timed(&$self.seq, &$self.seq_holder, concat!("seq.wait @", line!()), concat!("seq.held @", line!())).await
     };
 }
 
@@ -620,6 +629,8 @@ fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
 /// Writes through the log.
 pub struct DurableWrites<L: Log> {
     seq: Mutex<Sequencer<L>>,
+    /// Who holds `seq` now.
+    seq_holder: SeqHolder,
     /// The sequencer's log, shared: trimming and FORGET redaction use it without the
     /// sequencer (they need no ordering; holding it stalled every write).
     log: Arc<L>,
@@ -2125,7 +2136,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -3245,7 +3256,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             tokio::select! {
                 // Committed by another write's holder.
                 r = &mut rx => return r.unwrap_or_else(|_| Err(AdbError::Internal("platform write dropped".into()))),
-                seq = seq_timed(&self.seq, concat!("seq.wait @", line!()), concat!("seq.held @", line!())) => {
+                seq = seq_timed(&self.seq, &self.seq_holder, concat!("seq.wait @", line!()), concat!("seq.held @", line!())) => {
                     let mut seq = seq;
                     let batch: Vec<PlatformPending> = {
                         let mut q = self.platform_queue.lock().unwrap();

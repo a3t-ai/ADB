@@ -869,7 +869,22 @@ impl PartitionedEngine {
         // here (a restart at the same epoch opens what it has).
         if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
             at("begin epoch (object storage)");
-            e.begin_epoch(epoch).await?;
+            // It takes the sequencer first: a write holding it stalls the open.
+            let holder = e.durable_writes().cloned().map(|d| {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        if let Some((site, held)) = d.sequencer_holder() {
+                            tracing::warn!(partition = p, site, held_s = held.as_secs(), "the open waits for the sequencer");
+                        }
+                    }
+                })
+            });
+            let begun = e.begin_epoch(epoch).await;
+            if let Some(h) = holder {
+                h.abort();
+            }
+            begun?;
             std::fs::write(pdir.join("owner.epoch"), epoch.to_string()).map_err(|e| format!("owner epoch: {e}"))?;
             self.replicas.clear(p);
         }

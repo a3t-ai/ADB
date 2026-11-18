@@ -226,6 +226,11 @@ pub struct ShipStats {
 }
 
 impl<L: Log> DurableWrites<L> {
+    /// Who holds the sequencer now (its site), and for how long: `None` when free.
+    pub fn sequencer_holder(&self) -> Option<(&'static str, std::time::Duration)> {
+        self.seq_holder.0.lock().unwrap().map(|(site, t)| (site, t.elapsed()))
+    }
+
     /// The owner epoch this engine writes object keys under (0 on a single node).
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
@@ -235,7 +240,7 @@ impl<L: Log> DurableWrites<L> {
     /// offset this owner will write, before any write is taken. Records below it are
     /// the ones the log holds now. A no-op without object storage.
     pub async fn begin_epoch(&self, epoch: u64) -> AdbResult<()> {
-        let seq = seq_timed(&self.seq, "seq.wait @epoch", "seq.held @epoch").await;
+        let seq = seq_timed(&self.seq, &self.seq_holder, "seq.wait @epoch", "seq.held @epoch").await;
         if let Some(cold) = self.store.as_ref().and_then(|s| s.cold_uri().map(|c| (c.to_string(), s.partition()))) {
             let start = seq.log().last_offset().0 + 1;
             let bytes = serde_json::to_vec(&EpochMarker { start }).map_err(|e| AdbError::Internal(format!("epoch marker: {e}")))?;
@@ -285,7 +290,7 @@ impl<L: Log> DurableWrites<L> {
         loop {
             // Read a batch under the sequencer, releasing it between batches.
             let batch = {
-                let seq = seq_timed(&self.seq, "seq.wait @ship", "seq.held @ship").await;
+                let seq = seq_timed(&self.seq, &self.seq_holder, "seq.wait @ship", "seq.held @ship").await;
                 let durable = seq.log().durable_offset().0;
                 if durable <= from {
                     Vec::new()
@@ -321,7 +326,7 @@ impl<L: Log> DurableWrites<L> {
         }
         *shipped = Some(stats.shipped);
         // The replica may drop what object storage now holds (step 5).
-        seq_timed(&self.seq, "seq.wait @ship", "seq.held @ship").await.log().note_shipped(LogOffset(stats.shipped));
+        seq_timed(&self.seq, &self.seq_holder, "seq.wait @ship", "seq.held @ship").await.log().note_shipped(LogOffset(stats.shipped));
         Ok(stats)
     }
 
