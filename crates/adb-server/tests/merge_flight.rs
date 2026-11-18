@@ -21,6 +21,7 @@ async fn action(url: &str, kind: &str, body: Value) -> Result<Value, (String, St
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: branch merges (DB-19) and the BRANCH modifier are being replaced by BRANCH/MERGE on namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn conflicts_merge_and_revert_over_flight() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -57,7 +58,7 @@ async fn conflicts_merge_and_revert_over_flight() {
         "resolutions": [{ "lineage": c["lineage"], "memory": c["memory"], "take": "edit", "value": { "key": "refund", "steps": "edited" } }],
     })).await.unwrap();
     assert_eq!((m["changed"].clone(), m["added"].clone()), (json!(1), json!(1)), "{m}");
-    let now = aql(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "ops" LIMIT 10"#).await;
+    let now = aql(r#"RECALL FROM PROCEDURAL NAMESPACE "ops" LIMIT 10"#).await;
     let s = now.to_string();
     assert!(s.contains("edited") && s.contains("new") && !s.contains("\"main\""), "{now}");
 

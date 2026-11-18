@@ -14,7 +14,7 @@ pub fn tool_list() -> Value {
     json!({ "tools": [
         {
             "name": "aql_query",
-            "description": "Execute an AQL (Agent Query Language) query against ADB. Use this for all memory operations including STORE, RECALL, SCAN, LOOKUP, LOAD, FORGET, UPDATE, LINK, REFLECT, and PIPELINE. See the resource adb://guide/memory.",
+            "description": "Execute an AQL (Agent Query Language) query against ADB. Use this for all memory operations: RECALL, STORE, UPDATE, FORGET, LINK, UNLINK, PIPELINE, SUBSCRIBE and PUBLISH (AQL v0.13). See the resource adb://guide/memory.",
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": "The AQL query to execute" },
                 "variables": { "type": "object", "description": "Values for {name} placeholders in the query (optional)" }
@@ -153,7 +153,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "watch",
-            "description": "Keep a query's result current: returns its result now (`{cq_id, offset, result}`); read what changes with `watch_changes`. Takes RECALL, LOOKUP, SCAN or LOAD.",
+            "description": "Keep a query's result current: returns its result now (`{cq_id, offset, result}`); read what changes with `watch_changes`. Takes a RECALL (`SUBSCRIBE RECALL …`).",
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": "The AQL read, e.g. RECALL FROM SEMANTIC WHERE topic = \"billing\" LIMIT 20" },
                 "variables": { "type": "object", "description": "Values for $name variables in the query (optional)" },

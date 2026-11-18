@@ -43,14 +43,14 @@ async fn query_matches_flowr_clawdb_adapter() {
     let base = start().await;
     let (st, body) = post(
         &format!("{base}/query"),
-        json!({"query": r#"STORE INTO SEMANTIC (key = "k1", content = "hello") SCOPE private NAMESPACE "agent-7""#}),
+        json!({"query": r#"STORE INTO SEMANTIC (key = "k1", content = "hello") NAMESPACE "agent-7""#}),
     )
     .await;
     assert_eq!(st, 200);
     assert_eq!(body["success"], json!(true));
     assert!(body["execution_time_ms"].is_u64());
 
-    let (_, body) = post(&format!("{base}/query"), json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "k1""#})).await;
+    let (_, body) = post(&format!("{base}/query"), json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "k1" NAMESPACE "agent-7""#})).await;
     assert_eq!(body["success"], json!(true));
     let data = &body["data"]; // what execute_aql returns
     let records = data["data"]["records"].as_array().expect("data.data.records");
@@ -233,7 +233,7 @@ async fn watch_events_over_sse() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://{addr}");
 
-    let (st, v) = post(&format!("{base}/query"), json!({"query": r#"WATCH RECALL FROM SEMANTIC WHERE topic = "x" DEBOUNCE 50ms"#})).await;
+    let (st, v) = post(&format!("{base}/query"), json!({"query": r#"SUBSCRIBE RECALL FROM SEMANTIC WHERE topic = "x""#})).await;
     assert_eq!(st, 200, "{v}");
     let id = v["data"]["data"]["cq_id"].as_str().unwrap().to_string();
     let offset = v["data"]["data"]["offset"].as_u64().unwrap();

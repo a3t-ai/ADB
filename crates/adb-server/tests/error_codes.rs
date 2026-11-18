@@ -58,10 +58,9 @@ async fn refusals_carry_stable_codes() {
     assert!(ok.get("code").is_none(), "no code on success: {ok}");
     for (q, want) in [
         (r#"STORE INTO SEMANTIC (key = "k", fact = "b") NAMESPACE "crm""#, "key_exists"),
-        (r#"RECALL FROM SEMANTIC ALL BRANCH "try""#, "branch_needs_namespace"),
-        (r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "nope""#, "branch_not_found"),
         (r#"STORE INTO SEMANTIC (fact = "x") NAMESPACE "a|b""#, "namespace_invalid"),
-        ("FORGET FROM WORKING", "missing_predicate"),
+        // AQL v0.13: the parser refuses a FORGET with neither WHERE nor NAMESPACE.
+        ("FORGET FROM WORKING", "parse_error"),
         ("RECALL FRM SEMANTIC", "parse_error"),
     ] {
         let a = query(&base, q).await;

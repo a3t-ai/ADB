@@ -53,15 +53,15 @@ async fn tokens_stay_in_their_namespaces() {
     // Each org writes and reads its own.
     assert!(aql("acme-token", r#"STORE INTO SEMANTIC (key = "a", content = "acme secret") NAMESPACE "acme--bot""#).await.is_ok());
     assert!(aql("globex-token", r#"STORE INTO SEMANTIC (key = "g", content = "globex secret") NAMESPACE "globex--bot""#).await.is_ok());
-    let own = aql("acme-token", r#"RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot""#).await.unwrap();
+    let own = aql("acme-token", r#"RECALL FROM SEMANTIC NAMESPACE "acme--bot""#).await.unwrap();
     assert!(own.to_string().contains("acme secret"), "{own}");
 
     // And never the other's: reads, writes, forgets, branches, copies, stats, tables.
     for q in [
-        r#"RECALL FROM SEMANTIC ALL NAMESPACE "globex--bot""#,
+        r#"RECALL FROM SEMANTIC NAMESPACE "globex--bot""#,
         r#"STORE INTO SEMANTIC (key = "x", content = "y") NAMESPACE "globex--bot""#,
         r#"FORGET FROM SEMANTIC WHERE key = "g" NAMESPACE "globex--bot""#,
-        r#"RECALL FROM SEMANTIC ALL"#,
+        r#"RECALL FROM SEMANTIC"#,
     ] {
         assert_eq!(aql("acme-token", q).await.unwrap_err(), "forbidden", "{q}");
     }
@@ -90,14 +90,14 @@ async fn tokens_stay_in_their_namespaces() {
     assert_eq!(c.do_get(req).await.err().map(|s| s.code()), Some(tonic::Code::PermissionDenied));
 
     // The non-prod token reads everything, as a pod reads its parents, and writes nothing.
-    let read = aql("np-token", r#"RECALL FROM SEMANTIC ALL NAMESPACE "globex--bot""#).await.unwrap();
+    let read = aql("np-token", r#"RECALL FROM SEMANTIC NAMESPACE "globex--bot""#).await.unwrap();
     assert!(read.to_string().contains("globex secret"), "{read}");
     assert!(action(&f, "np-token", "branch_parent_rows", json!({ "namespace": "acme--bot", "memory": "SEMANTIC", "at": i64::MAX })).await.is_ok());
     assert_eq!(aql("np-token", r#"STORE INTO SEMANTIC (key = "x", content = "y") NAMESPACE "acme--bot""#).await.unwrap_err(), "forbidden");
     assert!(action(&f, "np-token", "branch_create", json!({ "namespace": "acme--bot", "name": "b" })).await.is_err());
 
     // An unknown token gets nothing; the main token is unchanged.
-    assert!(aql("guess", r#"RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot""#).await.is_err());
+    assert!(aql("guess", r#"RECALL FROM SEMANTIC NAMESPACE "acme--bot""#).await.is_err());
     assert!(action(&f, "root", "list_tables", json!({})).await.is_ok());
 
     // HTTP: the same check on /query, and nothing else.
@@ -110,10 +110,10 @@ async fn tokens_stay_in_their_namespaces() {
         let (http, base) = (http.clone(), base.clone());
         async move { http.post(format!("{base}/query")).bearer_auth(token).json(&json!({ "query": q })).send().await.unwrap().status().as_u16() }
     };
-    assert_eq!(post("acme-token", r#"RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot""#).await, 200);
-    assert_eq!(post("acme-token", r#"RECALL FROM SEMANTIC ALL NAMESPACE "globex--bot""#).await, 403);
+    assert_eq!(post("acme-token", r#"RECALL FROM SEMANTIC NAMESPACE "acme--bot""#).await, 200);
+    assert_eq!(post("acme-token", r#"RECALL FROM SEMANTIC NAMESPACE "globex--bot""#).await, 403);
     assert_eq!(post("np-token", r#"STORE INTO SEMANTIC (key = "x", content = "y") NAMESPACE "acme--bot""#).await, 403);
-    assert_eq!(post("nobody", r#"RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot""#).await, 401);
+    assert_eq!(post("nobody", r#"RECALL FROM SEMANTIC NAMESPACE "acme--bot""#).await, 401);
     let mcp = http.post(format!("{base}/mcp")).bearer_auth("acme-token").json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).send().await.unwrap();
     assert_eq!(mcp.status().as_u16(), 403);
     assert_eq!(http.get(format!("{base}/stats")).bearer_auth("acme-token").send().await.unwrap().status().as_u16(), 403);

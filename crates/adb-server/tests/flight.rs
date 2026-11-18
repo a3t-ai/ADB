@@ -99,7 +99,7 @@ async fn platform_tables_and_aql_over_flight() {
         // AQL rides the same wire, with POST /query's answer.
         let r = action(&mut c, "aql", json!({ "query": r#"STORE INTO WORKING (key = "w1", task = "flight")"# })).await.unwrap();
         assert_eq!(r["success"], true, "{r}");
-        let r = action(&mut c, "aql", json!({ "query": "SCAN FROM WORKING" })).await.unwrap();
+        let r = action(&mut c, "aql", json!({ "query": "RECALL FROM WORKING" })).await.unwrap();
         assert_eq!(r["data"]["data"]["records"][0]["data"]["task"], "flight", "{r}");
         let r = action(&mut c, "aql", json!({ "query": "FORGET FROM WORKING" })).await.unwrap();
         assert_eq!(r["success"], false, "AQL errors come back in the body: {r}");
@@ -108,7 +108,7 @@ async fn platform_tables_and_aql_over_flight() {
     // Restart: platform tables and memory came back (log + Lance).
     let (mut c, server) = start(dir.path()).await;
     assert_eq!(ids(&get(&mut c, json!({ "table": "agent_configs" })).await.unwrap()), ["a2", "a3"]);
-    let r = action(&mut c, "aql", json!({ "query": "SCAN FROM WORKING" })).await.unwrap();
+    let r = action(&mut c, "aql", json!({ "query": "RECALL FROM WORKING" })).await.unwrap();
     assert_eq!(r["data"]["data"]["records"][0]["data"]["task"], "flight");
     server.abort();
 }
@@ -241,6 +241,7 @@ async fn feed(c: &mut FlightServiceClient<Channel>, ticket: Value) -> (Vec<Value
 
 /// GR-15 over the wire: a snapshot, then changes from `next`.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: FACT and the fact feed are being replaced (relationships are LINKs, values are fields)"]
 async fn fact_feed_over_flight() {
     let dir = tempfile::tempdir().unwrap();
     let (mut c, server) = start(dir.path()).await;

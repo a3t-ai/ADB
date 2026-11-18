@@ -90,6 +90,34 @@ async fn stats_count_each_tier_of_one_space_and_its_branch() {
     assert_eq!(kept["tiers"]["SEMANTIC"]["count"], json!(2), "{kept}");
     let fresh = action(&f, "space_stats", json!({ "namespace": "crm", "max_age_ms": 0 })).await.unwrap();
     assert_eq!(fresh["tiers"]["SEMANTIC"]["count"], json!(3), "{fresh}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
+async fn stats_count_each_tier_of_one_space_and_its_branch_with_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = serve(dir.path()).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "a", content = "first") NAMESPACE "crm""#).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "b", content = "second") NAMESPACE "crm""#).await;
+    aql(&f, r#"STORE INTO PROCEDURAL (key = "p", steps = "s") NAMESPACE "crm""#).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "other", content = "not this space") NAMESPACE "billing""#).await;
+    // An update is one record, not two.
+    aql(&f, r#"UPDATE INTO SEMANTIC WHERE key = "a" (content = "first, edited") NAMESPACE "crm""#).await;
+
+    let s = action(&f, "space_stats", json!({ "namespace": "crm", "max_age_ms": 0 })).await.unwrap();
+    assert_eq!(s["tiers"]["SEMANTIC"]["count"], json!(2), "{s}");
+    assert_eq!(s["tiers"]["PROCEDURAL"]["count"], json!(1), "{s}");
+    assert_eq!(s["tiers"]["TOOLS"]["count"], json!(0), "{s}");
+    assert!(s["tiers"]["SEMANTIC"]["bytes"].as_u64().unwrap() > 0, "{s}");
+    assert!(s["tiers"]["SEMANTIC"]["last_write_ts"].as_i64().unwrap() > 0, "{s}");
+    assert!(s["tiers"]["TOOLS"]["last_write_ts"].is_null(), "{s}");
+
+    // Kept for the asked age: a new write doesn't show until it passes.
+    aql(&f, r#"STORE INTO SEMANTIC (key = "c", content = "third") NAMESPACE "crm""#).await;
+    let kept = action(&f, "space_stats", json!({ "namespace": "crm", "max_age_ms": 60000 })).await.unwrap();
+    assert_eq!(kept["tiers"]["SEMANTIC"]["count"], json!(2), "{kept}");
+    let fresh = action(&f, "space_stats", json!({ "namespace": "crm", "max_age_ms": 0 })).await.unwrap();
+    assert_eq!(fresh["tiers"]["SEMANTIC"]["count"], json!(3), "{fresh}");
 
     // A branch counts its own view; opt-in on branch_list.
     action(&f, "branch_create", json!({ "namespace": "crm", "name": "try" })).await.unwrap();
@@ -197,6 +225,76 @@ async fn feed_follows_one_space_and_never_returns_an_erased_payload() {
     let woke = wait.await.unwrap();
     assert_eq!(woke["changes"][0]["key"], json!("late"), "{woke}");
     assert!(t.elapsed() < std::time::Duration::from_secs(2), "reached the feed in {:?}", t.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
+async fn feed_follows_one_space_and_never_returns_an_erased_payload_with_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = serve(dir.path()).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "before", content = "x") NAMESPACE "crm""#).await;
+
+    // No offset: reset, then follow from next.
+    let first = action(&f, "space_changes", json!({ "namespace": "crm" })).await.unwrap();
+    assert_eq!(first["reset"], json!(true), "{first}");
+    let from = first["next"].clone();
+
+    aql(&f, r#"STORE INTO SEMANTIC (key = "fact", content = "secret words") NAMESPACE "crm""#).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "elsewhere", content = "y") NAMESPACE "billing""#).await;
+    aql(&f, r#"STORE INTO EPISODIC (key = "ep", content = "talked") NAMESPACE "crm""#).await;
+    aql(&f, r#"UPDATE INTO EPISODIC WHERE key = "ep" (content = "talked more") NAMESPACE "crm""#).await;
+    aql(&f, r#"UPDATE INTO SEMANTIC WHERE key = "fact" (content = "secret words, edited") NAMESPACE "crm""#).await;
+    aql(&f, r#"STORE INTO SEMANTIC (key = "gone", content = "erase these words") NAMESPACE "crm""#).await;
+    aql(&f, r#"FORGET FROM SEMANTIC WHERE key = "gone" NAMESPACE "crm""#).await;
+
+    // A feed answers with what is applied when it is read: follow it (as a consumer
+    // does, from `next`) until the FORGET is in.
+    let mut gathered: Vec<serde_json::Value> = Vec::new();
+    let mut at = from.clone();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let page = action(&f, "space_changes", json!({ "namespace": "crm", "from": at, "wait_ms": 500 })).await.unwrap();
+        assert_eq!(page["reset"], json!(false), "{page}");
+        gathered.extend(page["changes"].as_array().cloned().unwrap_or_default());
+        at = page["next"].clone();
+        if gathered.iter().any(|c| c["op"] == "forget") || std::time::Instant::now() >= until {
+            break;
+        }
+    }
+    let all = json!({ "changes": gathered, "next": at });
+    let changes = all["changes"].as_array().unwrap();
+    let got: Vec<(String, String, String)> = changes
+        .iter()
+        .map(|c| (c["op"].as_str().unwrap().into(), c["memory"].as_str().unwrap().to_ascii_uppercase(), c["key"].as_str().unwrap_or_default().to_string()))
+        .collect();
+    let want = |op: &str, m: &str, k: &str| (op.to_string(), m.to_string(), k.to_string());
+    for w in [
+        want("put", "SEMANTIC", "fact"),
+        want("put", "EPISODIC", "ep"),
+        want("update", "EPISODIC", "ep"),
+        want("update", "SEMANTIC", "fact"),
+        want("forget", "SEMANTIC", "gone"),
+    ] {
+        assert!(got.contains(&w), "missing {w:?} in {got:?}");
+    }
+    assert!(got.iter().all(|(_, _, k)| k != "elsewhere"), "another space's write: {got:?}");
+    assert!(!all.to_string().contains("erase these words"), "an erased payload in the feed: {all}");
+    assert!(changes.windows(2).all(|w| w[0]["offset"].as_u64() <= w[1]["offset"].as_u64()), "{all}");
+
+    // One memory type only; a waiting read wakes on the next write.
+    let only = action(&f, "space_changes", json!({ "namespace": "crm", "from": from, "memories": ["EPISODIC"] })).await.unwrap();
+    assert!(only["changes"].as_array().unwrap().iter().all(|c| c["memory"].as_str().unwrap().eq_ignore_ascii_case("EPISODIC")), "{only}");
+    assert_eq!(only["changes"].as_array().unwrap().len(), 2, "{only}");
+
+    let next = all["next"].clone();
+    let g = f.clone();
+    let wait = tokio::spawn(async move { action(&g, "space_changes", json!({ "namespace": "crm", "from": next, "wait_ms": 10000 })).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    aql(&f, r#"STORE INTO SEMANTIC (key = "late", content = "z") NAMESPACE "crm""#).await;
+    let woke = wait.await.unwrap();
+    assert_eq!(woke["changes"][0]["key"], json!("late"), "{woke}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(2), "reached the feed in {:?}", t.elapsed());
 
     // A branch's writes are on its own feed, not main's.
     action(&f, "branch_create", json!({ "namespace": "crm", "name": "try" })).await.unwrap();
@@ -210,6 +308,7 @@ async fn feed_follows_one_space_and_never_returns_an_erased_payload() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn branch_and_clone_at_a_tag_or_offset_read_what_that_point_held() {
     let dir = tempfile::tempdir().unwrap();
     let f = serve(dir.path()).await;
@@ -222,26 +321,26 @@ async fn branch_and_clone_at_a_tag_or_offset_read_what_that_point_held() {
 
     // At a tag: what v1 held. It came before the procedure existed.
     let b = action(&f, "branch_create", json!({ "namespace": "crm", "name": "at-tag", "at": { "tag": "v1" } })).await.unwrap();
-    let read = aql(&f, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "at-tag" LIMIT 10"#).await;
+    let read = aql(&f, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "at-tag" LIMIT 10"#).await;
     assert!(holds(&read, "original") && !holds(&read, "changed later"), "{read}");
-    let procs = aql(&f, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" BRANCH "at-tag" LIMIT 10"#).await;
+    let procs = aql(&f, r#"RECALL FROM PROCEDURAL NAMESPACE "crm" BRANCH "at-tag" LIMIT 10"#).await;
     assert!(!holds(&procs, "first") && !holds(&procs, "second"), "{procs}");
 
     // At an offset: the memory point of an answer.
     action(&f, "branch_create", json!({ "namespace": "crm", "name": "at-off", "at": { "offset": offset } })).await.unwrap();
-    let procs = aql(&f, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" BRANCH "at-off" LIMIT 10"#).await;
+    let procs = aql(&f, r#"RECALL FROM PROCEDURAL NAMESPACE "crm" BRANCH "at-off" LIMIT 10"#).await;
     assert!(holds(&procs, "first") && !holds(&procs, "second"), "{procs}");
 
     // The branch writes on top of the past, main is untouched.
     aql(&f, r#"STORE INTO SEMANTIC (key = "new", content = "from the past") NAMESPACE "crm" BRANCH "at-off""#).await;
-    let main = aql(&f, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" LIMIT 10"#).await;
+    let main = aql(&f, r#"RECALL FROM SEMANTIC NAMESPACE "crm" LIMIT 10"#).await;
     assert!(holds(&main, "changed later") && !holds(&main, "from the past"), "{main}");
 
     // A clone at the tag.
     let c = action(&f, "space_clone", json!({ "namespace": "crm", "into": "crm-v1", "at": { "tag": "v1" } })).await.unwrap();
     assert_eq!(c["records"], json!(1), "{c}");
     assert!(c["from"]["point"]["offset"].is_u64(), "{c}");
-    let cloned = aql(&f, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm-v1" LIMIT 10"#).await;
+    let cloned = aql(&f, r#"RECALL FROM SEMANTIC NAMESPACE "crm-v1" LIMIT 10"#).await;
     assert!(holds(&cloned, "original") && !holds(&cloned, "changed later"), "{cloned}");
 
     // Refusals, with their codes.
@@ -268,7 +367,7 @@ async fn a_procedures_only_copy_carries_nothing_about_clients() {
 
     let c = action(&f, "space_clone", json!({ "namespace": "acme--bot", "into": "globex--bot", "procedures_only": true })).await.unwrap();
     assert_eq!(c["records"], json!(1), "{c}");
-    assert!(holds(&aql(&f, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "globex--bot""#).await, "check, then pay"));
+    assert!(holds(&aql(&f, r#"RECALL FROM PROCEDURAL NAMESPACE "globex--bot""#).await, "check, then pay"));
     let stats = action(&f, "space_stats", json!({ "namespace": "globex--bot", "max_age_ms": 0 })).await.unwrap();
     for (tier, count) in [("PROCEDURAL", 1), ("SEMANTIC", 0), ("EPISODIC", 0), ("WORKING", 0), ("TOOLS", 0)] {
         assert_eq!(stats["tiers"][tier]["count"], json!(count), "{tier}: {stats}");

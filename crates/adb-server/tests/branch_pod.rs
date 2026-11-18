@@ -69,6 +69,7 @@ async fn start_pod(dir: &std::path::Path, org: &str, port: u16) -> (Arc<dyn Engi
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier and branch pods are being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn a_branch_in_its_own_pod() {
     let (org_dir, pod_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (org_port, pod_port) = (free_port(), free_port());
@@ -101,17 +102,17 @@ async fn a_branch_in_its_own_pod() {
 
     // Statements on the branch run in the pod; the org's table doesn't move.
     let org_stats = org.stats().await.unwrap();
-    let org_at = offset(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" LIMIT 1"#).await.unwrap());
+    let org_at = offset(&q(r#"RECALL FROM SEMANTIC NAMESPACE "crm" LIMIT 1"#).await.unwrap());
     q(r#"UPDATE INTO SEMANTIC WHERE key = "p" (fact = "PII-pod-copy") NAMESPACE "crm" BRANCH "pod-try""#).await.unwrap();
     q(r#"STORE INTO SEMANTIC (key = "e", fact = "e1") NAMESPACE "crm" BRANCH "pod-try""#).await.unwrap();
     assert_eq!(org.stats().await.unwrap(), org_stats, "branch writes stay in the pod");
-    assert_eq!(offset(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" LIMIT 1"#).await.unwrap()), org_at, "DB-1: nothing reached the org's log");
+    assert_eq!(offset(&q(r#"RECALL FROM SEMANTIC NAMESPACE "crm" LIMIT 1"#).await.unwrap()), org_at, "DB-1: nothing reached the org's log");
     // DB-20: the pod's first record says where it came from.
-    let origin = q(r#"RECALL FROM EPISODIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 10"#).await.unwrap();
+    let origin = q(r#"RECALL FROM EPISODIC NAMESPACE "crm" BRANCH "pod-try" LIMIT 10"#).await.unwrap();
     assert_eq!(events(&origin), ["branch_created"], "{origin}");
-    let on = || async { facts(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#).await.unwrap()) };
+    let on = || async { facts(&q(r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#).await.unwrap()) };
     assert_eq!(on().await, ["PII-main-s", "PII-pod-copy", "a1", "e1"], "parent AS OF the point (no late1) + its own");
-    assert_eq!(facts(&pod.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#, None).await.unwrap()), on().await);
+    assert_eq!(facts(&pod.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "pod-try" LIMIT 100"#, None).await.unwrap()), on().await);
 
     // FORGET on main reaches the running pod: no read there returns its copy from the
     // FORGET's commit on, and the pod's next compaction takes it off the disk
@@ -141,6 +142,6 @@ async fn a_branch_in_its_own_pod() {
     // Promote the pod branch as a new agent.
     let p = org.branch_promote("crm", "pod-try", "crm-v2", true).await.unwrap();
     assert_eq!(p["records"], 2, "{p}");
-    assert_eq!(facts(&q(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm-v2" LIMIT 100"#).await.unwrap()), ["a1", "e1"]);
+    assert_eq!(facts(&q(r#"RECALL FROM SEMANTIC NAMESPACE "crm-v2" LIMIT 100"#).await.unwrap()), ["a1", "e1"]);
     assert!(org.branch_create("crm", "child", Some("pod-try"), None).await.is_err(), "no hosted branch on a pod branch (yet)");
 }

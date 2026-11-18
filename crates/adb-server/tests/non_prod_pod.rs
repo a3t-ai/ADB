@@ -34,6 +34,7 @@ async fn start_pod(dir: &std::path::Path, org: &str, own: &str, port: u16) -> to
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier and branch pods are being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn one_pod_hosts_the_branches_of_many_agents() {
     std::env::set_var("ADB_SCOPED_TOKENS", json!([{ "name": "non-prod", "token": NP, "read": ["*"] }]).to_string());
     let (org_dir, pod_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -65,25 +66,25 @@ async fn one_pod_hosts_the_branches_of_many_agents() {
     let before = act("space_changes", json!({ "namespace": "crm" })).await.unwrap()["tip"].clone();
 
     // Each branch reads its own parent through the pod, and writes stay on the branch.
-    let read = aql(&pod, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "dev""#).await.to_string();
+    let read = aql(&pod, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "dev""#).await.to_string();
     assert!(read.contains("crm original") && !read.contains("ops original"), "{read}");
-    let read = aql(&pod, r#"RECALL FROM SEMANTIC ALL NAMESPACE "ops" BRANCH "dev""#).await.to_string();
+    let read = aql(&pod, r#"RECALL FROM SEMANTIC NAMESPACE "ops" BRANCH "dev""#).await.to_string();
     assert!(read.contains("ops original") && !read.contains("crm original"), "{read}");
     aql(&pod, r#"STORE INTO SEMANTIC (key = "new", content = "crm branch only") NAMESPACE "crm" BRANCH "dev""#).await;
     aql(&pod, r#"STORE INTO SEMANTIC (key = "new", content = "ops branch only") NAMESPACE "ops" BRANCH "dev""#).await;
-    let read = aql(&pod, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "dev""#).await.to_string();
+    let read = aql(&pod, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "dev""#).await.to_string();
     assert!(read.contains("crm branch only") && !read.contains("ops branch only"), "{read}");
 
     // Prod's log and main never moved, and prod's own forwarding reaches the same data.
     assert_eq!(act("space_changes", json!({ "namespace": "crm" })).await.unwrap()["tip"], before, "the prod log moved");
-    assert!(!aql(&org, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#).await.to_string().contains("branch only"));
-    let via_prod = aql(&org, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "dev""#).await.to_string();
+    assert!(!aql(&org, r#"RECALL FROM SEMANTIC NAMESPACE "crm""#).await.to_string().contains("branch only"));
+    let via_prod = aql(&org, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "dev""#).await.to_string();
     assert!(via_prod.contains("crm branch only"), "{via_prod}");
     let stats = act("space_stats", json!({ "namespace": "crm", "branch": "dev", "max_age_ms": 0 })).await.unwrap();
     assert_eq!(stats["tiers"]["SEMANTIC"]["count"], json!(3), "{stats}");
 
     // No main here, and a branch not placed here is refused.
-    for q in [r#"STORE INTO SEMANTIC (key = "x", content = "y") NAMESPACE "crm""#, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "elsewhere""#, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "nope""#] {
+    for q in [r#"STORE INTO SEMANTIC (key = "x", content = "y") NAMESPACE "crm""#, r#"RECALL FROM SEMANTIC NAMESPACE "crm""#, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "elsewhere""#, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "nope""#] {
         let r = flight_action(&pod, Some(ROOT), "aql", json!({ "query": q })).await.unwrap();
         assert_eq!(r["success"], json!(false), "{q}: {r}");
     }
@@ -91,7 +92,7 @@ async fn one_pod_hosts_the_branches_of_many_agents() {
     // FORGET on main reaches the live pod.
     aql(&pod, r#"UPDATE INTO SEMANTIC WHERE key = "fact" (content = "crm edited on the branch") NAMESPACE "crm" BRANCH "dev""#).await;
     aql(&org, r#"FORGET FROM SEMANTIC WHERE key = "forget-me" NAMESPACE "crm""#).await;
-    assert!(!aql(&pod, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "dev""#).await.to_string().contains("erase these words"));
+    assert!(!aql(&pod, r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "dev""#).await.to_string().contains("erase these words"));
 
     // Down, then back: its writes are still there, and a FORGET it missed is applied before it serves.
     pod_task.abort();
@@ -101,7 +102,7 @@ async fn one_pod_hosts_the_branches_of_many_agents() {
     let pending = act("branch_pending", json!({ "namespace": "ops", "name": "dev" })).await.unwrap();
     assert_eq!(pending["forgets"].as_array().map(|f| f.len()), Some(1), "{pending}");
     pod_task = start_pod(pod_dir.path(), &org, &pod, pod_port).await;
-    let back = aql(&pod, r#"RECALL FROM SEMANTIC ALL NAMESPACE "ops" BRANCH "dev""#).await.to_string();
+    let back = aql(&pod, r#"RECALL FROM SEMANTIC NAMESPACE "ops" BRANCH "dev""#).await.to_string();
     assert!(back.contains("ops branch only") && !back.contains("ops original"), "{back}");
     let acked = act("branch_pending", json!({ "namespace": "ops", "name": "dev" })).await.unwrap();
     assert_eq!(acked["forgets"], json!([]), "{acked}");
@@ -113,7 +114,7 @@ async fn one_pod_hosts_the_branches_of_many_agents() {
     // Promote a branch hosted on the pod as a new agent: prod reads the pod's view.
     let promoted = act("branch_promote", json!({ "namespace": "crm", "name": "dev", "into": "crm2", "allow_stale": true })).await.unwrap();
     assert_eq!(promoted["namespace"], json!("crm2"), "{promoted}");
-    let copy = aql(&org, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm2""#).await.to_string();
+    let copy = aql(&org, r#"RECALL FROM SEMANTIC NAMESPACE "crm2""#).await.to_string();
     assert!(copy.contains("crm branch only") && copy.contains("crm edited on the branch"), "{copy}");
     pod_task.abort();
 }
