@@ -939,6 +939,10 @@ impl PartitionedEngine {
 
     /// Run `aql` within `reach` (see the module docs).
     pub async fn query_in(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        // AQL v0.13: a script runs statement by statement, each with its USE applied.
+        if aql_parser::is_script(aql) {
+            return crate::engine::run_script(aql, None, |stmt| async move { Box::pin(self.query_in(&stmt, variables, reach)).await }).await;
+        }
         if let Some(r) = Box::pin(self.watch_routed(aql, variables, reach)).await {
             return r;
         }

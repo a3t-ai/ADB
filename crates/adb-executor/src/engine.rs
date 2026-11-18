@@ -458,6 +458,23 @@ pub(crate) fn namespace_drop(aql: &str) -> Option<String> {
     }
 }
 
+/// AQL v0.13 scripts: the statements of `aql` in order, each with the USE in force
+/// (`default`: a session's namespace before the script) and run by `run` as AQL text.
+/// The answer is the last statement's; a failing one stops the script, named by its
+/// position as written. A script of USE alone answers with no data.
+pub async fn run_script<F, Fut>(aql: &str, default: Option<&str>, run: F) -> Result<Value, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let steps = aql_parser::script_steps(aql, default).map_err(|e| e.to_string())?;
+    let mut last = json!({ "success": true, "data": null });
+    for (i, stmt) in steps {
+        last = Box::pin(run(stmt.to_string())).await.map_err(|e| format!("statement {i}: {e}"))?;
+    }
+    Ok(last)
+}
+
 /// A statement's point in time: an RFC 3339 timestamp or a date, or a variable that
 /// holds one.
 pub(crate) fn time_of(t: &aql_parser::ast::TimePoint, variables: Option<&HashMap<String, Value>>) -> Result<adb_core::log::CommitTs, String> {
@@ -1461,6 +1478,11 @@ impl Engine for LocalEngine {
     }
 
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
+        // AQL v0.13: a script (a USE, or statements separated by `;`) runs statement by
+        // statement, each with the USE in force.
+        if aql_parser::is_script(aql) {
+            return run_script(aql, None, |stmt| async move { self.query(&stmt, variables).await }).await;
+        }
         // OB-3: every AQL statement (HTTP, Flight, MCP) is timed here, once: a branch
         // engine's statements came through its parent, which times them.
         if self.parent.is_some() {
