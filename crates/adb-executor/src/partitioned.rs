@@ -695,6 +695,12 @@ impl PartitionedEngine {
             return false;
         }
         let _ = std::fs::remove_dir_all(&base);
+        // A write the reader's table had in flight (a compaction) may recreate its old
+        // path: gone again a minute later, as a rebuilt reader's old directory is.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = std::fs::remove_dir_all(base);
+        });
         tracing::info!(partition = p, took_ms = t0.elapsed().as_millis() as u64, "reader promoted: the takeover starts from it");
         true
     }
@@ -738,8 +744,11 @@ impl PartitionedEngine {
                     tracing::info!(partition = p, took_ms = t0.elapsed().as_millis() as u64, "reader ready");
                     readers.insert(p, ReaderSlot::Ready(r));
                 }
-                Ok(_) => {
+                Ok(r) => {
+                    // Owned meanwhile: the reader is of no use, nor its directory.
                     readers.remove(&p);
+                    drop(r);
+                    let _ = std::fs::remove_dir_all(me.dir.join("parts").join(format!("reader-p{p}")));
                 }
                 Err(e) => {
                     tracing::warn!(partition = p, error = %e, "reader not built; reads go to the owner, retried later");
@@ -888,12 +897,10 @@ impl PartitionedEngine {
             std::fs::write(pdir.join("owner.epoch"), epoch.to_string()).map_err(|e| format!("owner epoch: {e}"))?;
             self.replicas.clear(p);
         }
-        // A reader of `p` the open didn't take (owned without a takeover): no more use.
-        let left = self.readers.lock().unwrap().remove(&p);
-        if left.is_some() {
-            drop(left);
-            let _ = std::fs::remove_dir_all(self.dir.join("parts").join(format!("reader-p{p}")));
-        }
+        // A reader of `p` the open didn't take (owned without a takeover): no more use,
+        // nor anything left in its directory.
+        drop(self.readers.lock().unwrap().remove(&p));
+        let _ = std::fs::remove_dir_all(self.dir.join("parts").join(format!("reader-p{p}")));
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);

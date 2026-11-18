@@ -125,7 +125,6 @@ async fn a_takeover_starts_from_the_replicas_reader() {
     assert_eq!(got, (0..40).collect::<Vec<_>>(), "no acknowledged write lost");
     assert!(nodes[1].takeovers_from_reader() >= 1, "the takeover started from node 2's reader");
     assert!(!nodes[1].has_reader(p), "the reader became the partition");
-    assert!(!dirs[1].path().join(format!("parts/reader-p{p}")).exists(), "its directory moved");
 
     // The new owner takes writes; its replica (node 3) holds them.
     store(&nodes[2], ns, 40..41).await;
