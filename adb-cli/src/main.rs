@@ -122,8 +122,45 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// `ADB_DATA_NICE` (default 5; 0 leaves it): the niceness of the data runtime's
+/// threads — requests, applies, compaction and every thread they start (Lance,
+/// DataFusion inherit it). The control plane's threads stay at the process's own, so
+/// a node saturated by requests still heartbeats in time: at 90–100% CPU the control
+/// threads were starved past the 3 s lease and the leader moved a live node's
+/// partitions (Hetzner p14). Lowering priority needs no privilege; raising it would.
+fn data_nice() -> i32 {
+    std::env::var("ADB_DATA_NICE").ok().and_then(|v| v.parse().ok()).filter(|n: &i32| (0..=19).contains(n)).unwrap_or(5)
+}
+
+#[cfg(unix)]
+fn lower_this_thread(nice: i32) {
+    if nice > 0 {
+        // On Linux, PRIO_PROCESS with 0 sets the calling thread's niceness.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lower_this_thread(_nice: i32) {}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The control runtime first, from this thread: its threads keep normal priority
+    // (threads started from a lowered one inherit its niceness).
+    let _ = adb_cluster::control::runtime();
+    let nice = data_nice();
+    // This thread too: it runs the startup (`block_on`), whose threads (WAL writers,
+    // Lance's CPU pool) inherit its niceness.
+    lower_this_thread(nice);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || lower_this_thread(nice))
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     // A client command: no engine of its own.
     if let Some(Commands::ImportLancedb { path, flight, replace }) = &cli.command {

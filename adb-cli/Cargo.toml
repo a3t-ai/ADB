@@ -18,6 +18,8 @@ adb-server = { path = "../crates/adb-server" }
 adb-executor = { path = "../crates/adb-executor" }
 adb-mcp = { path = "../crates/adb-mcp" }
 adb-cluster = { path = "../crates/adb-cluster" }
+# Lowers the data threads' priority below the control plane's (`main.rs`).
+libc = "0.2"
 axum = "0.7"
 tokio.workspace = true
 adb-core = { path = "../crates/adb-core" }
