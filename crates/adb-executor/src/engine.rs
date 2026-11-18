@@ -1916,29 +1916,86 @@ pub(crate) fn scans(aql: &str) -> bool {
     adb_core::metrics::statement_of(aql).0 == "RECALL" && !bounded_recall(aql)
 }
 
-/// A RECALL answered by a bounded number of lookups, not a scan: the planner's exact
-/// lookup (AQL v0.13 has no LOOKUP verb: `RECALL … WHERE key = v` / `id = v` within a
-/// NAMESPACE), or a newest-first EPISODIC read the recent-episodes index answers
-/// (`RECALL FROM EPISODIC LIMIT k NAMESPACE …`). Decided on the plan, so the permit
-/// follows the access path taken; the text checks only skip the parse for statements
-/// that can be neither.
+/// A RECALL answered by a bounded number of lookups, not a scan — the two shapes, read
+/// from the tokens (parsing and planning every read to decide its permit cost the key
+/// reads ~10%, Hetzner p15):
+/// - an exact lookup: `RECALL FROM <memory> WHERE key|id = <value> NAMESPACE <ns>`
+///   (optionally `WITH LINKS`), as the planner plans it (not TOOLS, which loads);
+/// - newest-first episodes the recent-episodes index answers: `RECALL FROM EPISODIC
+///   LIMIT k NAMESPACE <ns>` (either order, k within what the index keeps).
+///
+/// Anything else counts as a scan (a permit), the cautious side.
 fn bounded_recall(aql: &str) -> bool {
-    let has = |w: &str| aql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|t| t.eq_ignore_ascii_case(w));
-    if !has("NAMESPACE") {
+    let t = tokens(aql);
+    let t: Vec<&str> = t.iter().map(String::as_str).collect();
+    let up = |i: usize| t.get(i).map(|w| w.to_ascii_uppercase());
+    let is = |i: usize, w: &str| up(i).as_deref() == Some(w);
+    let value = |i: usize| t.get(i).is_some_and(|w| w.starts_with('"') || w.starts_with('$') || w.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-'));
+    if !(is(0, "RECALL") && is(1, "FROM")) {
         return false;
     }
-    let keyed = aql.contains('=') && (has("key") || has("id"));
-    let newest = has("EPISODIC") && has("LIMIT") && !has("WHERE");
-    if !keyed && !newest {
-        return false;
+    let memory = up(2).unwrap_or_default();
+    // RECALL FROM m WHERE key|id = v NAMESPACE ns [WITH LINKS]
+    if ["SEMANTIC", "EPISODIC", "PROCEDURAL", "WORKING"].contains(&memory.as_str())
+        && is(3, "WHERE")
+        && (is(4, "KEY") || is(4, "ID"))
+        && t.get(5) == Some(&"=")
+        && value(6)
+        && is(7, "NAMESPACE")
+        && value(8)
+        && (t.len() == 9 || (t.len() == 11 && is(9, "WITH") && is(10, "LINKS")))
+    {
+        return true;
     }
-    let Ok(stmt) = aql_parser::parse(aql) else { return false };
-    match aql_planner::Planner::new().plan(&stmt) {
-        Ok(aql_planner::ExecutionPlan::Single(s)) => {
-            matches!(s.predicate, adb_core::predicate::Predicate::Key { .. }) || crate::query::is_newest_episodes(s.memory_type, &s.predicate, &s.modifiers)
+    // RECALL FROM EPISODIC LIMIT k NAMESPACE ns | NAMESPACE ns LIMIT k
+    if memory == "EPISODIC" && t.len() == 7 {
+        let k = match (up(3).as_deref(), up(5).as_deref()) {
+            (Some("LIMIT"), Some("NAMESPACE")) if value(6) => t[4].parse::<usize>().ok(),
+            (Some("NAMESPACE"), Some("LIMIT")) if value(4) => t[6].parse::<usize>().ok(),
+            _ => None,
+        };
+        return k.is_some_and(|k| k <= adb_store::recent_index::keep());
+    }
+    false
+}
+
+/// AQL's tokens, cheaply: words, `$vars`, numbers, quoted strings (kept whole, quotes
+/// included) and single punctuation.
+fn tokens(aql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = aql.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '"' {
+            let mut s = String::from(chars.next().unwrap());
+            while let Some(d) = chars.next() {
+                s.push(d);
+                if d == '\\' {
+                    if let Some(e) = chars.next() {
+                        s.push(e);
+                    }
+                } else if d == '"' {
+                    break;
+                }
+            }
+            out.push(s);
+        } else if c.is_alphanumeric() || c == '_' || c == '$' || c == '-' || c == '.' {
+            let mut s = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_alphanumeric() || d == '_' || d == '$' || d == '-' || d == '.' {
+                    s.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push(s);
+        } else {
+            out.push(chars.next().unwrap().to_string());
         }
-        _ => false,
     }
+    out
 }
 
 /// Reads running at once (C-5): `ADB_MAX_READS`, default twice the CPUs (at least 2).
