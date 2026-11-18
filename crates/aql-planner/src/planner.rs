@@ -112,7 +112,7 @@ impl Planner {
     /// RECALL: the access path from what is asked.
     fn plan_recall(&self, stmt: &RecallStmt) -> PlanResult<ExecutionPlan> {
         if !stmt.modifiers.namespaces.is_empty() {
-            return Err(PlanError::NotImplemented("NAMESPACE (…) — a read across namespaces runs on the server's router"));
+            return Err(PlanError::NotImplemented("NAMESPACE (…) — a read across namespaces runs on the engine"));
         }
         if stmt.modifiers.with_history.as_ref().is_some_and(|h| h.between.is_some()) {
             return Err(PlanError::NotImplemented("WITH HISTORY BETWEEN"));

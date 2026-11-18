@@ -51,3 +51,17 @@ async fn aliases_reach_the_record() {
     q(&e, r#"UPDATE INTO SEMANTIC WHERE key = "person:ada" (aliases = []) NAMESPACE "crm""#).await;
     assert!(keys(&q(&e, r#"RECALL FROM SEMANTIC WHERE key = "person:ada-l" NAMESPACE "crm""#).await).is_empty());
 }
+
+/// AQL v0.13: a RECALL may read several namespaces: NAMESPACE ("a", "b").
+#[tokio::test]
+async fn a_read_across_namespaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    q(&e, r#"STORE INTO SEMANTIC (key = "a1", n = 1) NAMESPACE "a""#).await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "b1", n = 2) NAMESPACE "b""#).await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "c1", n = 3) NAMESPACE "c""#).await;
+    let r = q(&e, r#"RECALL FROM SEMANTIC NAMESPACE ("a", "b") ORDER BY n DESC"#).await;
+    assert_eq!(r["data"]["records"].as_array().unwrap().iter().map(|x| x["data"]["key"].as_str().unwrap()).collect::<Vec<_>>(), ["b1", "a1"], "{r}");
+    assert_eq!(q(&e, r#"RECALL FROM SEMANTIC NAMESPACE ("a", "b", "c") LIMIT 2"#).await["data"]["count"], 2);
+    assert!(e.query(r#"RECALL FROM SEMANTIC NAMESPACE ("a", "b") AGGREGATE COUNT(*) AS n"#, None).await.is_err());
+}

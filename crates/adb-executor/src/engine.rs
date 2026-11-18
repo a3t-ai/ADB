@@ -475,6 +475,70 @@ where
     Ok(last)
 }
 
+/// A RECALL naming several namespaces (`NAMESPACE ("a", "b")`, AQL v0.13).
+pub(crate) fn across_namespaces(aql: &str) -> Option<(aql_parser::ast::RecallStmt, Vec<String>)> {
+    if !aql.contains('(') || !aql.trim_start().get(..6).is_some_and(|v| v.eq_ignore_ascii_case("RECALL")) {
+        return None;
+    }
+    match aql_parser::parse(aql).ok()? {
+        aql_parser::ast::Statement::Recall(r) if !r.modifiers.namespaces.is_empty() => {
+            let list = r.modifiers.namespaces.clone();
+            Some((r, list))
+        }
+        _ => None,
+    }
+}
+
+/// A RECALL across `namespaces`: run in each (as AQL text, by `run`), the records
+/// together — a LIKE ranked by its confidence, else in the statement's ORDER BY —
+/// then its LIMIT. Aggregates across namespaces aren't combined (refused).
+pub async fn read_across<F, Fut>(stmt: &aql_parser::ast::RecallStmt, namespaces: &[String], run: F) -> Result<Value, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    if stmt.modifiers.aggregate.is_some() {
+        return Err("AGGREGATE over NAMESPACE (…): aggregate one namespace at a time".into());
+    }
+    let mut records = Vec::new();
+    let mut metadata = Value::Null;
+    for ns in namespaces {
+        let mut one = stmt.clone();
+        one.modifiers.namespaces.clear();
+        one.modifiers.namespace = Some(ns.clone());
+        let v = Box::pin(run(aql_parser::ast::Statement::Recall(one).to_string())).await.map_err(|e| format!("namespace {ns:?}: {e}"))?;
+        records.extend(v["data"]["records"].as_array().cloned().unwrap_or_default());
+        metadata = v["metadata"].clone();
+    }
+    let num = |r: &Value, path: &[&str]| path.iter().fold(r, |v, k| &v[*k]).as_f64();
+    match (&stmt.predicate, &stmt.modifiers.order_by) {
+        (_, Some(o)) => {
+            let field = o.field.split('.').collect::<Vec<_>>();
+            let key = |r: &Value| {
+                let d = field.iter().fold(&r["data"], |v, k| &v[*k]);
+                if d.is_null() { field.iter().fold(r, |v, k| &v[*k]).clone() } else { d.clone() }
+            };
+            records.sort_by(|a, b| {
+                let (x, y) = (key(a), key(b));
+                let ord = match (x.as_f64(), y.as_f64()) {
+                    (Some(p), Some(q)) => p.partial_cmp(&q).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => x.to_string().cmp(&y.to_string()),
+                };
+                if o.ascending { ord } else { ord.reverse() }
+            });
+        }
+        (aql_parser::ast::Predicate::Like { .. }, None) => {
+            records.sort_by(|a, b| num(b, &["metadata", "confidence"]).unwrap_or(0.0).partial_cmp(&num(a, &["metadata", "confidence"]).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        _ => {}
+    }
+    if let Some(n) = stmt.modifiers.limit {
+        records.truncate(n);
+    }
+    let count = records.len();
+    Ok(json!({ "success": true, "data": { "type": "records", "records": records, "count": count }, "metadata": metadata }))
+}
+
 /// A statement's point in time: an RFC 3339 timestamp or a date, or a variable that
 /// holds one.
 pub(crate) fn time_of(t: &aql_parser::ast::TimePoint, variables: Option<&HashMap<String, Value>>) -> Result<adb_core::log::CommitTs, String> {
@@ -1482,6 +1546,9 @@ impl Engine for LocalEngine {
         // statement, each with the USE in force.
         if aql_parser::is_script(aql) {
             return run_script(aql, None, |stmt| async move { self.query(&stmt, variables).await }).await;
+        }
+        if let Some((stmt, list)) = across_namespaces(aql) {
+            return read_across(&stmt, &list, |one| async move { self.query(&one, variables).await }).await;
         }
         // OB-3: every AQL statement (HTTP, Flight, MCP) is timed here, once: a branch
         // engine's statements came through its parent, which times them.

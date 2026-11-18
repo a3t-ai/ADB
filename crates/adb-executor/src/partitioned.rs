@@ -943,6 +943,9 @@ impl PartitionedEngine {
         if aql_parser::is_script(aql) {
             return crate::engine::run_script(aql, None, |stmt| async move { Box::pin(self.query_in(&stmt, variables, reach)).await }).await;
         }
+        if let Some((stmt, list)) = crate::engine::across_namespaces(aql) {
+            return crate::engine::read_across(&stmt, &list, |one| async move { Box::pin(self.query_in(&one, variables, reach)).await }).await;
+        }
         if let Some(r) = Box::pin(self.watch_routed(aql, variables, reach)).await {
             return r;
         }
