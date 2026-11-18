@@ -824,12 +824,13 @@ impl LocalEngine {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
         let wal: EngineLog = Arc::new(open_wal(&dir, role).await?);
-        Box::pin(Self::durable_with(dir, wal, role)).await
+        Box::pin(Self::durable_with(dir, wal, role, false)).await
     }
 
     /// [`Self::durable_partition`] over `log` (a cluster owner's replicated log, step 5).
     pub async fn durable_partition_on(dir: impl Into<std::path::PathBuf>, role: PartitionRole, log: EngineLog) -> Result<(Self, ReplayStats), String> {
-        Box::pin(Self::durable_with(dir.into(), log, role)).await
+        // A cluster owner: nothing ships to object storage before its epoch begins.
+        Box::pin(Self::durable_with(dir.into(), log, role, true)).await
     }
 
     /// Step 6, for readers on other nodes: committed records from `from` (at most `max`,
@@ -872,7 +873,7 @@ impl LocalEngine {
     /// node's local WAL. Everything else is as [`Self::durable`].
     pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
         // Boxed: keeps the callers' future types shallow (the compiler's query depth).
-        Box::pin(Self::durable_with(dir.into(), wal, PartitionRole::SINGLE)).await
+        Box::pin(Self::durable_with(dir.into(), wal, PartitionRole::SINGLE, false)).await
     }
 
     /// The engine's data directory.
@@ -1003,7 +1004,7 @@ impl LocalEngine {
         self.durable.as_ref()
     }
 
-    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
+    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, role: PartitionRole, epoch_owner: bool) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
         let (store, embedder) = open_store(&dir, role.id).await?;
@@ -1052,6 +1053,9 @@ impl LocalEngine {
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });
         writes.set_embedder(embedder.clone());
+        if epoch_owner {
+            writes.await_epoch();
+        }
         let registry = Arc::clone(writes.branches());
         writes.set_pins(Arc::new(move || registry.pins()));
         let spaces = crate::spaces::SpaceView::new(crate::spaces::LocalSpaces { store: Some(Arc::clone(&store)), barrier: barrier.clone(), registry: Arc::clone(writes.branches()) });

@@ -631,6 +631,8 @@ pub struct DurableWrites<L: Log> {
     seq: Mutex<Sequencer<L>>,
     /// Who holds `seq` now.
     seq_holder: SeqHolder,
+    /// A cluster owner before its epoch began: nothing is shipped yet.
+    epoch_pending: std::sync::atomic::AtomicBool,
     /// The sequencer's log, shared: trimming and FORGET redaction use it without the
     /// sequencer (they need no ordering; holding it stalled every write).
     log: Arc<L>,
@@ -2136,7 +2138,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

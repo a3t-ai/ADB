@@ -232,6 +232,13 @@ impl<L: Log> DurableWrites<L> {
     }
 
     /// The owner epoch this engine writes object keys under (0 on a single node).
+    /// A cluster owner's engine: ship nothing until [`Self::begin_epoch`] (segments
+    /// written under no epoch are ignored by restores, yet would let the replica drop
+    /// the records they hold).
+    pub fn await_epoch(&self) {
+        self.epoch_pending.store(true, Ordering::SeqCst);
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -240,6 +247,11 @@ impl<L: Log> DurableWrites<L> {
     /// offset this owner will write, before any write is taken. Records below it are
     /// the ones the log holds now. A no-op without object storage.
     pub async fn begin_epoch(&self, epoch: u64) -> AdbResult<()> {
+        // Lock order: `shipped`, then the sequencer — as `ship_segments` takes them (it
+        // holds `shipped` through its run and the sequencer per batch). Taken the other
+        // way round, a takeover whose shipper had work deadlocked with it: the partition
+        // took no request again (Hetzner p13/p14, promoted readers).
+        let mut shipped = self.shipped.lock().await;
         let seq = seq_timed(&self.seq, &self.seq_holder, "seq.wait @epoch", "seq.held @epoch").await;
         if let Some(cold) = self.store.as_ref().and_then(|s| s.cold_uri().map(|c| (c.to_string(), s.partition()))) {
             let start = seq.log().last_offset().0 + 1;
@@ -259,9 +271,11 @@ impl<L: Log> DurableWrites<L> {
             tracing::info!(epoch, start, "owner epoch started");
         }
         self.epoch.store(epoch, Ordering::SeqCst);
+        self.epoch_pending.store(false, Ordering::SeqCst);
         // What object storage holds is looked up again under the new epoch.
-        *self.shipped.lock().await = None;
+        *shipped = None;
         drop(seq);
+        drop(shipped);
         Ok(())
     }
 
@@ -271,8 +285,12 @@ impl<L: Log> DurableWrites<L> {
         let Some(store) = &self.store else { return Ok(ShipStats::default()) };
         let Some(cold) = store.cold_uri().map(str::to_string) else { return Ok(ShipStats::default()) };
         let partition = store.partition();
-        let epoch = self.epoch();
         let mut shipped = self.shipped.lock().await;
+        // Read under `shipped` (begin_epoch sets it holding that lock).
+        let epoch = self.epoch();
+        if self.epoch_pending.load(Ordering::SeqCst) {
+            return Ok(ShipStats::default());
+        }
         let mut from = match *shipped {
             Some(s) => s,
             // First call: what object storage holds already (segments, or a checkpoint).
