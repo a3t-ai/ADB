@@ -127,8 +127,10 @@ impl Planner {
         }
         let memory = convert_memory_type(stmt.memory_type)?;
         let history = modifiers.as_of.is_some() || modifiers.with_history;
+        // An exact lookup for `key = v` within a namespace; without one, RECALL reads
+        // across namespaces as any filtered read does.
         let key = match &predicate {
-            CorePredicate::Where { conditions } if modifiers.aggregate.is_none() => exact_key(conditions),
+            CorePredicate::Where { conditions } if modifiers.aggregate.is_none() && modifiers.namespace.is_some() => exact_key(conditions),
             _ => None,
         };
         if let Some((field, value)) = key.filter(|_| !(stmt.memory_type == MemoryType::Tools && !history)) {
@@ -456,7 +458,7 @@ mod tests {
     fn recall_picks_the_access_path() {
         assert_eq!(single("RECALL FROM WORKING WINDOW LAST 10").operation, Operation::Scan);
         assert_eq!(single(r#"RECALL FROM TOOLS WHERE task = "bidding" LIMIT 3"#).operation, Operation::Load);
-        let s = single(r#"RECALL FROM SEMANTIC WHERE key = "person:ada""#);
+        let s = single(r#"RECALL FROM SEMANTIC WHERE key = "person:ada" NAMESPACE "crm""#);
         assert_eq!(s.operation, Operation::Lookup);
         assert!(matches!(s.predicate, CorePredicate::Key { ref field, .. } if field == "key"));
         assert_eq!(single(r#"RECALL FROM SEMANTIC WHERE key = "a" AND n > 1"#).operation, Operation::Recall);

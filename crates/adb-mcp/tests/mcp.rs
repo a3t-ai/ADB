@@ -242,20 +242,28 @@ async fn watch_tools_follow_a_query() {
     assert!(!err && v["data"]["unsubscribed"] == json!(true), "{v}");
 }
 
-/// P1.4: `remember` with subject + predicate stores a fact, which supersedes and
-/// can be followed as a link.
+/// AQL v0.13 (no facts): `remember` with subject + predicate + object is a LINK of
+/// TYPE predicate between the two records (both must exist); with a value, a field.
 #[tokio::test]
 async fn remember_stores_facts() {
     let s = server().await;
-    let fact = |o: &str| json!({"content": format!("Ada works at {o}"), "subject": "person:ada", "predicate": "works_at", "object": o, "confidence": 0.9});
-    let (err, v) = call(&s, "remember", fact("org:acme")).await;
+    for k in ["person:ada", "org:acme"] {
+        let (err, v) = call(&s, "aql_query", json!({"query": format!(r#"STORE INTO SEMANTIC (key = "{k}")"#)})).await;
+        assert!(!err, "{v}");
+    }
+    let (err, v) = call(&s, "remember", json!({"content": "Ada works at Acme", "subject": "person:ada", "predicate": "works_at", "object": "org:acme"})).await;
     assert!(!err, "{v}");
-    let (err, v) = call(&s, "remember", fact("org:globex")).await;
+    let (err, v) = call(&s, "remember", json!({"content": "Ada is 36", "subject": "person:ada", "predicate": "age", "value": 36})).await;
     assert!(!err, "{v}");
-    let (err, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS TYPE "works_at""#})).await;
+    let (err, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "person:ada" FOLLOW LINKS TYPE "works_at""#})).await;
     assert!(!err, "{v}");
     assert_eq!(v["data"]["count"], json!(1), "{v}");
-    assert_eq!(v["data"]["records"][0]["id"], json!("org:globex"), "{v}");
+    assert_eq!(v["data"]["records"][0]["data"]["key"], json!("org:acme"), "{v}");
+    let (err, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "person:ada""#})).await;
+    assert!(!err && v["data"]["records"][0]["data"]["age"] == json!(36), "{v}");
+    // An end that doesn't exist: refused (no silent stubs).
+    let (err, _) = call(&s, "remember", json!({"content": "x", "subject": "person:nobody", "predicate": "p", "object": "org:acme"})).await;
+    assert!(err);
     // A fact is SEMANTIC.
     let (err, _) = call(&s, "remember", json!({"content": "x", "memory_type": "episodic", "subject": "a", "predicate": "p", "object": "b"})).await;
     assert!(err);

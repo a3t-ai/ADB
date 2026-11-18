@@ -236,7 +236,8 @@ fn obj(args: &Value, name: &str) -> serde_json::Map<String, Value> {
     args.get(name).and_then(Value::as_object).cloned().unwrap_or_default()
 }
 
-/// ClawDB `store_memory`: `STORE INTO <type> (fields) [SCOPE s] [NAMESPACE "ns"]`.
+/// ClawDB `store_memory`: `STORE INTO <type> (fields) [NAMESPACE "ns"]`. AQL v0.13 has
+/// no SCOPE private|shared|cluster: a `scope` of those is accepted and has no effect.
 fn store_memory(args: &Value) -> Result<String, String> {
     let mt = memory_type(args, "memory_type", None)?;
     let data = args.get("data").and_then(Value::as_object).ok_or("Missing or invalid: data (must be object)")?;
@@ -245,9 +246,8 @@ fn store_memory(args: &Value) -> Result<String, String> {
     }
     let mut q = format!("STORE INTO {mt} {}", payload(data)?);
     if let Some(scope) = args.get("scope").and_then(Value::as_str) {
-        match scope {
-            "private" | "shared" | "cluster" => q.push_str(&format!(" SCOPE {scope}")),
-            other => return Err(format!("Invalid scope: {other}")),
+        if !["private", "shared", "cluster"].contains(&scope) {
+            return Err(format!("Invalid scope: {scope}"));
         }
     }
     if let Some(ns) = args.get("namespace").and_then(Value::as_str) {

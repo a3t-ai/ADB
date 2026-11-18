@@ -32,8 +32,11 @@ async fn two_agents_hold_the_same_key_apart() {
         let stub = q(format!(r#"RECALL FROM SEMANTIC WHERE key = "user:alice" NAMESPACE "{ns}""#)).await.unwrap();
         assert_eq!(facts(&stub, "key"), ["user:alice"], "{ns}: its own entity stub");
     }
-    // Without NAMESPACE a key names a record without one.
-    assert_eq!(facts(&q(r#"RECALL FROM SEMANTIC WHERE key = "pref""#.into()).await.unwrap(), "fact"), Vec::<String>::new());
+    // AQL v0.13: a RECALL without NAMESPACE reads every namespace (an exact key lookup
+    // is within the statement's namespace): both agents' records of the key.
+    let mut both = facts(&q(r#"RECALL FROM SEMANTIC WHERE key = "pref""#.into()).await.unwrap(), "fact");
+    both.sort();
+    assert_eq!(both, ["coffee", "tea"]);
     // FORGET in one namespace leaves the other.
     q(r#"FORGET FROM SEMANTIC WHERE id = "pref" NAMESPACE "acme--a""#.into()).await.unwrap();
     assert_eq!(facts(&q(r#"RECALL FROM SEMANTIC WHERE key = "pref" NAMESPACE "acme--b""#.into()).await.unwrap(), "fact"), ["coffee"]);
