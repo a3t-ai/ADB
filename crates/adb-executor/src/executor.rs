@@ -664,6 +664,15 @@ impl Executor {
 
     async fn execute_recall(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
+        // A key that is another record's alias reads that record (AQL v0.13).
+        let resolved;
+        let step = match self.alias_of_end(step.memory_type, &step.predicate, step.modifiers.namespace.as_deref()).await? {
+            Some(p) => {
+                resolved = StepPlan { predicate: p, ..step.clone() };
+                &resolved
+            }
+            None => step,
+        };
 
         // For aggregation, we need records WITHOUT field projection applied
         // So we recall with predicate and filters, but apply RETURN later
@@ -1081,18 +1090,23 @@ impl Executor {
     /// A link end `key = v` (or `id = v`) on SEMANTIC naming another key of a record
     /// (an alias): the record's own key instead.
     async fn alias_end(&self, memory: MemoryType, predicate: &Predicate, namespace: Option<&str>) -> ExecutorResult<Predicate> {
+        Ok(self.alias_of_end(memory, predicate, namespace).await?.unwrap_or_else(|| predicate.clone()))
+    }
+
+    /// [`Self::alias_end`]: `Some` when the key is an alias (the record's own key then).
+    async fn alias_of_end(&self, memory: MemoryType, predicate: &Predicate, namespace: Option<&str>) -> ExecutorResult<Option<Predicate>> {
         if memory != MemoryType::Semantic {
-            return Ok(predicate.clone());
+            return Ok(None);
         }
-        let Predicate::Where { conditions } = predicate else { return Ok(predicate.clone()) };
+        let Predicate::Where { conditions } = predicate else { return Ok(None) };
         let [adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value: adb_core::Value::String(v), logical_op }] = conditions.as_slice() else {
-            return Ok(predicate.clone());
+            return Ok(None);
         };
         if !matches!(field.as_str(), "key" | "id") {
-            return Ok(predicate.clone());
+            return Ok(None);
         }
         match self.writes.alias_resolve(&adb_store::namespaced(namespace, v)).await? {
-            Some(to) => Ok(Predicate::Where {
+            Some(to) => Ok(Some(Predicate::Where {
                 conditions: vec![adb_core::Condition::Simple {
                     field: field.clone(),
                     operator: adb_core::Operator::Eq,
@@ -1102,8 +1116,8 @@ impl Executor {
                     }),
                     logical_op: *logical_op,
                 }],
-            }),
-            None => Ok(predicate.clone()),
+            })),
+            None => Ok(None),
         }
     }
 

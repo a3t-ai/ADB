@@ -1164,13 +1164,14 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     let tx = modifiers.as_of.as_ref().map(|t| instant(t, "AS OF", now)).transpose()?.unwrap_or(now);
     let valid = modifiers.valid_at.as_ref().map(|t| instant(t, "VALID AT", now)).transpose()?.unwrap_or(tx);
     let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
+    let from = modifiers.history_from.as_ref().map(|t| instant(t, "WITH HISTORY BETWEEN", now)).transpose()?;
     let rows = store.versions(memory.into(), None).await.map_err(store_err)?;
     let micros = |t: CommitTs| serde_json::json!(t.to_datetime().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
     let mut records: Vec<MemoryRecord> = rows
         .iter()
         .filter(|r| in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns)))
         .filter(|r| match modifiers.with_history {
-            true => r.commit_ts <= tx && (modifiers.valid_at.is_none() || r.holds_at(valid)),
+            true => r.commit_ts <= tx && from.is_none_or(|f| r.commit_ts >= f) && (modifiers.valid_at.is_none() || r.holds_at(valid)),
             false => r.is_current_at(tx, valid),
         })
         .map(|r| {
@@ -1316,7 +1317,15 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
-    let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, predicate)).cloned().collect();
+    // `task` / `task_type` rank the tools (their relevance to it); the other
+    // conditions filter.
+    let filter = match predicate {
+        Predicate::Where { conditions } => Predicate::Where {
+            conditions: conditions.iter().filter(|c| !matches!(c, Condition::Simple { field, .. } if field == "task" || field == "task_type")).cloned().collect(),
+        },
+        p => p.clone(),
+    };
+    let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, &filter)).cloned().collect();
     let task = match predicate {
         Predicate::Where { conditions } => conditions.iter().find_map(|c| match c {
             Condition::Simple { field, value: Value::String(s), .. } if field == "task" || field == "task_type" => Some(s.clone()),

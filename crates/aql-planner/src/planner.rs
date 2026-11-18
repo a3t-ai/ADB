@@ -114,14 +114,15 @@ impl Planner {
         if !stmt.modifiers.namespaces.is_empty() {
             return Err(PlanError::NotImplemented("NAMESPACE (…) — a read across namespaces runs on the engine"));
         }
-        if stmt.modifiers.with_history.as_ref().is_some_and(|h| h.between.is_some()) {
-            return Err(PlanError::NotImplemented("WITH HISTORY BETWEEN"));
-        }
         if stmt.memory_type == MemoryType::Working && stmt.modifiers.in_scope.is_some() {
             return Err(PlanError::InvalidMemoryType("IN SCOPE doesn't apply to WORKING (a session's own state)".to_string()));
         }
-        let modifiers = convert_modifiers(&stmt.modifiers)?;
+        let mut modifiers = convert_modifiers(&stmt.modifiers)?;
         let predicate = convert_predicate(&stmt.predicate, stmt.memory_type, stmt.modifiers.confidence)?;
+        // `LIKE "text"` (not a procedure match): the text is the query.
+        if let (CorePredicate::Like { .. }, Predicate::Like { text: Some(t), .. }) = (&predicate, &stmt.predicate) {
+            modifiers.like_query = Some(serde_json::Value::String(t.clone()));
+        }
         if stmt.memory_type == MemoryType::All {
             return Ok(ExecutionPlan::FanOut(FanOutPlan { operation: Operation::Recall, predicate, modifiers, data: None }));
         }
@@ -138,7 +139,7 @@ impl Planner {
         }
         Ok(ExecutionPlan::Single(match (stmt.memory_type, &predicate) {
             // The session's state, newest first, over an optional window.
-            (MemoryType::Working, CorePredicate::All) if !history => StepPlan::scan(modifiers),
+            (MemoryType::Working, CorePredicate::All) if !history && modifiers.order_by.is_none() && modifiers.aggregate.is_none() => StepPlan::scan(modifiers),
             // Tools ranked for the task.
             (MemoryType::Tools, CorePredicate::Where { .. } | CorePredicate::All) if !history && modifiers.aggregate.is_none() => {
                 StepPlan::load(predicate, modifiers)
@@ -273,6 +274,7 @@ fn convert_predicate(pred: &Predicate, memory: MemoryType, confidence: Option<f3
             Ok(CorePredicate::Pattern { pattern_var: variable.clone(), threshold: confidence, text: None })
         }
         Predicate::Like { variable, .. } => Ok(CorePredicate::Like { embedding_var: variable.clone() }),
+
         Predicate::All => Ok(CorePredicate::All),
     }
 }
@@ -372,9 +374,11 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         window: mods.window.as_ref().map(convert_window),
         with_links: mods.with_links.as_ref().map(link_select),
         follow_links: mods.follow_links.as_ref().map(|f| adb_core::FollowLinks { select: link_select(&f.select), depth: f.depth }),
-        as_of: mods.as_of.as_ref().map(convert_time_point),
+        // WITH HISTORY BETWEEN t1 AND t2: the versions recorded by t2 (from t1).
+        as_of: mods.as_of.as_ref().or(mods.with_history.as_ref().and_then(|h| h.between.as_ref()).map(|(_, to)| to)).map(convert_time_point),
         valid_at: None,
         with_history: mods.with_history.is_some(),
+        history_from: mods.with_history.as_ref().and_then(|h| h.between.as_ref()).map(|(from, _)| convert_time_point(from)),
     })
 }
 
