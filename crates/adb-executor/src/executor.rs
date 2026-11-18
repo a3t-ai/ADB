@@ -169,8 +169,18 @@ impl Executor {
             Operation::Recall => self.execute_recall(step).await?,
             Operation::Lookup => self.execute_lookup(step).await?,
             Operation::Load => self.execute_load(step).await?,
-            Operation::Store => self.execute_store(step).await?,
-            Operation::Update => self.execute_update(step).await?,
+            Operation::Store | Operation::Update => {
+                let r = match step.operation {
+                    Operation::Store => self.execute_store(step).await?,
+                    _ => self.execute_update(step).await?,
+                };
+                // AQL v0.13: a record's other keys (`aliases`) take effect at once.
+                let payload = step.data.as_ref().and_then(|d| d.get("payload").or(Some(d)));
+                if step.memory_type == MemoryType::Semantic && payload.is_some_and(|p| p.get("aliases").is_some()) {
+                    self.writes.aliases_changed().await?;
+                }
+                r
+            }
             Operation::Forget => self.execute_forget(step).await?,
             Operation::Link => self.execute_link(step).await?,
             Operation::UpdateLink => self.execute_link_edit(step, false).await?,
@@ -518,13 +528,25 @@ impl Executor {
         select: &adb_core::LinkSelect,
     ) -> ExecutorResult<HashMap<(MemoryType, String), Vec<adb_core::Link>>> {
         let mut ids: HashMap<MemoryType, Vec<String>> = HashMap::new();
+        // AQL v0.13: links stored to or from a record's other keys (`aliases`) are its
+        // links too: alias id → the record's id.
+        let mut alias_of: HashMap<(MemoryType, String), String> = HashMap::new();
         for r in records {
             ids.entry(r.memory_type).or_default().push(r.id.clone());
+            if let Some(aliases) = r.data.get("aliases").and_then(|a| a.as_array()) {
+                let ns = adb_store::namespace_of(&r.id).map(String::from).or_else(|| r.metadata.namespace.clone());
+                for a in aliases.iter().filter_map(|a| a.as_str()) {
+                    let id = adb_store::namespaced(ns.as_deref(), a);
+                    ids.entry(r.memory_type).or_default().push(id.clone());
+                    alias_of.insert((r.memory_type, id), r.id.clone());
+                }
+            }
         }
-        let mut out = HashMap::new();
+        let mut out: HashMap<(MemoryType, String), Vec<adb_core::Link>> = HashMap::new();
         for (memory, ids) in ids {
             for (id, links) in self.reads.links_touching(memory, &ids, select).await? {
-                out.insert((memory, id), links);
+                let owner = alias_of.get(&(memory, id.clone())).cloned().unwrap_or(id);
+                out.entry((memory, owner)).or_default().extend(links);
             }
         }
         Ok(out)
@@ -981,11 +1003,14 @@ impl Executor {
         let to_predicate = self.build_predicate_from_conditions(data.get("to_conditions"))?;
 
         // Look up source records using step.memory_type and step.predicate (within
-        // the statement's NAMESPACE, AQL v0.12).
+        // the statement's NAMESPACE, AQL v0.12). An end named by another key of a
+        // record (its `aliases`, AQL v0.13) is that record.
         let within = link_scope(step);
+        let from_predicate = self.alias_end(step.memory_type, &step.predicate, within.namespace.as_deref()).await?;
+        let to_predicate = self.alias_end(to_type, &to_predicate, within.namespace.as_deref()).await?;
         let source_records = self
             .reads
-            .lookup_with_modifiers(step.memory_type, &step.predicate, &within)
+            .lookup_with_modifiers(step.memory_type, &from_predicate, &within)
             .await?;
 
         if source_records.is_empty() {
@@ -1053,6 +1078,35 @@ impl Executor {
     }
 
     /// Build a predicate from serialized conditions array
+    /// A link end `key = v` (or `id = v`) on SEMANTIC naming another key of a record
+    /// (an alias): the record's own key instead.
+    async fn alias_end(&self, memory: MemoryType, predicate: &Predicate, namespace: Option<&str>) -> ExecutorResult<Predicate> {
+        if memory != MemoryType::Semantic {
+            return Ok(predicate.clone());
+        }
+        let Predicate::Where { conditions } = predicate else { return Ok(predicate.clone()) };
+        let [adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value: adb_core::Value::String(v), logical_op }] = conditions.as_slice() else {
+            return Ok(predicate.clone());
+        };
+        if !matches!(field.as_str(), "key" | "id") {
+            return Ok(predicate.clone());
+        }
+        match self.writes.alias_resolve(&adb_store::namespaced(namespace, v)).await? {
+            Some(to) => Ok(Predicate::Where {
+                conditions: vec![adb_core::Condition::Simple {
+                    field: field.clone(),
+                    operator: adb_core::Operator::Eq,
+                    value: adb_core::Value::String(match field.as_str() {
+                        "id" => to,
+                        _ => adb_store::unscoped(&to).to_string(),
+                    }),
+                    logical_op: *logical_op,
+                }],
+            }),
+            None => Ok(predicate.clone()),
+        }
+    }
+
     fn build_predicate_from_conditions(&self, conditions_value: Option<&serde_json::Value>) -> ExecutorResult<Predicate> {
         let conditions_arr = conditions_value
             .and_then(|v| v.as_array())

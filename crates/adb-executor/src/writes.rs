@@ -170,6 +170,11 @@ pub trait Writes: Send + Sync {
         Err(needs_table("MERGE"))
     }
 
+    /// AQL v0.13: a record's `aliases` field was written — the alias map follows.
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        Ok(())
+    }
+
     /// The entity a merged entity's record id (its key, with its namespace) is now an
     /// alias of (GR-12).
     fn alias_of(&self, _key: &str) -> Option<String> {
@@ -950,6 +955,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             ids.extend(self.entity_facts(&ids, in_scope).await?);
         }
         let m: Memory = memory_type.into();
+        // A record that is now another's alias leaves its links to that record: the
+        // slow path does that (rare).
+        if memory_type == MemoryType::Semantic && ids.iter().any(|id| self.alias_of(id).is_some()) {
+            return Ok(None);
+        }
         let mut keys: Vec<(Memory, String)> = ids.iter().map(|k| (m, k.clone())).collect();
         if memory_type == MemoryType::Semantic {
             keys.extend(entities.iter().map(|k| (m, refs_key(k))));
@@ -2577,6 +2587,44 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// GR-13: the facts about the entities among `ids` (as subject or object), every
     /// version, not already in `ids`: forgetting an entity forgets them too, in the
     /// same record. With `in_scope`, only facts of that scope.
+    /// The links of the SEMANTIC records `ids` that are now aliases of other records,
+    /// as new links of those records (ends re-pointed; ones they have already, or that
+    /// would join a record to itself, skipped).
+    async fn links_to_survivors(&self, seq: &mut Sequencer<L>, ts: CommitTs, ids: &[String]) -> AdbResult<Vec<Effect>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(to) = self.alias_of(id) else { continue };
+            let end = adb_store::sql_str(&adb_store::row_id(Memory::Semantic, id));
+            let edges = store.live(Some(&format!("kind = 'edge' AND (subject_id = {end} OR object_id = {end})")), ts).await.map_err(err)?;
+            let to_row = adb_store::row_id(Memory::Semantic, &to);
+            let theirs: std::collections::HashSet<(String, String, Option<String>)> = {
+                let mine = adb_store::sql_str(&to_row);
+                store
+                    .live(Some(&format!("kind = 'edge' AND (subject_id = {mine} OR object_id = {mine})")), ts)
+                    .await
+                    .map_err(err)?
+                    .into_iter()
+                    .map(|e| (e.data.subject_id.unwrap_or_default(), e.data.object_id.unwrap_or_default(), e.data.link_type))
+                    .collect()
+            };
+            for e in edges {
+                let swap = |x: &Option<String>| x.as_deref().map(|v| if adb_store::sql_str(v) == end { to.clone() } else { adb_store::key_of(v).to_string() });
+                let mut d = e.data.clone();
+                d.subject_id = swap(&e.data.subject_id);
+                d.object_id = swap(&e.data.object_id);
+                let n = NewRow { id: seq.new_id(ts), lineage_id: RecordId(String::new()), version: 1, data: d };
+                let q = adb_store::qualified(&n);
+                if q.data.subject_id == q.data.object_id || theirs.contains(&(q.data.subject_id.clone().unwrap_or_default(), q.data.object_id.clone().unwrap_or_default(), q.data.link_type.clone())) {
+                    continue;
+                }
+                out.push(Effect::PutEdge(NewRow { lineage_id: n.id.clone(), ..n }));
+            }
+        }
+        Ok(out)
+    }
+
     async fn entity_facts(&self, ids: &[String], in_scope: Option<&str>) -> AdbResult<Vec<String>> {
         let Some(store) = &self.store else { return Ok(Vec::new()) };
         let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
@@ -3520,8 +3568,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if memory_type == MemoryType::Semantic {
             ids.extend(self.entity_facts(&ids, in_scope).await?);
         }
-        let effects: Vec<Effect> =
-            ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
+        // AQL v0.13: a record whose key is now another record's alias leaves its links
+        // to that record (they named it; the alias reaches it) — in the same write.
+        let mut effects: Vec<Effect> = Vec::new();
+        if memory_type == MemoryType::Semantic {
+            effects.extend(self.links_to_survivors(&mut seq, ts, &ids).await?);
+        }
+        effects.extend(ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }));
         self.usage_stale().await;
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
@@ -3533,6 +3586,16 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         // compaction (user, 7 Nov: no read may miss a FORGET; disk removal can wait).
         self.forget_on_branches(memory_type, &ids).await?;
         Ok(removed)
+    }
+
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        let Some(store) = &self.store else { return Ok(()) };
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let fresh = load_aliases(store).await?;
+        *self.aliases.lock().unwrap() = fresh;
+        Ok(())
     }
 
     fn alias_of(&self, key: &str) -> Option<String> {
