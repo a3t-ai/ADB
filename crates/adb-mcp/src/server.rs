@@ -178,14 +178,14 @@ impl McpServer {
     }
 
     /// Run AQL built by a shortcut tool.
-    /// `remember` sets a fact: a new key is stored, a key in use is updated (a new
+    /// `remember` sets a memory: a new key is stored, a key in use is updated (a new
     /// version, history kept) — unlike `STORE` / `store_memory`, which refuse a key
     /// in use (D3 S4).
     async fn remember(&self, args: &Value) -> Result<Value, String> {
         let aql = remember(args)?;
-        // A fact has its own key (subject, predicate) and supersedes by itself.
-        let fact = args.get("subject").is_some() && args.get("predicate").is_some();
-        let Some(key) = args.get("key").and_then(Value::as_str).filter(|_| !fact) else {
+        // subject + predicate is a LINK or an UPDATE of the subject: no key of its own.
+        let relation = args.get("subject").is_some() && args.get("predicate").is_some();
+        let Some(key) = args.get("key").and_then(Value::as_str).filter(|_| !relation) else {
             return self.run(Ok(aql)).await;
         };
         match self.engine.query(&aql, None).await {
