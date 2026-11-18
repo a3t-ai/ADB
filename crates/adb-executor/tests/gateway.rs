@@ -209,69 +209,6 @@ async fn layers_quotas_and_copies_cross_nodes() {
     assert!(e.contains("quota_exceeded"), "the other node's usage counts: {e}");
 }
 
-/// Partition operations across nodes: a memory layer whose space another node owns, a
-/// pattern quota over namespaces on different nodes, a branch promoted into another
-/// node's partition — all asked through a node owning none of them.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
-async fn layers_quotas_and_copies_cross_nodes_with_branch() {
-    use adb_core::MemoryType;
-    use adb_executor::branches::{Layer, LayerMode};
-    std::env::set_var("ADB_S3", "off");
-    let peers = LocalPeers::new();
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = Vec::new();
-    for n in 1..=3u64 {
-        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
-        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
-        peers.add(&format!("node{n}"), &node);
-        nodes.push(node);
-    }
-    let owner = |ns: &str| u64::from(nodes[0].partition_of(ns)) % 3 + 1;
-    let pick = |prefix: &str, f: &dyn Fn(u64) -> bool| -> &'static str { Box::leak((0..1000).map(|i| format!("{prefix}{i}")).find(|n| f(owner(n))).unwrap().into_boxed_str()) };
-    let src = pick("compliance", &|o| o == 1);
-    let dst = pick("trading", &|o| o == 2);
-    let via = &nodes[2]; // node 3 owns neither
-    let q = |aql: String| async move { via.query(&aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) };
-
-    // A layer read from another node's partition.
-    q(format!(r#"STORE INTO SEMANTIC (key = "rule", fact = "limit 1M") NAMESPACE "{src}""#)).await;
-    q(format!(r#"STORE INTO SEMANTIC (key = "desk", fact = "desk 4") NAMESPACE "{dst}""#)).await;
-    via.tag_create(src, "v1", None).await.unwrap();
-    via.layers_set(dst, vec![Layer { space: src.into(), mode: LayerMode::Pin, tag: Some("v1".into()), memories: vec![MemoryType::Semantic], sealed: true }]).await.unwrap();
-    q(format!(r#"UPDATE INTO SEMANTIC WHERE key = "rule" (fact = "limit 2M") NAMESPACE "{src}""#)).await;
-    let facts = values(&q(format!(r#"RECALL FROM SEMANTIC WHERE fact != "" NAMESPACE "{dst}""#)).await, "fact");
-    assert_eq!(facts, ["desk 4", "limit 1M"], "pinned at v1, read from node 1");
-    let refused = via.tag_drop(src, "v1").await.unwrap_err();
-    assert!(refused.contains("pinned"), "{refused}");
-
-    // A pattern quota over namespaces on two nodes (catalog read on every check here;
-    // by default a node may lag another's new namespace by ADB_CATALOG_TTL_MS).
-    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
-    let a = pick("q--a", &|o| o == 1);
-    let b = pick("q--b", &|o| o == 2);
-    via.quota_set("q--*", None, Some(3), None).await.unwrap();
-    q(format!(r#"STORE INTO SEMANTIC (key = "1") NAMESPACE "{a}""#)).await;
-    q(format!(r#"STORE INTO SEMANTIC (key = "2") NAMESPACE "{a}""#)).await;
-    q(format!(r#"STORE INTO SEMANTIC (key = "3") NAMESPACE "{b}""#)).await;
-    let e = via.query(&format!(r#"STORE INTO SEMANTIC (key = "4") NAMESPACE "{b}""#), None).await.unwrap_err();
-    assert!(e.contains("quota_exceeded"), "the other node's usage counts: {e}");
-
-    // A branch promoted into another node's partition.
-    let agent = pick("bot", &|o| o == 1);
-    let v2 = pick("bot-v2-", &|o| o == 2);
-    q(format!(r#"STORE INTO PROCEDURAL (key = "p1", steps = "p1-v1") NAMESPACE "{agent}""#)).await;
-    q(format!(r#"STORE INTO EPISODIC (event = "said hello") NAMESPACE "{agent}""#)).await;
-    via.branch_create(agent, "try", None, None).await.unwrap();
-    q(format!(r#"UPDATE INTO PROCEDURAL WHERE key = "p1" (steps = "p1-branch") NAMESPACE "{agent}" BRANCH "try""#)).await;
-    let p = via.branch_promote(agent, "try", v2, false).await.unwrap();
-    assert_eq!(p["records"], 1, "{p}");
-    assert_eq!(values(&q(format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{v2}""#)).await, "steps"), ["p1-branch"]);
-    let eps = values(&q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{v2}" LIMIT 100"#)).await, "event");
-    assert_eq!(eps, ["promoted_from", "said hello"], "its origin, and the old agent's episodes from node 1");
-    assert_eq!(via.branch_list(Some(agent)).await.unwrap().len(), 1);
-}
-
 /// The superadmin's SQL view on a cluster: asked through any node, it runs on the
 /// system partition's owner over every partition's memory rows (gathered from their
 /// owners) and the platform tables, and answers as one engine does.
@@ -461,46 +398,6 @@ async fn a_watch_across_partitions_sees_every_node() {
     assert!(e.contains("unknown watch"), "{e}");
 }
 
-/// A merged entity's key (GR-12) on a cluster: a LOOKUP naming no namespace runs
-/// across partitions and still finds the entity it merged into, through every node.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "AQL v0.13: MERGE ENTITY is being replaced (aliases: UPDATE … (aliases = [...]) + FORGET)"]
-async fn a_merged_key_resolves_across_partitions() {
-    std::env::set_var("ADB_S3", "off");
-    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
-    let ref_dir = tempfile::tempdir().unwrap();
-    let (reference, _) = LocalEngine::durable(ref_dir.path()).await.unwrap();
-    let reference: Arc<dyn Engine> = Arc::new(reference);
-    let peers = LocalPeers::new();
-    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes = Vec::new();
-    for n in 1..=3u64 {
-        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
-        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
-        peers.add(&format!("node{n}"), &node);
-        nodes.push(node);
-    }
-    workload(&|_| Arc::clone(&reference)).await;
-    let via = |i: usize| -> Arc<dyn Engine> { Arc::new(Arc::clone(&nodes[i % 3])) };
-    workload(&via).await;
-    let steps = [
-        r#"STORE INTO SEMANTIC (key = "person:ada-lovelace", born = 1815)"#,
-        r#"STORE INTO SEMANTIC (key = "person:ada", field = "maths")"#,
-        r#"MERGE ENTITY "person:ada-lovelace" INTO "person:ada""#,
-    ];
-    for (i, s) in steps.iter().enumerate() {
-        reference.query(s, None).await.unwrap();
-        via(i).query(s, None).await.unwrap_or_else(|e| panic!("{s}: {e}"));
-    }
-    let q = r#"RECALL FROM SEMANTIC WHERE id = "person:ada-lovelace""#;
-    let want = stable(&reference.query(q, None).await.unwrap());
-    assert_eq!(want.as_array().map(|a| a.len()), Some(1), "one engine finds the survivor: {want}");
-    for (i, node) in nodes.iter().enumerate() {
-        let got = stable(&node.query(q, None).await.unwrap());
-        assert_eq!(got, want, "through node {}", i + 1);
-    }
-}
-
 /// AQL v0.12 on a cluster: a LINK naming its namespace runs on that namespace's
 /// partition from any node; a namespace's topics and subscriptions work from any
 /// node, and a scoped call reaches only its own namespace's.
@@ -546,4 +443,36 @@ async fn links_and_topics_with_a_namespace_on_a_cluster() {
     assert!(e.contains("outside this call's scope"), "{e}");
     let u = nodes[1].query_in(&format!(r#"UNSUBSCRIBE "{sub}" NAMESPACE "{ns}""#), None, &scope).await.unwrap();
     assert_eq!(u["data"]["unsubscribed"], true, "{u}");
+}
+
+/// AQL v0.13 aliases on a cluster: merging two entities (UPDATE … aliases, FORGET the
+/// duplicate) answers through every node as on one engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_resolves_through_every_node() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let peers = LocalPeers::new();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut nodes = Vec::new();
+    for n in 1..=3u64 {
+        let place = Arc::new(Static { me: n, map: RwLock::new(Arc::new(map3())) });
+        let node = PartitionedEngine::open_cluster(dirs[n as usize - 1].path(), place as Arc<dyn Placement>, Arc::clone(&peers) as _).await.unwrap();
+        peers.add(&format!("node{n}"), &node);
+        nodes.push(node);
+    }
+    let q = |i: usize, aql: &'static str| {
+        let node = Arc::clone(&nodes[i % 3]);
+        async move { node.query(aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
+    };
+    q(0, r#"STORE INTO SEMANTIC (key = "person:ada-lovelace", born = "1815") NAMESPACE "crm""#).await;
+    q(1, r#"STORE INTO SEMANTIC (key = "person:ada", field = "maths") NAMESPACE "crm""#).await;
+    q(2, r#"STORE INTO SEMANTIC (key = "org:acme", name = "Acme") NAMESPACE "crm""#).await;
+    q(0, r#"LINK FROM SEMANTIC WHERE key = "person:ada" INTO SEMANTIC WHERE key = "org:acme" TYPE "works_at" NAMESPACE "crm""#).await;
+    q(1, r#"UPDATE INTO SEMANTIC WHERE key = "person:ada-lovelace" (aliases = ["person:ada"]) NAMESPACE "crm""#).await;
+    q(2, r#"FORGET FROM SEMANTIC WHERE key = "person:ada" NAMESPACE "crm""#).await;
+    for i in 0..3 {
+        let r = q(i, r#"RECALL FROM SEMANTIC WHERE key = "person:ada" WITH LINKS NAMESPACE "crm""#).await;
+        assert_eq!(values(&r, "born"), ["1815"], "node {}: the alias reads the survivor: {r}", i + 1);
+        assert!(r.to_string().contains("works_at"), "node {}: the duplicate's link is the survivor's: {r}", i + 1);
+    }
 }

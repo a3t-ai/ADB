@@ -151,3 +151,111 @@ async fn dropping_namespaces_with_branches() {
     q(&e, r#"STORE INTO SEMANTIC (key = "new", role = "fresh") NAMESPACE "crm-try""#).await;
     assert_eq!(roles(&e, "crm-try").await, ["fresh"]);
 }
+
+/// FORGET is never missed (user, 13 Nov): a record forgotten on the base is gone from
+/// its branches too, though they read the base as it was at their point.
+#[tokio::test]
+async fn forget_on_the_base_reaches_its_branches() {
+    let (_d, e) = engine().await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "ada", role = "engineer") NAMESPACE "crm""#).await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "bob", role = "sales") NAMESPACE "crm""#).await;
+    q(&e, r#"BRANCH FROM "crm" INTO "crm-try""#).await;
+    q(&e, r#"BRANCH FROM "crm-try" INTO "crm-try2""#).await;
+    q(&e, r#"FORGET FROM SEMANTIC WHERE key = "bob" NAMESPACE "crm""#).await;
+    assert_eq!(roles(&e, "crm-try").await, ["engineer"], "the branch");
+    assert_eq!(roles(&e, "crm-try2").await, ["engineer"], "and the branch of the branch");
+    assert!(vals(&e, r#"RECALL FROM SEMANTIC WHERE key = "bob" NAMESPACE "crm-try""#, "role").await.is_empty(), "a key lookup too");
+}
+
+/// LIKE (ranked recall) and PROCEDURAL matching read a branch's view: its own records
+/// and its base's at the point.
+#[tokio::test]
+async fn like_reads_a_branch() {
+    let (_d, e) = engine().await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "tea", content = "ada likes green tea") NAMESPACE "crm""#).await;
+    q(&e, r#"STORE INTO PROCEDURAL (key = "restart", pattern = "pod OOMKilled restart", steps = "raise the memory limit") NAMESPACE "crm""#).await;
+    q(&e, r#"BRANCH FROM "crm" INTO "crm-try""#).await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "coffee", content = "bob likes black coffee") NAMESPACE "crm-try""#).await;
+    q(&e, r#"STORE INTO PROCEDURAL (key = "loop", pattern = "pod OOMKilled loop", steps = "find the leak") NAMESPACE "crm-try""#).await;
+    let like = q(&e, r#"RECALL FROM SEMANTIC LIKE "who likes drinks" NAMESPACE "crm-try" LIMIT 10"#).await.to_string();
+    assert!(like.contains("green tea") && like.contains("black coffee"), "inherited and own: {like}");
+    let base = q(&e, r#"RECALL FROM SEMANTIC LIKE "who likes drinks" NAMESPACE "crm" LIMIT 10"#).await.to_string();
+    assert!(!base.contains("black coffee"), "the base doesn't see it: {base}");
+    let p = |ns: &'static str| {
+        let e = &e;
+        async move { vals(e, &format!(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.4 NAMESPACE "{ns}""#), "pattern").await }
+    };
+    assert_eq!(p("crm-try").await, ["pod OOMKilled loop", "pod OOMKilled restart"], "the branch's and the inherited one");
+    assert_eq!(p("crm").await, ["pod OOMKilled restart"], "the base: its own only");
+}
+
+/// A link made on a branch is the branch's: the base doesn't have it, UNLINK there
+/// finds it once. Links the base had at the point are seen through.
+#[tokio::test]
+async fn a_link_on_a_branch_stays_on_it() {
+    let (_d, e) = engine().await;
+    for k in ["a", "b", "c"] {
+        q(&e, &format!(r#"STORE INTO SEMANTIC (key = "{k}", role = "{k}") NAMESPACE "p""#)).await;
+    }
+    q(&e, r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "c" TYPE "old" NAMESPACE "p""#).await;
+    q(&e, r#"BRANCH FROM "p" INTO "p-b1""#).await;
+    let l = q(&e, r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" TYPE "rel" NAMESPACE "p-b1""#).await;
+    assert_eq!(l["data"]["count"], 1, "{l}");
+    let links = |ns: &'static str| {
+        let e = &e;
+        async move {
+            let r = q(e, &format!(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS NAMESPACE "{ns}""#)).await;
+            let mut t: Vec<String> = r["data"]["records"][0]["data"]["links"].as_array().map(|a| a.iter().filter_map(|l| l["type"].as_str().or(l["link_type"].as_str()).map(String::from)).collect()).unwrap_or_default();
+            t.sort();
+            t
+        }
+    };
+    assert_eq!(links("p").await, ["old"], "not on the base");
+    let u = q(&e, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" NAMESPACE "p-b1""#).await;
+    assert_eq!(u["data"]["count"], 1, "the link is on the branch: {u}");
+    let u = q(&e, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" NAMESPACE "p-b1""#).await;
+    assert_eq!(u["data"]["count"], 0, "and gone: {u}");
+    assert_eq!(links("p").await, ["old"]);
+}
+
+/// BRANCH … AS OF reads every memory type as it was then: episodes and tools too.
+#[tokio::test]
+async fn a_branch_as_of_reads_episodes_and_tools_as_they_were() {
+    let (_d, e) = engine().await;
+    q(&e, r#"STORE INTO EPISODIC (key = "ep", content = "first telling") NAMESPACE "crm""#).await;
+    q(&e, r#"STORE INTO TOOLS (key = "t", name = "lookup", description = "old description", schema = "{}") NAMESPACE "crm""#).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let t = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    q(&e, r#"UPDATE INTO EPISODIC WHERE key = "ep" (content = "second telling") NAMESPACE "crm""#).await;
+    q(&e, r#"UPDATE INTO TOOLS WHERE key = "t" (description = "new description") NAMESPACE "crm""#).await;
+    q(&e, &format!(r#"BRANCH FROM "crm" INTO "crm-past" AS OF "{t}""#)).await;
+    assert_eq!(vals(&e, r#"RECALL FROM EPISODIC NAMESPACE "crm-past""#, "content").await, ["first telling"]);
+    assert_eq!(vals(&e, r#"RECALL FROM TOOLS NAMESPACE "crm-past""#, "description").await, ["old description"]);
+    assert_eq!(vals(&e, r#"RECALL FROM EPISODIC NAMESPACE "crm""#, "content").await, ["second telling"]);
+}
+
+/// The branch API (A3T's review): stats and records of a branch are its namespace's.
+#[tokio::test]
+async fn the_branch_api_reads_the_branch_namespace() {
+    use adb_core::MemoryType;
+    let (_d, e) = engine().await;
+    q(&e, r#"STORE INTO SEMANTIC (key = "ada", role = "engineer") NAMESPACE "crm""#).await;
+    q(&e, r#"STORE INTO EPISODIC (key = "e1", role = "called") NAMESPACE "crm""#).await;
+    let b = e.branch_create("crm", "try", None, Some("dev@a3t")).await.unwrap();
+    assert_eq!((b.namespace.as_str(), b.name.as_str(), b.parent.as_str()), ("crm", "try", "main"));
+    q(&e, r#"STORE INTO SEMANTIC (key = "cy", role = "intern") NAMESPACE "crm@try""#).await;
+    let s = e.space_stats("crm", Some("try"), std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(s["tiers"]["SEMANTIC"]["count"], 2, "inherited and own: {s}");
+    assert_eq!(s["tiers"]["EPISODIC"]["count"], 1, "{s}");
+    let main = e.space_stats("crm", None, std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(main["tiers"]["SEMANTIC"]["count"], 1, "{main}");
+    let r = e.space_records("crm", MemoryType::Semantic, Some("try"), None, 10).await.unwrap();
+    assert_eq!(r["records"].as_array().unwrap().len(), 2, "{r}");
+    // A branch of a namespace with no records yet (a new agent's space).
+    e.branch_create("fresh", "try", None, None).await.unwrap();
+    assert_eq!(e.branch_list(Some("fresh")).await.unwrap().len(), 1);
+    // A past point is AQL's BRANCH … AS OF; the API cuts one now.
+    assert!(e.branch_drop("crm", "try").await.unwrap());
+    assert!(!e.branch_drop("crm", "try").await.unwrap(), "already gone");
+}

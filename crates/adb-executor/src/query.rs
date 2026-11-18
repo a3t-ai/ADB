@@ -1133,9 +1133,9 @@ async fn aggregate_from(
     Ok(Answer::of(&c, v))
 }
 
-/// Whether a read asks for history (AQL v0.10): `AS OF`, `VALID AT` or `WITH HISTORY`.
+/// Whether a read asks for history: `AS OF` or `WITH HISTORY`.
 pub fn is_history(modifiers: &Modifiers) -> bool {
-    modifiers.as_of.is_some() || modifiers.valid_at.is_some() || modifiers.with_history
+    modifiers.as_of.is_some() || modifiers.with_history
 }
 
 /// A history read's time, at `now` for `AGO`.
@@ -1146,11 +1146,9 @@ fn instant(t: &adb_core::TimePoint, what: &str, now: CommitTs) -> AdbResult<Comm
     })
 }
 
-/// `RECALL` / `LOOKUP` with `AS OF`, `VALID AT` or `WITH HISTORY` (AQL v0.10, L9 /
-/// GR-14) over SEMANTIC or PROCEDURAL, from Lance (the hot cache holds current rows
-/// only). `AS OF t`: each record's version at t, if it held at t; `VALID AT v`: facts
-/// holding at v, from the versions current at `AS OF` (default now); `WITH HISTORY`:
-/// every version recorded by `AS OF`, whatever its validity. Each record carries
+/// `RECALL` with `AS OF` or `WITH HISTORY` (L9) over SEMANTIC or PROCEDURAL, from
+/// Lance (the hot cache holds current rows only). `AS OF t`: each record's version at
+/// t, if it held at t; `WITH HISTORY`: every version recorded by `AS OF`. Each record carries
 /// `_recorded_at` (its version's commit) and `_replaced_at` (when a newer version
 /// replaced it, by `AS OF`; else null). Versions superseded more than
 /// `writes::HISTORY` ago are compacted away; forgotten and expired records have none.
@@ -1159,10 +1157,9 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
         return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY aren't valid on WORKING: it's session state, without versions".into()));
     }
     if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
-        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, VALID AT, WITH HISTORY)".into()));
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, WITH HISTORY)".into()));
     }
     let tx = modifiers.as_of.as_ref().map(|t| instant(t, "AS OF", now)).transpose()?.unwrap_or(now);
-    let valid = modifiers.valid_at.as_ref().map(|t| instant(t, "VALID AT", now)).transpose()?.unwrap_or(tx);
     let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
     let from = modifiers.history_from.as_ref().map(|t| instant(t, "WITH HISTORY BETWEEN", now)).transpose()?;
     let rows = store.versions(memory.into(), None).await.map_err(store_err)?;
@@ -1171,8 +1168,8 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
         .iter()
         .filter(|r| in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns)))
         .filter(|r| match modifiers.with_history {
-            true => r.commit_ts <= tx && from.is_none_or(|f| r.commit_ts >= f) && (modifiers.valid_at.is_none() || r.holds_at(valid)),
-            false => r.is_current_at(tx, valid),
+            true => r.commit_ts <= tx && from.is_none_or(|f| r.commit_ts >= f),
+            false => r.is_current_at(tx, tx),
         })
         .map(|r| {
             let mut rec = record(r);
@@ -1228,11 +1225,11 @@ fn pattern_match(records: &[Arc<MemoryRecord>], pattern_var: &str, threshold: Op
         .collect()
 }
 
-/// `RECALL` / `LOOKUP` on a branch engine (B2): the branch's view (its rows, then its
-/// parent's as of the point), then the predicate and modifiers as on main.
+/// `RECALL` on a branch namespace: the branch's view (its rows, then its base's as of
+/// the point), then the predicate and modifiers as on main.
 pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
     if is_history(modifiers) {
-        return Err(AdbError::UnsupportedOperation("AS OF, VALID AT and WITH HISTORY are not read on a branch yet".into()));
+        return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY are not read on a branch yet".into()));
     }
     if modifiers.follow_links.is_some() || modifiers.with_links.is_some() {
         return Err(AdbError::UnsupportedOperation("FOLLOW LINKS and WITH LINKS are not read on a branch yet".into()));

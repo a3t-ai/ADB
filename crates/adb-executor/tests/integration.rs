@@ -535,60 +535,6 @@ async fn reflect_follow_links_respects_type() {
     assert!(text.contains("\"b\"") && !text.contains("\"c\""), "{text}");
 }
 
-async fn keys(adb: &Mem, aql: &str) -> Vec<String> {
-    let result = adb.execute(aql).await.unwrap_or_else(|e| panic!("{aql}: {e}"));
-    result.get_records().unwrap().iter().map(|r| r.id.clone()).collect()
-}
-
-/// P1.4 (P1_GRAPH D2): a fact with an entity object is a link of its predicate;
-/// its entities are created; a new fact for (subject, predicate) supersedes.
-#[tokio::test]
-#[ignore = "AQL v0.13: FACT is being replaced (relationships are LINKs, values are fields)"]
-async fn facts_are_links_between_entities() {
-    let adb = Mem::new().await;
-    let fact = |s: &str, p: &str, o: &str| format!(r#"STORE INTO SEMANTIC FACT (subject = "{s}", predicate = "{p}", object = "{o}", confidence = 0.8)"#);
-    adb.execute(&fact("person:ada", "works_at", "org:acme")).await.unwrap();
-    // Entities made for both ends.
-    assert_eq!(keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "org:acme""#).await, ["org:acme"]);
-    let follow = r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS TYPE "works_at""#;
-    assert_eq!(keys(&adb, follow).await, ["org:acme"]);
-    let r = adb.execute(follow).await.unwrap();
-    assert!((r.get_records().unwrap()[0].data["_path_weight"].as_f64().unwrap() - 0.8).abs() < 1e-6);
-
-    // A new fact for (person:ada, works_at) supersedes the old one, link and all.
-    adb.execute(&fact("person:ada", "works_at", "org:globex")).await.unwrap();
-    assert_eq!(keys(&adb, follow).await, ["org:globex"]);
-    assert_eq!(keys(&adb, r#"RECALL FROM SEMANTIC WHERE predicate = "works_at""#).await.len(), 1);
-    // Inbound: who works at globex; nobody at acme any more.
-    assert_eq!(keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "org:globex" FOLLOW LINKS INBOUND"#).await, ["person:ada"]);
-    assert!(keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "org:acme" FOLLOW LINKS INBOUND"#).await.is_empty());
-
-    // MULTI: one fact per object.
-    let multi = |o: &str| format!(r#"STORE INTO SEMANTIC FACT MULTI (subject = "person:ada", predicate = "knows", object = "{o}")"#);
-    adb.execute(&multi("person:bob")).await.unwrap();
-    adb.execute(&multi("person:cy")).await.unwrap();
-    adb.execute(&multi("person:bob")).await.unwrap();
-    let mut known = keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS TYPE "knows""#).await;
-    known.sort();
-    assert_eq!(known, ["person:bob", "person:cy"]);
-
-    // Two hops over facts: bob ← ada → globex.
-    adb.execute(&fact("org:globex", "based_in", "city:london")).await.unwrap();
-    let r = keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS TYPE ("works_at", "based_in") DEPTH 2"#).await;
-    assert_eq!(r, ["org:globex", "city:london"]);
-
-    // A literal value is a fact, not a link.
-    adb.execute(r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "born", value = 1815)"#).await.unwrap();
-    let born = adb.execute(r#"RECALL FROM SEMANTIC WHERE predicate = "born""#).await.unwrap();
-    assert_eq!(born.get_records().unwrap()[0].data["value"], 1815);
-    assert_eq!(keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS TYPE "born""#).await.len(), 0);
-
-    // FORGET a fact: its link goes.
-    adb.execute(r#"FORGET FROM SEMANTIC WHERE predicate = "based_in""#).await.unwrap();
-    let r = keys(&adb, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS TYPE ("works_at", "based_in") DEPTH 2"#).await;
-    assert_eq!(r, ["org:globex"]);
-}
-
 /// AQL v0.13 has no FACT: the old statements are refused.
 #[tokio::test]
 async fn fact_statements_are_checked() {

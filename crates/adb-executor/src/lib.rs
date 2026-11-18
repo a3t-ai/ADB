@@ -22,7 +22,6 @@ pub use adb_core::steps;
 pub mod replica;
 pub mod follower;
 pub mod branches;
-pub mod branch_engine;
 pub mod merge;
 pub mod restore;
 pub mod partitioned;

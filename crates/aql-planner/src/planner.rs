@@ -165,7 +165,6 @@ impl Planner {
             namespace: modifiers.namespace.clone().or_else(|| self.default_namespace.clone()),
             in_scope: modifiers.in_scope.clone(),
             ttl: modifiers.ttl,
-            fact: None,
         };
         Ok(StepPlan::store(memory_type, store_data, modifiers))
     }
@@ -376,7 +375,6 @@ fn convert_modifiers(mods: &Modifiers) -> PlanResult<CoreModifiers> {
         follow_links: mods.follow_links.as_ref().map(|f| adb_core::FollowLinks { select: link_select(&f.select), depth: f.depth }),
         // WITH HISTORY BETWEEN t1 AND t2: the versions recorded by t2 (from t1).
         as_of: mods.as_of.as_ref().or(mods.with_history.as_ref().and_then(|h| h.between.as_ref()).map(|(_, to)| to)).map(convert_time_point),
-        valid_at: None,
         with_history: mods.with_history.is_some(),
         history_from: mods.with_history.as_ref().and_then(|h| h.between.as_ref()).map(|(from, _)| convert_time_point(from)),
     })

@@ -98,10 +98,6 @@ pub trait Engine: Send + Sync {
     async fn space_copy_procedures(&self, _namespace: &str, _into: &str, _tools: bool) -> Result<Value, String> {
         Err("copying a memory space needs a durable engine (start ADB with --data-dir)".into())
     }
-    /// DB-9: a branch of main at a past point.
-    async fn branch_create_past(&self, _namespace: &str, _name: &str, _created_by: Option<&str>, _at: &crate::branches::PointRef) -> Result<Value, String> {
-        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
-    }
     /// DB-9: clone `namespace` as it was at a past point.
     async fn space_clone_at(&self, _namespace: &str, _into: &str, _at: &crate::branches::PointRef) -> Result<Value, String> {
         Err("cloning a memory space needs a durable engine (start ADB with --data-dir)".into())
@@ -135,8 +131,8 @@ pub trait Engine: Send + Sync {
     async fn space_records(&self, _namespace: &str, _memory: MemoryType, _branch: Option<&str>, _after: Option<&str>, _limit: usize) -> Result<Value, String> {
         Err("space records need a durable engine (start ADB with --data-dir)".into())
     }
-    /// DB-14: the gateway whose log holds a space's writes: the org's, or a hosted branch's.
-    async fn space_gateway(&self, _namespace: &str, _branch: Option<&str>) -> Result<Arc<Gateway>, String> {
+    /// DB-14: the gateway whose log holds a space's writes.
+    async fn space_gateway(&self, _namespace: &str) -> Result<Arc<Gateway>, String> {
         Err("the space feed needs a durable engine (start ADB with --data-dir)".into())
     }
 
@@ -160,28 +156,6 @@ pub trait Engine: Send + Sync {
     /// unless `force_skip`, which reverts the rest).
     async fn merge_revert(&self, _namespace: &str, _merge_id: &str, _by: Option<&str>, _force_skip: bool) -> Result<Value, String> {
         Err("memory branches need a durable engine (start ADB with --data-dir)".into())
-    }
-
-    /// B6: rows of `namespace` in `memory` as this engine (or its hosted branch
-    /// `branch`) saw them at `at` — what a branch in its own pod reads its parent
-    /// through, and what an org reads a pod's view through.
-    async fn parent_rows(&self, _memory: MemoryType, _namespace: &str, _branch: Option<&str>, _at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
-        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
-    }
-    /// B6: the branch runs in its own pod at `url` (Flight) from now on.
-    async fn branch_place(&self, _namespace: &str, _name: &str, _url: &str) -> Result<crate::branches::Branch, String> {
-        Err("memory branches need a durable engine (start ADB with --data-dir)".into())
-    }
-    /// B6: FORGETs a branch's pod hasn't applied; `ack` drops the first `n` of them.
-    async fn branch_pending(&self, _namespace: &str, _name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
-        Ok(Vec::new())
-    }
-    async fn branch_pending_ack(&self, _namespace: &str, _name: &str, _n: usize) -> Result<(), String> {
-        Ok(())
-    }
-    /// B6, on a branch engine: erase this engine's own rows of `lineages`.
-    async fn forget_lineages(&self, _memory: MemoryType, _lineages: &[String]) -> Result<u64, String> {
-        Err("not a branch engine".into())
     }
 
     /// B7: tags (named points of a space) and layers (inherited spaces).
@@ -382,10 +356,6 @@ pub struct LocalEngine {
     dir: std::path::PathBuf,
     /// The embedder in use (W9.10: reported with the settings).
     embedder: Option<Arc<adb_embed::Embedder>>,
-    /// The org engine's branch engines (B2, hosted placement); `None` on a branch engine.
-    branch_host: Option<Arc<crate::branch_engine::BranchHost>>,
-    /// A branch engine's parent (B2); `None` on the org engine.
-    parent: Option<crate::branch_engine::ParentView>,
     /// Where other spaces (memory layers) are read: this partition, or (cluster) the
     /// router's source, set by [`crate::partitioned::PartitionedEngine`].
     spaces: Option<crate::spaces::SpaceView>,
@@ -854,12 +824,12 @@ impl LocalEngine {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| format!("partition data dir {}: {e}", dir.display()))?;
         let wal: EngineLog = Arc::new(open_wal(&dir, role).await?);
-        Box::pin(Self::durable_with(dir, wal, None, role)).await
+        Box::pin(Self::durable_with(dir, wal, role)).await
     }
 
     /// [`Self::durable_partition`] over `log` (a cluster owner's replicated log, step 5).
     pub async fn durable_partition_on(dir: impl Into<std::path::PathBuf>, role: PartitionRole, log: EngineLog) -> Result<(Self, ReplayStats), String> {
-        Box::pin(Self::durable_with(dir.into(), log, None, role)).await
+        Box::pin(Self::durable_with(dir.into(), log, role)).await
     }
 
     /// Step 6, for readers on other nodes: committed records from `from` (at most `max`,
@@ -902,16 +872,7 @@ impl LocalEngine {
     /// node's local WAL. Everything else is as [`Self::durable`].
     pub async fn durable_on(dir: impl Into<std::path::PathBuf>, wal: EngineLog) -> Result<(Self, ReplayStats), String> {
         // Boxed: keeps the callers' future types shallow (the compiler's query depth).
-        Box::pin(Self::durable_with(dir.into(), wal, None, PartitionRole::SINGLE)).await
-    }
-
-    /// A branch engine (B2): its own WAL, sequencer and delta table in `dir`, reading
-    /// its parent through `parent` (the org, or another branch).
-    pub async fn durable_branch(dir: impl Into<std::path::PathBuf>, parent: crate::branch_engine::ParentView) -> Result<(Self, ReplayStats), String> {
-        let dir = dir.into();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("branch data dir {}: {e}", dir.display()))?;
-        let wal: EngineLog = Arc::new(open_wal(&dir, PartitionRole::SINGLE).await?);
-        Box::pin(Self::durable_with(dir, wal, Some(parent), PartitionRole::SINGLE)).await
+        Box::pin(Self::durable_with(dir.into(), wal, PartitionRole::SINGLE)).await
     }
 
     /// The engine's data directory.
@@ -946,106 +907,31 @@ impl LocalEngine {
         d.last_commit().await.map_err(|e| e.to_string())
     }
 
-    /// This engine as a parent of a branch: the org's table, or a branch's overlay.
-    pub fn as_parent_source(&self) -> Option<Arc<dyn crate::branch_engine::ParentSource>> {
-        let (store, barrier) = self.store.as_ref()?;
-        Some(match &self.parent {
-            None => Arc::new(crate::branch_engine::StoreSource { store: Arc::clone(store), barrier: barrier.clone() }),
-            Some(p) => Arc::new(crate::branch_engine::BranchSource { store: Arc::clone(store), barrier: barrier.clone(), parent: p.clone() }),
-        })
-    }
-
-    /// B5: what `source` sees of `namespace` now, in the memories a new agent takes
-    /// (SEMANTIC, PROCEDURAL, TOOLS — EPISODIC stays with the original agent, WORKING
-    /// is session state), written into `into`.
-    /// DB-10: base (main at the branch point), main now and the branch's view, per
-    /// memory type, and their diff. Branches of main only.
-    async fn three_way(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<ThreeWay, String> {
-        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
-        let host = self.branch_host.as_ref().ok_or("branches are merged on the org's engine")?;
-        let branch = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
-        if branch.parent != crate::branches::MAIN {
-            return Err(format!("branch {name:?} is a branch of {:?}: merging into a parent branch isn't supported yet", branch.parent));
-        }
-        let parent = self.as_parent_source().ok_or("a branch engine has no table")?;
-        let view_src = host.source(namespace, name).await?;
-        let main_point = d.point().await;
-        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let mut w = ThreeWay { behind: 0, branch: branch.clone(), main_point, clean: Vec::new(), conflicts: Vec::new(), main: Default::default(), view: Default::default() };
-        for m in memories {
-            let base = parent.rows_as_of(*m, namespace, branch.point()).await.map_err(|e| e.to_string())?;
-            let main = parent.rows_as_of(*m, namespace, now).await.map_err(|e| e.to_string())?;
-            let view = view_src.rows_as_of(*m, namespace, now).await.map_err(|e| e.to_string())?;
-            let base_ids: std::collections::HashMap<&str, &str> = base.iter().map(|r| (r.lineage_id.as_str(), r.id.as_str())).collect();
-            w.behind += main.iter().filter(|r| base_ids.get(r.lineage_id.as_str()) != Some(&r.id.as_str())).count();
-            let (c, k) = crate::merge::diff(*m, &base, &main, &view);
-            w.clean.extend(c);
-            w.conflicts.extend(k);
-            w.main.extend(main.into_iter().map(|r| (r.lineage_id.clone(), r)));
-            w.view.extend(view.into_iter().map(|r| (r.lineage_id.clone(), r)));
-        }
-        Ok(w)
-    }
-
-    async fn materialise_from(&self, source: Arc<dyn crate::branch_engine::ParentSource>, namespace: &str, into: &str) -> Result<u64, String> {
-        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        self.materialise_at(source, namespace, into, now).await
-    }
-
     /// DB-17: copy only PROCEDURAL (and TOOLS' schemas, with `tools`) of `namespace` into `into`:
     /// nothing a client said or was learned about them travels.
     async fn materialise_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<u64, String> {
+        let memories: &[MemoryType] = if tools { &[MemoryType::Procedural, MemoryType::Tools] } else { &[MemoryType::Procedural] };
+        self.materialise_at(namespace, into, memories, now_ts()).await
+    }
+
+    /// `space`'s records of `memory` as they were at `at` (a branch namespace reads
+    /// through its base, `crate::spaces::SpaceView::rows_at`).
+    async fn space_rows(&self, memory: MemoryType, space: &str, at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {
+        let v = self.spaces.as_ref().ok_or("space reads need a durable engine (start ADB with --data-dir)")?;
+        v.rows_at(memory.into(), space, at, now_ts()).await.map_err(|e| e.to_string())
+    }
+
+    /// `namespace`'s `memories` as they were at `at`, copied into `into`.
+    async fn materialise_at(&self, namespace: &str, into: &str, memories: &[MemoryType], at: adb_core::log::CommitTs) -> Result<u64, String> {
         let d = self.durable.as_ref().ok_or("copying needs a durable engine (start ADB with --data-dir)")?;
         if namespace == into {
             return Err(format!("promote into a new namespace, not {into:?} itself"));
         }
-        let source = self.as_parent_source().ok_or("copying needs a durable engine (start ADB with --data-dir)")?;
-        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let mut rows = source.rows_as_of(MemoryType::Procedural, namespace, now).await.map_err(|e| e.to_string())?;
-        if tools {
-            rows.extend(source.rows_as_of(MemoryType::Tools, namespace, now).await.map_err(|e| e.to_string())?);
-        }
-        d.materialise(into, rows).await.map_err(|e| e.to_string())
-    }
-
-    /// DB-14: a space's rows as main or as a hosted or placed branch sees them.
-    async fn space_source(&self, namespace: &str, branch: Option<&str>) -> Result<Arc<dyn crate::branch_engine::ParentSource>, String> {
-        match branch.filter(|b| !b.is_empty() && *b != crate::branches::MAIN) {
-            Some(b) => {
-                let host = self.branch_host.as_ref().ok_or("branches are read on the org's engine")?;
-                host.source(namespace, b).await
-            }
-            None => self.as_parent_source().ok_or_else(|| "space reads need a durable engine (start ADB with --data-dir)".to_string()),
-        }
-    }
-
-    async fn materialise_at(&self, source: Arc<dyn crate::branch_engine::ParentSource>, namespace: &str, into: &str, at: adb_core::log::CommitTs) -> Result<u64, String> {
-        let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
-        if namespace == into {
-            return Err(format!("promote into a new namespace, not {into:?} itself"));
-        }
         let mut rows = Vec::new();
-        for m in [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools] {
-            rows.extend(source.rows_as_of(m, namespace, at).await.map_err(|e| e.to_string())?);
+        for m in memories {
+            rows.extend(self.space_rows(*m, namespace, at).await?);
         }
         d.materialise(into, rows).await.map_err(|e| e.to_string())
-    }
-
-    /// B5 / DB-11: branch `name` of `namespace`, if it may be promoted: a copy of a
-    /// branch behind main would drop main's newer memory (unless `allow_stale`).
-    pub async fn promote_check(&self, namespace: &str, name: &str, allow_stale: bool) -> Result<crate::branches::Branch, String> {
-        let d = self.durable.as_ref().ok_or("promoting needs a durable engine (start ADB with --data-dir)")?;
-        let branch = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
-        if !allow_stale && branch.parent == crate::branches::MAIN {
-            let w = self.three_way(namespace, name, &[MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools]).await?;
-            if !w.conflicts.is_empty() {
-                return Err(format!("merge_conflicts: {} records changed on both main and the branch: {}: rebase first", w.conflicts.len(), w.conflicts.iter().map(|c| c.lineage.as_str()).collect::<Vec<_>>().join(", ")));
-            }
-            if w.behind > 0 {
-                return Err(format!("merge_stale: main changed {} records since the branch point: rebase first (allow_stale promotes without them)", w.behind));
-            }
-        }
-        Ok(branch)
     }
 
     /// DB-4: (records, payload bytes) of this partition's namespaces `quota` covers.
@@ -1058,10 +944,10 @@ impl LocalEngine {
     /// Step 3, a copy between partitions — out: `namespace`'s rows of `memories` as
     /// main (or `branch`) saw them at `at`.
     pub async fn copy_out(&self, namespace: &str, branch: Option<&str>, memories: &[MemoryType], at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {
-        let source = self.space_source(namespace, branch).await?;
+        let space = space_of(namespace, branch);
         let mut rows = Vec::new();
         for m in memories {
-            rows.extend(source.rows_as_of(*m, namespace, at).await.map_err(|e| e.to_string())?);
+            rows.extend(self.space_rows(*m, &space, at).await?);
         }
         Ok(rows)
     }
@@ -1076,13 +962,6 @@ impl LocalEngine {
     pub async fn resolve_point(&self, namespace: &str, at: &crate::branches::PointRef) -> Result<(u64, adb_core::log::CommitTs), String> {
         let d = self.durable.as_ref().ok_or("points need a durable engine (start ADB with --data-dir)")?;
         d.resolve_point(namespace, at).await.map_err(|e| e.to_string())
-    }
-
-    /// B6: how this org reaches branches in their own pods (the server's Flight client).
-    pub fn set_branch_remote(&self, remote: Arc<dyn crate::branch_engine::BranchRemote>) {
-        if let Some(host) = &self.branch_host {
-            host.set_remote(remote);
-        }
     }
 
     /// Ship the log records object storage lacks as WAL segments now (the shipper
@@ -1115,7 +994,6 @@ impl LocalEngine {
         }
     }
 
-    /// The durable writer (B4: the branch host sets pins and forwards FORGETs).
     /// A newer owner fenced this partition's engine: it takes no more writes.
     pub fn moved(&self) -> bool {
         self.durable.as_ref().is_some_and(|d| d.moved())
@@ -1125,7 +1003,7 @@ impl LocalEngine {
         self.durable.as_ref()
     }
 
-    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, parent: Option<crate::branch_engine::ParentView>, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
+    async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, role: PartitionRole) -> Result<(Self, ReplayStats), String> {
         // Shared: the sequencer appends, subscribers read (stage E).
         let seq = Sequencer::new(Arc::clone(&wal), Epoch(1));
         let (store, embedder) = open_store(&dir, role.id).await?;
@@ -1174,27 +1052,14 @@ impl LocalEngine {
             Arc::new(Gateway::new(log, lineages, Arc::clone(writes.subscriptions()), b.watch()))
         });
         writes.set_embedder(embedder.clone());
-        writes.set_parent(parent.clone());
-        let branch_host = match &parent {
-            None => Some(Arc::new(crate::branch_engine::BranchHost::new(
-                dir.join("branches"),
-                Arc::new(crate::branch_engine::StoreSource { store: Arc::clone(&store), barrier: barrier.clone() }),
-                Arc::clone(writes.branches()),
-            ))),
-            Some(_) => None,
-        };
-        if let Some(host) = &branch_host {
-            writes.set_branch_host(Arc::clone(host));
-            let registry = Arc::clone(writes.branches());
-            writes.set_pins(Arc::new(move || registry.pins(None)));
-        }
+        let registry = Arc::clone(writes.branches());
+        writes.set_pins(Arc::new(move || registry.pins()));
         let spaces = crate::spaces::SpaceView::new(crate::spaces::LocalSpaces { store: Some(Arc::clone(&store)), barrier: barrier.clone(), registry: Arc::clone(writes.branches()) });
         writes.set_spaces(spaces.clone());
         let reads: Arc<dyn Reads> = Arc::new(
             LanceReads::new(Arc::clone(&store), barrier.clone())
                 .with_embedder(embedder.clone())
-                .with_parent(parent.clone())
-                .with_layers(parent.is_none().then(|| Arc::clone(writes.branches())))
+                .with_layers(Some(Arc::clone(writes.branches())))
                 .with_spaces(Some(spaces.clone())),
         );
         let durable = Arc::new(writes);
@@ -1242,8 +1107,6 @@ impl LocalEngine {
                 temp: None,
                 dir,
                 embedder,
-                branch_host,
-                parent,
                 spaces: Some(spaces),
                 log: Some(Arc::clone(&wal)),
             },
@@ -1415,11 +1278,7 @@ impl Engine for LocalEngine {
         if let Some((stmt, list)) = across_namespaces(aql) {
             return read_across(&stmt, &list, |one| async move { self.query(&one, variables).await }).await;
         }
-        // OB-3: every AQL statement (HTTP, Flight, MCP) is timed here, once: a branch
-        // engine's statements came through its parent, which times them.
-        if self.parent.is_some() {
-            return self.query_unobserved(aql, variables).await;
-        }
+        // OB-3: every AQL statement (HTTP, Flight, MCP) is timed here, once.
         let t0 = std::time::Instant::now();
         // C-5: reads take a permit; beyond the bound they queue here instead of all taking
         // the CPU at once (CPU-saturating reads lost the leader its lead on AWS, 10 Nov).
@@ -1475,13 +1334,8 @@ impl Engine for LocalEngine {
             })
         });
         let compacted = w.compact().await.map_err(|e| e.to_string())?;
-        let branches = match &self.branch_host {
-            Some(host) => host.compact_hosted().await?,
-            None => 0,
-        };
         match compacted {
             Some(s) => Ok(json!({
-                "branches": branches,
                 "total": s.total, "kept": s.kept, "bytes_before": s.bytes_before, "bytes_after": s.bytes_after,
                 "took_ms": s.took.as_millis() as u64, "platform": platform,
             })),
@@ -1607,12 +1461,12 @@ impl Engine for LocalEngine {
     }
 
     async fn tag_create(&self, namespace: &str, name: &str, created_by: Option<&str>) -> Result<crate::branches::Tag, String> {
-        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("tags are created on the org's engine")?;
+        let d = self.durable.as_ref().ok_or("tags need a durable engine (start ADB with --data-dir)")?;
         d.tag_create(namespace, name, created_by).await.map_err(|e| e.to_string())
     }
 
     async fn tag_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("tags are dropped on the org's engine")?;
+        let d = self.durable.as_ref().ok_or("tags need a durable engine (start ADB with --data-dir)")?;
         d.tag_drop(namespace, name).await.map_err(|e| e.to_string())
     }
 
@@ -1629,71 +1483,6 @@ impl Engine for LocalEngine {
         Ok(self.durable.as_ref().map(|d| d.branches().layers_of(namespace)).unwrap_or_default())
     }
 
-    async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
-        let source = match (branch.filter(|b| *b != crate::branches::MAIN), &self.branch_host) {
-            (Some(b), Some(host)) => host.source(namespace, b).await?,
-            // A pod that is one branch, asked for that branch by name.
-            (Some(b), None) if self.parent.as_ref().is_some_and(|p| p.branch == b && p.namespace == namespace) => {
-                self.as_parent_source().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?
-            }
-            (Some(b), None) => return Err(format!("no branch {b:?} here: this engine is a branch itself")),
-            (None, _) => {
-                if let Some(p) = self.parent.as_ref().filter(|p| p.namespace != namespace) {
-                    return Err(format!("this is a branch of {:?}, not {namespace:?}", p.namespace));
-                }
-                self.as_parent_source().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?
-            }
-        };
-        source.rows_as_of(memory, namespace, adb_core::log::CommitTs(at)).await.map_err(|e| e.to_string())
-    }
-
-    async fn branch_place(&self, namespace: &str, name: &str, url: &str) -> Result<crate::branches::Branch, String> {
-        let (d, host) = match (&self.durable, &self.branch_host) {
-            (Some(d), Some(h)) => (d, h),
-            _ => return Err("branches are placed on the org's engine".into()),
-        };
-        if url.is_empty() {
-            return Err("branch_place needs the pod's Flight URL".into());
-        }
-        let b = d.branches().get(namespace, name).ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))?;
-        if b.placement.is_none() && host.hosted_exists(&b) {
-            return Err(format!("branch {name:?} already has a hosted engine with its own writes: moving one to a pod isn't supported yet (B6)"));
-        }
-        if d.branches().has_children(namespace, name) {
-            return Err(format!("branch {name:?} has branches of its own: a pod branch can't be a parent yet (B6)"));
-        }
-        let url = url.to_string();
-        let b = d.branch_change(namespace, name, |b| b.placement = Some(url)).await.map_err(|e| e.to_string())?;
-        b.ok_or_else(|| format!("no branch {name:?} in namespace {namespace:?}"))
-    }
-
-    async fn branch_pending(&self, namespace: &str, name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
-        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
-        Ok(d.branches().get(namespace, name).map(|b| b.pending_forgets).unwrap_or_default())
-    }
-
-    async fn branch_pending_ack(&self, namespace: &str, name: &str, n: usize) -> Result<(), String> {
-        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
-        if n == 0 {
-            return Ok(());
-        }
-        d.branch_change(namespace, name, |b| {
-            let k = n.min(b.pending_forgets.len());
-            b.pending_forgets.drain(..k);
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
-        if self.parent.is_none() {
-            return Err("forget_lineages runs on a branch engine (FORGET on main reaching it)".into());
-        }
-        let d = self.durable.as_ref().ok_or("a branch engine is durable")?;
-        d.forget_lineages(memory, lineages).await.map_err(|e| e.to_string())
-    }
-
     async fn branch_promote(&self, namespace: &str, name: &str, into: &str, _allow_stale: bool) -> Result<Value, String> {
         crate::review::promote(&crate::namespaces::LocalNs(self), namespace, name, into).await
     }
@@ -1703,49 +1492,29 @@ impl Engine for LocalEngine {
     }
 
     async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {
-        if self.parent.is_some() {
-            return Err("spaces are cloned on the org's engine".into());
-        }
-        let source = self.as_parent_source().ok_or("cloning a memory space needs a durable engine (start ADB with --data-dir)")?;
-        let n = self.materialise_from(source, namespace, into).await?;
+        let n = self.materialise_at(namespace, into, &PROMOTED, now_ts()).await?;
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN } }))
     }
 
-    async fn branch_create_past(&self, namespace: &str, name: &str, created_by: Option<&str>, at: &crate::branches::PointRef) -> Result<Value, String> {
-        if self.parent.is_some() {
-            return Err("branches are created on the org's engine".into());
-        }
-        let d = self.durable.as_ref().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
-        let b = d.branch_create_past(namespace, name, created_by, at).await.map_err(|e| e.to_string())?;
-        Ok(serde_json::to_value(&b).unwrap_or_default())
-    }
-
     async fn space_copy_procedures(&self, namespace: &str, into: &str, tools: bool) -> Result<Value, String> {
-        if self.parent.is_some() {
-            return Err("spaces are copied on the org's engine".into());
-        }
         let n = self.materialise_procedures(namespace, into, tools).await?;
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN }, "procedures_only": true }))
     }
 
     async fn space_clone_at(&self, namespace: &str, into: &str, at: &crate::branches::PointRef) -> Result<Value, String> {
-        if self.parent.is_some() {
-            return Err("spaces are cloned on the org's engine".into());
-        }
         let d = self.durable.as_ref().ok_or("cloning a memory space needs a durable engine (start ADB with --data-dir)")?;
         let (offset, ts) = d.resolve_point(namespace, at).await.map_err(|e| e.to_string())?;
-        let source = self.as_parent_source().ok_or("cloning a memory space needs a durable engine (start ADB with --data-dir)")?;
-        let n = self.materialise_at(source, namespace, into, ts).await?;
+        let n = self.materialise_at(namespace, into, &PROMOTED, ts).await?;
         Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": crate::branches::MAIN, "point": { "offset": offset, "ts": ts.0 } } }))
     }
 
     async fn quota_set(&self, pattern: &str, max_bytes: Option<u64>, max_records: Option<u64>, history_days: Option<u64>) -> Result<crate::branches::Quota, String> {
-        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("quotas are set on the org's engine")?;
+        let d = self.durable.as_ref().ok_or("quotas need a durable engine (start ADB with --data-dir)")?;
         d.quota_set(pattern, max_bytes, max_records, history_days).await.map_err(|e| e.to_string())
     }
 
     async fn quota_drop(&self, pattern: &str) -> Result<bool, String> {
-        let d = self.durable.as_ref().filter(|_| self.parent.is_none()).ok_or("quotas are set on the org's engine")?;
+        let d = self.durable.as_ref().ok_or("quotas need a durable engine (start ADB with --data-dir)")?;
         d.quota_drop(pattern).await.map_err(|e| e.to_string())
     }
 
@@ -1777,11 +1546,11 @@ impl Engine for LocalEngine {
                 return Ok(v);
             }
         }
-        let source = self.space_source(namespace, branch).await?;
-        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let space = space_of(namespace, branch);
+        let now = now_ts();
         let mut tiers = serde_json::Map::new();
         for m in [MemoryType::Working, MemoryType::Tools, MemoryType::Procedural, MemoryType::Semantic, MemoryType::Episodic] {
-            let rows = source.rows_as_of(m, namespace, now).await.map_err(|e| e.to_string())?;
+            let rows = self.space_rows(m, &space, now).await?;
             let bytes: usize = rows.iter().map(|r| r.data.value.to_string().len()).sum();
             let last = rows.iter().map(|r| r.commit_ts.0).max();
             let name = serde_json::to_value(m).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
@@ -1797,9 +1566,7 @@ impl Engine for LocalEngine {
     }
 
     async fn space_records(&self, namespace: &str, memory: MemoryType, branch: Option<&str>, after: Option<&str>, limit: usize) -> Result<Value, String> {
-        let source = self.space_source(namespace, branch).await?;
-        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
-        let mut rows = source.rows_as_of(memory, namespace, now).await.map_err(|e| e.to_string())?;
+        let mut rows = self.space_rows(memory, &space_of(namespace, branch), now_ts()).await?;
         rows.sort_by(|a, b| (b.commit_ts.0, &b.lineage_id).cmp(&(a.commit_ts.0, &a.lineage_id)));
         let cursor = match after {
             None => None,
@@ -1824,17 +1591,10 @@ impl Engine for LocalEngine {
         Ok(json!({ "records": records, "next": next }))
     }
 
-    async fn space_gateway(&self, namespace: &str, branch: Option<&str>) -> Result<Arc<Gateway>, String> {
-        match branch.filter(|b| !b.is_empty() && *b != crate::branches::MAIN) {
-            Some(b) => {
-                let host = self.branch_host.as_ref().ok_or("branches are read on the org's engine")?;
-                if host.placement(namespace, b).is_some() {
-                    return Err(format!("branch {b:?} runs in its own pod: follow its feed there (B6)"));
-                }
-                host.engine(namespace, b).await?.gateway().ok_or_else(|| "a branch engine has no feed".to_string())
-            }
-            None => self.gateway().ok_or_else(|| "the space feed needs a durable engine (start ADB with --data-dir)".to_string()),
-        }
+    /// Every namespace's writes are in this engine's log (a branch's too: it is the
+    /// namespace `<ns>@<name>`): one gateway; the feed filters by namespace.
+    async fn space_gateway(&self, _namespace: &str) -> Result<Arc<Gateway>, String> {
+        self.gateway().ok_or_else(|| "the space feed needs a durable engine (start ADB with --data-dir)".to_string())
     }
 
     async fn branch_conflicts(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<Value, String> {
@@ -1892,18 +1652,6 @@ impl Engine for LocalEngine {
 fn is_write(aql: &str) -> bool {
     let verb = aql.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
     matches!(verb.as_str(), "STORE" | "UPDATE" | "FORGET" | "LINK" | "UNLINK" | "MERGE" | "PIPELINE")
-}
-
-/// DB-10's inputs and diff (see `LocalEngine::three_way`).
-struct ThreeWay {
-    /// Main's records added or changed since the branch point.
-    behind: usize,
-    branch: crate::branches::Branch,
-    main_point: (u64, adb_core::log::CommitTs),
-    clean: Vec<crate::merge::Change>,
-    conflicts: Vec<crate::merge::Conflict>,
-    main: std::collections::HashMap<String, adb_store::StoredRow>,
-    view: std::collections::HashMap<String, adb_store::StoredRow>,
 }
 
 /// ADB result → ClawDB wire `QueryResult`.
@@ -2046,29 +1794,22 @@ mod tests {
     }
 }
 
+/// The memories a promoted or cloned agent takes: what it knows and can do. EPISODIC
+/// stays with the original agent; WORKING is session state.
+const PROMOTED: [MemoryType; 3] = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
+
+fn now_ts() -> adb_core::log::CommitTs {
+    adb_core::log::CommitTs::from_datetime(adb_core::time::now())
+}
+
+/// The namespace of branch `branch` of `namespace` (`<ns>@<branch>`), or `namespace`
+/// itself for main.
+fn space_of(namespace: &str, branch: Option<&str>) -> String {
+    crate::review::branch_ns(namespace, branch.unwrap_or_default())
+}
+
 impl LocalEngine {
     async fn query_unobserved(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
-        // B2: a statement on a branch runs on the branch's own engine.
-        match crate::branch_engine::statement_branch(aql)? {
-            Some((b, ns)) => match (&self.branch_host, &self.parent) {
-                (Some(host), _) => {
-                    let ns = ns.ok_or_else(|| format!("BRANCH \"{b}\" needs NAMESPACE: a branch belongs to one memory space"))?;
-                    // B6: a branch in its own pod runs the statement there.
-                    if let Some(url) = host.placement(&ns, &b) {
-                        let vars = variables.map(|v| serde_json::to_value(v).unwrap_or_default());
-                        return host.query_remote(&url, aql, vars).await;
-                    }
-                    return host.engine(&ns, &b).await?.query(aql, variables).await;
-                }
-                (None, Some(p)) => {
-                    if b != p.branch || ns.as_deref().is_some_and(|n| n != p.namespace) {
-                        return Err(format!("this is branch {:?} of {:?}, not {b:?}", p.branch, p.namespace));
-                    }
-                }
-                (None, None) => return Err("memory branches need a durable engine".into()),
-            },
-            None => {}
-        }
         if let Some(stmt) = watch_statement(aql) {
             if let Some(answer) = self.watch(stmt, variables).await {
                 return answer;

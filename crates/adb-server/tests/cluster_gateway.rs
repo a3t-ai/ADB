@@ -15,7 +15,6 @@ use adb_cluster::map::{Assignment, ControlCmd, NodeId, Partition, PartitionMap};
 use adb_executor::partitioned::PartitionedEngine;
 use adb_executor::remote::Placement;
 use adb_executor::Engine;
-use adb_server::branch_remote::flight_action;
 use arrow_array::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -60,6 +59,21 @@ async fn query(http: &reqwest::Client, node: &str, token: &str, aql: &str) -> (u
 
 fn records(v: &Value) -> Vec<Value> {
     v.pointer("/data/data/records").and_then(|r| r.as_array()).cloned().unwrap_or_default().iter().map(|r| r["data"].clone()).collect()
+}
+
+
+/// One Flight action on the ADB at `url`, with `token` as the bearer.
+async fn flight_action(url: &str, token: Option<&str>, kind: &str, body: Value) -> Result<Value, String> {
+    use futures::StreamExt;
+    let channel = tonic::transport::Channel::from_shared(url.to_string()).map_err(|e| format!("{url}: {e}"))?.connect().await.map_err(|e| format!("connect {url}: {e}"))?;
+    let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel).max_decoding_message_size(256 << 20).max_encoding_message_size(64 << 20);
+    let mut req = tonic::Request::new(arrow_flight::Action { r#type: kind.into(), body: body.to_string().into() });
+    if let Some(t) = token {
+        req.metadata_mut().insert("authorization", format!("Bearer {t}").parse().unwrap());
+    }
+    let mut s = client.do_action(req).await.map_err(|e| format!("{kind} on {url}: {}", e.message()))?.into_inner();
+    let r = s.next().await.ok_or(format!("{kind} on {url}: no answer"))?.map_err(|e| format!("{kind} on {url}: {}", e.message()))?;
+    serde_json::from_slice(&r.body).map_err(|e| format!("{kind} on {url}: {e}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]

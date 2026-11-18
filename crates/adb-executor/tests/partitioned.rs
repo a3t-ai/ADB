@@ -247,7 +247,7 @@ async fn copies_cross_partitions() {
         let n = (0..1000).map(|i| format!("{prefix}{i}")).find(|n| node.partition_of(n) != node.partition_of("bot")).unwrap();
         Box::leak(n.into_boxed_str())
     };
-    let (v2, clone, at, procs) = (elsewhere("bot-v2-"), elsewhere("bot-clone-"), elsewhere("bot-at-"), elsewhere("bot-procs-"));
+    let (clone, at, procs) = (elsewhere("bot-clone-"), elsewhere("bot-at-"), elsewhere("bot-procs-"));
     let q = |aql: String| {
         let node = std::sync::Arc::clone(&node);
         async move { node.query(&aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
@@ -281,77 +281,6 @@ async fn copies_cross_partitions() {
     assert_eq!(c["records"], 2, "{c}");
     let sem = q(format!(r#"RECALL FROM SEMANTIC NAMESPACE "{procs}""#)).await;
     assert_eq!(sem["data"]["count"], 0, "no facts travel");
-}
-
-/// Copies between namespaces in different partitions: clone (now and at a tag),
-/// procedures only, and promoting a branch — read out of the source's partition,
-/// materialised in the target's, with the promoted agent's history layer reading
-/// the old agent's episodes from the old partition.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
-async fn copies_cross_partitions_with_branch() {
-    use adb_executor::branches::PointRef;
-    std::env::set_var("ADB_S3", "off");
-    // Correctness, not the catalog lag: every statement sees the current catalog.
-    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
-    let dir = tempfile::tempdir().unwrap();
-    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
-    let elsewhere = |prefix: &str| -> &'static str {
-        let n = (0..1000).map(|i| format!("{prefix}{i}")).find(|n| node.partition_of(n) != node.partition_of("bot")).unwrap();
-        Box::leak(n.into_boxed_str())
-    };
-    let (v2, clone, at, procs) = (elsewhere("bot-v2-"), elsewhere("bot-clone-"), elsewhere("bot-at-"), elsewhere("bot-procs-"));
-    let q = |aql: String| {
-        let node = std::sync::Arc::clone(&node);
-        async move { node.query(&aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
-    };
-    let steps = |ns: &'static str, branch: Option<&'static str>| {
-        let node = std::sync::Arc::clone(&node);
-        async move {
-            let b = branch.map(|b| format!(r#" BRANCH "{b}""#)).unwrap_or_default();
-            values(&node.query(&format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{ns}"{b} LIMIT 100"#), None).await.unwrap(), "steps")
-        }
-    };
-    for k in ["p1", "p2"] {
-        q(format!(r#"STORE INTO PROCEDURAL (key = "{k}", steps = "{k}-v1") NAMESPACE "bot""#)).await;
-    }
-    q(r#"STORE INTO SEMANTIC (key = "fact1", fact = "likes tea") NAMESPACE "bot""#.into()).await;
-    q(r#"STORE INTO EPISODIC (event = "said hello") NAMESPACE "bot""#.into()).await;
-    node.tag_create("bot", "v1", None).await.unwrap();
-    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p1" (steps = "p1-v2") NAMESPACE "bot""#.into()).await;
-
-    // Clone now: SEMANTIC, PROCEDURAL, TOOLS — no episodes.
-    let c = node.space_clone("bot", clone).await.unwrap();
-    assert_eq!(c["records"], 3, "{c}");
-    assert_eq!(steps(clone, None).await, ["p1-v2", "p2-v1"]);
-    let eps = q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{clone}""#)).await;
-    assert_eq!(eps["data"]["count"], 0);
-    // Clone at the tag: the older procedure.
-    let c = node.space_clone_at("bot", at, &PointRef { tag: Some("v1".into()), ..Default::default() }).await.unwrap();
-    assert_eq!(steps(at, None).await, ["p1-v1", "p2-v1"], "{c}");
-    // Procedures only.
-    let c = node.space_copy_procedures("bot", procs, false).await.unwrap();
-    assert_eq!(c["records"], 2, "{c}");
-    let sem = q(format!(r#"RECALL FROM SEMANTIC NAMESPACE "{procs}""#)).await;
-    assert_eq!(sem["data"]["count"], 0, "no facts travel");
-
-    // Promote a branch into another partition.
-    node.branch_create("bot", "try", None, None).await.unwrap();
-    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-branch") NAMESPACE "bot" BRANCH "try""#.into()).await;
-    assert_eq!(steps("bot", Some("try")).await, ["p1-v2", "p2-branch"]);
-    let p = node.branch_promote("bot", "try", v2, false).await.unwrap();
-    assert_eq!(p["records"], 3, "{p}");
-    assert_eq!(steps(v2, None).await, ["p1-v2", "p2-branch"]);
-    assert_eq!(steps("bot", None).await, ["p1-v2", "p2-v1"], "the old agent is untouched");
-    q(r#"STORE INTO EPISODIC (event = "old agent later") NAMESPACE "bot""#.into()).await;
-    q(format!(r#"STORE INTO EPISODIC (event = "new agent said hi") NAMESPACE "{v2}""#)).await;
-    let eps = values(&q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{v2}" LIMIT 100"#)).await, "event");
-    assert_eq!(eps, ["new agent said hi", "promoted_from", "said hello"], "own, origin, and the old agent's (from its partition) as of the promote");
-    // Behind main: refused unless allow_stale, as on one engine.
-    node.branch_create("bot", "behind", None, None).await.unwrap();
-    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-main") NAMESPACE "bot""#.into()).await;
-    let err = node.branch_promote("bot", "behind", elsewhere("bot-v3-"), false).await.unwrap_err();
-    assert!(err.starts_with("merge_stale:"), "{err}");
 }
 
 /// Quotas in a cluster (option A, user 14 Nov): kept once in the system partition and
@@ -399,4 +328,38 @@ async fn quotas_and_settings_span_partitions() {
     let late_dir = dir.path().join("parts").join(format!("p{}", node.partition_of(late)));
     let rules = adb_store::CacheConfig::load(&late_dir).unwrap().expect("the late partition has the cache rules");
     assert_eq!(rules.rules.len(), 1);
+}
+
+/// A branch read and promoted across partitions: the branch namespace `bot@try` and
+/// the new agent may live in other partitions than `bot`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_promoted_into_another_partition() {
+    std::env::set_var("ADB_S3", "off");
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let dir = tempfile::tempdir().unwrap();
+    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
+    let v2: &'static str = Box::leak((0..1000).map(|i| format!("bot-v2-{i}")).find(|n| node.partition_of(n) != node.partition_of("bot")).unwrap().into_boxed_str());
+    let q = |aql: String| {
+        let node = std::sync::Arc::clone(&node);
+        async move { node.query(&aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
+    };
+    let steps = |ns: String| {
+        let node = std::sync::Arc::clone(&node);
+        async move { values(&node.query(&format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{ns}" LIMIT 100"#), None).await.unwrap(), "steps") }
+    };
+    for k in ["p1", "p2"] {
+        q(format!(r#"STORE INTO PROCEDURAL (key = "{k}", steps = "{k}-v1") NAMESPACE "bot""#)).await;
+    }
+    q(r#"STORE INTO EPISODIC (event = "said hello") NAMESPACE "bot""#.into()).await;
+    node.branch_create("bot", "try", None, None).await.unwrap();
+    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p2" (steps = "p2-branch") NAMESPACE "bot@try""#.into()).await;
+    assert_eq!(steps("bot@try".into()).await, ["p1-v1", "p2-branch"]);
+    assert_eq!(steps("bot".into()).await, ["p1-v1", "p2-v1"]);
+    let p = node.branch_promote("bot", "try", v2, false).await.unwrap();
+    assert_eq!(p["records"], 3, "two procedures and the episode: {p}");
+    assert_eq!(steps(v2.into()).await, ["p1-v1", "p2-branch"]);
+    assert_eq!(values(&q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{v2}""#)).await, "event"), ["said hello"]);
+    assert_eq!(steps("bot".into()).await, ["p1-v1", "p2-v1"], "the old agent is untouched");
+    assert!(node.branch_promote("bot", "try", v2, false).await.unwrap_err().starts_with("target_not_empty"));
+    assert_eq!(node.branch_list(Some("bot")).await.unwrap().len(), 1);
 }

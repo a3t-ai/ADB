@@ -21,6 +21,45 @@ use crate::writes::MergeWrite;
 
 const MEMORIES: [Memory; 5] = [Memory::Semantic, Memory::Episodic, Memory::Procedural, Memory::Tools, Memory::Working];
 
+/// A row a branch wrote to delete a parent record: it hides the lineage.
+pub fn branch_deleted(r: &StoredRow) -> bool {
+    r.data.value.get("_branch_deleted").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// DB-3: what a statement touches: per stage, its `NAMESPACE` and whether it writes. A kind
+/// that doesn't say (LINK, SUBSCRIBE, …), or a statement that doesn't parse, is an error.
+pub fn statement_namespaces(aql: &str) -> Result<Vec<(Option<String>, bool)>, String> {
+    use aql_parser::Statement as S;
+    let stmt = aql_parser::parse(aql).map_err(|_| "a statement that doesn't parse".to_string())?;
+    fn of(s: &S) -> Option<Vec<(Option<String>, bool)>> {
+        let read = |m: &aql_parser::ast::Modifiers| match m.namespaces.is_empty() {
+            true => vec![(m.namespace.clone(), false)],
+            false => m.namespaces.iter().map(|n| (Some(n.clone()), false)).collect(),
+        };
+        Some(match s {
+            S::Recall(x) => read(&x.modifiers),
+            S::Store(x) => vec![(x.modifiers.namespace.clone(), true)],
+            S::Update(x) => vec![(x.modifiers.namespace.clone(), true)],
+            S::Forget(x) => vec![(x.modifiers.namespace.clone(), true)],
+            S::Link(x) => vec![(x.namespace.clone(), true)],
+            S::Unlink(x) => vec![(x.namespace.clone(), true)],
+            // Reads the source, writes the destination.
+            S::Branch(n) | S::Fork(n) => vec![(Some(n.from.clone()), false), (Some(n.into.clone()), true)],
+            S::Merge(m) => vec![(Some(m.from.clone()), false), (Some(m.into.clone()), true)],
+            _ => return None,
+        })
+    }
+    let stages: Vec<&S> = match &stmt {
+        S::Pipeline(p) => p.stages.iter().collect(),
+        other => vec![other],
+    };
+    let mut out = Vec::new();
+    for s in stages {
+        out.extend(of(s).ok_or_else(|| "this kind of statement".to_string())?);
+    }
+    Ok(out)
+}
+
 /// What BRANCH / FORK / MERGE need of the namespaces they touch.
 #[async_trait]
 pub trait NsOps: Send + Sync {

@@ -26,9 +26,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-pub mod facts;
 pub mod tables;
-pub use facts::{Fact, FactBatch, FactChange, FactQuery};
 
 /// What a subscription follows (spec §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,10 +190,6 @@ pub trait Lineages: Send + Sync {
     async fn lineage(&self, memory: Memory, key: &str) -> Option<(String, Kind)>;
     /// Current rows of a scope; a topic's retained messages after offset `after`.
     async fn current_rows(&self, target: &Target, after: u64) -> Result<Vec<StoredRow>, String>;
-    /// The facts in the current view (the fact feed's snapshot, GR-15).
-    async fn current_facts(&self, scope: Option<&str>, namespace: Option<&str>) -> Result<Vec<StoredRow>, String>;
-    /// The version of fact `key` ADB held at `t`, if it held then.
-    async fn fact_at(&self, key: &str, t: CommitTs) -> Option<StoredRow>;
 }
 
 #[async_trait::async_trait]
@@ -215,22 +209,6 @@ impl Lineages for PartitionStore {
             Target::Topic(t) => format!("kind = 'event' AND subject_id = {} AND log_offset > {after}", sql_str(t)),
         };
         self.current(Some(&filter), CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
-    }
-
-    async fn current_facts(&self, scope: Option<&str>, namespace: Option<&str>) -> Result<Vec<StoredRow>, String> {
-        let mut filter = "kind = 'fact'".to_string();
-        if let Some(s) = scope {
-            filter.push_str(&format!(" AND scope = {}", sql_str(s)));
-        }
-        if let Some(n) = namespace {
-            filter.push_str(&format!(" AND namespace = {}", sql_str(n)));
-        }
-        self.current(Some(&filter), CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
-    }
-
-    async fn fact_at(&self, key: &str, t: CommitTs) -> Option<StoredRow> {
-        let filter = format!("lineage_id = {} AND kind = 'fact'", sql_str(&row_id(Memory::Semantic, key)));
-        self.scan(Some(&filter)).await.ok()?.into_iter().find(|r| r.is_current_at(t, t))
     }
 }
 

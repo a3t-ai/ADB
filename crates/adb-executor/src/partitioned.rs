@@ -948,7 +948,7 @@ impl PartitionedEngine {
         }
         // AQL v0.13 BRANCH / FORK / MERGE: each step on the partition of its namespace.
         if let Some(stmt) = crate::engine::namespace_statement(aql) {
-            for (ns, writes) in crate::branch_engine::statement_namespaces(aql)? {
+            for (ns, writes) in crate::namespaces::statement_namespaces(aql)? {
                 if let Some(ns) = ns.filter(|ns| !reach.allows(ns)) {
                     return Err(out_of_reach(&ns).to_string());
                 }
@@ -1733,11 +1733,6 @@ impl Writes for Routed {
         t.writes.store(memory_type, key, payload, scope, namespace, ttl, in_scope).await
     }
 
-    async fn store_fact(&self, payload: Value, multi: bool, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {
-        let t = self.write_target(namespace).await?;
-        t.writes.store_fact(payload, multi, scope, namespace, ttl, in_scope).await
-    }
-
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         let n = self
             .each(namespace, |t| {
@@ -1807,11 +1802,6 @@ impl Writes for Routed {
         Ok(found.into_iter().flatten().next())
     }
 
-    /// MERGE ENTITY: in the namespace's partition (without one: the entities without
-    /// one, in their partition).
-    async fn merge(&self, from: &str, into: &str, namespace: Option<&str>) -> AdbResult<u64> {
-        self.write_target(namespace).await?.writes.merge(from, into, namespace).await
-    }
 }
 
 #[async_trait]
@@ -1915,22 +1905,21 @@ impl Engine for Arc<PartitionedEngine> {
         }
     }
 
-    async fn branch_create_past(&self, namespace: &str, name: &str, created_by: Option<&str>, at: &crate::branches::PointRef) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_create_past", json!({ "namespace": namespace, "name": name, "created_by": created_by, "at": at })).await
-    }
-
+    /// On the partition of the space read: a branch is the namespace `<ns>@<branch>`.
     async fn space_stats(&self, namespace: &str, branch: Option<&str>, max_age: Duration) -> Result<Value, String> {
-        self.op_ns(namespace, "space_stats", json!({ "namespace": namespace, "branch": branch, "max_age_ms": max_age.as_millis() as u64 })).await
+        let space = crate::review::branch_ns(namespace, branch.unwrap_or_default());
+        self.op_ns(&space, "space_stats", json!({ "namespace": namespace, "branch": branch, "max_age_ms": max_age.as_millis() as u64 })).await
     }
 
     async fn space_records(&self, namespace: &str, memory: MemoryType, branch: Option<&str>, after: Option<&str>, limit: usize) -> Result<Value, String> {
-        self.op_ns(namespace, "space_records", json!({ "namespace": namespace, "memory": memory, "branch": branch, "after": after, "limit": limit })).await
+        let space = crate::review::branch_ns(namespace, branch.unwrap_or_default());
+        self.op_ns(&space, "space_records", json!({ "namespace": namespace, "memory": memory, "branch": branch, "after": after, "limit": limit })).await
     }
 
     /// A space's change stream: served by the node owning its partition.
-    async fn space_gateway(&self, namespace: &str, branch: Option<&str>) -> Result<Arc<adb_gateway::Gateway>, String> {
+    async fn space_gateway(&self, namespace: &str) -> Result<Arc<adb_gateway::Gateway>, String> {
         match self.handle_of(namespace).await? {
-            Handle::Local(e) => e.space_gateway(namespace, branch).await,
+            Handle::Local(e) => e.space_gateway(namespace).await,
             Handle::Remote(r) => Err(format!("not_owner:0:{}: namespace {namespace:?}'s changes are served by its owner", r.addr)),
         }
     }
@@ -1949,22 +1938,6 @@ impl Engine for Arc<PartitionedEngine> {
 
     async fn merge_revert(&self, namespace: &str, merge_id: &str, by: Option<&str>, force_skip: bool) -> Result<Value, String> {
         crate::review::revert(&RouterNs(Arc::clone(self)), namespace, merge_id, by, force_skip).await
-    }
-
-    async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
-        self.op_ns(namespace, "parent_rows", json!({ "memory": memory, "namespace": namespace, "branch": branch, "at": at })).await
-    }
-
-    async fn branch_place(&self, namespace: &str, name: &str, url: &str) -> Result<crate::branches::Branch, String> {
-        self.op_ns(namespace, "branch_place", json!({ "namespace": namespace, "name": name, "url": url })).await
-    }
-
-    async fn branch_pending(&self, namespace: &str, name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
-        self.op_ns(namespace, "branch_pending", json!({ "namespace": namespace, "name": name })).await
-    }
-
-    async fn branch_pending_ack(&self, namespace: &str, name: &str, n: usize) -> Result<(), String> {
-        self.op_ns(namespace, "branch_pending_ack", json!({ "namespace": namespace, "name": name, "n": n })).await
     }
 
     async fn tag_create(&self, namespace: &str, name: &str, created_by: Option<&str>) -> Result<crate::branches::Tag, String> {
@@ -2044,12 +2017,6 @@ impl Engine for Arc<PartitionedEngine> {
         // Layer spaces are read from their own partitions (RouterSpaces).
         self.note(namespace).await?;
         self.op_ns(namespace, "layers_set", json!({ "namespace": namespace, "layers": layers })).await
-    }
-
-    // ---- every partition
-
-    async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
-        Ok(self.op_all::<u64>("forget_lineages", json!({ "memory": memory, "lineages": lineages })).await?.into_iter().sum())
     }
 
     // ---- quotas: kept once, in the system partition (every partition reads them)

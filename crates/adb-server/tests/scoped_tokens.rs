@@ -1,5 +1,5 @@
 //! DB-3 end to end, over Flight and HTTP: an org's token reaches its own namespaces only,
-//! and a read-only token (the non-prod pod's) can't write. Own test binary: it sets
+//! and a read-only token can't write. Own test binary: it sets
 //! `ADB_SCOPED_TOKENS`.
 
 use std::sync::Arc;
@@ -31,7 +31,7 @@ async fn tokens_stay_in_their_namespaces() {
         json!([
             { "name": "acme", "token": "acme-token", "write": ["acme--*"] },
             { "name": "globex", "token": "globex-token", "write": ["globex--*"] },
-            { "name": "non-prod", "token": "np-token", "read": ["*"] },
+            { "name": "read-all", "token": "np-token", "read": ["*"] },
         ])
         .to_string(),
     );
@@ -89,10 +89,10 @@ async fn tokens_stay_in_their_namespaces() {
     req.metadata_mut().insert("authorization", MetadataValue::try_from("Bearer acme-token").unwrap());
     assert_eq!(c.do_get(req).await.err().map(|s| s.code()), Some(tonic::Code::PermissionDenied));
 
-    // The non-prod token reads everything, as a pod reads its parents, and writes nothing.
+    // A read-everything token reads every namespace and writes nothing.
     let read = aql("np-token", r#"RECALL FROM SEMANTIC NAMESPACE "globex--bot""#).await.unwrap();
     assert!(read.to_string().contains("globex secret"), "{read}");
-    assert!(action(&f, "np-token", "branch_parent_rows", json!({ "namespace": "acme--bot", "memory": "SEMANTIC", "at": i64::MAX })).await.is_ok());
+    assert!(action(&f, "np-token", "space_stats", json!({ "namespace": "acme--bot", "max_age_ms": 0 })).await.is_ok());
     assert_eq!(aql("np-token", r#"STORE INTO SEMANTIC (key = "x", content = "y") NAMESPACE "acme--bot""#).await.unwrap_err(), "forbidden");
     assert!(action(&f, "np-token", "branch_create", json!({ "namespace": "acme--bot", "name": "b" })).await.is_err());
 

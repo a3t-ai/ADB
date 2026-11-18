@@ -60,8 +60,6 @@ fn branch_row(ns: &str, name: &str, parent: &str, b: &Base) -> Branch {
         point_offset: b.point_offset,
         point_ts: b.point_ts,
         created_by: None,
-        placement: None,
-        pending_forgets: Vec::new(),
     }
 }
 

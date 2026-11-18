@@ -117,8 +117,6 @@ pub struct LanceReads {
     barrier: Option<Arc<ApplyBarrier>>,
     /// Embeds the text of `LIKE $q` (MVP W4); `None`: only vectors can be passed.
     embedder: Option<Arc<adb_embed::Embedder>>,
-    /// On a branch engine (B2): reads overlay the branch's rows on its parent's.
-    parent: Option<crate::branch_engine::ParentView>,
     /// B7: the org's tags and layers (a read in a namespace with layers sees them).
     registry: Option<Arc<crate::branches::Branches>>,
     /// Where a layer space's rows and tags are read (its own partition in a cluster).
@@ -197,12 +195,7 @@ pub fn lance_owned(memory: MemoryType) -> bool {
 
 impl LanceReads {
     pub fn new(store: Arc<PartitionStore>, barrier: Option<Arc<ApplyBarrier>>) -> Self {
-        Self { store, barrier, embedder: None, parent: None, registry: None, spaces: None }
-    }
-
-    pub fn with_parent(mut self, parent: Option<crate::branch_engine::ParentView>) -> Self {
-        self.parent = parent;
-        self
+        Self { store, barrier, embedder: None, registry: None, spaces: None }
     }
 
     /// B7: reads in a namespace with layers see them.
@@ -351,15 +344,8 @@ impl LanceReads {
             let rows = self.branch_rows(memory, &ns, modifiers.in_scope.as_deref(), now).await?;
             return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
         }
-        // A branch engine ranks its view (its rows, then the parent's at the branch point).
-        if let Some(p) = &self.parent {
-            let in_scope = modifiers.in_scope.as_deref();
-            let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
-            let rows = rows.into_iter().map(|(r, _)| r).filter(|r| in_scope.is_none_or(|s| r.data.scope == s)).map(Arc::new).collect();
-            return Ok(crate::query::rank_rows(rows, modifiers, query_text.as_deref(), query_vec.as_deref(), now));
-        }
         // B7: a space with layers ranks its merged rows.
-        if let Some((ns, layers)) = self.layers_for(memory, modifiers).filter(|_| self.parent.is_none()) {
+        if let Some((ns, layers)) = self.layers_for(memory, modifiers) {
             let rows = self.layer_rows(memory, &ns, &layers, modifiers.in_scope.as_deref(), now).await?;
             return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
         }
@@ -381,10 +367,6 @@ impl LanceReads {
     /// A non-`LIKE` RECALL / LOOKUP.
     async fn read(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         let now = self.committed().await;
-        if let Some(p) = &self.parent {
-            let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
-            return crate::query::branch_read(rows.into_iter().map(|(r, _)| r).collect(), memory, predicate, modifiers);
-        }
         // AQL v0.13: a branch namespace reads its records and its base's at the point.
         if let Some(ns) = self.branch_of(modifiers) {
             let rows = self.branch_rows(memory, &ns, modifiers.in_scope.as_deref(), now).await?;
@@ -446,7 +428,7 @@ impl Reads for LanceReads {
     async fn aggregate(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Option<serde_json::Value>> {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         // Branches, layered namespaces and history reads aggregate their records.
-        if self.parent.is_some() || self.branch_of(modifiers).is_some() || self.layers_for(memory, modifiers).is_some() || crate::query::is_history(modifiers) || matches!(predicate, Predicate::Like { .. }) {
+        if self.branch_of(modifiers).is_some() || self.layers_for(memory, modifiers).is_some() || crate::query::is_history(modifiers) || matches!(predicate, Predicate::Like { .. }) {
             return Ok(None);
         }
         let now = self.committed().await;
@@ -457,7 +439,7 @@ impl Reads for LanceReads {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         if matches!(predicate, Predicate::Like { .. }) {
             if crate::query::is_history(modifiers) {
-                return Err(AdbError::UnsupportedOperation("LIKE doesn't read history (AS OF, VALID AT, WITH HISTORY)".into()));
+                return Err(AdbError::UnsupportedOperation("LIKE doesn't read history (AS OF, WITH HISTORY)".into()));
             }
             if !Self::serves(memory) {
                 return Err(AdbError::UnsupportedOperation(format!("LIKE on {memory:?} (supported on SEMANTIC, EPISODIC and PROCEDURAL)")));

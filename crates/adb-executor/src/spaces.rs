@@ -152,7 +152,7 @@ impl SpaceView {
                 if !seen.insert(bare.clone()) {
                     continue;
                 }
-                if crate::branch_engine::branch_deleted(&r) {
+                if crate::namespaces::branch_deleted(&r) {
                     continue;
                 }
                 if level != space {

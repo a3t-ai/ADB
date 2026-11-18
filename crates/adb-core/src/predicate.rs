@@ -552,9 +552,6 @@ pub struct Modifiers {
     /// `AS OF t` (AQL v0.10): the records as they were at t
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<TimePoint>,
-    /// `VALID AT t` (AQL v0.10): facts that held at t, as known now
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valid_at: Option<TimePoint>,
     /// `WITH HISTORY` (AQL v0.10): every version, current and replaced
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub with_history: bool,

@@ -185,15 +185,6 @@ impl Executor {
             Operation::Link => self.execute_link(step).await?,
             Operation::UpdateLink => self.execute_link_edit(step, false).await?,
             Operation::Unlink => self.execute_link_edit(step, true).await?,
-            Operation::Merge => {
-                let start = Instant::now();
-                let data = step.data.as_ref().ok_or_else(|| ExecutorError::MissingData("merge data".to_string()))?;
-                let key = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                // AQL v0.13: both entities are the NAMESPACE's (without one: records
-                // without a namespace).
-                let n = self.writes.merge(&key("from"), &key("into"), step.modifiers.namespace.as_deref()).await?;
-                QueryResult::count(n, start.elapsed().as_millis() as u64)
-            }
         };
 
         let mut result = result;
@@ -289,8 +280,8 @@ impl Executor {
                 bound_step.predicate = Predicate::Pattern { pattern_var: pattern_var.clone(), threshold: *threshold, text: Some(text) };
             }
         }
-        // `AS OF $t` / `VALID AT $t` (AQL v0.10): the bound value is the time.
-        for t in [&mut bound_step.modifiers.as_of, &mut bound_step.modifiers.valid_at].into_iter().flatten() {
+        // `AS OF $t`: the bound value is the time.
+        for t in bound_step.modifiers.as_of.iter_mut() {
             if let adb_core::TimePoint::Variable { name } = t {
                 if let Some(serde_json::Value::String(time)) = bindings.get(name.as_str()).map(|v| v.to_json()) {
                     *t = adb_core::TimePoint::At { time };
@@ -926,14 +917,7 @@ impl Executor {
             .and_then(|v| v.as_u64())
             .map(std::time::Duration::from_millis);
 
-        let record = match data.get("fact") {
-            // STORE … FACT [MULTI] (P1_GRAPH D2): the writes give it its key.
-            Some(fact) if !fact.is_null() => {
-                let multi = fact.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
-                self.writes.store_fact(payload, multi, scope, namespace, ttl, in_scope).await?
-            }
-            _ => self.writes.store(step.memory_type, key, payload, scope, namespace, ttl, in_scope).await?,
-        };
+        let record = self.writes.store(step.memory_type, key, payload, scope, namespace, ttl, in_scope).await?;
 
         Ok(QueryResult::stored(
             record,
