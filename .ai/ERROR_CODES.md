@@ -26,16 +26,13 @@ Where the code appears:
 | `key_exists` | A keyed STORE on a key that has a current record | UPDATE it, or FORGET it first |
 | `key_on_branch` | A keyed STORE on a branch for a key the branch already sees | UPDATE it on the branch |
 | `merged_record` | A write to an entity that was merged into another | Write to the survivor |
-| `merge_invalid` | MERGE ENTITY can't apply (no entity, already merged, same entity) | — |
+| `merge_invalid` | `MERGE FROM … INTO …` can't apply (the two have no common base) | — |
 | `link_target_missing` | LINK to a record that doesn't exist (any more) | — |
 | `namespace_invalid` | Empty namespace, or one containing `\|` or `~` | Rename |
 | `branch_name_invalid` | Branch name not 1–64 of letters, digits, `-`, `_`, `.`, or `main` | Rename |
 | `branch_exists` | The namespace already has a branch of that name | Pick another name |
 | `branch_not_found` | No such branch (or parent) in the namespace | — |
-| `branch_needs_namespace` | `BRANCH` without `NAMESPACE`, or a pipeline stage without `BRANCH` | Add it |
-| `branch_wrong_namespace` | The branch belongs to another namespace, or the engine serves another branch | — |
 | `branch_has_children` | Drop of a branch with branches of its own | Drop the children first |
-| `branch_pod_unsupported` | An operation pod branches don't support yet (B6 limits) | — |
 | `target_not_empty` | Promote or clone into a namespace that holds records | Use a new namespace |
 | `promote_into_self` | Promote into the branch's own namespace | Use a new namespace |
 | `tag_exists` | The namespace already has a tag of that name | Pick another name |
@@ -43,7 +40,6 @@ Where the code appears:
 | `tag_pinned` | Drop of a tag a layer pins | Change that space's layers first |
 | `layer_invalid` | A layer that is nested, itself, of a wrong memory type, a bad space, or a pin without a tag | Fix the layer |
 | `sealed_key` | A write that would shadow a sealed layer's key | Don't; change the layer |
-| `wrong_engine` | An operation sent to the wrong kind of engine (org vs branch) | Send it to the org |
 | `durable_required` | The feature needs `--data-dir` | Start ADB with a data dir |
 | `forbidden` | The token doesn't open this operation (pool or engine token) | Use the right token |
 | `unauthorized` | No or bad token | Send `Authorization: Bearer` |
@@ -65,3 +61,7 @@ Merges and tables:
 | `transaction_invalid` | A transaction that can't be checked (empty, unknown op, change after a schema change) | Split it |
 | `table_not_found` | No such platform table | Create it |
 | `column_not_found` | No such column | `add_columns` |
+
+Removed 18 Nov 2026 with the branch engines (AQL v0.13, branches are namespaces):
+`branch_needs_namespace`, `branch_wrong_namespace`, `branch_pod_unsupported`,
+`wrong_engine` — nothing answers with them any more.

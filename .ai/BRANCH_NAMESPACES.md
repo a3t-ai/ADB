@@ -80,3 +80,24 @@ rows as of the point (`StoreSource` when the parent is in this engine; a remote
 5. Remove branch engines, pods, promote, `BranchHost`; tests: branches.rs, merge.rs,
    namespace_statements (branch links), a cluster test: a branch survives a takeover
    of its partition (rebuilt from S3 like any namespace).
+
+## Status (18 Nov 2026): done
+
+Built on `base:<ns>` control rows and point tags (`branch.<ns>` / `fork.<ns>`) rather
+than branch rows in the parent's partition; `SpaceView::rows_at` follows the chain of
+bases. Step 5 is done: branch engines (`branch_engine.rs`, `BranchHost`,
+`durable_branch`), branch pods (`branch_remote.rs`, `adb-cli` `branch.rs`,
+`deploy/k8s/adb-branch.yaml`, `ADB_BRANCH_OF` / `ADB_BRANCH`), the non-prod pod
+(`non_prod.rs`, `ADB_NON_PROD_*`), the old registry branch writes, DB-19 merge rows and
+the ops `branch_place`, `branch_pending(_ack)`, `branch_parent_rows`, `branch_forget`,
+`branch_create_past`, `parent_rows`, `forget_lineages`, `promote_check` are removed.
+The branch review API (list, create, drop, conflicts, merge, rebase, revert, promote,
+`space_stats` / `space_records` / `space_changes` with `branch`) runs on branch
+namespaces (`review.rs`). A branch at a past point is `BRANCH FROM … INTO … AS OF`.
+
+An ADB that held old branches: their `br:` registry rows stay in the table and are not
+read (so they pin nothing); `<data dir>/branches/` engines are not opened. Their
+records were the branch engines' own and don't appear anywhere.
+
+Open: `WITH LINKS`, `FOLLOW LINKS` and history (`AS OF`, `WITH HISTORY`) aren't read
+on a branch namespace yet (refused with `unsupported`).
