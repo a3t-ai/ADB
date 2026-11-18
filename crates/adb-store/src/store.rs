@@ -1570,16 +1570,22 @@ impl PartitionStore {
     /// recent-episodes index; `None` when the index can't answer (not built, or it
     /// doesn't hold k of them) — the caller reads as before.
     pub async fn recent_episodes(&self, namespace: &str, k: usize, now: CommitTs) -> StoreResult<Option<Vec<StoredRow>>> {
-        let Some(ids) = self.recent.newest(namespace, k) else { return Ok(None) };
-        let mut out = Vec::with_capacity(ids.len());
+        let Some((ids, older)) = self.recent.newest(namespace) else { return Ok(None) };
+        let mut out = Vec::with_capacity(k);
         for id in &ids {
+            if out.len() == k {
+                return Ok(Some(out));
+            }
             match self.get_cached(id).await? {
                 Some(r) if r.is_live(now) => out.push(r),
-                // Expired since, or not readable here: the full read decides.
-                _ => return Ok(None),
+                // Expired (its tombstone not applied yet): not in the answer.
+                Some(_) => {}
+                // Not readable here: the full read decides.
+                None => return Ok(None),
             }
         }
-        Ok(Some(out))
+        // Every one it holds taken: the answer, unless older ones exist it doesn't hold.
+        Ok((out.len() == k || !older).then_some(out))
     }
 
     pub fn recent_episodes_ready(&self) -> bool {

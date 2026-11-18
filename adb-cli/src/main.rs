@@ -304,14 +304,20 @@ async fn serve_embed(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::
     // The worker embeds with its own model, never through a pool.
     std::env::remove_var("ADB_EMBED_URL");
     let embedder = adb_embed::Embedder::from_env().ok_or("serve-embed needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?;
-    async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, headers: axum::http::HeaderMap, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        // A database node's deferred vectors: behind every request someone waits on.
+        let background = headers.get(adb_embed::PRIORITY_HEADER).is_some_and(|v| v.as_bytes() == b"background");
         let texts: Vec<String> = match req.get("input") {
             Some(serde_json::Value::String(s)) => vec![s.clone()],
             Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
             _ => Vec::new(),
         };
         let _t = adb_core::steps::timer("embed.served by this worker");
-        match e.embed_here(texts).await {
+        let r = match background {
+            true => e.embed_here_background(texts).await,
+            false => e.embed_here(texts).await,
+        };
+        match r {
             Ok(v) => {
                 let data: Vec<serde_json::Value> = v.into_iter().enumerate().map(|(i, e)| serde_json::json!({ "object": "embedding", "index": i, "embedding": e })).collect();
                 (axum::http::StatusCode::OK, axum::Json(serde_json::json!({ "object": "list", "model": e.model(), "data": data })))

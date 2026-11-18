@@ -590,14 +590,18 @@ pub fn defer_embedding(memory: MemoryType) -> bool {
 
 /// Records waiting for a deferred vector at most; more wait for the backfill scan.
 const EMBED_SOON_MAX: usize = 200_000;
-/// Texts per embedding call of [`DurableWrites::embed_deferred`] (the model's batch).
-const EMBED_SOON_BATCH: usize = 64;
+/// Texts per embedding call of [`DurableWrites::embed_deferred`]: small enough that a
+/// foreground request waits little behind one on a worker, large enough to batch.
+const EMBED_SOON_BATCH: usize = 32;
 
-/// Deferred-embedding calls in flight at once (`ADB_EMBED_DEFER_PARALLEL`, default 4):
-/// a pool's workers each take one.
+/// Deferred-embedding calls in flight at once per node (`ADB_EMBED_DEFER_PARALLEL`,
+/// default 2): background work, in the model's background lane.
 fn embed_parallel() -> usize {
-    std::env::var("ADB_EMBED_DEFER_PARALLEL").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(4)
+    std::env::var("ADB_EMBED_DEFER_PARALLEL").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(2)
 }
+
+/// How long after the last deferred record the backfill scan waits.
+const BACKFILL_AFTER_DEFERRED: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) fn retain_max() -> u64 {
     std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
@@ -738,6 +742,10 @@ pub struct DurableWrites<L: Log> {
     /// wakes. Bounded: past [`EMBED_SOON_MAX`] a record waits for the backfill scan.
     embed_soon: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
     embed_wake: Arc<tokio::sync::Notify>,
+    /// When a record was last queued for its vector: the backfill scan waits while
+    /// the deferred embedder has work (both scanning and embedding the same rows
+    /// burned the nodes' CPU, Hetzner p15).
+    deferred_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
     poisoned: Arc<std::sync::atomic::AtomicBool>,
@@ -2066,6 +2074,11 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// between just gets a vector it no longer needs. Returns how many.
     pub async fn embed_backfill(&self, batch: usize) -> AdbResult<u64> {
         let (Some(_), Some(embedder)) = (&self.store, &self.embedder) else { return Ok(0) };
+        // Rows waiting for a deferred vector are the deferred embedder's: no scan for
+        // them while it has work, or had some lately (they'd be found and embedded twice).
+        if self.embeds_queued() > 0 || self.deferred_at.lock().unwrap().is_some_and(|t| t.elapsed() < BACKFILL_AFTER_DEFERRED) {
+            return Ok(0);
+        }
         // PF-51: one scan fills a queue (memory, row id, text) and the batches come from
         // it; the table is scanned again only when the queue is empty. Scanning every
         // unembedded row for each batch of 64 pinned the leader's CPU for hours with
@@ -2084,7 +2097,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         if todo.is_empty() {
             return Ok(0);
         }
-        let vectors = embedder.embed(todo.iter().map(|(_, _, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+        let vectors = embedder.embed_background(todo.iter().map(|(_, _, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
         self.commit_vectors(&todo, vectors).await
     }
 
@@ -2113,6 +2126,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
             q.push_back((memory, id, text));
         }
+        *self.deferred_at.lock().unwrap() = Some(std::time::Instant::now());
         self.embed_wake.notify_one();
     }
 
@@ -2149,7 +2163,7 @@ impl<L: Log + 'static> DurableWrites<L> {
             if batches.is_empty() {
                 return Ok(done);
             }
-            let calls = batches.iter().map(|b| embedder.embed(b.iter().map(|(_, _, t)| t.clone()).collect()));
+            let calls = batches.iter().map(|b| embedder.embed_background(b.iter().map(|(_, _, t)| t.clone()).collect()));
             let results = futures::future::join_all(calls).await;
             for (batch, r) in batches.iter().zip(results) {
                 match r {
@@ -2240,7 +2254,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), embed_soon: Default::default(), embed_wake: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), embed_soon: Default::default(), embed_wake: Default::default(), deferred_at: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

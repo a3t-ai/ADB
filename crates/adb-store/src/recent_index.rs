@@ -7,10 +7,10 @@
 //!   `ADB_RECENT_EPISODES`, default 256) by commit time. An episode forgotten or
 //!   superseded leaves; past the bound the oldest leaves and the namespace is marked
 //!   as having older ones.
-//! - **What it answers.** The newest k when it holds at least k of a namespace's
-//!   episodes, or all of them when none was ever pushed out — everything newer than
-//!   its oldest entry is in it, so its first k are the namespace's first k. Otherwise
-//!   `None`, and the caller reads as before. Time bounds (TTL) are checked on the rows.
+//! - **What it answers.** The newest k live episodes, taken from the ones it holds
+//!   newest first (an expired one skipped): everything newer than its oldest entry is
+//!   in it, so they are the namespace's first k — or all of them when none was ever
+//!   pushed out. When it runs out first, the caller reads as before.
 //! - **When it is built.** In the background after open, from one scan of the current
 //!   episodes; applies made meanwhile are held and replayed on top (as the live keys).
 
@@ -146,15 +146,13 @@ impl RecentIndex {
         matches!(*self.state.lock().unwrap(), State::Ready(_))
     }
 
-    /// The ids of `namespace`'s newest `k` episodes, newest first (ties by id, as the
-    /// default order), when the index holds them; `None` otherwise.
-    pub fn newest(&self, namespace: &str, k: usize) -> Option<Vec<String>> {
+    /// The ids of `namespace`'s newest episodes held, newest first (ties by id, as the
+    /// default order), and whether older ones exist that it doesn't hold; `None` until
+    /// it is built.
+    pub fn newest(&self, namespace: &str) -> Option<(Vec<String>, bool)> {
         let s = self.state.lock().unwrap();
         let State::Ready(ix) = &*s else { return None };
-        let Some(space) = ix.spaces.get(namespace) else { return Some(Vec::new()) };
-        if k > space.newest.len() && space.evicted {
-            return None;
-        }
-        Some(space.newest.iter().rev().take(k).map(|(_, id)| id.clone()).collect())
+        let Some(space) = ix.spaces.get(namespace) else { return Some((Vec::new(), false)) };
+        Some((space.newest.iter().rev().map(|(_, id)| id.clone()).collect(), space.evicted))
     }
 }
