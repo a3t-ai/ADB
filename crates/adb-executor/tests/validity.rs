@@ -1,5 +1,6 @@
 //! AQL v0.10 (GR-14, L9): fact validity (`valid_from` / `valid_to`), history reads
-//! (`AS OF`, `VALID AT`, `WITH HISTORY`) and the validity timer's `begin` / `end`.
+//! (`AS OF`, `WITH HISTORY`) and the validity timer's `begin` / `end`. AQL v0.13 has
+//! no FACT and no `VALID AT`: the fact tests are ignored until reworked.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -32,6 +33,7 @@ fn later(d: Duration) -> String {
 /// treat one outside it as not there, `VALID AT` and `WITH HISTORY` still find it,
 /// FORGET removes it.
 #[tokio::test]
+#[ignore = "AQL v0.13: FACT validity and VALID AT are removed (validity, if needed, is ordinary fields)"]
 async fn facts_hold_within_their_validity() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -41,7 +43,7 @@ async fn facts_hold_within_their_validity() {
 
     // Current: only the fact that holds now.
     assert_eq!(objects(&engine, r#"RECALL FROM SEMANTIC WHERE subject = "person:ada""#).await, ["org:acme"]);
-    let r = q(&engine, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS ALL"#).await;
+    let r = q(&engine, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS"#).await;
     let reached: Vec<String> = records(&r).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
     assert_eq!(reached, ["org:acme"], "{r}");
     // Stored in one form.
@@ -81,53 +83,62 @@ async fn facts_hold_within_their_validity() {
     }
 }
 
-/// `AS OF`: each record as it was then (a supersede, a later STORE); `$t` and `AGO`;
-/// PROCEDURAL too. History reads refuse LIKE and links.
+/// `AS OF`: each record as it was then (an UPDATE, a later STORE); `$t` and a
+/// timestamp; PROCEDURAL too. History reads refuse LIKE and links.
 #[tokio::test]
 async fn as_of_reads_past_versions() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    q(&engine, r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:acme")"#).await;
+    let employers = |aql: String| {
+        let engine = &engine;
+        async move {
+            let mut v: Vec<String> = records(&q(engine, &aql).await).iter().filter_map(|r| r["data"]["employer"].as_str().map(String::from)).collect();
+            v.sort();
+            v
+        }
+    };
+    q(&engine, r#"STORE INTO SEMANTIC (key = "person:ada", employer = "org:acme")"#).await;
     q(&engine, r#"STORE INTO PROCEDURAL (pattern_id = "deploy", pattern = "deploy app", steps = ["build"])"#).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     let t1 = chrono::Utc::now().to_rfc3339();
     tokio::time::sleep(Duration::from_millis(20)).await;
-    q(&engine, r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:globex")"#).await;
-    q(&engine, r#"STORE INTO SEMANTIC FACT (subject = "person:bob", predicate = "works_at", object = "org:acme")"#).await;
+    q(&engine, r#"UPDATE INTO SEMANTIC WHERE key = "person:ada" (employer = "org:globex")"#).await;
+    q(&engine, r#"STORE INTO SEMANTIC (key = "person:bob", employer = "org:acme")"#).await;
     q(&engine, r#"UPDATE INTO PROCEDURAL WHERE pattern_id = "deploy" (steps = ["build", "ship"])"#).await;
 
     let at = |aql: &str| aql.replace("T1", &t1);
-    assert_eq!(objects(&engine, r#"RECALL FROM SEMANTIC WHERE predicate = "works_at""#).await, ["org:globex", "org:acme"]);
-    assert_eq!(objects(&engine, &at(r#"RECALL FROM SEMANTIC WHERE predicate = "works_at" AS OF "T1""#)).await, ["org:acme"]);
+    let hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    assert_eq!(employers(r#"RECALL FROM SEMANTIC WHERE employer != """#.into()).await, ["org:acme", "org:globex"]);
+    assert_eq!(employers(at(r#"RECALL FROM SEMANTIC WHERE employer != "" AS OF "T1""#)).await, ["org:acme"]);
     let vars: HashMap<String, Value> = [("t".to_string(), Value::String(t1.clone()))].into();
-    let r = engine.query(r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF $t"#, Some(&vars)).await.unwrap();
+    let r = engine.query(r#"RECALL FROM SEMANTIC WHERE key = "person:ada" AS OF $t"#, Some(&vars)).await.unwrap();
     assert_eq!(records(&r).len(), 1, "{r}");
-    assert_eq!(records(&r)[0]["data"]["object"], "org:acme");
-    assert!(objects(&engine, r#"RECALL FROM SEMANTIC WHERE predicate = "works_at" AS OF 1h AGO"#).await.is_empty());
-    // Entities are records too: the stubs existed at T1 (ada, acme), bob didn't.
-    let r = q(&engine, &at(r#"RECALL FROM SEMANTIC WHERE name = "person:bob" AS OF "T1""#)).await;
+    assert_eq!(records(&r)[0]["data"]["employer"], "org:acme");
+    assert!(employers(format!(r#"RECALL FROM SEMANTIC WHERE employer != "" AS OF "{hour_ago}""#)).await.is_empty());
+    // bob didn't exist at T1.
+    let r = q(&engine, &at(r#"RECALL FROM SEMANTIC WHERE key = "person:bob" AS OF "T1""#)).await;
     assert!(records(&r).is_empty(), "{r}");
 
-    let r = q(&engine, &at(r#"LOOKUP FROM PROCEDURAL KEY pattern_id = "deploy" AS OF "T1""#)).await;
+    let r = q(&engine, &at(r#"RECALL FROM PROCEDURAL WHERE pattern_id = "deploy" AS OF "T1""#)).await;
     assert_eq!(records(&r)[0]["metadata"]["version"], 1, "{r}");
-    let r = q(&engine, r#"LOOKUP FROM PROCEDURAL KEY pattern_id = "deploy" WITH HISTORY"#).await;
+    let r = q(&engine, r#"RECALL FROM PROCEDURAL WHERE pattern_id = "deploy" WITH HISTORY"#).await;
     assert_eq!(records(&r).len(), 2, "{r}");
     // AS OF bounds WITH HISTORY to the versions recorded by then.
-    let r = q(&engine, &at(r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" WITH HISTORY AS OF "T1""#)).await;
+    let r = q(&engine, &at(r#"RECALL FROM SEMANTIC WHERE key = "person:ada" WITH HISTORY AS OF "T1""#)).await;
     assert_eq!(records(&r).len(), 1, "{r}");
     assert!(records(&r)[0]["data"]["_replaced_at"].is_null(), "not replaced by T1: {r}");
     // Aggregates count versions.
-    let r = q(&engine, r#"RECALL FROM SEMANTIC WHERE predicate = "works_at" WITH HISTORY AGGREGATE COUNT(*) AS n"#).await;
+    let r = q(&engine, r#"RECALL FROM SEMANTIC WHERE employer != "" WITH HISTORY AGGREGATE COUNT(*) AS n"#).await;
     assert_eq!(r["data"]["values"]["n"], 3, "{r}");
 
     for bad in [
-        r#"RECALL FROM SEMANTIC LIKE $q AS OF 1h AGO"#,
-        r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF 1h AGO FOLLOW LINKS ALL"#,
-        r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF "yesterday""#,
-        r#"RECALL FROM SEMANTIC WHERE subject = "person:ada" AS OF $unbound"#,
-        r#"RECALL FROM WORKING WHERE a = 1 AS OF 1h AGO"#,
+        format!(r#"RECALL FROM SEMANTIC LIKE $q AS OF "{hour_ago}""#),
+        format!(r#"RECALL FROM SEMANTIC WHERE key = "person:ada" AS OF "{hour_ago}" FOLLOW LINKS"#),
+        r#"RECALL FROM SEMANTIC WHERE key = "person:ada" AS OF "yesterday""#.to_string(),
+        r#"RECALL FROM SEMANTIC WHERE key = "person:ada" AS OF $unbound"#.to_string(),
+        format!(r#"RECALL FROM WORKING WHERE a = 1 AS OF "{hour_ago}""#),
     ] {
-        assert!(engine.query(bad, None).await.is_err(), "{bad} should be refused");
+        assert!(engine.query(&bad, None).await.is_err(), "{bad} should be refused");
     }
 }
 
@@ -149,6 +160,7 @@ async fn drain(gw: &Gateway, sub: &str) -> Batch {
 /// once, also for a bound that passed while ADB was down; a superseded fact's old
 /// bound fires nothing.
 #[tokio::test]
+#[ignore = "AQL v0.13: FACT validity and VALID AT are removed (validity, if needed, is ordinary fields)"]
 async fn validity_bounds_are_delivered() {
     let dir = tempfile::tempdir().unwrap();
     let ops = |b: &Batch| b.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect::<Vec<_>>();

@@ -25,6 +25,7 @@ async fn objects(engine: &LocalEngine, aql: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: MERGE ENTITY is being replaced (aliases: UPDATE … (aliases = [...]) + FORGET)"]
 async fn merge_moves_facts_and_links_to_the_survivor() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -39,7 +40,7 @@ async fn merge_moves_facts_and_links_to_the_survivor() {
         q(&engine, r#"STORE INTO SEMANTIC FACT MULTI (subject = "person:ada-lovelace", predicate = "wrote", object = "note:g")"#).await;
         q(&engine, r#"STORE INTO SEMANTIC FACT (subject = "person:bob", predicate = "knows", object = "person:ada-lovelace")"#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "org:x", name = "X")"#).await;
-        q(&engine, r#"LINK FROM SEMANTIC WHERE key = "person:ada-lovelace" TO SEMANTIC WHERE key = "org:x" TYPE "funded_by""#).await;
+        q(&engine, r#"LINK FROM SEMANTIC WHERE key = "person:ada-lovelace" INTO SEMANTIC WHERE key = "org:x" TYPE "funded_by""#).await;
 
         let r = q(&engine, r#"MERGE ENTITY "person:ada-lovelace" INTO "person:ada""#).await;
 
@@ -48,13 +49,13 @@ async fn merge_moves_facts_and_links_to_the_survivor() {
         assert_eq!(records(&q(&engine, r#"RECALL FROM SEMANTIC WHERE subject = "person:ada-lovelace""#).await).len(), 0);
         assert_eq!(records(&q(&engine, r#"RECALL FROM SEMANTIC WHERE object = "person:ada-lovelace""#).await).len(), 0);
         assert_eq!(objects(&engine, r#"RECALL FROM SEMANTIC WHERE predicate = "knows""#).await, ["person:ada"]);
-        let reached = q(&engine, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS ALL"#).await;
+        let reached = q(&engine, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS"#).await;
         let ids: Vec<String> = records(&reached).iter().filter_map(|r| r["id"].as_str().map(String::from)).collect();
         assert!(ids.contains(&"org:x".to_string()) && ids.contains(&"org:globex".to_string()), "{ids:?}");
 
         assert_eq!(r["data"]["count"], 4, "works_at, wrote, knows and the link: {r}");
         // The duplicate's key is an alias now.
-        let found = records(&q(&engine, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-lovelace""#).await);
+        let found = records(&q(&engine, r#"RECALL FROM SEMANTIC WHERE id = "person:ada-lovelace""#).await);
         assert_eq!(found.len(), 1);
         assert_eq!((found[0]["id"].as_str(), found[0]["data"]["name"].as_str()), (Some("person:ada"), Some("Ada")));
         assert_eq!(found[0]["data"]["aliases"], serde_json::json!(["person:ada-lovelace"]));
@@ -78,7 +79,7 @@ async fn merge_moves_facts_and_links_to_the_survivor() {
     // A chain: merging the survivor on moves its aliases along.
     q(&engine, r#"STORE INTO SEMANTIC (key = "person:countess", name = "Countess")"#).await;
     q(&engine, r#"MERGE ENTITY "person:ada" INTO "person:countess""#).await;
-    let found = records(&q(&engine, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-lovelace""#).await);
+    let found = records(&q(&engine, r#"RECALL FROM SEMANTIC WHERE id = "person:ada-lovelace""#).await);
     assert_eq!(found[0]["id"], "person:countess");
     assert_eq!(objects(&engine, r#"RECALL FROM SEMANTIC WHERE subject = "person:countess" AND predicate = "works_at""#).await, ["org:globex"]);
 }

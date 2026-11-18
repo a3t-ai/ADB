@@ -30,12 +30,12 @@ async fn reads_stay_within_the_read_memory_budget() {
     }
 
     // Every row: more than 4 MB once decoded — refused, not grown.
-    let all = engine.query("RECALL FROM SEMANTIC ALL", None).await;
+    let all = engine.query("RECALL FROM SEMANTIC", None).await;
     let err = all.expect_err("a read past the budget fails").to_string();
     assert!(err.contains("read memory budget exceeded"), "{err}");
 
     // The first 5 by n (descending), ties in default order: keys of i = 996, 1993, …
-    let top = q(&engine, "RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 5").await;
+    let top = q(&engine, "RECALL FROM SEMANTIC ORDER BY n DESC LIMIT 5").await;
     let keys: Vec<String> = records(&top).iter().map(|r| r["key"].as_str().or_else(|| r["data"]["key"].as_str()).unwrap_or_default().to_string()).collect();
     let want: Vec<String> = (0..N).filter(|i| i % 997 == 996).take(5).map(|i| format!("k{i:05}")).collect();
     assert_eq!(keys, want, "{top}");
@@ -46,7 +46,7 @@ async fn reads_stay_within_the_read_memory_budget() {
     assert_eq!(keys, vec!["k00003", "k00023", "k00043", "k00063"], "{some}");
 
     // Aggregates fold while they scan (PF-39): over every row, within the same budget.
-    let agg = q(&engine, "RECALL FROM SEMANTIC ALL AGGREGATE COUNT(*) AS c, SUM(n) AS s, MAX(n) AS m").await;
+    let agg = q(&engine, "RECALL FROM SEMANTIC AGGREGATE COUNT(*) AS c, SUM(n) AS s, MAX(n) AS m").await;
     let values = |v: &Value| if v["data"]["values"].is_null() { v["data"]["data"]["values"].clone() } else { v["data"]["values"].clone() };
     let a = values(&agg);
     let sum: u64 = (0..N as u64).map(|i| i % 997).sum();
@@ -54,7 +54,7 @@ async fn reads_stay_within_the_read_memory_budget() {
     assert_eq!(a["s"].as_f64(), Some(sum as f64), "{agg}");
     assert_eq!(a["m"].as_f64(), Some(996.0), "{agg}");
     // Grouped: one row per topic, in the order of each group's first record.
-    let grouped = q(&engine, "RECALL FROM SEMANTIC ALL GROUP BY topic AGGREGATE COUNT(*) AS c").await;
+    let grouped = q(&engine, "RECALL FROM SEMANTIC GROUP BY topic AGGREGATE COUNT(*) AS c").await;
     let rows = values(&grouped);
     let rows = rows.as_array().unwrap_or_else(|| panic!("{grouped}"));
     assert_eq!(rows.len(), 20, "{grouped}");
@@ -69,5 +69,5 @@ async fn reads_stay_within_the_read_memory_budget() {
     assert_eq!(rows[0]["topic"], serde_json::json!("t9"), "{some}");
 
     // The budget came back: the same reads again.
-    assert_eq!(records(&q(&engine, "RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 5").await).len(), 5);
+    assert_eq!(records(&q(&engine, "RECALL FROM SEMANTIC ORDER BY n DESC LIMIT 5").await).len(), 5);
 }

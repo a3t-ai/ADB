@@ -13,7 +13,7 @@ async fn a_branch_is_one_record_at_the_log_position_and_survives_a_restart() {
             engine.query(&format!(r#"STORE INTO SEMANTIC (concept = "c{i}", fact = "f{i}") NAMESPACE "crm""#), None).await.unwrap();
         }
         let before = engine.stats().await.unwrap();
-        let recall = engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap();
+        let recall = engine.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm""#, None).await.unwrap();
         let b = engine.branch_create("crm", "try-new-recall", None, Some("dev@a3t")).await.unwrap();
         assert_eq!(b.parent, "main");
         assert_eq!(b.namespace, "crm");
@@ -21,7 +21,7 @@ async fn a_branch_is_one_record_at_the_log_position_and_survives_a_restart() {
         // No memory row was added or changed by the branch.
         assert_eq!(engine.stats().await.unwrap(), before);
         // (The records; the answer's memory point moves with the log, DB-7.)
-        assert_eq!(engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap()["data"], recall["data"]);
+        assert_eq!(engine.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm""#, None).await.unwrap()["data"], recall["data"]);
         // A child of the branch; checks.
         let c = engine.branch_create("crm", "child", Some("try-new-recall"), None).await.unwrap();
         assert_eq!(c.parent, "try-new-recall");
@@ -39,7 +39,7 @@ async fn a_branch_is_one_record_at_the_log_position_and_survives_a_restart() {
     assert_eq!(crm.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["child", "try-new-recall"]);
     assert_eq!(crm.iter().find(|b| b.name == "try-new-recall").unwrap().point_offset, offset_before);
     assert_eq!(engine.branch_list(None).await.unwrap().len(), 3);
-    assert_eq!(engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm""#, None).await.unwrap()["data"], recall_before["data"]);
+    assert_eq!(engine.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm""#, None).await.unwrap()["data"], recall_before["data"]);
     assert!(engine.branch_drop("crm", "child").await.unwrap());
     assert!(engine.branch_drop("crm", "try-new-recall").await.unwrap());
     assert!(!engine.branch_drop("crm", "try-new-recall").await.unwrap(), "already gone");
@@ -50,20 +50,21 @@ async fn a_branch_is_one_record_at_the_log_position_and_survives_a_restart() {
 }
 
 #[tokio::test]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn the_branch_modifier_parses_through_to_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     // B1 carries BRANCH through the planner; reading on a branch is B2.
-    let r = engine.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "main""#, None).await;
+    let r = engine.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "main""#, None).await;
     assert!(r.is_ok(), "{r:?}");
 }
 
 async fn main(e: &LocalEngine) -> Vec<String> {
-    values(&e.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" LIMIT 100"#, None).await.unwrap(), "fact")
+    values(&e.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm" LIMIT 100"#, None).await.unwrap(), "fact")
 }
 
 async fn on(e: &LocalEngine, b: &str) -> Vec<String> {
-    values(&e.query(&format!(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "{b}" LIMIT 100"#), None).await.unwrap(), "fact")
+    values(&e.query(&format!(r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "{b}" LIMIT 100"#), None).await.unwrap(), "fact")
 }
 
 /// The values of `field` in a RECALL answer, sorted.
@@ -77,6 +78,7 @@ fn values(answer: &serde_json::Value, field: &str) -> Vec<String> {
 /// B2 + B3, isolated engines: a branch reads its parent as of the point plus its own
 /// writes; its writes go to its own engine — the org's log and table do not move.
 #[tokio::test]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn a_branch_is_its_own_engine_and_the_org_never_sees_its_writes() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -116,10 +118,10 @@ async fn a_branch_is_its_own_engine_and_the_org_never_sees_its_writes() {
     assert_eq!(on(&e, "deeper").await, ["a1", "b-try2", "e-deeper"], "no f: try wrote it after deeper's point");
     assert_eq!(on(&e, "try").await, ["a1", "b-try2", "e1", "f1"]);
 
-    let l = e.query(r#"LOOKUP FROM SEMANTIC WHERE key = "b" NAMESPACE "crm" BRANCH "try""#, None).await.unwrap();
+    let l = e.query(r#"RECALL FROM SEMANTIC WHERE key = "b" NAMESPACE "crm" BRANCH "try""#, None).await.unwrap();
     assert_eq!(values(&l, "fact"), ["b-try2"]);
-    assert!(e.query(r#"RECALL FROM SEMANTIC ALL BRANCH "try""#, None).await.is_err(), "BRANCH needs NAMESPACE");
-    assert!(e.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "nope""#, None).await.is_err());
+    assert!(e.query(r#"RECALL FROM SEMANTIC BRANCH "try""#, None).await.is_err(), "BRANCH needs NAMESPACE");
+    assert!(e.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "nope""#, None).await.is_err());
 
     // The same after a restart (branch engines reopen from their own directories).
     let (m, t, d) = (main(&e).await, on(&e, "try").await, on(&e, "deeper").await);
@@ -145,6 +147,7 @@ fn files_with(dir: &std::path::Path, needle: &[u8]) -> Vec<String> {
 /// the next compaction);
 /// dropping a branch deletes its engine, and a new branch of the same name starts clean.
 #[tokio::test]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -173,7 +176,7 @@ async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
     e.query(r#"STORE INTO SEMANTIC (key = "t", fact = "only-on-deeper") NAMESPACE "crm" BRANCH "deeper""#, None).await.unwrap();
     assert!(e.branch_drop("crm", "deeper").await.unwrap());
     assert!(!branches.join("crm__deeper").exists(), "its engine's data is deleted");
-    assert!(e.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "deeper""#, None).await.is_err());
+    assert!(e.query(r#"RECALL FROM SEMANTIC NAMESPACE "crm" BRANCH "deeper""#, None).await.is_err());
     e.branch_create("crm", "deeper", Some("try"), None).await.unwrap();
     assert_eq!(on(&e, "deeper").await, ["a1"], "no only-on-deeper: a new branch");
     drop(e);
@@ -185,6 +188,7 @@ async fn forget_on_main_reaches_branches_and_drop_deletes_the_engine() {
 /// (SEMANTIC, PROCEDURAL, TOOLS) as fresh records; EPISODIC stays; the original agent
 /// and the branch are unchanged; a clone copies main as it is now.
 #[tokio::test]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn promote_a_branch_as_a_new_agent_and_clone_main() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -215,13 +219,13 @@ async fn promote_a_branch_as_a_new_agent_and_clone_main() {
     assert_eq!(main(&e).await, ["a1", "b1", "c1", "d1"], "the original agent unchanged");
     assert_eq!(on(&e, "try").await, ["a1", "b-try", "e1"], "the branch unchanged");
     // The new agent is a normal space: keyed lookups, its own fact and entity, its procedure.
-    assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "b" NAMESPACE "crm-v2""#.into()).await, "fact"), ["b-try"]);
+    assert_eq!(values(&q(r#"RECALL FROM SEMANTIC WHERE key = "b" NAMESPACE "crm-v2""#.into()).await, "fact"), ["b-try"]);
     assert_eq!(values(&q(r#"RECALL FROM SEMANTIC WHERE subject = "user:alice" NAMESPACE "crm-v2""#.into()).await, "value"), ["pro"]);
-    assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "user:alice" NAMESPACE "crm-v2""#.into()).await, "key"), ["user:alice"]);
-    assert_eq!(q(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm-v2""#.into()).await.pointer("/data/count").and_then(|c| c.as_u64()), Some(1));
+    assert_eq!(values(&q(r#"RECALL FROM SEMANTIC WHERE key = "user:alice" NAMESPACE "crm-v2""#.into()).await, "key"), ["user:alice"]);
+    assert_eq!(q(r#"RECALL FROM PROCEDURAL NAMESPACE "crm-v2""#.into()).await.pointer("/data/count").and_then(|c| c.as_u64()), Some(1));
     // D1: episodes stay with the original agent; the new one reads them through a history
     // layer (not a copy), beside its own origin record.
-    let eps = q(r#"RECALL FROM EPISODIC ALL NAMESPACE "crm-v2""#.into()).await;
+    let eps = q(r#"RECALL FROM EPISODIC NAMESPACE "crm-v2""#.into()).await;
     assert_eq!(eps.pointer("/data/count").and_then(|c| c.as_u64()), Some(2), "{eps}");
     assert_eq!(values(&eps, "event").iter().filter(|e| *e == "promoted_from").count(), 1, "{eps}");
     // Writes to the new agent leave the original alone.
@@ -276,10 +280,10 @@ async fn a_sealed_layer_pinned_then_mounted() {
     e.layers_set("trading", vec![layer(LayerMode::Pin)]).await.unwrap();
 
     assert_eq!(fact("trading").await, ["desk 4", "limit 1M"], "pinned at v1");
-    assert_eq!(values(&q(r#"LOOKUP FROM SEMANTIC KEY key = "rule:max-trade" NAMESPACE "trading""#.into()).await.unwrap(), "fact"), ["limit 1M"]);
-    let procs = q(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "trading""#.into()).await.unwrap();
+    assert_eq!(values(&q(r#"RECALL FROM SEMANTIC WHERE key = "rule:max-trade" NAMESPACE "trading""#.into()).await.unwrap(), "fact"), ["limit 1M"]);
+    let procs = q(r#"RECALL FROM PROCEDURAL NAMESPACE "trading""#.into()).await.unwrap();
     assert_eq!(procs.pointer("/data/count").and_then(|c| c.as_u64()), Some(1), "the inherited procedure: {procs}");
-    let eps = q(r#"RECALL FROM EPISODIC ALL NAMESPACE "trading""#.into()).await.unwrap();
+    let eps = q(r#"RECALL FROM EPISODIC NAMESPACE "trading""#.into()).await.unwrap();
     assert_eq!(eps.pointer("/data/count").and_then(|c| c.as_u64()), Some(0), "no compliance episodes");
     assert!(q(r#"STORE INTO SEMANTIC (key = "rule:max-trade", fact = "limit 9M") NAMESPACE "trading""#.into()).await.is_err(), "sealed: can't shadow");
     assert_eq!(fact("compliance").await, ["limit 2M"], "the layer's own space is unchanged");
@@ -304,6 +308,7 @@ async fn a_sealed_layer_pinned_then_mounted() {
 /// PATTERN and LIKE read a branch's view: its own records and its parent's at the
 /// branch point, ranked as on main; main never sees the branch's.
 #[tokio::test]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn pattern_and_like_read_a_branch() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -316,7 +321,7 @@ async fn pattern_and_like_read_a_branch() {
     let pattern = |branch: &'static str| {
         let e = &e;
         async move {
-            let aql = format!(r#"LOOKUP FROM PROCEDURAL PATTERN "pod OOMKilled restart" THRESHOLD 0.4 NAMESPACE "ops"{branch}"#);
+            let aql = format!(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.4 NAMESPACE "ops"{branch}"#);
             let r = e.query(&aql, None).await.unwrap_or_else(|x| panic!("{aql}: {x}"));
             let mut s = values(&r, "pattern");
             s.sort();

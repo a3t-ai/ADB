@@ -41,7 +41,7 @@ async fn a_forgotten_record_leaves_no_bytes_on_disk() {
         q(&engine, &format!(r#"STORE INTO SEMANTIC (key = "secret", content = "{v1}")"#)).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "other", content = "nothing to hide")"#).await;
         q(&engine, &format!(r#"UPDATE INTO SEMANTIC WHERE key = "secret" (content = "{v2}")"#)).await;
-        q(&engine, r#"LINK FROM SEMANTIC WHERE key = "secret" TO SEMANTIC WHERE key = "other" TYPE "rel""#).await;
+        q(&engine, r#"LINK FROM SEMANTIC WHERE key = "secret" INTO SEMANTIC WHERE key = "other" TYPE "rel""#).await;
         q(&engine, &format!(r#"STORE INTO WORKING (key = "scratch", note = "{w}")"#)).await;
         for i in 0..300 {
             q(&engine, &format!(r#"STORE INTO EPISODIC (key = "e{i}", content = "filler {i}")"#)).await;

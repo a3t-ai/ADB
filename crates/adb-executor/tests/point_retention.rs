@@ -52,7 +52,9 @@ async fn an_offset_that_left_the_log_needs_its_time_and_a_recent_one() {
     assert!(engine.space_clone_at("crm", "crm-old", &PointRef { offset: Some(offset), ts: Some(old), ..Default::default() }).await.is_err());
 
     // With the memory point's time: it reads what that point held.
+    // (AQL v0.13: a branch is a namespace; a copy at the point reads the same.)
     engine.branch_create_past("crm", "with-time", None, &PointRef { offset: Some(offset), ts: Some(ts), ..Default::default() }).await.unwrap();
-    let read = q(&engine, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "with-time" LIMIT 10"#).await.to_string();
+    engine.space_clone_at("crm", "crm-with-time", &PointRef { offset: Some(offset), ts: Some(ts), ..Default::default() }).await.unwrap();
+    let read = q(&engine, r#"RECALL FROM SEMANTIC NAMESPACE "crm-with-time" LIMIT 10"#).await.to_string();
     assert!(read.contains("original") && !read.contains("changed later"), "{read}");
 }

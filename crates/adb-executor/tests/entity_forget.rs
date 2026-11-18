@@ -16,6 +16,7 @@ fn count(v: &Value) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: FACT is being replaced (relationships are LINKs, values are fields)"]
 async fn forgetting_an_entity_forgets_its_facts() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -42,7 +43,7 @@ async fn forgetting_an_entity_forgets_its_facts() {
     }
     assert_eq!(count(&q(&engine, r#"RECALL FROM SEMANTIC WHERE subject = "org:acme""#).await), 1);
     // A link walk from bob no longer reaches ada.
-    let linked = q(&engine, r#"LOOKUP FROM SEMANTIC KEY id = "person:bob" FOLLOW LINKS ALL"#).await;
+    let linked = q(&engine, r#"RECALL FROM SEMANTIC WHERE id = "person:bob" FOLLOW LINKS"#).await;
     assert!(!linked.to_string().contains("person:ada"), "{linked}");
 
     // The fact feed's copy agrees.

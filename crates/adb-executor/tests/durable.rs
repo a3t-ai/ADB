@@ -17,26 +17,30 @@ const WRITES: &[&str] = &[
     r#"UPDATE INTO PROCEDURAL WHERE pattern = "oom" (confidence = 0.9)"#,
     r#"FORGET FROM WORKING WHERE task = "t2""#,
     r#"FORGET FROM EPISODIC WHERE bid_id = "e2""#,
-    r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
-    r#"LINK FROM PROCEDURAL WHERE pattern = "oom" TO EPISODIC WHERE bid_id = "e1" TYPE "applied_to" WEIGHT 0.95"#,
-    // Facts (P1.4): links between entities, one superseded, one MULTI, one literal.
-    r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:acme", confidence = 0.9)"#,
-    r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:globex", confidence = 0.7)"#,
-    r#"STORE INTO SEMANTIC FACT MULTI (subject = "person:ada", predicate = "knows", object = "person:bob")"#,
-    r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "born", value = 1815)"#,
+    r#"LINK FROM SEMANTIC WHERE concept = "acme" INTO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
+    r#"LINK FROM PROCEDURAL WHERE pattern = "oom" INTO EPISODIC WHERE bid_id = "e1" TYPE "applied_to" WEIGHT 0.95"#,
+    // Relationships (v0.13: records + links; the old FACT supersede = UNLINK + LINK).
+    r#"STORE INTO SEMANTIC (key = "person:ada", born = 1815)"#,
+    r#"STORE INTO SEMANTIC (key = "person:bob")"#,
+    r#"STORE INTO SEMANTIC (key = "org:acme")"#,
+    r#"STORE INTO SEMANTIC (key = "org:globex")"#,
+    r#"LINK FROM SEMANTIC WHERE key = "person:ada" INTO SEMANTIC WHERE key = "org:acme" TYPE "works_at" WEIGHT 0.9"#,
+    r#"UNLINK FROM SEMANTIC WHERE key = "person:ada" INTO SEMANTIC WHERE key = "org:acme" TYPE "works_at""#,
+    r#"LINK FROM SEMANTIC WHERE key = "person:ada" INTO SEMANTIC WHERE key = "org:globex" TYPE "works_at" WEIGHT 0.7"#,
+    r#"LINK FROM SEMANTIC WHERE key = "person:ada" INTO SEMANTIC WHERE key = "person:bob" TYPE "knows""#,
 ];
 
 /// Reads whose results must be identical before and after a restart.
 const READS: &[&str] = &[
-    r#"SCAN FROM WORKING WINDOW LAST 10"#,
+    r#"RECALL FROM WORKING WINDOW LAST 10"#,
     r#"RECALL FROM SEMANTIC WHERE active = true RETURN concept, content"#,
     r#"RECALL FROM EPISODIC WHERE campaign = "summer""#,
-    r#"LOOKUP FROM PROCEDURAL WHERE pattern = "oom" WITH LINKS ALL"#,
-    r#"LOAD FROM TOOLS WHERE ranking > 0.5 ORDER BY ranking DESC"#,
+    r#"RECALL FROM PROCEDURAL WHERE pattern = "oom" WITH LINKS"#,
+    r#"RECALL FROM TOOLS WHERE ranking > 0.5 ORDER BY ranking DESC"#,
     r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#,
-    r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS ALL DEPTH 2"#,
-    r#"LOOKUP FROM SEMANTIC KEY id = "org:globex" FOLLOW LINKS INBOUND"#,
-    r#"RECALL FROM SEMANTIC WHERE subject = "person:ada""#,
+    r#"RECALL FROM SEMANTIC WHERE key = "person:ada" FOLLOW LINKS DEPTH 2"#,
+    r#"RECALL FROM SEMANTIC WHERE key = "org:globex" FOLLOW LINKS"#,
+    r#"RECALL FROM SEMANTIC WHERE key = "person:ada" WITH LINKS"#,
 ];
 
 /// Log records `WRITES` makes: one per write (a FORGET commits a tombstone and
@@ -108,7 +112,7 @@ async fn ttl_measured_from_commit_time_after_restart() {
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     // Replay must not restart the short TTL: it expired while ADB was down.
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    let r = engine.query(r#"SCAN FROM WORKING WINDOW LAST 10"#, None).await.unwrap().to_string();
+    let r = engine.query(r#"RECALL FROM WORKING WINDOW LAST 10"#, None).await.unwrap().to_string();
     assert!(r.contains("long") && !r.contains("short"), "{r}");
 }
 
@@ -163,16 +167,16 @@ async fn lance_table_mirrors_the_engine() {
     assert_eq!(applied, log_records(), "every log record applied");
     let s = summary(&rows);
     // working t1 (t2 forgotten), semantic acme, episodic e1 (e2 forgotten),
-    // procedural oom-fix, tools search, two edges; three current facts (works_at
-    // superseded) and the four entities they made (ada, acme, globex, bob).
-    assert_eq!(rows.len(), 14, "{s:?}");
+    // procedural oom-fix, tools search, two edges; the four entities (ada, acme,
+    // globex, bob) and their two current links (works_at acme unlinked).
+    assert_eq!(rows.len(), 13, "{s:?}");
     let e1 = rows.iter().find(|r| r.data.value.get("bid_id").and_then(|v| v.as_str()) == Some("e1")).unwrap();
     assert_eq!(e1.data.value["won"], true, "UPDATE applied in Lance");
     assert_eq!(e1.data.value["brand_lift"], 0.04);
     let t1 = rows.iter().find(|r| r.data.value.get("task").and_then(|v| v.as_str()) == Some("t1")).unwrap();
     assert_eq!(t1.data.value["step"], 5);
     assert!(t1.data.ttl_at.is_some(), "TTL carried into Lance");
-    assert_eq!(rows.iter().filter(|r| r.data.kind == adb_core::log::Kind::Edge).count(), 2, "{s:?}");
+    assert_eq!(rows.iter().filter(|r| r.data.kind == adb_core::log::Kind::Edge).count(), 4, "{s:?}");
 }
 
 #[tokio::test]
@@ -212,22 +216,22 @@ async fn lance_reads_match_backend_reads() {
     const QUERIES: &[&str] = &[
         r#"RECALL FROM SEMANTIC WHERE active = true"#,
         r#"RECALL FROM SEMANTIC WHERE avg_cpm > 2 RETURN concept, avg_cpm"#,
-        r#"LOOKUP FROM SEMANTIC KEY concept = "gamma""#,
-        r#"LOOKUP FROM SEMANTIC KEY id = "acme""#,
-        r#"RECALL FROM SEMANTIC ALL ORDER BY concept ASC"#,
+        r#"RECALL FROM SEMANTIC WHERE concept = "gamma""#,
+        r#"RECALL FROM SEMANTIC WHERE id = "acme""#,
+        r#"RECALL FROM SEMANTIC ORDER BY concept ASC"#,
         r#"RECALL FROM EPISODIC WHERE campaign = "summer""#,
         r#"RECALL FROM EPISODIC WHERE cpm_paid > 1 ORDER BY cpm_paid DESC LIMIT 2"#,
-        r#"RECALL FROM EPISODIC ALL"#,
+        r#"RECALL FROM EPISODIC"#,
         r#"RECALL FROM EPISODIC WHERE won = true RETURN bid_id, cpm_paid"#,
         r#"RECALL FROM EPISODIC WHERE campaign = "summer" AGGREGATE COUNT(*) AS n, AVG(cpm_paid) AS avg RETURN n, avg"#,
         r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#,
-        r#"LOOKUP FROM SEMANTIC KEY concept = "acme" WITH LINKS ALL"#,
+        r#"RECALL FROM SEMANTIC WHERE concept = "acme" WITH LINKS"#,
         r#"RECALL FROM ALL WHERE campaign = "summer""#,
-        r#"LOOKUP FROM PROCEDURAL ALL ORDER BY confidence DESC"#,
-        r#"LOOKUP FROM PROCEDURAL WHERE severity = "medium""#,
-        r#"LOOKUP FROM PROCEDURAL WHERE confidence > 0.5 RETURN pattern_id, confidence, version"#,
-        r#"LOOKUP FROM PROCEDURAL KEY id = "disk-fix""#,
-        r#"LOOKUP FROM PROCEDURAL WHERE pattern = "oom" FOLLOW LINKS TYPE "applied_to""#,
+        r#"RECALL FROM PROCEDURAL ORDER BY confidence DESC"#,
+        r#"RECALL FROM PROCEDURAL WHERE severity = "medium""#,
+        r#"RECALL FROM PROCEDURAL WHERE confidence > 0.5 RETURN pattern_id, confidence, version"#,
+        r#"RECALL FROM PROCEDURAL WHERE id = "disk-fix""#,
+        r#"RECALL FROM PROCEDURAL WHERE pattern = "oom" FOLLOW LINKS TYPE "applied_to""#,
     ];
     let dir = tempfile::tempdir().unwrap();
     {
@@ -443,7 +447,7 @@ async fn same_key_in_two_memory_types_is_two_records() {
     }
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     for (m, note) in [("WORKING", "working"), ("SEMANTIC", "semantic"), ("EPISODIC", "episodic")] {
-        let r = engine.query(&format!("RECALL FROM {m} ALL"), None).await.unwrap().to_string();
+        let r = engine.query(&format!("RECALL FROM {m}"), None).await.unwrap().to_string();
         assert!(r.contains(&format!(r#""note":"{note}""#)), "{m} lost its record after a restart: {r}");
     }
 }
@@ -455,7 +459,7 @@ async fn same_key_in_two_memory_types_is_two_records() {
 async fn forgetting_a_record_removes_its_links() {
     let dir = tempfile::tempdir().unwrap();
     let links = |r: Value| r.to_string().matches(r#""link_type""#).count();
-    let with_links = r#"RECALL FROM SEMANTIC WHERE concept = "acme" WITH LINKS ALL"#;
+    let with_links = r#"RECALL FROM SEMANTIC WHERE concept = "acme" WITH LINKS"#;
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
         for q in [
@@ -463,8 +467,8 @@ async fn forgetting_a_record_removes_its_links() {
             r#"STORE INTO EPISODIC (key = "e1", bid_id = "e1")"#,
             r#"STORE INTO EPISODIC (key = "e2", bid_id = "e2")"#,
             r#"STORE INTO WORKING (key = "e1", note = "same key, other type")"#,
-            r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
-            r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e2" TYPE "evidence" WEIGHT 0.5"#,
+            r#"LINK FROM SEMANTIC WHERE concept = "acme" INTO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
+            r#"LINK FROM SEMANTIC WHERE concept = "acme" INTO EPISODIC WHERE bid_id = "e2" TYPE "evidence" WEIGHT 0.5"#,
         ] {
             engine.query(q, None).await.unwrap_or_else(|e| panic!("{q}: {e}"));
         }
@@ -500,14 +504,14 @@ async fn lance_history(dir: &std::path::Path) -> Vec<adb_store::StoredRow> {
 #[tokio::test]
 async fn update_supersedes_facts_and_procedures() {
     let dir = tempfile::tempdir().unwrap();
-    let fact = r#"LOOKUP FROM SEMANTIC KEY id = "acme""#;
+    let fact = r#"RECALL FROM SEMANTIC WHERE id = "acme""#;
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
         for q in [
             r#"STORE INTO SEMANTIC (key = "acme", concept = "acme", content = "Acme renews on 1 Nov", ttl_note = "none")"#,
             r#"STORE INTO EPISODIC (key = "e1", bid_id = "e1")"#,
-            r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
-            r#"LINK FROM EPISODIC WHERE bid_id = "e1" TO SEMANTIC WHERE concept = "acme" TYPE "about" WEIGHT 0.5"#,
+            r#"LINK FROM SEMANTIC WHERE concept = "acme" INTO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
+            r#"LINK FROM EPISODIC WHERE bid_id = "e1" INTO SEMANTIC WHERE concept = "acme" TYPE "about" WEIGHT 0.5"#,
             r#"UPDATE INTO SEMANTIC WHERE concept = "acme" (content = "Acme renews on 15 Nov")"#,
             r#"UPDATE INTO SEMANTIC WHERE concept = "acme" (content = "Acme renews on 20 Nov")"#,
             r#"STORE INTO PROCEDURAL (pattern_id = "p1", pattern = "disk full", steps = "prune", confidence = 0.5)"#,
@@ -517,13 +521,13 @@ async fn update_supersedes_facts_and_procedures() {
         }
         let r = engine.query(fact, None).await.unwrap().to_string();
         assert!(r.contains("20 Nov") && !r.contains("15 Nov") && r.contains(r#""version":3"#), "current version only: {r}");
-        let r = engine.query(r#"RECALL FROM SEMANTIC ALL"#, None).await.unwrap();
+        let r = engine.query(r#"RECALL FROM SEMANTIC"#, None).await.unwrap();
         assert_eq!(r["data"]["count"], 1, "one record, not one per version: {r}");
         let r = engine.query(r#"RECALL FROM SEMANTIC WHERE concept = "acme" FOLLOW LINKS TYPE "evidence""#, None).await.unwrap().to_string();
         assert!(r.contains(r#""bid_id":"e1""#), "links from the record survive a supersede: {r}");
         let r = engine.query(r#"RECALL FROM EPISODIC WHERE bid_id = "e1" FOLLOW LINKS TYPE "about""#, None).await.unwrap().to_string();
         assert!(r.contains("20 Nov"), "links to the record reach its current version: {r}");
-        let r = engine.query(r#"LOOKUP FROM PROCEDURAL KEY id = "p1""#, None).await.unwrap().to_string();
+        let r = engine.query(r#"RECALL FROM PROCEDURAL WHERE id = "p1""#, None).await.unwrap().to_string();
         assert!(r.contains(r#""confidence":0.9"#) && r.contains(r#""version":2"#), "{r}");
     }
     // History in Lance: three versions of acme, v1 and v2 closed and chained.
@@ -566,10 +570,10 @@ async fn forget_matches_values_only_in_old_versions() {
     assert_eq!(current["data"]["count"], 0, "the old value isn't current: {current}");
     let n = engine.query(r#"FORGET FROM SEMANTIC WHERE email = "old@example.com""#, None).await.unwrap();
     assert!(n.to_string().contains("1"), "{n}");
-    let left = engine.query(r#"RECALL FROM SEMANTIC ALL"#, None).await.unwrap().to_string();
+    let left = engine.query(r#"RECALL FROM SEMANTIC"#, None).await.unwrap().to_string();
     assert!(!left.contains("new@example.com") && left.contains("keep@example.com"), "the whole lineage is gone, the other record stays: {left}");
     engine.query(r#"FORGET FROM PROCEDURAL WHERE severity = "high""#, None).await.unwrap();
-    let r = engine.query(r#"LOOKUP FROM PROCEDURAL ALL"#, None).await.unwrap();
+    let r = engine.query(r#"RECALL FROM PROCEDURAL"#, None).await.unwrap();
     assert_eq!(r["data"]["count"], 0, "{r}");
     drop(engine);
     let rows = lance_history(dir.path()).await;
@@ -606,7 +610,7 @@ async fn store_refuses_a_key_in_use() {
             let msg = format!("{:?}", engine.query(&format!("STORE INTO {m} {again}"), None).await);
             assert!(msg.contains("key_exists"), "{label}: {m} second STORE should fail with key_exists: {msg}");
         }
-        let r = engine.query(r#"LOOKUP FROM SEMANTIC KEY id = "k1""#, None).await.unwrap().to_string();
+        let r = engine.query(r#"RECALL FROM SEMANTIC WHERE id = "k1""#, None).await.unwrap().to_string();
         assert!(r.contains(r#""content":"one""#), "{label}: the first record is untouched: {r}");
     }
     let dir = tempfile::tempdir().unwrap();
@@ -639,14 +643,14 @@ async fn order_by_created_at_uses_the_records_time() {
             engine.query(&format!(r#"STORE INTO EPISODIC (key = "{k}", content = "event {k}")"#), None).await.unwrap();
         }
         for m in ["SEMANTIC", "EPISODIC"] {
-            let r = engine.query(&format!("RECALL FROM {m} ALL ORDER BY created_at DESC"), None).await.unwrap();
+            let r = engine.query(&format!("RECALL FROM {m} ORDER BY created_at DESC"), None).await.unwrap();
             assert_eq!(ids(r), ["o3", "o2", "o1"], "{m} newest first");
         }
         let r = engine.query(r#"RECALL FROM SEMANTIC WHERE content CONTAINS "renews" ORDER BY created_at ASC LIMIT 2"#, None).await.unwrap();
         assert_eq!(ids(r), ["o1", "o2"]);
     }
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    let r = engine.query("RECALL FROM SEMANTIC ALL ORDER BY created_at DESC", None).await.unwrap();
+    let r = engine.query("RECALL FROM SEMANTIC ORDER BY created_at DESC", None).await.unwrap();
     assert_eq!(ids(r), ["o3", "o2", "o1"], "after a restart");
 }
 
@@ -681,22 +685,22 @@ async fn forget_hides_at_once_and_compaction_erases() {
         engine.query(&format!(r#"STORE INTO SEMANTIC (key = "card", content = "{secret}")"#), None).await.unwrap();
         engine.query(&format!(r#"UPDATE INTO SEMANTIC WHERE key = "card" (note = "{secret} v2")"#), None).await.unwrap();
         engine.query(r#"STORE INTO EPISODIC (key = "e1", content = "called the bank")"#, None).await.unwrap();
-        engine.query(r#"LINK FROM SEMANTIC WHERE key = "keep" TO EPISODIC WHERE key = "e1" TYPE "related" WEIGHT 0.5"#, None).await.unwrap();
+        engine.query(r#"LINK FROM SEMANTIC WHERE key = "keep" INTO EPISODIC WHERE key = "e1" TYPE "related" WEIGHT 0.5"#, None).await.unwrap();
         assert!(!files_with(dir.path(), secret).is_empty(), "written to disk first (else this proves nothing)");
         let r = engine.query(r#"FORGET FROM SEMANTIC WHERE key = "card""#, None).await.unwrap();
         assert_eq!(r["data"]["count"], 1, "{r}");
-        let r = engine.query("RECALL FROM SEMANTIC ALL", None).await.unwrap().to_string();
+        let r = engine.query("RECALL FROM SEMANTIC", None).await.unwrap().to_string();
         assert!(!r.contains("SECRET"), "no read returns it once FORGET returns: {r}");
-        assert_eq!(engine.query(r#"LOOKUP FROM SEMANTIC KEY id = "card""#, None).await.unwrap()["data"]["count"], 0);
+        assert_eq!(engine.query(r#"RECALL FROM SEMANTIC WHERE id = "card""#, None).await.unwrap()["data"]["count"], 0);
         engine.compact().await.unwrap();
         assert_eq!(files_with(dir.path(), secret), Vec::<String>::new(), "gone from every file after the compaction");
-        let r = engine.query(r#"RECALL FROM SEMANTIC WHERE key = "keep" WITH LINKS ALL"#, None).await.unwrap();
+        let r = engine.query(r#"RECALL FROM SEMANTIC WHERE key = "keep" WITH LINKS"#, None).await.unwrap();
         assert_eq!(r["data"]["records"][0]["data"]["links"].as_array().map(|l| l.len()), Some(1), "{r}");
         // Writes go on after the compaction.
         engine.query(r#"STORE INTO SEMANTIC (key = "after", content = "written after the erase")"#, None).await.unwrap();
     }
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    let r = engine.query("RECALL FROM SEMANTIC ALL", None).await.unwrap().to_string();
+    let r = engine.query("RECALL FROM SEMANTIC", None).await.unwrap().to_string();
     assert!(r.contains("7am") && r.contains("after the erase") && !r.contains("SECRET"), "{r}");
     assert_eq!(engine.query(r#"RECALL FROM EPISODIC WHERE key = "e1""#, None).await.unwrap()["data"]["count"], 1);
     assert!(files_with(dir.path(), secret).is_empty());

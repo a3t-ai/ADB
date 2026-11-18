@@ -78,6 +78,7 @@ impl Copy {
 /// supersedes, updates, forgets, TTL and validity bounds; reading an offset twice
 /// gives the same rows; a reader from a purged offset gets a snapshot.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: FACT and the fact feed are being replaced (relationships are LINKs, values are fields)"]
 async fn fact_feed_follows_the_current_view() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -137,7 +138,7 @@ async fn fact_feed_follows_the_current_view() {
     copy.read(&gw).await;
     assert_eq!(copy.shown(), ["fact:person:ada|visits@1=city:york", "fact:person:ada|works_at@3=org:globex"]);
     // An updated fact still links its ends.
-    let linked = q(&engine, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS ALL"#).await;
+    let linked = q(&engine, r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS"#).await;
     let ids: Vec<&str> = linked["data"]["records"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
     assert!(ids.contains(&"org:globex"), "{ids:?}");
 

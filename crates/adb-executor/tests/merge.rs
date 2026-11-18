@@ -17,7 +17,7 @@ fn values(answer: &Value, field: &str) -> Vec<String> {
 }
 
 async fn procs(e: &LocalEngine) -> Vec<String> {
-    values(&e.query(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" LIMIT 100"#, None).await.unwrap(), "steps")
+    values(&e.query(r#"RECALL FROM PROCEDURAL NAMESPACE "crm" LIMIT 100"#, None).await.unwrap(), "steps")
 }
 
 async fn q(e: &LocalEngine, aql: &str) -> Value {
@@ -25,6 +25,7 @@ async fn q(e: &LocalEngine, aql: &str) -> Value {
 }
 
 #[tokio::test]
+#[ignore = "AQL v0.13: branch merges (DB-19) and the BRANCH modifier are being replaced by BRANCH/MERGE on namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn memory_points_origin_conflicts_merge_and_revert() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -35,17 +36,17 @@ async fn memory_points_origin_conflicts_merge_and_revert() {
     // DB-7: a write answers with its own record's point; a read with the last commit.
     let w = q(&e, r#"STORE INTO PROCEDURAL (key = "x", steps = "x1") NAMESPACE "crm""#).await;
     let p = w.pointer("/metadata/point").cloned().unwrap_or_else(|| panic!("no point: {w}"));
-    let r = q(&e, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" LIMIT 100"#).await;
+    let r = q(&e, r#"RECALL FROM PROCEDURAL NAMESPACE "crm" LIMIT 100"#).await;
     assert_eq!(r.pointer("/metadata/point/offset"), p.get("offset"), "a read after the write includes it: {r}");
     let at = p["at"].as_str().unwrap();
     q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "x" (steps = "x2") NAMESPACE "crm""#).await;
-    let then = q(&e, &format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" AS OF "{at}" LIMIT 100"#)).await;
+    let then = q(&e, &format!(r#"RECALL FROM PROCEDURAL NAMESPACE "crm" AS OF "{at}" LIMIT 100"#)).await;
     assert!(values(&then, "steps").contains(&"x1".to_string()), "AS OF the point reads it as it was: {then}");
 
     // A branch; DB-20: its first record says where it came from.
     e.branch_create("crm", "try", None, Some("dev@a3t")).await.unwrap();
     q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "a" (steps = "a-branch") NAMESPACE "crm" BRANCH "try""#).await;
-    let origin = q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "crm" BRANCH "try" LIMIT 10"#).await;
+    let origin = q(&e, r#"RECALL FROM EPISODIC NAMESPACE "crm" BRANCH "try" LIMIT 10"#).await;
     assert_eq!(values(&origin, "event"), ["branch_created"], "{origin}");
     assert_eq!(values(&origin, "created_by"), ["dev@a3t"]);
     q(&e, r#"UPDATE INTO PROCEDURAL WHERE key = "b" (steps = "b-branch") NAMESPACE "crm" BRANCH "try""#).await;
@@ -82,7 +83,7 @@ async fn memory_points_origin_conflicts_merge_and_revert() {
     assert_eq!((m["changed"].clone(), m["added"].clone(), m["ended"].clone()), (json!(2), json!(1), json!(1)), "{m}");
     assert_eq!(procs(&e).await, ["a-branch", "b-branch", "c-main", "e-branch", "x2"], "main after the merge");
     // The branch is unchanged by the merge.
-    let on_branch = values(&q(&e, r#"RECALL FROM PROCEDURAL ALL NAMESPACE "crm" BRANCH "try" LIMIT 100"#).await, "steps");
+    let on_branch = values(&q(&e, r#"RECALL FROM PROCEDURAL NAMESPACE "crm" BRANCH "try" LIMIT 100"#).await, "steps");
     assert_eq!(on_branch, ["a-branch", "b-branch", "c1", "e-branch", "x2"]);
 
     // Revert: main back as it was before the merge.
@@ -117,6 +118,7 @@ async fn memory_points_origin_conflicts_merge_and_revert() {
 /// new agent starts its own episodes, reads the old agent's as of the promote, read-only,
 /// and its first record names its origin.
 #[tokio::test]
+#[ignore = "AQL v0.13: branch merges (DB-19) and the BRANCH modifier are being replaced by BRANCH/MERGE on namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn rebase_then_promote_as_a_new_agent() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -124,7 +126,7 @@ async fn rebase_then_promote_as_a_new_agent() {
         let e = &e;
         async move {
             let on = b.map(|b| format!(r#" BRANCH "{b}""#)).unwrap_or_default();
-            values(&e.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{ns}"{on} LIMIT 100"#), None).await.unwrap(), "steps")
+            values(&e.query(&format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{ns}"{on} LIMIT 100"#), None).await.unwrap(), "steps")
         }
     };
     for k in ["p1", "p2", "p3"] {
@@ -163,9 +165,9 @@ async fn rebase_then_promote_as_a_new_agent() {
     assert_eq!(steps("bot", None).await, ["p1-main", "p2-main", "p3-main"], "the old agent is untouched");
     q(&e, r#"STORE INTO EPISODIC (event = "old agent later") NAMESPACE "bot""#).await;
     q(&e, r#"STORE INTO EPISODIC (event = "new agent said hi") NAMESPACE "bot-v2""#).await;
-    let eps = values(&q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "bot-v2" LIMIT 100"#).await, "event");
+    let eps = values(&q(&e, r#"RECALL FROM EPISODIC NAMESPACE "bot-v2" LIMIT 100"#).await, "event");
     assert_eq!(eps, ["new agent said hi", "promoted_from", "said hello"], "own episodes, the origin, and the old agent's as of the promote");
-    let old = values(&q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "bot" LIMIT 100"#).await, "event");
+    let old = values(&q(&e, r#"RECALL FROM EPISODIC NAMESPACE "bot" LIMIT 100"#).await, "event");
     assert_eq!(old, ["old agent later", "said hello"], "a new agent's episodes don't reach the old one");
 
     // Behind main with no conflict: refused unless allow_stale.
@@ -182,6 +184,7 @@ async fn rebase_then_promote_as_a_new_agent() {
 /// DB-1: dev and QA branch work never reaches the prod sequencer. Hundreds of writes and
 /// reads on two branches leave the org's log offset, stats and main's reads as they were.
 #[tokio::test]
+#[ignore = "AQL v0.13: branch merges (DB-19) and the BRANCH modifier are being replaced by BRANCH/MERGE on namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn branch_traffic_never_reaches_the_org() {
     let dir = tempfile::tempdir().unwrap();
     let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -191,14 +194,14 @@ async fn branch_traffic_never_reaches_the_org() {
     e.branch_create("prod", "dev", None, None).await.unwrap();
     e.branch_create("prod", "qa", None, None).await.unwrap();
     let at = |a: &Value| a.pointer("/metadata/point/offset").and_then(|o| o.as_u64()).unwrap();
-    let read_main = r#"RECALL FROM SEMANTIC ALL NAMESPACE "prod" LIMIT 100"#;
+    let read_main = r#"RECALL FROM SEMANTIC NAMESPACE "prod" LIMIT 100"#;
     let before = q(&e, read_main).await;
     let stats = e.stats().await.unwrap();
     for i in 0..150 {
         for b in ["dev", "qa"] {
             q(&e, &format!(r#"STORE INTO EPISODIC (event = "run {i}") NAMESPACE "prod" BRANCH "{b}""#)).await;
             q(&e, &format!(r#"UPDATE INTO SEMANTIC WHERE key = "k{}" (fact = "{b}{i}") NAMESPACE "prod" BRANCH "{b}""#, i % 20)).await;
-            q(&e, &format!(r#"RECALL FROM SEMANTIC ALL NAMESPACE "prod" BRANCH "{b}" LIMIT 5"#)).await;
+            q(&e, &format!(r#"RECALL FROM SEMANTIC NAMESPACE "prod" BRANCH "{b}" LIMIT 5"#)).await;
         }
     }
     let after = q(&e, read_main).await;

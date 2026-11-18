@@ -17,7 +17,7 @@ async fn q(engine: &LocalEngine, aql: &str) -> Value {
 async fn compare_and_set_once(memory: &str) {
     let engine = Arc::new(LocalEngine::temporary().await.unwrap());
     q(&engine, &format!(r#"STORE INTO {memory} (key = "counter", n = 0)"#)).await;
-    let v = q(&engine, &format!(r#"LOOKUP FROM {memory} KEY id = "counter""#)).await;
+    let v = q(&engine, &format!(r#"RECALL FROM {memory} WHERE id = "counter""#)).await;
     let version = v["data"]["records"][0]["metadata"]["version"].as_u64().unwrap();
 
     let tasks: Vec<_> = (0..20)
@@ -35,7 +35,7 @@ async fn compare_and_set_once(memory: &str) {
         won += t.await.unwrap();
     }
     assert_eq!(won, 1, "{memory}: exactly one update from version {version} wins");
-    let v = q(&engine, &format!(r#"LOOKUP FROM {memory} KEY id = "counter""#)).await;
+    let v = q(&engine, &format!(r#"RECALL FROM {memory} WHERE id = "counter""#)).await;
     assert_eq!(v["data"]["records"][0]["metadata"]["version"].as_u64().unwrap(), version + 1);
 }
 

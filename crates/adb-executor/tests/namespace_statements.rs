@@ -1,6 +1,6 @@
-//! AQL v0.12: LINK, UPDATE LINK, UNLINK and the topic statements name a NAMESPACE.
+//! AQL v0.12/v0.13: LINK, UNLINK and the topic statements name a NAMESPACE.
 //! A link stays within its namespace (both ends there); a namespace's topics are its
-//! own (`<ns>/<topic>`), and its subscriptions are acked or ended only within it.
+//! own (`<ns>/<topic>`), and its subscriptions are ended only within it.
 
 use std::time::Duration;
 
@@ -23,25 +23,28 @@ async fn a_link_with_a_namespace_stays_in_it() {
         q(&engine, &format!(r#"STORE INTO SEMANTIC (key = "a", n = 1) NAMESPACE "{ns}""#)).await;
         q(&engine, &format!(r#"STORE INTO EPISODIC (key = "b", n = 2) NAMESPACE "{ns}""#)).await;
     }
-    let l = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "b" TYPE "rel" WEIGHT 0.5 NAMESPACE "p""#).await;
+    let l = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "b" TYPE "rel" WEIGHT 0.5 NAMESPACE "p""#).await;
     assert_eq!(count(&l), 1, "only p's records: {l}");
     let with = |ns: &'static str| {
         let e = &engine;
         async move {
-            let r = q(e, &format!(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL NAMESPACE "{ns}""#)).await;
+            let r = q(e, &format!(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS NAMESPACE "{ns}""#)).await;
             r["data"]["records"][0]["data"]["links"].as_array().map_or(0, |a| a.len())
         }
     };
     assert_eq!((with("p").await, with("q").await), (1, 0));
-    let u = q(&engine, r#"UPDATE LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "b" TYPE "rel" WEIGHT 0.9 NAMESPACE "q""#).await;
-    assert_eq!(count(&u), 0, "q has no link: {u}");
-    let u = q(&engine, r#"UPDATE LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "b" TYPE "rel" WEIGHT 0.9 NAMESPACE "p""#).await;
+    // LINK on a link that exists sets its weight (create or update): p's is updated,
+    // q gets its own.
+    let u = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "b" TYPE "rel" WEIGHT 0.9 NAMESPACE "p""#).await;
     assert_eq!(count(&u), 1, "{u}");
-    let d = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "b" NAMESPACE "p""#).await;
+    assert_eq!((with("p").await, with("q").await), (1, 0), "updated, not a second link");
+    let u = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "b" TYPE "rel" WEIGHT 0.9 NAMESPACE "q""#).await;
+    assert_eq!(count(&u), 1, "{u}");
+    let d = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "b" NAMESPACE "p""#).await;
     assert_eq!(count(&d), 1, "{d}");
-    assert_eq!(with("p").await, 0);
+    assert_eq!((with("p").await, with("q").await), (0, 1), "q's link stays");
     // A LINK naming a namespace without the record: refused, as with none at all.
-    let e = engine.query(r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "b" TYPE "rel" NAMESPACE "r""#, None).await.unwrap_err();
+    let e = engine.query(r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "b" TYPE "rel" NAMESPACE "r""#, None).await.unwrap_err();
     assert!(e.contains("No source records"), "{e}");
 }
 
@@ -66,48 +69,43 @@ async fn a_namespace_has_its_own_topics_and_subscriptions() {
     assert_eq!(got_p.deliveries.len(), 1, "p's subscription sees p's message only: {:?}", ns_of(&got_p));
     assert_eq!(got_org.deliveries.len(), 1, "the org-wide topic sees its own message only: {:?}", ns_of(&got_org));
 
-    // Acked and ended only within the namespace.
-    let off = got_p.next;
-    let e = engine.query(&format!(r#"ACK "{p}" OFFSET {off} NAMESPACE "q""#), None).await.unwrap_err();
-    assert!(e.to_lowercase().contains("not found") || e.contains("subscription"), "{e}");
-    q(&engine, &format!(r#"ACK "{p}" OFFSET {off} NAMESPACE "p""#)).await;
-    let e = engine.query(&format!(r#"ACK "{org}" OFFSET 1 NAMESPACE "p""#), None).await.unwrap_err();
-    assert!(!e.is_empty());
+    // Ended only within the namespace. (AQL v0.13 has no ACK statement: acks are the
+    // server's API.)
     let u = q(&engine, &format!(r#"UNSUBSCRIBE "{p}" NAMESPACE "q""#)).await;
     assert_eq!(u["data"]["unsubscribed"], false, "{u}");
     let u = q(&engine, &format!(r#"UNSUBSCRIBE "{p}" NAMESPACE "p""#)).await;
     assert_eq!(u["data"]["unsubscribed"], true, "{u}");
-    // A scope subscription can't name a namespace (yet).
-    assert!(engine.query(r#"SUBSCRIBE SCOPE "agent:1" NAMESPACE "p""#, None).await.is_err());
 }
 
 #[tokio::test]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
 async fn a_link_on_a_branch_stays_on_it() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     q(&engine, r#"STORE INTO SEMANTIC (key = "a", n = 1) NAMESPACE "p""#).await;
     q(&engine, r#"STORE INTO SEMANTIC (key = "b", n = 2) NAMESPACE "p""#).await;
     engine.branch_create("p", "b1", None, None).await.unwrap();
-    let l = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "rel" NAMESPACE "p" BRANCH "b1""#).await;
+    let l = q(&engine, r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" TYPE "rel" NAMESPACE "p" BRANCH "b1""#).await;
     assert_eq!(count(&l), 1, "{l}");
     let links = |aql: &'static str| {
         let e = &engine;
         async move { q(e, aql).await["data"]["records"][0]["data"]["links"].as_array().map_or(0, |a| a.len()) }
     };
     // (WITH LINKS isn't read on a branch yet: main shows none, UNLINK finds it there.)
-    assert_eq!(links(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL NAMESPACE "p""#).await, 0, "not on main");
-    let u = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" NAMESPACE "p" BRANCH "b1""#).await;
+    assert_eq!(links(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS NAMESPACE "p""#).await, 0, "not on main");
+    let u = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" NAMESPACE "p" BRANCH "b1""#).await;
     assert_eq!(count(&u), 1, "the link is on the branch: {u}");
-    let u = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" NAMESPACE "p" BRANCH "b1""#).await;
+    let u = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" NAMESPACE "p" BRANCH "b1""#).await;
     assert_eq!(count(&u), 0, "and gone: {u}");
     // BRANCH needs the NAMESPACE it belongs to.
-    assert!(engine.query(r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "rel" BRANCH "b1""#, None).await.is_err());
+    assert!(engine.query(r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" TYPE "rel" BRANCH "b1""#, None).await.is_err());
 }
 
 /// AQL v0.13: MERGE ENTITY within a NAMESPACE merges that namespace's entities only;
 /// the merged key finds the survivor in that namespace (also after a restart), and
 /// another namespace's entity of the same key is untouched.
 #[tokio::test]
+#[ignore = "AQL v0.13: MERGE ENTITY and FACT are being replaced (aliases: UPDATE … (aliases = [...]) + FORGET)"]
 async fn a_merge_with_a_namespace_stays_in_it() {
     let dir = tempfile::tempdir().unwrap();
     let facts = |ns: &str| {
@@ -155,10 +153,29 @@ async fn a_merge_with_a_namespace_stays_in_it() {
     let found = |ns: &'static str| {
         let e = &engine;
         async move {
-            let r = q(e, &format!(r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-l" NAMESPACE "{ns}""#)).await;
+            let r = q(e, &format!(r#"RECALL FROM SEMANTIC WHERE id = "person:ada-l" NAMESPACE "{ns}""#)).await;
             r["data"]["records"][0]["data"]["key"].as_str().map(String::from)
         }
     };
     assert_eq!(found("p").await.as_deref(), Some("person:ada"), "the merged key finds the survivor in p");
     assert_eq!(found("q").await.as_deref(), Some("person:ada-l"), "q's own entity");
+}
+
+/// AQL v0.13: USE names the namespace once for the statements after it; a statement's
+/// own NAMESPACE wins; a failing statement stops the script, named by position.
+#[tokio::test]
+async fn use_and_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    let r = q(&engine, r#"USE "p"; STORE INTO SEMANTIC (key = "a", n = 1); STORE INTO SEMANTIC (key = "b", n = 2) NAMESPACE "q"; RECALL FROM SEMANTIC WHERE key = "a""#).await;
+    assert_eq!(r["data"]["count"], 1, "the last statement's answer: {r}");
+    let n = |ns: &'static str| {
+        let e = &engine;
+        async move { q(e, &format!(r#"RECALL FROM SEMANTIC NAMESPACE "{ns}""#)).await["data"]["count"].as_u64().unwrap() }
+    };
+    assert_eq!((n("p").await, n("q").await), (1, 1));
+    let e = engine.query(r#"USE "p"; STORE INTO SEMANTIC (key = "c", n = 1); STORE INTO SEMANTIC (key = "c", n = 2)"#, None).await.unwrap_err();
+    assert!(e.starts_with("statement 3:"), "{e}");
+    assert_eq!(n("p").await, 2, "the statements before it stay done");
+    assert!(engine.query(r#"USE "p""#, None).await.is_ok());
 }

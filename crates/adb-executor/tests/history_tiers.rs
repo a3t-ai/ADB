@@ -20,35 +20,67 @@ async fn episodes_and_tools_read_as_they_were() {
     q(&e, r#"STORE INTO EPISODIC (key = "ep", content = "first telling") NAMESPACE "crm""#).await;
     q(&e, r#"STORE INTO TOOLS (key = "t", name = "lookup", description = "old description", schema = "{}") NAMESPACE "crm""#).await;
     let answer = q(&e, r#"STORE INTO SEMANTIC (key = "marker", content = "m") NAMESPACE "crm""#).await;
-    let (offset, ts) = point(&answer);
+    let (_offset, ts) = point(&answer);
     tokio::time::sleep(Duration::from_millis(5)).await;
     q(&e, r#"UPDATE INTO EPISODIC WHERE key = "ep" (content = "second telling") NAMESPACE "crm""#).await;
     q(&e, r#"UPDATE INTO TOOLS WHERE key = "t" (description = "new description") NAMESPACE "crm""#).await;
 
     // Now: one record each, the latest.
-    let now = q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "crm""#).await;
+    let now = q(&e, r#"RECALL FROM EPISODIC NAMESPACE "crm""#).await;
     assert!(now.contains("second telling") && !now.contains("first telling"), "{now}");
     let stats = e.space_stats("crm", None, Duration::ZERO).await.unwrap();
     assert_eq!(stats["tiers"]["EPISODIC"]["count"], serde_json::json!(1), "{stats}");
 
     // As of the point: as they were.
     let at = chrono::DateTime::from_timestamp_micros(ts).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    let then = q(&e, &format!(r#"RECALL FROM EPISODIC ALL AS OF "{at}" NAMESPACE "crm""#)).await;
+    let then = q(&e, &format!(r#"RECALL FROM EPISODIC AS OF "{at}" NAMESPACE "crm""#)).await;
     assert!(then.contains("first telling") && !then.contains("second telling"), "{then}");
-    let then = q(&e, &format!(r#"RECALL FROM TOOLS ALL AS OF "{at}" NAMESPACE "crm""#)).await;
+    let then = q(&e, &format!(r#"RECALL FROM TOOLS AS OF "{at}" NAMESPACE "crm""#)).await;
     assert!(then.contains("old description") && !then.contains("new description"), "{then}");
-    let all = q(&e, r#"RECALL FROM EPISODIC ALL WITH HISTORY NAMESPACE "crm""#).await;
+    let all = q(&e, r#"RECALL FROM EPISODIC WITH HISTORY NAMESPACE "crm""#).await;
     assert!(all.contains("first telling") && all.contains("second telling"), "{all}");
 
     // WORKING has none, and says so.
-    assert!(e.query(r#"RECALL FROM WORKING ALL WITH HISTORY NAMESPACE "crm""#, None).await.is_err());
+    assert!(e.query(r#"RECALL FROM WORKING WITH HISTORY NAMESPACE "crm""#, None).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
+async fn episodes_and_tools_read_as_they_were_with_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    q(&e, r#"STORE INTO EPISODIC (key = "ep", content = "first telling") NAMESPACE "crm""#).await;
+    q(&e, r#"STORE INTO TOOLS (key = "t", name = "lookup", description = "old description", schema = "{}") NAMESPACE "crm""#).await;
+    let answer = q(&e, r#"STORE INTO SEMANTIC (key = "marker", content = "m") NAMESPACE "crm""#).await;
+    let (offset, ts) = point(&answer);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    q(&e, r#"UPDATE INTO EPISODIC WHERE key = "ep" (content = "second telling") NAMESPACE "crm""#).await;
+    q(&e, r#"UPDATE INTO TOOLS WHERE key = "t" (description = "new description") NAMESPACE "crm""#).await;
+
+    // Now: one record each, the latest.
+    let now = q(&e, r#"RECALL FROM EPISODIC NAMESPACE "crm""#).await;
+    assert!(now.contains("second telling") && !now.contains("first telling"), "{now}");
+    let stats = e.space_stats("crm", None, Duration::ZERO).await.unwrap();
+    assert_eq!(stats["tiers"]["EPISODIC"]["count"], serde_json::json!(1), "{stats}");
+
+    // As of the point: as they were.
+    let at = chrono::DateTime::from_timestamp_micros(ts).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let then = q(&e, &format!(r#"RECALL FROM EPISODIC AS OF "{at}" NAMESPACE "crm""#)).await;
+    assert!(then.contains("first telling") && !then.contains("second telling"), "{then}");
+    let then = q(&e, &format!(r#"RECALL FROM TOOLS AS OF "{at}" NAMESPACE "crm""#)).await;
+    assert!(then.contains("old description") && !then.contains("new description"), "{then}");
+    let all = q(&e, r#"RECALL FROM EPISODIC WITH HISTORY NAMESPACE "crm""#).await;
+    assert!(all.contains("first telling") && all.contains("second telling"), "{all}");
+
+    // WORKING has none, and says so.
+    assert!(e.query(r#"RECALL FROM WORKING WITH HISTORY NAMESPACE "crm""#, None).await.is_err());
 
     // A branch at that point reads them as they were.
     let at_point = adb_executor::branches::PointRef { offset: Some(offset), ..Default::default() };
     e.branch_create_past("crm", "past", None, &at_point).await.unwrap();
-    let on_branch = q(&e, r#"RECALL FROM EPISODIC ALL NAMESPACE "crm" BRANCH "past""#).await;
+    let on_branch = q(&e, r#"RECALL FROM EPISODIC NAMESPACE "crm" BRANCH "past""#).await;
     assert!(on_branch.contains("first telling") && !on_branch.contains("second telling"), "{on_branch}");
-    let tools = q(&e, r#"RECALL FROM TOOLS ALL NAMESPACE "crm" BRANCH "past""#).await;
+    let tools = q(&e, r#"RECALL FROM TOOLS NAMESPACE "crm" BRANCH "past""#).await;
     assert!(tools.contains("old description") && !tools.contains("new description"), "{tools}");
 }
 
@@ -64,8 +96,8 @@ async fn a_namespace_sets_its_own_history_window() {
     tokio::time::sleep(Duration::from_millis(5)).await;
     // Compaction applies the windows (a FORGET no longer compacts: PF-6, 7 Nov).
     e.compact().await.unwrap();
-    let short = q(&e, r#"RECALL FROM SEMANTIC ALL WITH HISTORY NAMESPACE "short""#).await;
+    let short = q(&e, r#"RECALL FROM SEMANTIC WITH HISTORY NAMESPACE "short""#).await;
     assert!(short.contains("new short") && !short.contains("old short"), "{short}");
-    let normal = q(&e, r#"RECALL FROM SEMANTIC ALL WITH HISTORY NAMESPACE "normal""#).await;
+    let normal = q(&e, r#"RECALL FROM SEMANTIC WITH HISTORY NAMESPACE "normal""#).await;
     assert!(normal.contains("new normal") && normal.contains("old normal"), "{normal}");
 }

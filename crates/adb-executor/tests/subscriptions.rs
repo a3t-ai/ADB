@@ -1,10 +1,13 @@
 //! Stage E: subscriptions on one node (E_SUBSCRIPTIONS.md) through the engine:
-//! AQL statements to register, publish and ack; the gateway for deliveries.
+//! AQL statements to register topic subscriptions and publish; the engine's API for
+//! scope (record change) subscriptions, replays and acks (AQL v0.13 leaves them to the
+//! server); the gateway for deliveries.
 
 use std::time::Duration;
 
-use adb_executor::{Engine, LocalEngine};
-use adb_gateway::{Batch, Gateway};
+use adb_core::{Condition, Operator, Value as CoreValue};
+use adb_executor::{Engine, LocalEngine, Writes};
+use adb_gateway::{Batch, Gateway, SubSpec, Target};
 use serde_json::Value;
 
 async fn q(engine: &LocalEngine, aql: &str) -> Value {
@@ -15,6 +18,16 @@ async fn subscribe(engine: &LocalEngine, aql: &str) -> String {
     let r = q(engine, aql).await;
     assert_eq!(r["data"]["type"], "subscription", "{r}");
     r["data"]["subscription"].as_str().unwrap().to_string()
+}
+
+/// A scope subscription (record changes) through the engine's API: `kinds` narrows
+/// the row kinds, `filter` is `field = value` on a change's value, `from` replays
+/// from that offset.
+async fn scope_sub(engine: &LocalEngine, scope: &str, kinds: &[&str], filter: Option<(&str, &str)>, from: Option<u64>) -> String {
+    let kinds = kinds.iter().map(|k| serde_json::from_value(Value::String(k.to_string())).unwrap()).collect();
+    let filter = filter.map(|(f, v)| vec![Condition::Simple { field: f.into(), operator: Operator::Eq, value: CoreValue::String(v.into()), logical_op: None }]);
+    let spec = SubSpec { target: Target::Scope(scope.into()), kinds, filter };
+    engine.io().0.subscribe(spec, from).await.unwrap().0
 }
 
 /// Everything delivered to `sub` from its cursor up to the applied tip.
@@ -65,10 +78,10 @@ async fn two_topic_subscribers_see_the_same_sequence_and_resume_after_a_restart(
         assert_eq!(c.value.as_ref().unwrap()["order_id"], "o-0");
         // Subscriber 1 acks the third message.
         acked = published[2];
-        let r = q(&engine, &format!(r#"ACK "{s1}" OFFSET {acked}"#)).await;
-        assert_eq!(r["data"]["cursor"], acked);
+        let cursor = engine.io().0.ack(&s1, acked).await.unwrap();
+        assert_eq!(cursor, acked);
         // Topic messages are not memory records.
-        let ep = q(&engine, "RECALL FROM EPISODIC ALL").await;
+        let ep = q(&engine, "RECALL FROM EPISODIC").await;
         assert_eq!(ep["data"]["count"], 0, "{ep}");
         let stats = engine.stats().await.unwrap();
         assert_eq!(stats["episodic"], 0, "{stats}");
@@ -97,8 +110,8 @@ async fn scope_subscription_sees_record_changes_with_filters() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let gw = engine.gateway().unwrap();
-    let all = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default""#).await;
-    let facts = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default" KINDS entity WHERE concept = "acme""#).await;
+    let all = scope_sub(&engine, "tenant:default", &[], None, None).await;
+    let facts = scope_sub(&engine, "tenant:default", &["entity"], Some(("concept", "acme")), None).await;
     let paid = subscribe(&engine, r#"SUBSCRIBE TOPIC "orders" WHERE status = "paid""#).await;
     for aql in [
         r#"STORE INTO SEMANTIC (key = "acme", concept = "acme", content = "renews 1 Nov")"#,
@@ -106,7 +119,7 @@ async fn scope_subscription_sees_record_changes_with_filters() {
         r#"STORE INTO EPISODIC (key = "e1", bid_id = "e1", won = false)"#,
         r#"UPDATE INTO EPISODIC WHERE bid_id = "e1" (won = true)"#,
         r#"UPDATE INTO SEMANTIC WHERE concept = "acme" (content = "renews 15 Nov")"#,
-        r#"LINK FROM SEMANTIC WHERE concept = "acme" TO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
+        r#"LINK FROM SEMANTIC WHERE concept = "acme" INTO EPISODIC WHERE bid_id = "e1" TYPE "evidence" WEIGHT 0.8"#,
         r#"FORGET FROM EPISODIC WHERE bid_id = "e1""#,
         r#"PUBLISH TOPIC "orders" (status = "paid", n = 1)"#,
         r#"PUBLISH TOPIC "orders" (status = "open", n = 2)"#,
@@ -125,14 +138,14 @@ async fn scope_subscription_sees_record_changes_with_filters() {
     );
     assert_eq!(a.deliveries[2].changes[0].version, Some(2));
     let f = drain(&gw, &facts, None).await;
-    assert_eq!(ops(&f), ["put:acme", "supersede:acme"], "KINDS entity WHERE concept = acme");
+    assert_eq!(ops(&f), ["put:acme", "supersede:acme"], "kinds entity, concept = acme");
     let p = drain(&gw, &paid, None).await;
     assert_eq!(p.deliveries.len(), 1, "WHERE status = paid on the topic");
     assert_eq!(p.deliveries[0].changes[0].value.as_ref().unwrap()["n"], 1);
 
-    // FROM OFFSET replays from that offset; UNSUBSCRIBE ends the subscription.
+    // A replay from an offset (the API's `from`); UNSUBSCRIBE ends the subscription.
     let from = a.deliveries[2].offset;
-    let replay = subscribe(&engine, &format!(r#"SUBSCRIBE SCOPE "tenant:default" FROM OFFSET {from}"#)).await;
+    let replay = scope_sub(&engine, "tenant:default", &[], None, Some(from)).await;
     assert_eq!(offsets(&drain(&gw, &replay, None).await), offsets(&a)[2..].to_vec());
     let r = q(&engine, &format!(r#"UNSUBSCRIBE "{replay}""#)).await;
     assert_eq!(r["data"]["unsubscribed"], true);
@@ -158,7 +171,7 @@ async fn ttl_expiry_is_committed_and_delivered() {
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
         let gw = engine.gateway().unwrap();
-        all = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default""#).await;
+        all = scope_sub(&engine, "tenant:default", &[], None, None).await;
         q(&engine, r#"STORE INTO WORKING (key = "w1", step = 1) TTL 1s"#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "s1", content = "short-lived") TTL 1s"#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "keep", content = "stays")"#).await;
@@ -180,7 +193,7 @@ async fn ttl_expiry_is_committed_and_delivered() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let after = ops(&drain(&gw, &all, None).await);
     assert_eq!(after.iter().filter(|o| *o == "expire:s1").count(), 1, "one expiry, not repeated after a restart: {after:?}");
-    let r = q(&engine, "RECALL FROM SEMANTIC ALL").await.to_string();
+    let r = q(&engine, "RECALL FROM SEMANTIC").await.to_string();
     assert!(r.contains("stays") && r.contains("back") && !r.contains("short-lived"), "{r}");
 }
 
@@ -194,7 +207,7 @@ async fn ttl_timers_survive_a_restart_and_skip_forgotten_records() {
     let all;
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-        all = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default""#).await;
+        all = scope_sub(&engine, "tenant:default", &[], None, None).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "later", content = "expires after the restart") TTL 2s"#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "gone", content = "forgotten first") TTL 2s"#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "updated", content = "v1") TTL 2s"#).await;
@@ -218,7 +231,7 @@ async fn ttl_timers_survive_a_restart_and_skip_forgotten_records() {
 
 /// Named scopes (AQL v0.6 `IN SCOPE`, E-L6): STORE writes the row's scope; RECALL /
 /// LOOKUP / UPDATE / FORGET with IN SCOPE see only that scope (without it, every
-/// scope); SUBSCRIBE SCOPE narrows to it; the scope survives a restart. IN SCOPE is
+/// scope); a scope subscription narrows to it; the scope survives a restart. IN SCOPE is
 /// refused, not ignored, where it can't be honoured.
 #[tokio::test]
 async fn named_scopes_partition_reads_writes_and_subscriptions() {
@@ -232,17 +245,17 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
         let gw = engine.gateway().unwrap();
-        sales_sub = subscribe(&engine, r#"SUBSCRIBE SCOPE "team:sales""#).await;
+        sales_sub = scope_sub(&engine, "team:sales", &[], None, None).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "a", topic = "billing") IN SCOPE "team:billing""#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "b", topic = "sales") IN SCOPE "team:sales""#).await;
         q(&engine, r#"STORE INTO SEMANTIC (key = "c", topic = "none")"#).await;
         q(&engine, r#"STORE INTO EPISODIC (key = "e", topic = "sales") IN SCOPE "team:sales""#).await;
 
         // A named scope's record ids carry it (E-L12).
-        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:billing" ALL"#).await), ["team:billing~a"]);
-        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC ALL"#).await), ["c", "team:billing~a", "team:sales~b"], "no IN SCOPE: every scope");
-        assert_eq!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:sales" KEY id = "b""#).await), ["team:sales~b"]);
-        assert!(keys(&q(&engine, r#"LOOKUP FROM SEMANTIC IN SCOPE "team:billing" KEY id = "b""#).await).is_empty());
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:billing""#).await), ["team:billing~a"]);
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC"#).await), ["c", "team:billing~a", "team:sales~b"], "no IN SCOPE: every scope");
+        assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales" WHERE id = "b""#).await), ["team:sales~b"]);
+        assert!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:billing" WHERE id = "b""#).await).is_empty());
 
         // UPDATE / FORGET only touch their scope.
         let u = q(&engine, r#"UPDATE INTO SEMANTIC WHERE topic = "sales" (seen = true) IN SCOPE "team:billing""#).await;
@@ -254,28 +267,28 @@ async fn named_scopes_partition_reads_writes_and_subscriptions() {
 
         // The scope subscription sees only its scope's records.
         let ids: Vec<String> = drain(&gw, &sales_sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| format!("{}:{}", c.op, c.id))).collect();
-        assert_eq!(ids, ["put:team:sales~b", "put:team:sales~e"], "SUBSCRIBE SCOPE team:sales");
+        assert_eq!(ids, ["put:team:sales~b", "put:team:sales~e"], "scope subscription team:sales");
 
         // Refused, not ignored.
         for bad in [
             r#"STORE INTO WORKING (step = 1) IN SCOPE "team:sales""#,
-            r#"RECALL FROM WORKING IN SCOPE "team:sales" ALL"#,
-            r#"RECALL FROM SEMANTIC IN SCOPE "team sales" ALL"#,
+            r#"RECALL FROM WORKING IN SCOPE "team:sales""#,
+            r#"RECALL FROM SEMANTIC IN SCOPE "team sales""#,
         ] {
             assert!(engine.query(bad, None).await.is_err(), "{bad} should be refused");
         }
     }
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales" ALL"#).await), ["team:sales~b"], "scope survives a restart");
-    assert_eq!(keys(&q(&engine, r#"RECALL FROM EPISODIC IN SCOPE "team:sales" ALL"#).await), ["team:sales~e"]);
+    assert_eq!(keys(&q(&engine, r#"RECALL FROM SEMANTIC IN SCOPE "team:sales""#).await), ["team:sales~b"], "scope survives a restart");
+    assert_eq!(keys(&q(&engine, r#"RECALL FROM EPISODIC IN SCOPE "team:sales""#).await), ["team:sales~e"]);
 
     let mem = LocalEngine::temporary().await.unwrap();
     q(&mem, r#"STORE INTO SEMANTIC (key = "t", k = 1) IN SCOPE "team:x""#).await;
-    assert_eq!(keys(&q(&mem, r#"RECALL FROM SEMANTIC IN SCOPE "team:x" ALL"#).await), ["team:x~t"], "a temporary engine has named scopes");
+    assert_eq!(keys(&q(&mem, r#"RECALL FROM SEMANTIC IN SCOPE "team:x""#).await), ["team:x~t"], "a temporary engine has named scopes");
 }
 
-/// AQL v0.7: UPDATE LINK makes a new version of the edge, UNLINK tombstones it;
-/// a repeated LINK of the same type updates the weight. All of it survives a
+/// AQL v0.13: a repeated LINK of the same type updates the weight (a new version of
+/// the edge), UNLINK tombstones it, and a retype is UNLINK + LINK. All of it survives a
 /// restart and reaches a scope subscriber; the records at either end stay. The
 /// in-memory engine gives the same answers.
 #[tokio::test]
@@ -289,20 +302,22 @@ async fn link_update_and_unlink() {
         for aql in [
             r#"STORE INTO SEMANTIC (key = "a", concept = "a")"#,
             r#"STORE INTO EPISODIC (key = "e", concept = "e")"#,
-            r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "evidence" WEIGHT 0.5"#,
-            r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "evidence" WEIGHT 0.6"#,
-            r#"LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "mentions" WEIGHT 0.2"#,
-            r#"UPDATE LINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "evidence" (type = "proof", weight = 0.9)"#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e" TYPE "evidence" WEIGHT 0.5"#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e" TYPE "evidence" WEIGHT 0.6"#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e" TYPE "mentions" WEIGHT 0.2"#,
+            // Retyping a link (was UPDATE LINK … (type = …)): UNLINK + LINK.
+            r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e" TYPE "evidence""#,
+            r#"LINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e" TYPE "proof" WEIGHT 0.9"#,
         ] {
             q(engine, aql).await;
         }
     }
-    let with_links = r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL"#;
+    let with_links = r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS"#;
     let dir = tempfile::tempdir().unwrap();
     let sub;
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-        sub = subscribe(&engine, r#"SUBSCRIBE SCOPE "tenant:default" KINDS edge"#).await;
+        sub = scope_sub(&engine, "tenant:default", &["edge"], None, None).await;
         script(&engine).await;
         let mut l = links(&q(&engine, with_links).await);
         l.sort_by(|a, b| a.0.cmp(&b.0));
@@ -312,20 +327,20 @@ async fn link_update_and_unlink() {
     let mut l = links(&q(&engine, with_links).await);
     l.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(l, [("mentions".to_string(), 0.2), ("proof".to_string(), 0.9)], "after a restart");
-    let r = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e" TYPE "mentions""#).await;
+    let r = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e" TYPE "mentions""#).await;
     assert_eq!(r["data"]["count"], 1, "{r}");
-    let r = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e""#).await;
+    let r = q(&engine, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e""#).await;
     assert_eq!(r["data"]["count"], 1, "{r}");
     assert!(links(&q(&engine, with_links).await).is_empty());
     assert_eq!(q(&engine, r#"RECALL FROM EPISODIC WHERE key = "e""#).await["data"]["count"], 1, "the records stay");
     let gw = engine.gateway().unwrap();
     let ops: Vec<String> = drain(&gw, &sub, None).await.deliveries.iter().flat_map(|d| d.changes.iter().map(|c| c.op.clone())).collect();
-    assert_eq!(ops, ["link", "supersede", "link", "supersede", "unlink", "unlink"], "LINK, re-LINK, LINK, UPDATE LINK, UNLINK ×2");
+    assert_eq!(ops, ["link", "supersede", "link", "unlink", "link", "unlink", "unlink"], "LINK, re-LINK, LINK, retype (UNLINK + LINK), UNLINK ×2");
 
     let mem = LocalEngine::temporary().await.unwrap();
     script(&mem).await;
     let mut l = links(&q(&mem, with_links).await);
     l.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(l, [("mentions".to_string(), 0.2), ("proof".to_string(), 0.9)], "in-memory engine");
-    assert_eq!(q(&mem, r#"UNLINK FROM SEMANTIC WHERE key = "a" TO EPISODIC WHERE key = "e""#).await["data"]["count"], 2);
+    assert_eq!(q(&mem, r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO EPISODIC WHERE key = "e""#).await["data"]["count"], 2);
 }

@@ -18,7 +18,7 @@ async fn q(engine: &LocalEngine, aql: &str) -> serde_json::Value {
 }
 
 async fn lookup(engine: &LocalEngine, key: &str) -> Vec<serde_json::Value> {
-    let r = q(engine, &format!(r#"LOOKUP FROM SEMANTIC KEY id = "{key}""#)).await;
+    let r = q(engine, &format!(r#"RECALL FROM SEMANTIC WHERE id = "{key}""#)).await;
     r["data"]["records"].as_array().cloned().unwrap_or_default()
 }
 

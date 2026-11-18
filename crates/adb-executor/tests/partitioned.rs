@@ -44,24 +44,24 @@ async fn workload(e: &dyn Engine) {
     }
     // No namespace.
     q(r#"STORE INTO SEMANTIC (key = "plain", topic = "t0", n = 99, owner = "none")"#.to_string()).await;
-    // A link inside one namespace, and one across namespaces (bot → demo).
-    q(r#"LINK FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" TO SEMANTIC WHERE key = "a3t-shared--bot-k1" TYPE "next""#.to_string()).await;
-    q(r#"LINK FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" TO SEMANTIC WHERE key = "demo--y-k0" TYPE "about""#.to_string()).await;
+    // A link inside one namespace. (AQL v0.13: a link's two ends are in the
+    // statement's namespace; the v0.12 link across namespaces, bot → demo, is gone.)
+    q(r#"LINK FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" INTO SEMANTIC WHERE key = "a3t-shared--bot-k1" TYPE "next" NAMESPACE "a3t-shared--bot""#.to_string()).await;
     // Updates and a FORGET spanning namespaces.
     q(r#"UPDATE INTO SEMANTIC WHERE topic = "t1" (flag = "odd")"#.to_string()).await;
     q(r#"FORGET FROM SEMANTIC WHERE n = 5"#.to_string()).await;
 }
 
 const READS: &[&str] = &[
-    r#"RECALL FROM SEMANTIC ALL ORDER BY n DESC"#,
-    r#"RECALL FROM SEMANTIC ALL ORDER BY n ASC LIMIT 4"#,
+    r#"RECALL FROM SEMANTIC ORDER BY n DESC"#,
+    r#"RECALL FROM SEMANTIC ORDER BY n ASC LIMIT 4"#,
     r#"RECALL FROM SEMANTIC WHERE topic = "t1" ORDER BY n ASC"#,
-    r#"RECALL FROM SEMANTIC ALL AGGREGATE COUNT(*) AS c, SUM(n) AS s, MAX(n) AS m"#,
-    r#"RECALL FROM SEMANTIC ALL GROUP BY topic AGGREGATE COUNT(*) AS c ORDER BY topic ASC"#,
+    r#"RECALL FROM SEMANTIC AGGREGATE COUNT(*) AS c, SUM(n) AS s, MAX(n) AS m"#,
+    r#"RECALL FROM SEMANTIC GROUP BY topic AGGREGATE COUNT(*) AS c ORDER BY topic ASC"#,
     r#"RECALL FROM EPISODIC WHERE campaign = "summer" ORDER BY n ASC"#,
     r#"RECALL FROM SEMANTIC WHERE owner = "a3t-shared--bot" ORDER BY n ASC NAMESPACE "a3t-shared--bot""#,
-    r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" FOLLOW LINKS ALL DEPTH 1"#,
-    r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" WITH LINKS ALL"#,
+    r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" FOLLOW LINKS DEPTH 1 NAMESPACE "a3t-shared--bot""#,
+    r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" WITH LINKS NAMESPACE "a3t-shared--bot""#,
 ];
 
 #[tokio::test(flavor = "multi_thread")]
@@ -93,21 +93,21 @@ async fn partitions_answer_as_one_engine_and_scopes_hold() {
 
     // Scoped to a3t-shared--*.
     let scope = Reach::Only(vec!["a3t-shared--*".into()]);
-    let mine = node.query_in(r#"RECALL FROM SEMANTIC ALL ORDER BY n ASC"#, None, &scope).await.unwrap();
+    let mine = node.query_in(r#"RECALL FROM SEMANTIC ORDER BY n ASC"#, None, &scope).await.unwrap();
     let owners: std::collections::BTreeSet<String> = stable(&mine).as_array().unwrap().iter().map(|r| r["owner"].as_str().unwrap().to_string()).collect();
     assert_eq!(owners, ["a3t-shared--bot", "a3t-shared--ops"].into_iter().map(String::from).collect(), "only its namespaces");
-    let refused = node.query_in(r#"RECALL FROM SEMANTIC ALL NAMESPACE "demo--y""#, None, &scope).await.unwrap_err();
+    let refused = node.query_in(r#"RECALL FROM SEMANTIC NAMESPACE "demo--y""#, None, &scope).await.unwrap_err();
     assert!(refused.contains("forbidden"), "{refused}");
     let refused = node.query_in(r#"STORE INTO SEMANTIC (key = "x") NAMESPACE "demo--y""#, None, &scope).await.unwrap_err();
     assert!(refused.contains("forbidden"), "{refused}");
     let refused = node.query_in(r#"STORE INTO SEMANTIC (key = "x")"#, None, &scope).await.unwrap_err();
     assert!(refused.contains("forbidden"), "no namespace is outside a3t-shared--*: {refused}");
     // The link into demo--y is not followed for this scope; the one inside is.
-    let followed = node.query_in(r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" FOLLOW LINKS ALL DEPTH 1"#, None, &scope).await.unwrap();
+    let followed = node.query_in(r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" FOLLOW LINKS DEPTH 1 NAMESPACE "a3t-shared--bot""#, None, &scope).await.unwrap();
     let text = followed.to_string();
     assert!(text.contains("a3t-shared--bot-k1"), "{followed}");
     assert!(!text.contains("demo--y"), "nothing of demo--y: {followed}");
-    let listed = node.query_in(r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" WITH LINKS ALL"#, None, &scope).await.unwrap();
+    let listed = node.query_in(r#"RECALL FROM SEMANTIC WHERE key = "a3t-shared--bot-k0" WITH LINKS NAMESPACE "a3t-shared--bot""#, None, &scope).await.unwrap();
     assert!(listed.to_string().contains("a3t-shared--bot-k1") && !listed.to_string().contains("demo--y"), "no link to demo--y listed: {listed}");
     // A FORGET without NAMESPACE stays in scope.
     let n = node.query_in(r#"FORGET FROM SEMANTIC WHERE topic = "t0""#, None, &scope).await.unwrap();
@@ -142,18 +142,18 @@ async fn a_shared_partition_never_leaks_across_the_scope() {
 
     let scope = Reach::Only(vec!["a3t-shared--*".into()]);
     // Linking to the out-of-scope record finds no target.
-    let e = node.query_in(r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "secret" TYPE "x""#, None, &scope).await;
+    let e = node.query_in(r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "secret" TYPE "x""#, None, &scope).await;
     assert!(e.is_err() || e.as_ref().unwrap().to_string().contains("\"count\":0"), "no link into {other}: {e:?}");
-    let all = node.query(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL"#, None).await.unwrap();
+    let all = node.query(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS NAMESPACE "a3t-shared--bot""#, None).await.unwrap();
     assert!(!all.to_string().contains("secret"), "nothing linked: {all}");
     // A link inside the scope, across two namespaces of one partition: once.
-    node.query_in(r#"LINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "x""#, None, &scope).await.unwrap();
-    let listed = node.query_in(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS ALL"#, None, &scope).await.unwrap();
+    node.query_in(r#"LINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" TYPE "x""#, None, &scope).await.unwrap();
+    let listed = node.query_in(r#"RECALL FROM SEMANTIC WHERE key = "a" WITH LINKS NAMESPACE "a3t-shared--bot""#, None, &scope).await.unwrap();
     assert_eq!(listed["data"]["records"][0]["data"]["links"].as_array().map(|l| l.len()), Some(1), "one link, not one per namespace: {listed}");
-    let gone = node.query_in(r#"UNLINK FROM SEMANTIC WHERE key = "a" TO SEMANTIC WHERE key = "b" TYPE "x""#, None, &scope).await.unwrap();
+    let gone = node.query_in(r#"UNLINK FROM SEMANTIC WHERE key = "a" INTO SEMANTIC WHERE key = "b" TYPE "x""#, None, &scope).await.unwrap();
     assert_eq!(gone["data"]["count"], 1, "counted once: {gone}");
     // Reads by id don't return the other namespace's record either.
-    let mine = node.query_in(r#"RECALL FROM SEMANTIC ALL"#, None, &scope).await.unwrap();
+    let mine = node.query_in(r#"RECALL FROM SEMANTIC"#, None, &scope).await.unwrap();
     assert!(!mine.to_string().contains("secret"), "{mine}");
 }
 
@@ -208,7 +208,7 @@ async fn memory_layers_reach_across_partitions() {
     node.layers_set(dst, vec![layer(LayerMode::Pin)]).await.unwrap();
 
     assert_eq!(fact(dst).await, ["desk 4", "limit 1M"], "pinned at v1, read from the other partition");
-    let procs = q(format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{dst}""#)).await.unwrap();
+    let procs = q(format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{dst}""#)).await.unwrap();
     assert_eq!(procs.pointer("/data/count").and_then(|c| c.as_u64()), Some(1), "the inherited procedure: {procs}");
     assert!(q(format!(r#"STORE INTO SEMANTIC (key = "rule:max-trade", fact = "limit 9M") NAMESPACE "{dst}""#)).await.is_err(), "sealed: can't shadow");
     let refused = node.tag_drop(src, "v1").await.unwrap_err();
@@ -227,7 +227,7 @@ async fn memory_layers_reach_across_partitions() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
     assert_eq!(node.layers_get(dst).await.unwrap().len(), 1, "layers survive a restart");
-    let procs = node.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{dst}""#), None).await.unwrap();
+    let procs = node.query(&format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{dst}""#), None).await.unwrap();
     assert_eq!(procs.pointer("/data/count").and_then(|c| c.as_u64()), Some(1), "and are read again: {procs}");
 }
 
@@ -256,7 +256,7 @@ async fn copies_cross_partitions() {
         let node = std::sync::Arc::clone(&node);
         async move {
             let b = branch.map(|b| format!(r#" BRANCH "{b}""#)).unwrap_or_default();
-            values(&node.query(&format!(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "{ns}"{b} LIMIT 100"#), None).await.unwrap(), "steps")
+            values(&node.query(&format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{ns}"{b} LIMIT 100"#), None).await.unwrap(), "steps")
         }
     };
     for k in ["p1", "p2"] {
@@ -271,7 +271,7 @@ async fn copies_cross_partitions() {
     let c = node.space_clone("bot", clone).await.unwrap();
     assert_eq!(c["records"], 3, "{c}");
     assert_eq!(steps(clone, None).await, ["p1-v2", "p2-v1"]);
-    let eps = q(format!(r#"RECALL FROM EPISODIC ALL NAMESPACE "{clone}""#)).await;
+    let eps = q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{clone}""#)).await;
     assert_eq!(eps["data"]["count"], 0);
     // Clone at the tag: the older procedure.
     let c = node.space_clone_at("bot", at, &PointRef { tag: Some("v1".into()), ..Default::default() }).await.unwrap();
@@ -279,7 +279,60 @@ async fn copies_cross_partitions() {
     // Procedures only.
     let c = node.space_copy_procedures("bot", procs, false).await.unwrap();
     assert_eq!(c["records"], 2, "{c}");
-    let sem = q(format!(r#"RECALL FROM SEMANTIC ALL NAMESPACE "{procs}""#)).await;
+    let sem = q(format!(r#"RECALL FROM SEMANTIC NAMESPACE "{procs}""#)).await;
+    assert_eq!(sem["data"]["count"], 0, "no facts travel");
+}
+
+/// Copies between namespaces in different partitions: clone (now and at a tag),
+/// procedures only, and promoting a branch — read out of the source's partition,
+/// materialised in the target's, with the promoted agent's history layer reading
+/// the old agent's episodes from the old partition.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "AQL v0.13: the BRANCH modifier is being replaced by branch namespaces (see .ai/BRANCH_NAMESPACES.md)"]
+async fn copies_cross_partitions_with_branch() {
+    use adb_executor::branches::PointRef;
+    std::env::set_var("ADB_S3", "off");
+    // Correctness, not the catalog lag: every statement sees the current catalog.
+    std::env::set_var("ADB_CATALOG_TTL_MS", "0");
+    let dir = tempfile::tempdir().unwrap();
+    let node = PartitionedEngine::open(dir.path(), map64()).await.unwrap();
+    let elsewhere = |prefix: &str| -> &'static str {
+        let n = (0..1000).map(|i| format!("{prefix}{i}")).find(|n| node.partition_of(n) != node.partition_of("bot")).unwrap();
+        Box::leak(n.into_boxed_str())
+    };
+    let (v2, clone, at, procs) = (elsewhere("bot-v2-"), elsewhere("bot-clone-"), elsewhere("bot-at-"), elsewhere("bot-procs-"));
+    let q = |aql: String| {
+        let node = std::sync::Arc::clone(&node);
+        async move { node.query(&aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}")) }
+    };
+    let steps = |ns: &'static str, branch: Option<&'static str>| {
+        let node = std::sync::Arc::clone(&node);
+        async move {
+            let b = branch.map(|b| format!(r#" BRANCH "{b}""#)).unwrap_or_default();
+            values(&node.query(&format!(r#"RECALL FROM PROCEDURAL NAMESPACE "{ns}"{b} LIMIT 100"#), None).await.unwrap(), "steps")
+        }
+    };
+    for k in ["p1", "p2"] {
+        q(format!(r#"STORE INTO PROCEDURAL (key = "{k}", steps = "{k}-v1") NAMESPACE "bot""#)).await;
+    }
+    q(r#"STORE INTO SEMANTIC (key = "fact1", fact = "likes tea") NAMESPACE "bot""#.into()).await;
+    q(r#"STORE INTO EPISODIC (event = "said hello") NAMESPACE "bot""#.into()).await;
+    node.tag_create("bot", "v1", None).await.unwrap();
+    q(r#"UPDATE INTO PROCEDURAL WHERE key = "p1" (steps = "p1-v2") NAMESPACE "bot""#.into()).await;
+
+    // Clone now: SEMANTIC, PROCEDURAL, TOOLS — no episodes.
+    let c = node.space_clone("bot", clone).await.unwrap();
+    assert_eq!(c["records"], 3, "{c}");
+    assert_eq!(steps(clone, None).await, ["p1-v2", "p2-v1"]);
+    let eps = q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{clone}""#)).await;
+    assert_eq!(eps["data"]["count"], 0);
+    // Clone at the tag: the older procedure.
+    let c = node.space_clone_at("bot", at, &PointRef { tag: Some("v1".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(steps(at, None).await, ["p1-v1", "p2-v1"], "{c}");
+    // Procedures only.
+    let c = node.space_copy_procedures("bot", procs, false).await.unwrap();
+    assert_eq!(c["records"], 2, "{c}");
+    let sem = q(format!(r#"RECALL FROM SEMANTIC NAMESPACE "{procs}""#)).await;
     assert_eq!(sem["data"]["count"], 0, "no facts travel");
 
     // Promote a branch into another partition.
@@ -292,7 +345,7 @@ async fn copies_cross_partitions() {
     assert_eq!(steps("bot", None).await, ["p1-v2", "p2-v1"], "the old agent is untouched");
     q(r#"STORE INTO EPISODIC (event = "old agent later") NAMESPACE "bot""#.into()).await;
     q(format!(r#"STORE INTO EPISODIC (event = "new agent said hi") NAMESPACE "{v2}""#)).await;
-    let eps = values(&q(format!(r#"RECALL FROM EPISODIC ALL NAMESPACE "{v2}" LIMIT 100"#)).await, "event");
+    let eps = values(&q(format!(r#"RECALL FROM EPISODIC NAMESPACE "{v2}" LIMIT 100"#)).await, "event");
     assert_eq!(eps, ["new agent said hi", "promoted_from", "said hello"], "own, origin, and the old agent's (from its partition) as of the promote");
     // Behind main: refused unless allow_stale, as on one engine.
     node.branch_create("bot", "behind", None, None).await.unwrap();
