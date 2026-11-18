@@ -565,17 +565,20 @@ fn sub_idle() -> Duration {
 }
 
 /// Memory types whose STORE doesn't wait for its vector (`ADB_EMBED_DEFER`: a comma
-/// list of memory types, default `episodic`; `none` waits for every vector). The record
-/// is committed and answered at once; its vector follows within moments
+/// list of memory types, e.g. `episodic`; default none — every STORE waits for its
+/// vector). A deferred record is committed and answered at once; its vector follows
 /// ([`DurableWrites::embed_deferred`]). A LIKE read in between doesn't rank it by
-/// meaning yet; key, time and field reads see it at once. Episodes are recalled on
-/// later turns, so they needn't make the writer wait for the model: waiting capped
-/// STORE EPISODIC at the embedding pool's pace (1.3–2.2k/s on 3 nodes against 16k/s
-/// for WORKING, Hetzner p14).
+/// meaning yet; key, time and field reads see it at once.
+///
+/// Off by default (user, 18 Nov): STORE EPISODIC then ran 7× faster (16k/s against
+/// 2.2k/s on 3 nodes, Hetzner p15), but each episode is written twice (the record,
+/// then its vector) and the catch-up after a burst took the nodes' CPU from reads
+/// (−46 to −66% until the vectors were in). On by deployment once the catch-up is
+/// paced.
 pub fn defer_embedding(memory: MemoryType) -> bool {
     static SET: std::sync::OnceLock<Vec<MemoryType>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
-        let v = std::env::var("ADB_EMBED_DEFER").unwrap_or_else(|_| "episodic".into());
+        let v = std::env::var("ADB_EMBED_DEFER").unwrap_or_default();
         v.split(',')
             .filter_map(|m| match m.trim().to_ascii_lowercase().as_str() {
                 "episodic" => Some(MemoryType::Episodic),

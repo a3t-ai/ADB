@@ -105,31 +105,3 @@ async fn like_without_a_value_or_on_working_is_an_error() {
     let vars: HashMap<String, Value> = [("q".to_string(), json!("x"))].into();
     assert!(engine.query("RECALL FROM WORKING LIKE $q", Some(&vars)).await.is_err());
 }
-
-/// STORE EPISODIC doesn't wait for its vector (`ADB_EMBED_DEFER`, default `episodic`):
-/// the vectors follow from the deferred embedder, and LIKE then ranks the episodes by
-/// meaning as it ranks facts.
-#[tokio::test]
-async fn episodes_get_their_vectors_after_the_store() {
-    if !have_model() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    for (k, c) in FACTS {
-        q(&engine, &format!(r#"STORE INTO EPISODIC (key = "{k}", content = "{c}") NAMESPACE "crm""#)).await;
-    }
-    let w = engine.durable_writes().expect("durable");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        if w.embeds_queued() == 0 && w.pending_embeddings().await.unwrap() == 0 {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "the deferred vectors never arrived");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    for (question, want) in [("When is the Acme deal up for renewal?", "acme-renewal"), ("service crashes with OOM", "payments-oom"), ("my VPN connection is broken", "vpn-reset")] {
-        let r = like(&engine, r#"RECALL FROM EPISODIC LIKE $q NAMESPACE "crm" LIMIT 3"#, question).await;
-        assert_eq!(keys(&r).first().map(String::as_str), Some(want), "{question}: {:?}", keys(&r));
-    }
-}
