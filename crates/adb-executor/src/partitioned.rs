@@ -739,8 +739,29 @@ impl PartitionedEngine {
     }
 
     /// Open partition `p` (taking it over first when this node holds an older epoch):
-    /// called once per partition, through its slot.
+    /// called once per partition, through its slot. Every request for `p` waits on this
+    /// open, so one that takes long says so (every 10 s, with the step it is in) instead
+    /// of leaving them waiting in silence.
     async fn open_part(&self, p: Partition) -> Result<Arc<LocalEngine>, String> {
+        let step: Arc<std::sync::Mutex<&'static str>> = Arc::new(std::sync::Mutex::new("start"));
+        let watchdog = {
+            let step = Arc::clone(&step);
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let at = *step.lock().unwrap();
+                    tracing::warn!(partition = p, step = at, waited_s = t0.elapsed().as_secs(), "partition open slow: every request for it waits");
+                }
+            })
+        };
+        let r = self.open_part_steps(p, &step).await;
+        watchdog.abort();
+        r
+    }
+
+    async fn open_part_steps(&self, p: Partition, step: &std::sync::Mutex<&'static str>) -> Result<Arc<LocalEngine>, String> {
+        let at = |s: &'static str| *step.lock().unwrap() = s;
         let sys = self.sys();
         let pdir = self.dir.join("parts").join(format!("p{p}"));
         // Step 7: owned at an epoch this directory doesn't hold — taken over from another
@@ -750,6 +771,7 @@ impl PartitionedEngine {
         if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
             let held = std::fs::read_to_string(pdir.join("owner.epoch")).ok().and_then(|s| s.trim().parse::<u64>().ok());
             if held != Some(epoch) {
+                at("take over");
                 Box::pin(self.take_over(p, epoch, &pdir)).await?;
             }
         }
@@ -757,6 +779,7 @@ impl PartitionedEngine {
         if p != sys {
             // Cluster-wide settings (one embedding model, one set of cache rules): the
             // system partition's, copied before a partition opens.
+            at("system settings");
             let settings: Value = match self.system_local() {
                 Some(s) => dispatch_op(&s, "settings", json!({})).await?,
                 // Boxed: opening a partition may reach the system partition's handle.
@@ -770,6 +793,7 @@ impl PartitionedEngine {
             }
         }
         let role = if p == sys { PartitionRole::system(p) } else { PartitionRole::memory(p) };
+        at("open engine");
         let (e, _) = match (&self.cluster, crate::replication::replicas()) {
             // A cluster owner: every record also on the partition's replica (step 5).
             (Some(_), n) if n > 0 => {
@@ -784,6 +808,7 @@ impl PartitionedEngine {
         // A cluster owner records its epoch on object storage before taking writes, then
         // here (a restart at the same epoch opens what it has).
         if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
+            at("begin epoch (object storage)");
             e.begin_epoch(epoch).await?;
             std::fs::write(pdir.join("owner.epoch"), epoch.to_string()).map_err(|e| format!("owner epoch: {e}"))?;
             self.replicas.clear(p);
