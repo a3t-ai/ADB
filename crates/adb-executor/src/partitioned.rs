@@ -1534,7 +1534,10 @@ fn sync_tree(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), String> {
-    let touches = touches(aql);
+    // Parsed once for both questions (it was parsed twice, then again by the
+    // executor: every read through the router paid for three parses).
+    let stmt = aql_parser::parse(aql).ok();
+    let touches = touches_in(stmt.as_ref());
     for (ns, _) in &touches {
         if let Some(ns) = ns {
             if !reach.allows(ns) {
@@ -1543,7 +1546,7 @@ fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), 
         }
     }
     // A namespace's topics (AQL v0.12) are on the system partition, within the scope.
-    if let Some(ns) = topic_namespace(aql) {
+    if let Some(ns) = stmt.as_ref().and_then(topic_namespace_of) {
         if !reach.allows(&ns) {
             return Err(out_of_reach(&ns).to_string());
         }
@@ -1560,23 +1563,23 @@ fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), 
 /// UNLINK, MERGE, SUBSCRIBE, …) count as none named: they run within the call's scope
 /// through the router. A statement that doesn't parse goes to the router's executor,
 /// which reports the parse error.
-fn touches(aql: &str) -> Vec<(Option<String>, bool)> {
+fn touches_in(stmt: Option<&aql_parser::Statement>) -> Vec<(Option<String>, bool)> {
     use aql_parser::Statement as S;
-    let Ok(stmt) = aql_parser::parse(aql) else { return vec![(None, false)] };
+    let Some(stmt) = stmt else { return vec![(None, false)] };
     let of = touches_of;
-    match &stmt {
+    match stmt {
         S::Pipeline(p) => p.stages.iter().map(of).collect(),
         other => vec![of(other)],
     }
 }
 
 /// The NAMESPACE a topic statement names (SUBSCRIBE, PUBLISH, ACK, UNSUBSCRIBE).
-fn topic_namespace(aql: &str) -> Option<String> {
+fn topic_namespace_of(stmt: &aql_parser::Statement) -> Option<String> {
     use aql_parser::Statement as S;
-    match aql_parser::parse(aql).ok()? {
-        S::Subscribe(x) => x.namespace,
-        S::Publish(x) => x.modifiers.namespace,
-        S::Unsubscribe(x) => x.namespace,
+    match stmt {
+        S::Subscribe(x) => x.namespace.clone(),
+        S::Publish(x) => x.modifiers.namespace.clone(),
+        S::Unsubscribe(x) => x.namespace.clone(),
         _ => None,
     }
 }
