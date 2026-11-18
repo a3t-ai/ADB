@@ -57,7 +57,7 @@ fn branch_row(ns: &str, name: &str, parent: &str, b: &Base) -> Branch {
         namespace: ns.to_string(),
         name: name.to_string(),
         parent: parent.to_string(),
-        point_offset: 0,
+        point_offset: b.point_offset,
         point_ts: b.point_ts,
         created_by: None,
         placement: None,
@@ -89,7 +89,13 @@ pub async fn list(ops: &dyn NsOps, ns: &str) -> Result<Vec<Branch>, String> {
 pub async fn create(ops: &dyn NsOps, ns: &str, name: &str, parent: Option<&str>) -> Result<Branch, String> {
     crate::branches::check_name(name)?;
     let parent = parent.filter(|p| !p.is_empty()).unwrap_or(MAIN);
-    crate::namespaces::branch(ops, &branch_ns(ns, parent), &branch_ns(ns, name), None, BaseKind::Branch).await?;
+    if ops.base_of(&branch_ns(ns, name)).await?.is_some() || ops.exists(&branch_ns(ns, name)).await? {
+        return Err(format!("namespace {ns:?} already has a branch {name:?}"));
+    }
+    if parent != MAIN && ops.base_of(&branch_ns(ns, parent)).await?.is_none() {
+        return Err(format!("no branch {parent:?} in namespace {ns:?} to branch from"));
+    }
+    crate::namespaces::cut(ops, &branch_ns(ns, parent), &branch_ns(ns, name), None, BaseKind::Branch).await?;
     let b = ops.base_of(&branch_ns(ns, name)).await?.ok_or("the branch has no base")?;
     Ok(branch_row(ns, name, parent, &b))
 }
@@ -237,7 +243,7 @@ pub async fn rebase(ops: &dyn NsOps, ns: &str, name: &str, main_offset: u64, res
     }
     ops.merge_apply(&child, writes).await?;
     let tag = ops.tag_drop(&w.base.from, &w.base.tag).await.and(ops.tag_at(&w.base.from, &w.base.tag, None).await)?;
-    ops.base_set(&child, Some(Base { point_ts: tag.point_ts, ..w.base.clone() })).await?;
+    ops.base_set(&child, Some(Base { point_ts: tag.point_ts, point_offset: tag.point_offset, ..w.base.clone() })).await?;
     Ok(json!({ "point": { "offset": 0, "ts": tag.point_ts }, "kept": kept, "dropped": dropped, "edited": edited }))
 }
 
@@ -282,6 +288,9 @@ pub async fn revert(ops: &dyn NsOps, ns: &str, merge_id: &str, by: Option<&str>,
 
 /// Copy branch `name` of `ns` (as it reads now) into the new namespace `into`.
 pub async fn promote(ops: &dyn NsOps, ns: &str, name: &str, into: &str) -> Result<Value, String> {
+    if into == ns {
+        return Err(format!("promote into a new namespace, not {into:?} itself"));
+    }
     let child = branch_ns(ns, name);
     if ops.base_of(&child).await?.is_none() {
         return Err(format!("branch_not_found: no branch {name:?} in namespace {ns:?}"));

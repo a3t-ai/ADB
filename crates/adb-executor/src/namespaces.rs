@@ -65,8 +65,18 @@ pub async fn branch(ops: &dyn NsOps, from: &str, into: &str, at: Option<CommitTs
     if !adb_store::valid_namespace(into) {
         return Err(format!("namespace {into:?}: can't be empty or contain '|' or '~'"));
     }
+    // AQL names `from` by hand: one with no records is most likely a typo.
     if !ops.exists(from).await? {
         return Err(format!("no namespace {from:?} to branch or fork from"));
+    }
+    cut(ops, from, into, at, kind).await
+}
+
+/// BRANCH / FORK without the check that `from` has records: the branch API's caller
+/// (A3T) knows the namespace is real (an agent's space before its first memory).
+pub async fn cut(ops: &dyn NsOps, from: &str, into: &str, at: Option<CommitTs>, kind: BaseKind) -> Result<Value, String> {
+    if !adb_store::valid_namespace(into) {
+        return Err(format!("namespace {into:?}: can't be empty or contain '|' or '~'"));
     }
     if ops.exists(into).await? {
         return Err(format!("namespace {into:?} exists: BRANCH and FORK make a new one"));
@@ -81,7 +91,7 @@ pub async fn branch(ops: &dyn NsOps, from: &str, into: &str, at: Option<CommitTs
         }
         answer["records"] = json!(ops.materialise(into, rows).await?);
     }
-    let base = Base { id: Base::id_of(into), namespace: into.into(), from: from.into(), kind, tag: tag.name, point_ts: tag.point_ts };
+    let base = Base { id: Base::id_of(into), namespace: into.into(), from: from.into(), kind, tag: tag.name, point_ts: tag.point_ts, point_offset: tag.point_offset };
     ops.base_set(into, Some(base)).await?;
     Ok(answer)
 }
@@ -153,7 +163,7 @@ pub async fn merge(ops: &dyn NsOps, from: &str, into: &str, prefer_source: Optio
     // They have parted now: the child's point moves (its tag on the base too).
     ops.tag_drop(&child.from, &child.tag).await?;
     let tag = ops.tag_at(&child.from, &child.tag, None).await?;
-    ops.base_set(&child.namespace, Some(Base { point_ts: tag.point_ts, ..child.clone() })).await?;
+    ops.base_set(&child.namespace, Some(Base { point_ts: tag.point_ts, point_offset: tag.point_offset, ..child.clone() })).await?;
     Ok(json!({ "from": from, "into": into, "merged": merged, "point": { "ts": tag.point_ts } }))
 }
 
@@ -164,7 +174,7 @@ pub async fn before_drop(ops: &dyn NsOps, namespace: &str) -> Result<(), String>
     let tags = ops.tags(namespace).await?;
     let branches: Vec<&str> = tags.iter().filter_map(|t| t.name.strip_prefix("branch.")).collect();
     if !branches.is_empty() {
-        return Err(format!("namespace {namespace:?} has branches: {} (drop or merge them first)", branches.join(", ")));
+        return Err(format!("namespace {namespace:?} has branches of its own: drop them first (or merge them): {}", branches.join(", ")));
     }
     if let Some(b) = ops.base_of(namespace).await? {
         ops.base_set(namespace, None).await?;

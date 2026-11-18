@@ -89,6 +89,9 @@ pub struct Base {
     pub kind: BaseKind,
     pub tag: String,
     pub point_ts: i64,
+    /// The source's log offset at the point (0 when branched AS OF a time).
+    #[serde(default)]
+    pub point_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

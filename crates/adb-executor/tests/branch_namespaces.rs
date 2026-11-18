@@ -141,7 +141,7 @@ async fn dropping_namespaces_with_branches() {
     q(&e, r#"BRANCH FROM "crm" INTO "crm-try""#).await;
     q(&e, r#"FORK FROM "crm" INTO "crm-copy""#).await;
     let x = err(&e, r#"FORGET FROM ALL NAMESPACE "crm""#).await;
-    assert!(x.contains("has branches") && x.contains("crm-try"), "{x}");
+    assert!(x.contains("has branches of its own") && x.contains("crm-try"), "{x}");
     q(&e, r#"FORGET FROM ALL NAMESPACE "crm-try""#).await;
     assert!(roles(&e, "crm-try").await.is_empty(), "the branch is gone");
     q(&e, r#"FORGET FROM ALL NAMESPACE "crm""#).await;

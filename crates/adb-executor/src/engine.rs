@@ -1582,9 +1582,27 @@ impl Engine for LocalEngine {
     }
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
+        let ops = crate::namespaces::LocalNs(self);
         match namespace {
-            Some(ns) => crate::review::list(&crate::namespaces::LocalNs(self), ns).await,
-            None => Err("branch_list names its namespace".into()),
+            Some(ns) => crate::review::list(&ops, ns).await,
+            // Every namespace here with branches (their sources hold the point tags).
+            None => {
+                let spaces = self.local_spaces().ok_or("memory branches need a durable engine (start ADB with --data-dir)")?;
+                let mut sources: Vec<String> = spaces
+                    .registry
+                    .tags(None)
+                    .into_iter()
+                    .filter(|t| t.name.starts_with("branch.") && !t.namespace.contains('@'))
+                    .map(|t| t.namespace)
+                    .collect();
+                sources.sort();
+                sources.dedup();
+                let mut out = Vec::new();
+                for ns in sources {
+                    out.extend(crate::review::list(&ops, &ns).await?);
+                }
+                Ok(out)
+            }
         }
     }
 
