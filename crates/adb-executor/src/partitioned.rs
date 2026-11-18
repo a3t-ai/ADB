@@ -119,6 +119,8 @@ pub struct PartitionedEngine {
     opening: std::sync::Mutex<BTreeSet<Partition>>,
     /// Takeovers done here (tests, metrics).
     taken_over: std::sync::atomic::AtomicU64,
+    /// Takeovers that started from this node's reader (no full restore).
+    from_reader: std::sync::atomic::AtomicU64,
     takeovers: Arc<tokio::sync::Semaphore>,
     /// Namespace → partition, as recorded in [`CATALOG`] (refreshed before every
     /// statement spanning partitions: other nodes add namespaces too).
@@ -434,6 +436,7 @@ impl PartitionedEngine {
             parts: Default::default(),
             opening: Default::default(),
             taken_over: Default::default(),
+            from_reader: Default::default(),
             takeovers: Arc::new(tokio::sync::Semaphore::new(takeovers())),
             catalog: Default::default(),
             catalog_at: Default::default(),
@@ -521,6 +524,11 @@ impl PartitionedEngine {
     /// How many partition takeovers this node has started (tests, metrics).
     pub fn takeovers_started(&self) -> u64 {
         self.taken_over.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many of them started from this node's reader of the partition (tests, metrics).
+    pub fn takeovers_from_reader(&self) -> u64 {
+        self.from_reader.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether this node has a reader of `p` ready (tests, metrics).
@@ -612,30 +620,83 @@ impl PartitionedEngine {
         if !was_replica {
             tracing::warn!(partition = p, epoch, "taking over a partition this node never replicated: only what object storage holds; acknowledged writes the old owner had not shipped are not here");
         }
-        let mut ends_at = 0;
-        if let Some(cold) = &cold {
-            let st = crate::restore::restore_partition_from_object_storage(pdir, cold, adb_core::log::PartitionId(p), Some(epoch)).await?;
-            ends_at = st.log_ends_at;
-        }
         let role = if p == self.sys() { PartitionRole::system(p) } else { PartitionRole::memory(p) };
-        let mut appended = 0;
-        if !tail.is_empty() && tail_epoch < epoch {
-            let wal = LocalEngine::open_partition_wal(pdir, role).await?;
-            for r in tail {
-                let last = adb_log::Log::last_offset(&*wal).0;
-                if r.offset.0 <= last {
-                    continue;
+        let tail = if tail_epoch < epoch { tail } else { Vec::new() };
+        let pid = adb_core::log::PartitionId(p);
+        // This node's reader of `p` already holds the partition up to what it last
+        // applied (checkpoint + every committed record since): the takeover starts from
+        // it, and object storage gives only the segments above it. A full restore
+        // replays everything since the last checkpoint — with a node's worth of
+        // partitions at once, a minute of waiting for every request (Hetzner p13).
+        let mut from_reader = false;
+        if let Some(cold) = &cold {
+            if self.promote_reader(p, pdir).await {
+                match crate::restore::append_segments_from_object_storage(pdir, cold, pid, Some(epoch)).await {
+                    Ok(_) => from_reader = true,
+                    Err(e) => tracing::warn!(partition = p, error = %e, "the promoted reader doesn't continue into object storage's segments; restoring in full"),
                 }
-                if r.offset.0 != last + 1 {
-                    return Err(format!("taking over partition {p}: object storage ends at {last}, this replica's tail starts at {}: acknowledged writes would be lost", r.offset.0));
-                }
-                adb_log::Log::append(&*wal, r).await.map_err(|e| format!("taking over partition {p}: {e}"))?;
-                appended += 1;
             }
-            ends_at = adb_log::Log::last_offset(&*wal).0;
         }
-        tracing::info!(partition = p, epoch, from_object_storage = cold.is_some(), tail_records = appended, log_ends_at = ends_at, took_ms = t0.elapsed().as_millis() as u64, "partition taken over");
+        let (appended, ends_at) = loop {
+            if !from_reader {
+                if pdir.exists() {
+                    std::fs::remove_dir_all(pdir).map_err(|e| format!("taking over partition {p}: {e}"))?;
+                }
+                if let Some(cold) = &cold {
+                    crate::restore::restore_partition_from_object_storage(pdir, cold, pid, Some(epoch)).await?;
+                }
+            }
+            match append_tail(pdir, role, &tail).await {
+                Ok(done) => break done,
+                Err(gap) if from_reader => {
+                    tracing::warn!(partition = p, error = %gap, "the promoted reader doesn't meet this replica's tail; restoring in full");
+                    from_reader = false;
+                }
+                Err(gap) => return Err(format!("taking over partition {p}: {gap}")),
+            }
+        };
+        if from_reader {
+            self.from_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        tracing::info!(partition = p, epoch, from_reader, from_object_storage = cold.is_some(), tail_records = appended, log_ends_at = ends_at, took_ms = t0.elapsed().as_millis() as u64, "partition taken over");
         Ok(())
+    }
+
+    /// Hand this node's ready reader of `p` to its takeover: its directory becomes the
+    /// partition's (`pdir`), synced to disk (a reader's copy is never synced: it was a
+    /// cache). `false` when there is none, or it can't be handed over cleanly.
+    async fn promote_reader(&self, p: Partition, pdir: &std::path::Path) -> bool {
+        let r = {
+            let mut readers = self.readers.lock().unwrap();
+            match readers.remove(&p) {
+                Some(ReaderSlot::Ready(r)) => r,
+                Some(other) => {
+                    readers.insert(p, other);
+                    return false;
+                }
+                None => return false,
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let base = r.base().to_path_buf();
+        let Some(dir) = r.retire(Duration::from_secs(5)).await else {
+            tracing::warn!(partition = p, "the reader's reads didn't finish; the takeover restores in full");
+            return false;
+        };
+        drop(r);
+        if pdir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(pdir) {
+                tracing::warn!(partition = p, error = %e, "the partition's old directory stays; the takeover restores in full");
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::rename(&dir, pdir).and_then(|_| sync_tree(pdir)) {
+            tracing::warn!(partition = p, error = %e, "the reader's directory couldn't become the partition's; the takeover restores in full");
+            return false;
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        tracing::info!(partition = p, took_ms = t0.elapsed().as_millis() as u64, "reader promoted: the takeover starts from it");
+        true
     }
 
     /// The reader of memory partition `p`, if this node reads it rather than owns it
@@ -653,8 +714,7 @@ impl PartitionedEngine {
         {
             let mut readers = self.readers.lock().unwrap();
             if self.owns(p) {
-                // Owned now (a takeover): its reader is of no more use.
-                readers.remove(&p);
+                // Owned now: its takeover promotes the reader (or drops it once open).
                 return None;
             }
             match readers.get(&p) {
@@ -812,6 +872,12 @@ impl PartitionedEngine {
             e.begin_epoch(epoch).await?;
             std::fs::write(pdir.join("owner.epoch"), epoch.to_string()).map_err(|e| format!("owner epoch: {e}"))?;
             self.replicas.clear(p);
+        }
+        // A reader of `p` the open didn't take (owned without a takeover): no more use.
+        let left = self.readers.lock().unwrap().remove(&p);
+        if left.is_some() {
+            drop(left);
+            let _ = std::fs::remove_dir_all(self.dir.join("parts").join(format!("reader-p{p}")));
         }
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
@@ -1392,6 +1458,47 @@ impl PartitionedEngine {
 
 /// The one namespace every stage of `aql` names (`None`: none, or several), and
 /// whether it writes; a named namespace outside `reach` is refused.
+/// Append a replica's sealed tail to the partition's log in `pdir` (records it already
+/// holds are skipped): (records appended, the log's last offset). A gap — the log ends
+/// before the tail starts — would lose acknowledged writes: an error.
+async fn append_tail(pdir: &std::path::Path, role: PartitionRole, tail: &[adb_core::log::LogRecord]) -> Result<(u64, u64), String> {
+    let wal = LocalEngine::open_partition_wal(pdir, role).await?;
+    let mut appended = 0;
+    for r in tail {
+        let last = adb_log::Log::last_offset(&*wal).0;
+        if r.offset.0 <= last {
+            continue;
+        }
+        if r.offset.0 != last + 1 {
+            return Err(format!("the log ends at {last}, this replica's tail starts at {}: acknowledged writes would be lost", r.offset.0));
+        }
+        adb_log::Log::append(&*wal, r.clone()).await.map_err(|e| e.to_string())?;
+        appended += 1;
+    }
+    Ok((appended, adb_log::Log::last_offset(&*wal).0))
+}
+
+/// fsync every file and directory under `dir` (and `dir`'s parent, for its new name).
+fn sync_tree(dir: &std::path::Path) -> std::io::Result<()> {
+    fn walk(d: &std::path::Path) -> std::io::Result<()> {
+        for e in std::fs::read_dir(d)? {
+            let e = e?;
+            let path = e.path();
+            if e.file_type()?.is_dir() {
+                walk(&path)?;
+            } else {
+                std::fs::File::open(&path)?.sync_all()?;
+            }
+        }
+        std::fs::File::open(d)?.sync_all()
+    }
+    walk(dir)?;
+    if let Some(parent) = dir.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), String> {
     let touches = touches(aql);
     for (ns, _) in &touches {
