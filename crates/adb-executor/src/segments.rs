@@ -244,7 +244,18 @@ impl<L: Log> DurableWrites<L> {
         if let Some(cold) = self.store.as_ref().and_then(|s| s.cold_uri().map(|c| (c.to_string(), s.partition()))) {
             let start = seq.log().last_offset().0 + 1;
             let bytes = serde_json::to_vec(&EpochMarker { start }).map_err(|e| AdbError::Internal(format!("epoch marker: {e}")))?;
-            put(&cold.0, cold.1, "epochs", &format!("{epoch:010}.json"), &bytes).await?;
+            let name = format!("{epoch:010}.json");
+            let marker = put(&cold.0, cold.1, "epochs", &name, &bytes);
+            tokio::pin!(marker);
+            let t0 = std::time::Instant::now();
+            loop {
+                tokio::select! {
+                    r = &mut marker => { r?; break; }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                        tracing::warn!(epoch, cold = %cold.0, partition = cold.1 .0, waited_s = t0.elapsed().as_secs(), "the owner epoch marker isn't written yet");
+                    }
+                }
+            }
             tracing::info!(epoch, start, "owner epoch started");
         }
         self.epoch.store(epoch, Ordering::SeqCst);
