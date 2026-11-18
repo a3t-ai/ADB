@@ -23,7 +23,7 @@ use adb_store::{PartitionStore, StoredRow};
 use async_trait::async_trait;
 
 use crate::apply::ApplyBarrier;
-use crate::branches::{Branch, Branches, MAIN};
+use crate::branches::{Branch, Branches};
 
 /// A parent's rows of `namespace` in `memory`, as they were at `at`.
 #[async_trait]

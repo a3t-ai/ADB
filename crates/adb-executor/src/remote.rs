@@ -156,6 +156,12 @@ fn val<T: Serialize>(v: T) -> Result<Value, String> {
 
 /// A partition operation by name, on a partition engine this node owns.
 pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, String> {
+    // AQL v0.13 BRANCH / FORK / MERGE: a router's calls to this partition.
+    if op.starts_with("ns_") {
+        if let Some(r) = crate::namespaces::dispatch(e, op, &a).await {
+            return r;
+        }
+    }
     let s = |n: &str| arg::<String>(&a, n);
     let o = |n: &str| arg::<Option<String>>(&a, n);
     match op {

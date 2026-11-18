@@ -98,6 +98,13 @@ impl SpaceView {
         Self { local: Arc::new(local), remote: Arc::new(OnceLock::new()) }
     }
 
+    /// A view that reads every space through `spaces` (a router's own, while it lives).
+    pub fn routed(spaces: &Arc<dyn Spaces>) -> Self {
+        let v = Self::new(LocalSpaces { store: None, barrier: None, registry: Arc::new(Branches::default()) });
+        v.set_remote(Arc::downgrade(spaces));
+        v
+    }
+
     /// Read other spaces through `spaces` from now on (set once, by the router).
     pub fn set_remote(&self, spaces: Weak<dyn Spaces>) {
         let _ = self.remote.set(spaces);

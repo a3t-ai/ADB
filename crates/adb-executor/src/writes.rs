@@ -234,7 +234,7 @@ const EXPIRE_BATCH: usize = 1000;
 /// long-term, versioned ones. WORKING (scratchpad) and TOOLS (registrations)
 /// keep replace-by-key.
 /// One key of an AQL v0.13 MERGE ([`DurableWrites::merge_apply`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeWrite {
     pub memory: Memory,
     /// The record's key without its namespace (or a table id of it).

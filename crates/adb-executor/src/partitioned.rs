@@ -946,6 +946,24 @@ impl PartitionedEngine {
         if let Some((stmt, list)) = crate::engine::across_namespaces(aql) {
             return crate::engine::read_across(&stmt, &list, |one| async move { Box::pin(self.query_in(&one, variables, reach)).await }).await;
         }
+        // AQL v0.13 BRANCH / FORK / MERGE: each step on the partition of its namespace.
+        if let Some(stmt) = crate::engine::namespace_statement(aql) {
+            for (ns, writes) in crate::branch_engine::statement_namespaces(aql)? {
+                if let Some(ns) = ns.filter(|ns| !reach.allows(ns)) {
+                    return Err(out_of_reach(&ns).to_string());
+                }
+                let _ = writes;
+            }
+            let started = std::time::Instant::now();
+            let v = crate::engine::namespace_statement_on(&RouterNs(Arc::clone(self)), stmt, variables).await?;
+            return Ok(to_wire(&crate::QueryResult::subscription(v, started.elapsed().as_millis() as u64)));
+        }
+        if let Some(ns) = crate::engine::namespace_drop(aql) {
+            if !reach.allows(&ns) {
+                return Err(out_of_reach(&ns).to_string());
+            }
+            crate::namespaces::before_drop(&RouterNs(Arc::clone(self)), &ns).await?;
+        }
         if let Some(r) = Box::pin(self.watch_routed(aql, variables, reach)).await {
             return r;
         }
@@ -1394,6 +1412,60 @@ fn topic_namespace(aql: &str) -> Option<String> {
         S::Publish(x) => x.modifiers.namespace,
         S::Unsubscribe(x) => x.namespace,
         _ => None,
+    }
+}
+
+/// [`crate::namespaces::NsOps`] on a cluster: each operation on the partition that
+/// holds its namespace (here, or one call to its owner).
+struct RouterNs(Arc<PartitionedEngine>);
+
+impl RouterNs {
+    async fn on<T, F, Fut>(&self, namespace: &str, op: &str, args: Value, local: F) -> Result<T, String>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(Arc<LocalEngine>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        match self.0.handle_of(namespace).await? {
+            Handle::Local(e) => local(e).await,
+            h => h.op_as(op, args).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::namespaces::NsOps for RouterNs {
+    async fn exists(&self, namespace: &str) -> Result<bool, String> {
+        self.on(namespace, "ns_exists", json!({ "namespace": namespace }), |e| async move { crate::namespaces::LocalNs(&e).exists(namespace).await }).await
+    }
+    async fn tag_at(&self, namespace: &str, name: &str, at: Option<adb_core::log::CommitTs>) -> Result<crate::branches::Tag, String> {
+        self.on(namespace, "ns_tag_at", json!({ "namespace": namespace, "name": name, "at": at }), |e| async move { crate::namespaces::LocalNs(&e).tag_at(namespace, name, at).await }).await
+    }
+    async fn tag_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
+        self.on(namespace, "ns_tag_drop", json!({ "namespace": namespace, "name": name }), |e| async move { crate::namespaces::LocalNs(&e).tag_drop(namespace, name).await }).await
+    }
+    async fn tags(&self, namespace: &str) -> Result<Vec<crate::branches::Tag>, String> {
+        self.on(namespace, "ns_tags", json!({ "namespace": namespace }), |e| async move { crate::namespaces::LocalNs(&e).tags(namespace).await }).await
+    }
+    async fn base_of(&self, namespace: &str) -> Result<Option<crate::branches::Base>, String> {
+        self.on(namespace, "space_base", json!({ "space": namespace }), |e| async move { crate::namespaces::LocalNs(&e).base_of(namespace).await }).await
+    }
+    async fn base_set(&self, namespace: &str, base: Option<crate::branches::Base>) -> Result<(), String> {
+        let args = json!({ "namespace": namespace, "base": base });
+        let r: Result<Value, String> = self.on(namespace, "ns_base_set", args, |e| async move { crate::namespaces::LocalNs(&e).base_set(namespace, base).await.map(|_| Value::Null) }).await;
+        r.map(|_| ())
+    }
+    async fn materialise(&self, namespace: &str, rows: Vec<adb_store::StoredRow>) -> Result<u64, String> {
+        let args = json!({ "namespace": namespace, "rows": rows });
+        self.on(namespace, "ns_materialise", args, |e| async move { crate::namespaces::LocalNs(&e).materialise(namespace, rows).await }).await
+    }
+    async fn merge_apply(&self, namespace: &str, writes: Vec<crate::writes::MergeWrite>) -> Result<u64, String> {
+        let args = json!({ "namespace": namespace, "writes": writes });
+        self.on(namespace, "ns_merge_apply", args, |e| async move { crate::namespaces::LocalNs(&e).merge_apply(namespace, writes).await }).await
+    }
+    async fn rows_at(&self, memory: adb_core::log::Memory, namespace: &str, at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {
+        let view = crate::spaces::SpaceView::routed(&self.0.spaces);
+        view.rows_at(memory, namespace, at, adb_core::log::CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
     }
 }
 
