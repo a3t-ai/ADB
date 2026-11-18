@@ -1463,6 +1463,14 @@ impl crate::namespaces::NsOps for RouterNs {
         let args = json!({ "namespace": namespace, "writes": writes });
         self.on(namespace, "ns_merge_apply", args, |e| async move { crate::namespaces::LocalNs(&e).merge_apply(namespace, writes).await }).await
     }
+    async fn record_put(&self, namespace: &str, id: &str, value: Value) -> Result<(), String> {
+        let args = json!({ "namespace": namespace, "id": id, "value": value });
+        let r: Result<Value, String> = self.on(namespace, "ns_record_put", args, |e| async move { crate::namespaces::LocalNs(&e).record_put(namespace, id, value).await.map(|_| Value::Null) }).await;
+        r.map(|_| ())
+    }
+    async fn records(&self, namespace: &str, prefix: &str) -> Result<Vec<Value>, String> {
+        self.on(namespace, "ns_records", json!({ "namespace": namespace, "prefix": prefix }), |e| async move { crate::namespaces::LocalNs(&e).records(namespace, prefix).await }).await
+    }
     async fn rows_at(&self, memory: adb_core::log::Memory, namespace: &str, at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {
         let view = crate::spaces::SpaceView::routed(&self.0.spaces);
         view.rows_at(memory, namespace, at, adb_core::log::CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
@@ -1887,19 +1895,23 @@ impl Engine for Arc<PartitionedEngine> {
 
     // ---- one namespace: its partition
 
-    async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
-        self.note(namespace).await?;
-        self.op_ns(namespace, "branch_create", json!({ "namespace": namespace, "name": name, "parent": parent, "created_by": created_by })).await
+    async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, _created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
+        crate::review::create(&RouterNs(Arc::clone(self)), namespace, name, parent).await
     }
 
     async fn branch_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        self.op_ns(namespace, "branch_drop", json!({ "namespace": namespace, "name": name })).await
+        let child = crate::review::branch_ns(namespace, name);
+        if crate::namespaces::NsOps::base_of(&RouterNs(Arc::clone(self)), &child).await?.is_none() {
+            return Ok(false);
+        }
+        Box::pin(self.query(&format!("FORGET FROM ALL NAMESPACE {}", serde_json::to_string(&child).unwrap_or_default()), None)).await?;
+        Ok(true)
     }
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
         match namespace {
-            Some(ns) => self.op_ns(ns, "branch_list", json!({ "namespace": ns })).await,
-            None => Ok(self.op_all::<Vec<crate::branches::Branch>>("branch_list", json!({ "namespace": null })).await?.into_iter().flatten().collect()),
+            Some(ns) => crate::review::list(&RouterNs(Arc::clone(self)), ns).await,
+            None => Err("branch_list names its namespace".into()),
         }
     }
 
@@ -1924,19 +1936,19 @@ impl Engine for Arc<PartitionedEngine> {
     }
 
     async fn branch_conflicts(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_conflicts", json!({ "namespace": namespace, "name": name, "memories": memories })).await
+        crate::review::conflicts(&RouterNs(Arc::clone(self)), namespace, name, memories).await
     }
 
     async fn branch_merge(&self, namespace: &str, name: &str, memories: &[MemoryType], main_offset: u64, resolutions: Vec<crate::merge::Resolution>, by: Option<&str>) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_merge", json!({ "namespace": namespace, "name": name, "memories": memories, "main_offset": main_offset, "resolutions": resolutions, "by": by })).await
+        crate::review::merge(&RouterNs(Arc::clone(self)), namespace, name, memories, main_offset, resolutions, by).await
     }
 
     async fn branch_rebase(&self, namespace: &str, name: &str, main_offset: u64, resolutions: Vec<crate::merge::Resolution>) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_rebase", json!({ "namespace": namespace, "name": name, "main_offset": main_offset, "resolutions": resolutions })).await
+        crate::review::rebase(&RouterNs(Arc::clone(self)), namespace, name, main_offset, resolutions).await
     }
 
     async fn merge_revert(&self, namespace: &str, merge_id: &str, by: Option<&str>, force_skip: bool) -> Result<Value, String> {
-        self.op_ns(namespace, "merge_revert", json!({ "namespace": namespace, "merge_id": merge_id, "by": by, "force_skip": force_skip })).await
+        crate::review::revert(&RouterNs(Arc::clone(self)), namespace, merge_id, by, force_skip).await
     }
 
     async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
@@ -1989,33 +2001,8 @@ impl Engine for Arc<PartitionedEngine> {
     // the source's, materialised in the target's (not one transaction: a copy that
     // fails half way is repeated into a fresh namespace)
 
-    async fn branch_promote(&self, namespace: &str, name: &str, into: &str, allow_stale: bool) -> Result<Value, String> {
-        self.note(into).await?;
-        if self.partition_of(namespace) == self.partition_of(into) {
-            return self.op_ns(namespace, "branch_promote", json!({ "namespace": namespace, "name": name, "into": into, "allow_stale": allow_stale })).await;
-        }
-        let (src, dst) = (self.handle_of(namespace).await?, self.handle_of(into).await?);
-        let branch: crate::branches::Branch = src.op_as("promote_check", json!({ "namespace": namespace, "name": name, "allow_stale": allow_stale })).await?;
-        let all = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
-        let rows: Value = src.op("copy_out", json!({ "namespace": namespace, "branch": name, "memories": all, "at": now() })).await?;
-        let n: u64 = dst.op_as("copy_in", json!({ "into": into, "rows": rows })).await?;
-        // D1, as on one engine: the new agent carries the old one's layers, reads its
-        // episodes as of now (a history layer, read from the old one's partition), and
-        // its first record says where it came from.
-        let old_layers: Vec<crate::branches::Layer> = src.op_as("layers_get", json!({ "namespace": namespace })).await?;
-        let safe: String = into.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).take(55).collect();
-        let tag = format!("promoted-{safe}");
-        src.op("tag_create", json!({ "namespace": namespace, "name": tag, "created_by": null })).await?;
-        let mut layers = vec![crate::branches::Layer { space: namespace.to_string(), mode: crate::branches::LayerMode::History, tag: Some(tag), memories: vec![MemoryType::Episodic], sealed: false }];
-        layers.extend(old_layers);
-        dst.op("layers_set", json!({ "namespace": into, "layers": layers })).await?;
-        let s = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
-        let aql = format!(
-            "STORE INTO EPISODIC (event = \"promoted_from\", from_namespace = {}, from_branch = {}, point_offset = \"{}\", point_ts = \"{}\") NAMESPACE {}",
-            s(namespace), s(name), branch.point_offset, branch.point_ts, s(into)
-        );
-        dst.op("query", json!({ "aql": aql, "variables": null })).await?;
-        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
+    async fn branch_promote(&self, namespace: &str, name: &str, into: &str, _allow_stale: bool) -> Result<Value, String> {
+        crate::review::promote(&RouterNs(Arc::clone(self)), namespace, name, into).await
     }
 
     async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {

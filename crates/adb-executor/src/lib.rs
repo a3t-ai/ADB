@@ -7,6 +7,7 @@
 
 pub mod engine;
 pub mod namespaces;
+pub mod review;
 pub mod engine_store;
 mod error;
 mod executor;

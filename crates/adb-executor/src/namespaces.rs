@@ -38,11 +38,16 @@ pub trait NsOps: Send + Sync {
     async fn merge_apply(&self, namespace: &str, writes: Vec<MergeWrite>) -> Result<u64, String>;
     /// `namespace` as it was at `at` (a branch through its bases).
     async fn rows_at(&self, memory: Memory, namespace: &str, at: CommitTs) -> Result<Vec<StoredRow>, String>;
+    /// A control record of `namespace` (a merge, for its revert).
+    async fn record_put(&self, namespace: &str, id: &str, value: Value) -> Result<(), String>;
+    /// `namespace`'s control records whose id starts with `prefix`.
+    async fn records(&self, namespace: &str, prefix: &str) -> Result<Vec<Value>, String>;
 }
 
 /// The tag on a namespace's source that holds its point.
 pub fn tag_name(namespace: &str, kind: BaseKind) -> String {
-    let safe: String = namespace.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).take(56).collect();
+    // `@` kept: a branch `<ns>@<name>` is read back from its source's tags.
+    let safe: String = namespace.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.@".contains(c) { c } else { '_' }).take(120).collect();
     match kind {
         BaseKind::Branch => format!("branch.{safe}"),
         BaseKind::Fork => format!("fork.{safe}"),
@@ -55,8 +60,10 @@ fn now() -> CommitTs {
 
 /// BRANCH (or FORK, `kind`) FROM `from` INTO `into` at `at` (now when `None`).
 pub async fn branch(ops: &dyn NsOps, from: &str, into: &str, at: Option<CommitTs>, kind: BaseKind) -> Result<Value, String> {
-    if !adb_store::valid_namespace(into) || into.contains(adb_cluster::routing::BRANCH_SEP) {
-        return Err(format!("namespace {into:?}: can't be empty or contain '|', '~' or '@'"));
+    // `@` is allowed: `<ns>@<name>` is how A3T names a branch of `<ns>` (kept out of
+    // reads across every namespace).
+    if !adb_store::valid_namespace(into) {
+        return Err(format!("namespace {into:?}: can't be empty or contain '|' or '~'"));
     }
     if !ops.exists(from).await? {
         return Err(format!("no namespace {from:?} to branch or fork from"));
@@ -218,6 +225,12 @@ impl NsOps for LocalNs<'_> {
     async fn merge_apply(&self, namespace: &str, writes: Vec<MergeWrite>) -> Result<u64, String> {
         self.d()?.merge_apply(namespace, writes).await.map_err(|e| e.to_string())
     }
+    async fn record_put(&self, namespace: &str, id: &str, value: Value) -> Result<(), String> {
+        self.d()?.record_put(namespace, id, value).await.map_err(|e| e.to_string())
+    }
+    async fn records(&self, _namespace: &str, prefix: &str) -> Result<Vec<Value>, String> {
+        self.d()?.records(prefix).await.map_err(|e| e.to_string())
+    }
     async fn rows_at(&self, memory: Memory, namespace: &str, at: CommitTs) -> Result<Vec<StoredRow>, String> {
         // Bases in other partitions are read through this engine's spaces (the router's
         // on a cluster node).
@@ -256,6 +269,14 @@ pub async fn dispatch(e: &crate::LocalEngine, op: &str, a: &Value) -> Option<Res
         },
         "ns_materialise" => match (s("namespace"), arg(a, "rows")) {
             (Ok(n), Ok(rows)) => ns.materialise(&n, rows).await.map(|n| json!(n)),
+            (a, b) => Err(a.err().or(b.err()).unwrap_or_default()),
+        },
+        "ns_record_put" => match (s("namespace"), s("id"), arg::<Value>(a, "value")) {
+            (Ok(n), Ok(id), Ok(v)) => ns.record_put(&n, &id, v).await.map(|_| Value::Null),
+            (a, b, c) => Err(a.err().or(b.err()).or(c.err()).unwrap_or_default()),
+        },
+        "ns_records" => match (s("namespace"), s("prefix")) {
+            (Ok(n), Ok(p)) => ns.records(&n, &p).await.map(Value::Array),
             (a, b) => Err(a.err().or(b.err()).unwrap_or_default()),
         },
         "ns_merge_apply" => match (s("namespace"), arg(a, "writes")) {

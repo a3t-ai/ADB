@@ -1595,6 +1595,27 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(n)
     }
 
+    /// A control record of `namespace` (`id`, e.g. `merge:<ns>/<id>`): a merge's
+    /// entries, for its revert. Kept in the table like branch rows.
+    pub async fn record_put(&self, namespace: &str, id: &str, value: serde_json::Value) -> AdbResult<()> {
+        let mut seq = seq_lock!(self);
+        let mut v = value;
+        if let Some(m) = v.as_object_mut() {
+            m.insert("id".into(), serde_json::Value::String(id.to_string()));
+        }
+        self.register_control(&mut seq, id, namespace, v).await
+    }
+
+    /// The control records whose id starts with `prefix`.
+    pub async fn records(&self, prefix: &str) -> AdbResult<Vec<serde_json::Value>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let rows = store.current(Some("kind = 'branch'"), CommitTs::from_datetime(time::now())).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        Ok(rows.into_iter().map(|r| r.data.value).filter(|v| v.get("id").and_then(|i| i.as_str()).is_some_and(|i| i.starts_with(prefix))).collect())
+    }
+
     /// AQL v0.13: record `b` (`base:<namespace>`), or drop it (`None` for `namespace`).
     pub async fn base_set(&self, namespace: &str, b: Option<&crate::branches::Base>) -> AdbResult<()> {
         let mut seq = seq_lock!(self);
