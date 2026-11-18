@@ -436,6 +436,43 @@ pub(crate) fn watch_statement(aql: &str) -> Option<aql_parser::ast::Statement> {
     }
 }
 
+/// BRANCH / FORK / MERGE (AQL v0.13): run by the engine, not the planner (they work
+/// across namespaces).
+pub(crate) fn namespace_statement(aql: &str) -> Option<aql_parser::ast::Statement> {
+    let first = aql.trim_start().split(|c: char| c.is_whitespace()).next()?;
+    if !["BRANCH", "FORK", "MERGE"].iter().any(|v| first.eq_ignore_ascii_case(v)) {
+        return None;
+    }
+    aql_parser::parse(aql).ok().filter(|s| matches!(s, aql_parser::ast::Statement::Branch(_) | aql_parser::ast::Statement::Fork(_) | aql_parser::ast::Statement::Merge(_)))
+}
+
+/// `FORGET FROM ALL NAMESPACE "x"` with no WHERE: the namespace is dropped.
+pub(crate) fn namespace_drop(aql: &str) -> Option<String> {
+    let first = aql.trim_start().split(|c: char| c.is_whitespace()).next()?;
+    if !first.eq_ignore_ascii_case("FORGET") {
+        return None;
+    }
+    match aql_parser::parse(aql).ok()? {
+        aql_parser::ast::Statement::Forget(f) if f.memory_type == aql_parser::ast::MemoryType::All && f.conditions.is_empty() => f.modifiers.namespace,
+        _ => None,
+    }
+}
+
+/// A statement's point in time: an RFC 3339 timestamp or a date, or a variable that
+/// holds one.
+pub(crate) fn time_of(t: &aql_parser::ast::TimePoint, variables: Option<&HashMap<String, Value>>) -> Result<adb_core::log::CommitTs, String> {
+    let text = match t {
+        aql_parser::ast::TimePoint::At { time } => time.clone(),
+        aql_parser::ast::TimePoint::Variable { name } => variables
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| format!("AS OF ${name}: the variable has no time (pass it in `variables`)"))?,
+    };
+    let at = adb_core::TimePoint::At { time: text.clone() }.resolve(chrono::Utc::now()).ok_or_else(|| format!("AS OF {text:?}: not a time (RFC 3339, or a date)"))?;
+    Ok(adb_core::log::CommitTs::from_datetime(at))
+}
+
 /// A live query's RECALL, as the statement a watch re-runs.
 pub(crate) fn live_query(stmt: &aql_parser::ast::Statement) -> Option<aql_parser::ast::Statement> {
     match stmt {
@@ -1188,6 +1225,178 @@ impl LocalEngine {
             .into_iter()
             .filter_map(|(id, v)| serde_json::from_value::<adb_cq::WatchSpec>(v).ok().filter(|s| s.across.is_some()).map(|s| (id, s)))
             .collect())
+    }
+
+    /// Before `namespace` is dropped (AQL v0.13): refused while namespaces are branched
+    /// from it (they read through to it; forks hold their own copy); a branch or fork
+    /// being dropped leaves its base first (its point's tag on the source goes too).
+    async fn before_namespace_drop(&self, namespace: &str) -> Result<(), String> {
+        let (Some(d), Some(spaces)) = (&self.durable, self.local_spaces()) else { return Ok(()) };
+        let branches: Vec<String> =
+            spaces.registry.based_on(namespace).into_iter().filter(|b| b.kind == crate::branches::BaseKind::Branch).map(|b| b.namespace).collect();
+        if !branches.is_empty() {
+            return Err(format!("namespace {namespace:?} has branches: {} (drop or merge them first)", branches.join(", ")));
+        }
+        if let Some(b) = spaces.registry.base_of(namespace) {
+            d.base_set(namespace, None).await.map_err(|e| e.to_string())?;
+            d.tag_drop(&b.from, &b.tag).await.map_err(|e| e.to_string())?;
+        }
+        // Forks of it keep their copy; the tags that held their points go.
+        for f in spaces.registry.based_on(namespace) {
+            d.tag_drop(namespace, &f.tag).await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Whether `namespace` holds anything: records of any memory type, or a base.
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
+        let spaces = self.local_spaces().ok_or("namespaces need a durable engine (start ADB with --data-dir)")?;
+        if spaces.registry.base_of(namespace).is_some() {
+            return Ok(true);
+        }
+        let view = crate::spaces::SpaceView::new(spaces);
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        for m in [MemoryType::Semantic, MemoryType::Episodic, MemoryType::Procedural, MemoryType::Tools, MemoryType::Working] {
+            if view.versions(m.into(), namespace).await.map_err(|e| e.to_string())?.iter().any(|r| r.is_current_at(now, now)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// BRANCH / FORK / MERGE on one engine (every namespace here).
+    async fn namespace_statement(&self, stmt: aql_parser::ast::Statement, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
+        use aql_parser::ast::Statement;
+        let started = std::time::Instant::now();
+        let d = self.durable.as_ref().ok_or("BRANCH / FORK / MERGE need a durable engine (start ADB with --data-dir)")?;
+        let value = match stmt {
+            Statement::Branch(n) | Statement::Fork(n) if !adb_store::valid_namespace(&n.into) || n.into.contains(adb_cluster::routing::BRANCH_SEP) => {
+                return Err(format!("namespace {:?}: can't be empty or contain '|', '~' or '@'", n.into));
+            }
+            Statement::Branch(n) | Statement::Fork(n) if !self.namespace_exists(&n.from).await? => return Err(format!("no namespace {:?} to branch or fork from", n.from)),
+            Statement::Branch(n) | Statement::Fork(n) if self.namespace_exists(&n.into).await? => {
+                return Err(format!("namespace {:?} exists: BRANCH and FORK make a new one", n.into))
+            }
+            ref st @ (Statement::Branch(ref n) | Statement::Fork(ref n)) => {
+                let kind = match st {
+                    Statement::Branch(_) => crate::branches::BaseKind::Branch,
+                    _ => crate::branches::BaseKind::Fork,
+                };
+                let at = n.as_of.as_ref().map(|t| time_of(t, variables)).transpose()?;
+                let tag = d.tag_create_at(&n.from, &crate::branches::Base::tag_of(&n.into), at).await.map_err(|e| e.to_string())?;
+                let point = adb_core::log::CommitTs(tag.point_ts);
+                let mut copied = 0;
+                if kind == crate::branches::BaseKind::Fork {
+                    let view = crate::spaces::SpaceView::new(self.local_spaces().ok_or("no table")?);
+                    let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+                    // Every memory type's records in one write (a new namespace takes one copy).
+                    let mut rows = Vec::new();
+                    for m in [MemoryType::Semantic, MemoryType::Episodic, MemoryType::Procedural, MemoryType::Tools, MemoryType::Working] {
+                        rows.extend(view.rows_at(m.into(), &n.from, point, now).await.map_err(|e| e.to_string())?);
+                    }
+                    copied = d.materialise(&n.into, rows).await.map_err(|e| e.to_string())?;
+                }
+                let base = crate::branches::Base { id: crate::branches::Base::id_of(&n.into), namespace: n.into.clone(), from: n.from.clone(), kind, tag: tag.name, point_ts: tag.point_ts };
+                d.base_set(&n.into, Some(&base)).await.map_err(|e| e.to_string())?;
+                let mut v = json!({ "namespace": n.into, "from": n.from, "point": { "ts": tag.point_ts, "at": point.to_datetime().to_rfc3339() } });
+                if kind == crate::branches::BaseKind::Fork {
+                    v["records"] = json!(copied);
+                }
+                v
+            }
+            Statement::Merge(m) => return self.merge_namespaces(&m.from, &m.into, m.prefer).await.map(|v| to_wire(&QueryResult::subscription(v, started.elapsed().as_millis() as u64))),
+            _ => return Err("not BRANCH, FORK or MERGE".into()),
+        };
+        Ok(to_wire(&QueryResult::subscription(value, started.elapsed().as_millis() as u64)))
+    }
+
+    /// MERGE FROM `from` INTO `into` (AQL v0.13 §5). The two parted at a point: one is
+    /// the other's base (BRANCH or FORK). Per key, a side *changed* it when its record
+    /// now differs from the base's at that point. `from`'s changes reach `into` in one
+    /// write; a key both changed differently is a conflict — refused (listed) unless
+    /// `prefer` says which side wins. Into a branch from its base: the branch's point
+    /// moves to now (the base's changes show through), and where the base wins a
+    /// conflict the branch's own record goes. Afterwards the two have parted now.
+    async fn merge_namespaces(&self, from: &str, into: &str, prefer: Option<aql_parser::ast::Prefer>) -> Result<Value, String> {
+        use crate::branches::{Base, BaseKind};
+        use aql_parser::ast::Prefer;
+        let d = self.durable.as_ref().ok_or("MERGE needs a durable engine (start ADB with --data-dir)")?;
+        let spaces = self.local_spaces().ok_or("MERGE needs a durable engine")?;
+        let registry = std::sync::Arc::clone(&spaces.registry);
+        let view = crate::spaces::SpaceView::new(spaces);
+        // Which one is the other's base, and the point they parted at.
+        let (child, base, rebase) = match (registry.base_of(from), registry.base_of(into)) {
+            (Some(b), _) if b.from == into => (b, into, false),
+            (_, Some(b)) if b.from == from => (b, from, true),
+            _ => return Err(format!("MERGE: {from:?} and {into:?} have no common base (one must be branched or forked from the other)")),
+        };
+        let point = child.point();
+        let now = adb_core::log::CommitTs::from_datetime(adb_core::time::now());
+        let bare = |r: &adb_store::StoredRow| adb_store::without_namespace(adb_store::key_of(&r.lineage_id)).to_string();
+        let same = |a: Option<&adb_store::StoredRow>, b: Option<&adb_store::StoredRow>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.data.value == b.data.value && a.data.link_type == b.data.link_type && a.data.weight == b.data.weight,
+            _ => false,
+        };
+        let mut writes = Vec::new();
+        let mut drop_override = Vec::new();
+        let mut conflicts = Vec::new();
+        for m in [MemoryType::Semantic, MemoryType::Episodic, MemoryType::Procedural, MemoryType::Tools, MemoryType::Working] {
+            let mem: adb_core::log::Memory = m.into();
+            let by_key = |rows: Vec<adb_store::StoredRow>| rows.into_iter().map(|r| (bare(&r), r)).collect::<std::collections::BTreeMap<_, _>>();
+            let then = by_key(view.rows_at(mem, base, point, now).await.map_err(|e| e.to_string())?);
+            let src = by_key(view.rows_at(mem, from, now, now).await.map_err(|e| e.to_string())?);
+            let dst = by_key(view.rows_at(mem, into, now, now).await.map_err(|e| e.to_string())?);
+            let keys: std::collections::BTreeSet<&String> = then.keys().chain(src.keys()).chain(dst.keys()).collect();
+            for k in keys {
+                let (t, s, dd) = (then.get(k), src.get(k), dst.get(k));
+                let s_changed = !same(s, t);
+                if !s_changed {
+                    continue;
+                }
+                let d_changed = !same(dd, t);
+                let conflict = d_changed && !same(s, dd);
+                if conflict {
+                    match prefer {
+                        None => {
+                            conflicts.push(format!("{m:?} {k}"));
+                            continue;
+                        }
+                        Some(Prefer::Target) => continue,
+                        Some(Prefer::Source) => {}
+                    }
+                }
+                // The target's own record of the key (a branch's inherited ones aren't).
+                let own = dd.filter(|r| r.data.namespace.as_deref() == Some(into)).cloned();
+                if rebase && child.kind == BaseKind::Branch {
+                    // Into a branch from its base: the base shows through once the point
+                    // moves; a conflict the base wins drops the branch's own record.
+                    if conflict {
+                        drop_override.push(crate::writes::MergeWrite { memory: mem, key: k.clone(), current: own, source: None });
+                    }
+                    continue;
+                }
+                writes.push(crate::writes::MergeWrite { memory: mem, key: k.clone(), current: own, source: s.cloned() });
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(format!(
+                "merge_conflict: {} record(s) changed on both sides: {} (MERGE … PREFER SOURCE or PREFER TARGET)",
+                conflicts.len(),
+                conflicts.join(", ")
+            ));
+        }
+        let changed = writes.len() + drop_override.len();
+        // Writes that remove a key the target never held are nothing to do.
+        let ops: Vec<_> = writes.into_iter().chain(drop_override).filter(|w| w.source.is_some() || w.current.is_some()).collect();
+        d.merge_apply(into, ops).await.map_err(|e| e.to_string())?;
+        // They have parted now: the child's point moves (its tag on the base too).
+        let tag = Base::tag_of(&child.namespace);
+        d.tag_drop(&child.from, &tag).await.map_err(|e| e.to_string())?;
+        let t = d.tag_create_at(&child.from, &tag, None).await.map_err(|e| e.to_string())?;
+        let moved = Base { point_ts: t.point_ts, tag: t.name, ..child.clone() };
+        d.base_set(&child.namespace, Some(&moved)).await.map_err(|e| e.to_string())?;
+        Ok(json!({ "from": from, "into": into, "merged": changed, "point": { "ts": t.point_ts } }))
     }
 
     /// A live query: `SUBSCRIBE RECALL …` (register, snapshot) and its UNSUBSCRIBE
@@ -2086,6 +2295,12 @@ impl LocalEngine {
             if let Some(answer) = self.watch(stmt, variables).await {
                 return answer;
             }
+        }
+        if let Some(stmt) = namespace_statement(aql) {
+            return self.namespace_statement(stmt, variables).await;
+        }
+        if let Some(ns) = namespace_drop(aql) {
+            self.before_namespace_drop(&ns).await?;
         }
         let started = std::time::Instant::now();
         let before = match &self.durable {

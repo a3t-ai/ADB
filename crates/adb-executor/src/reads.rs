@@ -219,6 +219,28 @@ impl LanceReads {
 
     /// B7 (spec §3.9): the layers of the statement's namespace carrying `memory`
     /// (`None`: no NAMESPACE, or none apply).
+    /// The spaces this engine reads through (the router's on a cluster).
+    fn space_view(&self) -> Option<crate::spaces::SpaceView> {
+        if let Some(v) = &self.spaces {
+            return Some(v.clone());
+        }
+        let reg = self.registry.as_ref()?;
+        Some(crate::spaces::SpaceView::new(crate::spaces::LocalSpaces { store: Some(Arc::clone(&self.store)), barrier: None, registry: Arc::clone(reg) }))
+    }
+
+    /// AQL v0.13: the namespace of a read, if it is a branch (BRANCH FROM … INTO it).
+    fn branch_of(&self, modifiers: &Modifiers) -> Option<String> {
+        let (reg, ns) = (self.registry.as_ref()?, modifiers.namespace.as_deref()?);
+        reg.base_of(ns).filter(|b| b.kind == crate::branches::BaseKind::Branch).map(|_| ns.to_string())
+    }
+
+    /// A branch's records now: its own, then its base's at the branch point (by key).
+    async fn branch_rows(&self, memory: MemoryType, ns: &str, in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<StoredRow>> {
+        let view = self.space_view().ok_or_else(|| AdbError::Internal("a branch needs the registry".into()))?;
+        let rows = view.rows_at(memory.into(), ns, now, now).await?;
+        Ok(rows.into_iter().filter(|r| in_scope.is_none_or(|s| r.data.scope == s)).collect())
+    }
+
     fn layers_for(&self, memory: MemoryType, modifiers: &Modifiers) -> Option<(String, Vec<crate::branches::Layer>)> {
         let (reg, ns) = (self.registry.as_ref()?, modifiers.namespace.as_deref()?);
         let layers: Vec<crate::branches::Layer> = reg.layers_of(ns).into_iter().filter(|l| l.memories.contains(&memory)).collect();
@@ -324,7 +346,12 @@ impl LanceReads {
             b.wait_for_committed().await;
         }
         let now = CommitTs::from_datetime(time::now());
-        // A branch ranks its view (its rows, then the parent's at the branch point).
+        // A branch namespace ranks its records and its base's at the branch point.
+        if let Some(ns) = self.branch_of(modifiers) {
+            let rows = self.branch_rows(memory, &ns, modifiers.in_scope.as_deref(), now).await?;
+            return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
+        }
+        // A branch engine ranks its view (its rows, then the parent's at the branch point).
         if let Some(p) = &self.parent {
             let in_scope = modifiers.in_scope.as_deref();
             let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
@@ -357,6 +384,11 @@ impl LanceReads {
         if let Some(p) = &self.parent {
             let rows = crate::branch_engine::view(&self.store, &self.barrier, p, memory, now).await?;
             return crate::query::branch_read(rows.into_iter().map(|(r, _)| r).collect(), memory, predicate, modifiers);
+        }
+        // AQL v0.13: a branch namespace reads its records and its base's at the point.
+        if let Some(ns) = self.branch_of(modifiers) {
+            let rows = self.branch_rows(memory, &ns, modifiers.in_scope.as_deref(), now).await?;
+            return crate::query::branch_read(rows, memory, predicate, modifiers);
         }
         if let Some(records) = self.layered(memory, predicate, modifiers, now).await? {
             return Ok(records);
@@ -414,7 +446,7 @@ impl Reads for LanceReads {
     async fn aggregate(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Option<serde_json::Value>> {
         check_scope(memory, modifiers.in_scope.as_deref())?;
         // Branches, layered namespaces and history reads aggregate their records.
-        if self.parent.is_some() || self.layers_for(memory, modifiers).is_some() || crate::query::is_history(modifiers) || matches!(predicate, Predicate::Like { .. }) {
+        if self.parent.is_some() || self.branch_of(modifiers).is_some() || self.layers_for(memory, modifiers).is_some() || crate::query::is_history(modifiers) || matches!(predicate, Predicate::Like { .. }) {
             return Ok(None);
         }
         let now = self.committed().await;

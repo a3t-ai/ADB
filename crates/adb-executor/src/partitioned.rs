@@ -303,6 +303,13 @@ impl crate::spaces::Spaces for RouterSpaces {
         }
     }
 
+    async fn base_of(&self, space: &str) -> AdbResult<Option<crate::branches::Base>> {
+        match self.handle_of(space).await? {
+            Handle::Local(e) => local_spaces(&e)?.base_of(space).await,
+            h => h.op_as("space_base", json!({ "space": space })).await.map_err(AdbError::Internal),
+        }
+    }
+
     async fn quotas(&self) -> AdbResult<Vec<crate::branches::Quota>> {
         let node = self.node()?;
         // The system partition's owner reads its registry; any other node its copy

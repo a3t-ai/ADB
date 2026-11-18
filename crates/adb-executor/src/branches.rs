@@ -76,6 +76,44 @@ impl Tag {
     }
 }
 
+/// AQL v0.13 BRANCH / FORK (`.ai/BRANCH_NAMESPACES.md`): namespace `namespace` was
+/// made from `from` as it was at `point_ts`. A branch reads through to it there (its own
+/// records first, by key); a fork holds a copy and only remembers where it came from
+/// (for MERGE). The point is held by the tag `tag` on `from`, which keeps the versions
+/// it reads through compaction, wherever `from` lives. `base:<namespace>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Base {
+    pub id: String,
+    pub namespace: String,
+    pub from: String,
+    pub kind: BaseKind,
+    pub tag: String,
+    pub point_ts: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseKind {
+    Branch,
+    Fork,
+}
+
+impl Base {
+    pub fn id_of(namespace: &str) -> String {
+        format!("base:{namespace}")
+    }
+
+    /// The tag on `from` that holds the point of `namespace`'s base.
+    pub fn tag_of(namespace: &str) -> String {
+        let safe: String = namespace.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect();
+        format!("base.{}", safe.chars().take(58).collect::<String>())
+    }
+
+    pub fn point(&self) -> CommitTs {
+        CommitTs(self.point_ts)
+    }
+}
+
 /// How a layer is read (B7, spec §3.9): its space now (`mount`) or at a tag (`pin`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -192,6 +230,8 @@ pub struct Branches {
     layers: RwLock<BTreeMap<String, Layers>>,
     /// DB-4: storage limits.
     quotas: RwLock<BTreeMap<String, Quota>>,
+    /// AQL v0.13: the namespaces made by BRANCH / FORK, by `base:<namespace>`.
+    bases: RwLock<BTreeMap<String, Base>>,
 }
 
 /// What a `branch`-kind control row holds, by its id's prefix.
@@ -203,6 +243,8 @@ fn control(value: &serde_json::Value) -> Option<Control> {
         serde_json::from_value(value.clone()).ok().map(Control::Layers)
     } else if id.starts_with("quota:") {
         serde_json::from_value(value.clone()).ok().map(Control::Quota)
+    } else if id.starts_with("base:") {
+        serde_json::from_value(value.clone()).ok().map(Control::Base)
     } else {
         serde_json::from_value(value.clone()).ok().map(Control::Branch)
     }
@@ -213,6 +255,7 @@ enum Control {
     Tag(Tag),
     Layers(Layers),
     Quota(Quota),
+    Base(Base),
 }
 
 impl Branches {
@@ -239,6 +282,9 @@ impl Branches {
             Some(Control::Quota(q)) => {
                 self.quotas.write().unwrap().insert(q.id.clone(), q);
             }
+            Some(Control::Base(b)) => {
+                self.bases.write().unwrap().insert(b.id.clone(), b);
+            }
             None => {}
         }
     }
@@ -253,10 +299,21 @@ impl Branches {
                     self.tags.write().unwrap().remove(&id.0);
                     self.layers.write().unwrap().remove(&id.0);
                     self.quotas.write().unwrap().remove(&id.0);
+                    self.bases.write().unwrap().remove(&id.0);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// The base of a namespace made by BRANCH or FORK.
+    pub fn base_of(&self, namespace: &str) -> Option<Base> {
+        self.bases.read().unwrap().get(&Base::id_of(namespace)).cloned()
+    }
+
+    /// The namespaces this engine holds that were branched or forked from `from`.
+    pub fn based_on(&self, from: &str) -> Vec<Base> {
+        self.bases.read().unwrap().values().filter(|b| b.from == from).cloned().collect()
     }
 
     /// DB-4: every quota.

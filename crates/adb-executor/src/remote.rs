@@ -219,6 +219,7 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         }
         "space_tag" => val(e.local_spaces().ok_or("no table")?.registry.tag(&s("space")?, &s("name")?)),
         "space_layers" => val(e.local_spaces().ok_or("no table")?.registry.layers_of(&s("space")?)),
+        "space_base" => val(e.local_spaces().ok_or("no table")?.registry.base_of(&s("space")?)),
         "space_layered_by" => val(e.local_spaces().ok_or("no table")?.registry.layered_by(&s("space")?)),
         "quotas" => val(e.local_spaces().ok_or("no table")?.registry.quotas()),
         "quota_set" => val(e.quota_set(&s("pattern")?, arg(&a, "max_bytes")?, arg(&a, "max_records")?, arg(&a, "history_days")?).await?),
