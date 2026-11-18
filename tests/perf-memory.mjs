@@ -100,19 +100,19 @@ console.log('\n2. Flush and compact (POST /admin/compact)');
 { const t = performance.now(); const r = await (await fetch(`http://127.0.0.1:${leader.http}/admin/compact`, { method: 'POST' })).json(); if (!r.success) throw new Error(`compact: ${JSON.stringify(r)}`); const s = (performance.now() - t) / 1000; console.log(`  compacted ${ROWS} rows in ${s.toFixed(1)} s`); results.compact_s = s; }
 
 const reads = (tag) => [
-  [`${tag}: LOOKUP KEY (SEMANTIC)`, i => `LOOKUP FROM SEMANTIC KEY id = "f${(i * 37) % ROWS}"`],
+  [`${tag}: LOOKUP KEY (SEMANTIC)`, i => `RECALL FROM SEMANTIC WHERE id = "f${(i * 37) % ROWS}"`],
   [`${tag}: RECALL WHERE topic LIMIT 10`, i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10`],
-  [`${tag}: RECALL ALL ORDER BY n LIMIT 10`, `RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 10`],
+  [`${tag}: RECALL ALL ORDER BY n LIMIT 10`, `RECALL FROM SEMANTIC ORDER BY n DESC LIMIT 10`],
   [`${tag}: AGGREGATE COUNT topic`, i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" AGGREGATE COUNT(*) AS c`],
-  [`${tag}: RECALL EPISODIC newest 10`, `RECALL FROM EPISODIC ALL LIMIT 10`],
-  [`${tag}: RECALL EPISODIC KEY`, i => `RECALL FROM EPISODIC KEY id = "e${(i * 7) % (ROWS / 5)}"`],
-  [`${tag}: RECALL WORKING KEY`, i => `RECALL FROM WORKING KEY id = "w${(i * 7) % (ROWS / 5)}"`],
+  [`${tag}: RECALL EPISODIC newest 10`, `RECALL FROM EPISODIC LIMIT 10`],
+  [`${tag}: RECALL EPISODIC KEY`, i => `RECALL FROM EPISODIC WHERE id = "e${(i * 7) % (ROWS / 5)}"`],
+  [`${tag}: RECALL WORKING KEY`, i => `RECALL FROM WORKING WHERE id = "w${(i * 7) % (ROWS / 5)}"`],
 ];
 const mixQueries = Array.from({ length: 64 }, (_, i) => [
-  `LOOKUP FROM SEMANTIC KEY id = "f${(i * 97) % ROWS}"`,
+  `RECALL FROM SEMANTIC WHERE id = "f${(i * 97) % ROWS}"`,
   `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10`,
-  `RECALL FROM EPISODIC KEY id = "e${(i * 13) % (ROWS / 5)}"`,
-  `RECALL FROM WORKING KEY id = "w${(i * 13) % (ROWS / 5)}"`,
+  `RECALL FROM EPISODIC WHERE id = "e${(i * 13) % (ROWS / 5)}"`,
+  `RECALL FROM WORKING WHERE id = "w${(i * 13) % (ROWS / 5)}"`,
 ][i % 4]);
 const countTopic = async t => Number((await q(`RECALL FROM SEMANTIC WHERE topic = "${t}" AGGREGATE COUNT(*) AS c`))?.values?.c);
 
@@ -135,10 +135,10 @@ if ('compact-before-merged' in args) {
 }
 console.log('\n5. Reads, merged: newer versions and new keys in the memtable over Lance files');
 for (const [label, query] of reads('merged')) await seq(label, query, nonEmpty(label));
-await seq('merged: LOOKUP updated key (memtable over Lance)', i => `LOOKUP FROM SEMANTIC KEY id = "f${i % UPD}"`, d => {
+await seq('merged: LOOKUP updated key (memtable over Lance)', i => `RECALL FROM SEMANTIC WHERE id = "f${i % UPD}"`, d => {
   const r = rowsOf(d); check(r.length === 1, `updated key: ${r.length} rows, want 1`); check(String(valueOf(r[0], 'v')) === '2', `updated key: v = ${valueOf(r[0], 'v')}, want 2`);
 });
-await seq('merged: LOOKUP new key (memtable only)', i => `LOOKUP FROM SEMANTIC KEY id = "g${i % UPD}"`, d => check(rowsOf(d).length === 1, 'new key not found'));
+await seq('merged: LOOKUP new key (memtable only)', i => `RECALL FROM SEMANTIC WHERE id = "g${i % UPD}"`, d => check(rowsOf(d).length === 1, 'new key not found'));
 await readers('merged: 8 readers, mixed point + filter', mixQueries);
 { const after = await countTopic('t3'); const added = Array.from({ length: UPD }, (_, i) => i).filter(i => i % 20 === 3).length; check(after === before + added, `count t3: ${after}, want ${before} + ${added} (an update must not count twice)`); }
 
@@ -146,7 +146,7 @@ console.log('\n6. Deletes (FORGET: a tombstone; bytes leave at the next compacti
 await (async () => { const xs = []; for (let i = 0; i < 20; i++) { const t = performance.now(); await q(`FORGET FROM SEMANTIC WHERE key = "f${ROWS - 1 - i}"`); xs.push(performance.now() - t); } const s = stat(xs); line('FORGET SEMANTIC (one key, sequential)', s); results.forget_semantic = s; })();
 await parallel('FORGET SEMANTIC (one key each, 8 at a time)', 40, i => `FORGET FROM SEMANTIC WHERE key = "f${ROWS - 100 - i}"`);
 await parallel('FORGET WORKING (one key each)', 200, i => `FORGET FROM WORKING WHERE key = "w${i}"`);
-await seq('after: LOOKUP forgotten key', i => `LOOKUP FROM SEMANTIC KEY id = "f${ROWS - 1 - (i % 20)}"`, d => check(rowsOf(d).length === 0, 'a forgotten key came back'));
+await seq('after: LOOKUP forgotten key', i => `RECALL FROM SEMANTIC WHERE id = "f${ROWS - 1 - (i % 20)}"`, d => check(rowsOf(d).length === 0, 'a forgotten key came back'));
 for (const [label, query] of reads('after')) await seq(label, query, nonEmpty(label));
 
 console.log(`\n7. Mixed agent load: ${C} agents, 70% reads / 25% STORE / 5% UPDATE, ${SECS * 2} s`);

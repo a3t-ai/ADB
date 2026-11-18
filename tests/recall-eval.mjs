@@ -82,7 +82,7 @@ try {
   a = await start({});
   let embedded = 0;
   for (let i = 0; i < 120 && embedded < corpus.length; i++) {
-    const r = await query(a.url, 'RECALL FROM SEMANTIC LIKE $q MIN_CONFIDENCE 0.01 LIMIT 1000', { q: 'company' });
+    const r = await query(a.url, 'RECALL FROM SEMANTIC LIKE $q CONFIDENCE 0.01 LIMIT 1000', { q: 'company' });
     embedded = r.records.length;
     if (embedded < corpus.length) await sleep(1000);
   }

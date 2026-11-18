@@ -23,6 +23,10 @@
  *   - an agent turn on a branch, recorded with its version and memory point (AC-6, AC-20).
  *
  *   node tests/agent-branches.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)>
+ *
+ * AQL v0.13: the `BRANCH "b"` statement modifier this script uses is removed; branches
+ * become namespaces (BRANCH / FORK / MERGE, see .ai/BRANCH_NAMESPACES.md). The branch
+ * steps fail until the script is reworked for that; the rest is v0.13 AQL.
  */
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -97,7 +101,7 @@ try {
     return r.data;
   };
   const facts = async ns => {
-    const d = await aql(`RECALL FROM SEMANTIC ALL NAMESPACE "${ns}"`);
+    const d = await aql(`RECALL FROM SEMANTIC NAMESPACE "${ns}"`);
     return ((d.data ?? d).records ?? []).map(r => r.data?.fact).sort();
   };
 
@@ -264,7 +268,7 @@ do:
         query: 'STORE INTO SEMANTIC (key = "\${ .key }", fact = "\${ .key }") NAMESPACE "acme--bot"'
 ` });
   const branchFacts = async () => {
-    const d = await aql('RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot" BRANCH "run"');
+    const d = await aql('RECALL FROM SEMANTIC NAMESPACE "acme--bot" BRANCH "run"');
     return ((d.data ?? d).records ?? []).map(x => x.data?.fact);
   };
   const until = async f => { for (let i = 0; i < 100; i++) { if (await f()) return true; await sleep(100); } return false; };
@@ -314,7 +318,7 @@ do:
   await api('DELETE', '/agents/bot/branches/ship');
 
   // --- merge request, kind 2: procedures back into this agent
-  const procs = async () => JSON.stringify(await aql('RECALL FROM PROCEDURAL ALL NAMESPACE "acme--bot"'));
+  const procs = async () => JSON.stringify(await aql('RECALL FROM PROCEDURAL NAMESPACE "acme--bot"'));
   await aql('STORE INTO PROCEDURAL (key = "mr-proc", steps = "v1") NAMESPACE "acme--bot"');
   await api('POST', '/agents/bot/branches', { name: 'mr2' });
   await aql('UPDATE INTO PROCEDURAL WHERE key = "mr-proc" (steps = "from-branch") NAMESPACE "acme--bot" BRANCH "mr2"');
@@ -479,7 +483,7 @@ do:
   check('that exists', (await api('POST', '/agents/bot/transfer', { project: 'nowhere' })).status === 404);
   r = await api('POST', '/agents/bot/transfer', { project: 'globex-crm', new_agent: { id: 'bot9' } });
   check('a transfer lands in the other org', r.status === 201 && r.body.agent?.org_id === 'org-globex' && r.body.version?.lineage?.transferred_from?.agent === 'bot', JSON.stringify(r));
-  const carried = JSON.stringify([await aql('RECALL FROM SEMANTIC ALL NAMESPACE "globex-crm--bot9"'), await aql('RECALL FROM EPISODIC ALL NAMESPACE "globex-crm--bot9"')]);
+  const carried = JSON.stringify([await aql('RECALL FROM SEMANTIC NAMESPACE "globex-crm--bot9"'), await aql('RECALL FROM EPISODIC NAMESPACE "globex-crm--bot9"')]);
   check('it carries procedures, no facts or episodes', r.body.memory?.records > 0 && !carried.includes('"key"'), carried);
 
   // --- drop

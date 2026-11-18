@@ -68,7 +68,7 @@ const t0 = Date.now();
 await seed(Array.from({ length: ROWS }, (_, i) => `STORE INTO SEMANTIC (key = "f${i}", topic = "t${i % 20}", n = ${i % 997}, content = "fact number ${i} about topic t${i % 20}")`));
 await seed(Array.from({ length: 200 }, (_, i) => `STORE INTO EPISODIC (key = "e${i}", kind = "event", content = "event ${i}")`));
 await seed(Array.from({ length: 200 }, (_, i) => `STORE INTO WORKING (key = "w${i}", priority = ${i % 10})`));
-await seed(Array.from({ length: 50 }, (_, i) => `LINK FROM SEMANTIC WHERE key = "f${i}" TO EPISODIC WHERE key = "e${i}" TYPE "about"`));
+await seed(Array.from({ length: 50 }, (_, i) => `LINK FROM SEMANTIC WHERE key = "f${i}" INTO EPISODIC WHERE key = "e${i}" TYPE "about"`));
 console.log(`seeded ${ROWS} facts in ${((Date.now() - t0) / 1000).toFixed(1)} s (ADB_QUERY=${process.env.ADB_QUERY ?? "default"})`);
 if (process.argv.includes("--compact")) {
   const t1 = Date.now();
@@ -93,16 +93,16 @@ if (CACHE !== "default") {
 }
 
 const reads = {
-  "LOOKUP KEY": `LOOKUP FROM SEMANTIC KEY id = "f4242"`,
+  "LOOKUP KEY": `RECALL FROM SEMANTIC WHERE id = "f4242"`,
   "RECALL WHERE (pushed down)": `RECALL FROM SEMANTIC WHERE topic = "t7" LIMIT 10`,
   "RECALL WHERE != (not pushed)": `RECALL FROM SEMANTIC WHERE topic != "t7" LIMIT 10`,
-  "RECALL ALL ORDER BY LIMIT 10": `RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 10`,
-  "WITH LINKS (50 records)": `RECALL FROM SEMANTIC WHERE n < 50 AND topic = "t1" WITH LINKS ALL`,
+  "RECALL ALL ORDER BY LIMIT 10": `RECALL FROM SEMANTIC ORDER BY n DESC LIMIT 10`,
+  "WITH LINKS (50 records)": `RECALL FROM SEMANTIC WHERE n < 50 AND topic = "t1" WITH LINKS`,
   "FOLLOW LINKS": `RECALL FROM SEMANTIC WHERE topic = "t3" FOLLOW LINKS TYPE "about"`,
-  "SCAN WORKING WINDOW": `SCAN FROM WORKING WINDOW LAST 10`,
-  "RECALL WORKING KEY": `RECALL FROM WORKING KEY id = "w42"`,
-  "RECALL EPISODIC newest 10": `RECALL FROM EPISODIC ALL LIMIT 10`,
-  "RECALL EPISODIC KEY": `RECALL FROM EPISODIC KEY id = "e42"`,
+  "SCAN WORKING WINDOW": `RECALL FROM WORKING WINDOW LAST 10`,
+  "RECALL WORKING KEY": `RECALL FROM WORKING WHERE id = "w42"`,
+  "RECALL EPISODIC newest 10": `RECALL FROM EPISODIC LIMIT 10`,
+  "RECALL EPISODIC KEY": `RECALL FROM EPISODIC WHERE id = "e42"`,
   "AGGREGATE COUNT": `RECALL FROM SEMANTIC WHERE topic = "t5" AGGREGATE COUNT(*) AS c`,
   // Words only (the server runs with ADB_EMBED=off): ranks every fact.
   "LIKE (words, 10k)": [`RECALL FROM SEMANTIC LIKE $q LIMIT 10`, { q: "fact about topic t7" }],

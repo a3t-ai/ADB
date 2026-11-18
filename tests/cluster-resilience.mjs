@@ -90,7 +90,7 @@ for (let b = 0; b < acked.length; b += batch) {
     for (let attempt = 0; attempt < NODES.length * 3; attempt++) {
       const node = NODES[(i + attempt) % NODES.length];
       try {
-        const d = await q(node, `LOOKUP FROM SEMANTIC KEY id = "${run}k${i}" NAMESPACE "${ns(i)}"`);
+        const d = await q(node, `RECALL FROM SEMANTIC WHERE id = "${run}k${i}" NAMESPACE "${ns(i)}"`);
         checked++;
         if ((d?.data?.count ?? d?.data?.records?.length ?? d?.count ?? d?.records?.length ?? 0) < 1) { missing++; if (lost.length < 10) lost.push(i); }
         return;

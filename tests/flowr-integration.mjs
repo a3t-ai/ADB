@@ -194,7 +194,7 @@ try {
   check('stats via `stats` (A3T tool name)', flowOutput(r.text)?.semantic === 1 && flowOutput(r.text)?.episodic === 1, r.text);
 
   r = await callTool('aql_query', { query: 'FORGET FROM SEMANTIC' });
-  check('bad AQL surfaces as an error', /WHERE predicate/.test(r.text), r.text);
+  check('bad AQL surfaces as an error', /WHERE/.test(r.text), r.text);
 
   // ---------------------------------------------------------------- ADB resource + driver (call:adb)
   r = await flowr('create_resource', {
@@ -218,7 +218,7 @@ try {
   r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'RECALL FROM WORKING WHERE name = "alice"' });
   check('call:adb RECALL', flowOutput(r.text)?.data?.records?.[0]?.data?.score === 95, r.text);
   r = await run({ test_type: 'adb', resource: 'a3t/adb', query: 'FORGET FROM WORKING' });
-  check('call:adb bad AQL fails the step with ADB’s message', r.isError && /WHERE predicate/.test(r.text), r.text);
+  check('call:adb bad AQL fails the step with ADB’s message', r.isError && /WHERE/.test(r.text), r.text);
 
   // DB console: query_resource returns flat rows for the table view.
   r = await flowr('query_resource', { resource: 'adb', namespace: 'a3t', query: 'RECALL FROM WORKING WHERE name = "alice"' });
@@ -318,8 +318,10 @@ do:
     console.log('  (no ADB_EMBED_MODEL_DIR: W4 relevance checks skipped)');
   }
   // P1.5: other facts about the entities of a recalled fact come along as related.
-  await adbQ('STORE INTO SEMANTIC FACT (subject = "org:acme", predicate = "renews_on", value = "1 Nov", content = "Acme renews on 1 Nov") NAMESPACE "f-test"');
-  await adbQ('STORE INTO SEMANTIC FACT (subject = "org:acme", predicate = "account_manager", object = "person:dana", confidence = 0.9, content = "Dana is the account manager") NAMESPACE "f-test"');
+  // (AQL v0.13: no FACT — a value is a field, a relationship a LINK.)
+  await adbQ('STORE INTO SEMANTIC (key = "org:acme", renews_on = "1 Nov", content = "Acme renews on 1 Nov") NAMESPACE "f-test"');
+  await adbQ('STORE INTO SEMANTIC (key = "person:dana", content = "Dana is the account manager") NAMESPACE "f-test"');
+  await adbQ('LINK FROM SEMANTIC WHERE key = "org:acme" INTO SEMANTIC WHERE key = "person:dana" TYPE "account_manager" WEIGHT 0.9 NAMESPACE "f-test"');
   r = await ask('f-s1d', 'When does Acme renew?', { memory_config: { semantic: { limit: 1 } } });
   const t4 = JSON.stringify(flowOutput(r.text) ?? r.text);
   check('P1.5: a recalled fact brings related facts about its entity', t4.includes('Acme renews on 1 Nov') && t4.includes('(related, link weight 0.90) Dana is the account manager'), t4.slice(0, 800));
@@ -359,7 +361,7 @@ do:
     && (await adbQ('RECALL FROM SEMANTIC WHERE source = "reflection" NAMESPACE "f-test"'))?.records?.length === 1);
   check('F-L3: off by default (no reflection call)', !reflections.some(x => x.includes('Where do I live?')));
   // Another owner's reflected facts stay out of this user's prompt.
-  await adbQ('STORE INTO SEMANTIC FACT (subject = "user:someone-else", predicate = "likes", object = "thing:zebra", content = "The user likes zebras", owner = "someone-else", source = "reflection") NAMESPACE "f-test"');
+  await adbQ('STORE INTO SEMANTIC (key = "user:someone-else", likes = "thing:zebra", content = "The user likes zebras", owner = "someone-else", source = "reflection") NAMESPACE "f-test"');
   r = await ask('f-r4', 'What do I like? zebras?');
   check('F-L3: another owner\'s facts aren\'t recalled', !JSON.stringify(flowOutput(r.text)).includes('likes zebras'), r.text.slice(0, 600));
 
