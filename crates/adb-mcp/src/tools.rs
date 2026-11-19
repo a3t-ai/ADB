@@ -14,7 +14,7 @@ pub fn tool_list() -> Value {
     json!({ "tools": [
         {
             "name": "aql_query",
-            "description": "Execute an AQL (Agent Query Language) query against ADB. Use this for all memory operations including STORE, RECALL, SCAN, LOOKUP, LOAD, FORGET, UPDATE, LINK, REFLECT, and PIPELINE. See the resource adb://guide/memory.",
+            "description": "Execute an AQL (Agent Query Language) query against ADB. Use this for all memory operations: RECALL, STORE, UPDATE, FORGET, LINK, UNLINK, PIPELINE, SUBSCRIBE and PUBLISH (AQL v0.13). See the resource adb://guide/memory.",
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": "The AQL query to execute" },
                 "variables": { "type": "object", "description": "Values for {name} placeholders in the query (optional)" }
@@ -48,7 +48,7 @@ pub fn tool_list() -> Value {
         },
         {
             "name": "remember",
-            "description": "Remember something. Stores `content` (plus optional fields) in memory. Default memory type SEMANTIC (facts); use EPISODIC for events, PROCEDURAL for how-tos, WORKING for the current task. With `subject` + `predicate` (+ `object` or `value`) it is a fact in the knowledge graph.",
+            "description": "Remember something. Stores `content` (plus optional fields) in memory. Default memory type SEMANTIC (facts); use EPISODIC for events, PROCEDURAL for how-tos, WORKING for the current task. With `subject` + `predicate`: `object` links the two records (a LINK of that type); `value` sets that field on the subject.",
             "inputSchema": { "type": "object", "properties": {
                 "scope": { "type": "string", "description": "Named scope, e.g. \"team:billing\" or \"agent:42\" (optional; SEMANTIC, EPISODIC, PROCEDURAL). Without it, recall and forget cover every scope." },
                 "content": { "type": "string", "description": "What to remember, in plain words" },
@@ -56,14 +56,10 @@ pub fn tool_list() -> Value {
                 "key": { "type": "string", "description": "A stable key, so you can update, link or forget it later (optional). Remembering a key again updates that memory (a new version)." },
                 "fields": { "type": "object", "description": "Extra structured fields, e.g. {\"account\": \"acct-9\"} (optional)" },
                 "namespace": { "type": "string", "description": "Namespace for isolation (optional)" },
-                "subject": { "type": "string", "description": "Make it a fact about this entity, e.g. \"person:ada\" (with predicate; SEMANTIC). A new fact for the same subject and predicate replaces the old one." },
-                "predicate": { "type": "string", "description": "The fact's relation, e.g. \"works_at\" (with subject)" },
-                "object": { "type": "string", "description": "The entity the fact points at, e.g. \"org:acme\" — a link you can follow (or give value)" },
-                "value": { "description": "The fact's literal value, e.g. 1815 (or give object)" },
-                "confidence": { "type": "number", "description": "How sure, 0-1 (the link's weight; default 1)" },
-                "multi": { "type": "boolean", "description": "The predicate holds several values (e.g. knows): keep one fact per object" },
-                "valid_from": { "type": "string", "description": "The fact holds from this date or time, e.g. \"2026-11-01\" (optional; before it, recall doesn't return it)" },
-                "valid_to": { "type": "string", "description": "The fact holds until this date or time (optional; from then on, recall doesn't return it)" }
+                "subject": { "type": "string", "description": "The key of an existing SEMANTIC record, e.g. \"person:ada\" (with predicate): link it to `object`, or set a field on it to `value`" },
+                "predicate": { "type": "string", "description": "The link type, or the field name, e.g. \"works_at\" (with subject)" },
+                "object": { "type": "string", "description": "The key of the record to link to, e.g. \"org:acme\" (or give value)" },
+                "value": { "description": "The field's value on the subject, e.g. 1815 (or give object)" }
             }, "required": ["content"] }
         },
         {
@@ -148,12 +144,13 @@ pub fn tool_list() -> Value {
             "description": "Mark a subscription's deliveries up to `offset` as handled.",
             "inputSchema": { "type": "object", "properties": {
                 "subscription": { "type": "string" },
-                "offset": { "type": "integer" }
+                "offset": { "type": "integer" },
+                "namespace": { "type": "string", "description": "the subscription's namespace (as SUBSCRIBE … NAMESPACE)" }
             }, "required": ["subscription", "offset"] }
         },
         {
             "name": "watch",
-            "description": "Keep a query's result current: returns its result now (`{cq_id, offset, result}`); read what changes with `watch_changes`. Takes RECALL, LOOKUP, SCAN or LOAD.",
+            "description": "Keep a query's result current: returns its result now (`{cq_id, offset, result}`); read what changes with `watch_changes`. Takes a RECALL (`SUBSCRIBE RECALL …`).",
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": "The AQL read, e.g. RECALL FROM SEMANTIC WHERE topic = \"billing\" LIMIT 20" },
                 "variables": { "type": "object", "description": "Values for $name variables in the query (optional)" },
@@ -287,19 +284,16 @@ mod tests {
     }
 }
 
-/// `watch`: `WATCH <query> [DEBOUNCE <n>ms]` (MVP W6).
+/// `watch`: a live query, `SUBSCRIBE <RECALL …>` (AQL v0.13; how often it re-runs is
+/// the server's setting).
 pub fn watch(args: &Value) -> Result<String, String> {
     let query = args.get("query").and_then(Value::as_str).ok_or("Missing required: query")?.trim();
-    let query = query.strip_prefix("WATCH ").or_else(|| query.strip_prefix("watch ")).unwrap_or(query);
-    let mut aql = format!("WATCH {query}");
-    if let Some(ms) = args.get("debounce_ms").and_then(Value::as_u64) {
-        aql.push_str(&format!(" DEBOUNCE {ms}ms"));
-    }
-    Ok(aql)
+    let query = query.strip_prefix("SUBSCRIBE ").or_else(|| query.strip_prefix("subscribe ")).unwrap_or(query);
+    Ok(format!("SUBSCRIBE {query}"))
 }
 
-/// `unwatch`: `UNWATCH "<cq_id>"`.
+/// `unwatch`: `UNSUBSCRIBE "<cq_id>"`.
 pub fn unwatch(args: &Value) -> Result<String, String> {
     let id = args.get("cq_id").and_then(Value::as_str).ok_or("Missing required: cq_id")?;
-    Ok(format!("UNWATCH {}", quote(id)))
+    Ok(format!("UNSUBSCRIBE {}", quote(id)))
 }

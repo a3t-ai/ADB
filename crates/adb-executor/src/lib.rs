@@ -6,6 +6,8 @@
 #![recursion_limit = "256"]
 
 pub mod engine;
+pub mod namespaces;
+pub mod review;
 pub mod engine_store;
 mod error;
 mod executor;
@@ -20,7 +22,6 @@ pub use adb_core::steps;
 pub mod replica;
 pub mod follower;
 pub mod branches;
-pub mod branch_engine;
 pub mod merge;
 pub mod restore;
 pub mod partitioned;

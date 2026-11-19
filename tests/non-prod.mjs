@@ -5,6 +5,10 @@
  * and prod's main doesn't change; prod still reads the branch through forwarding.
  *
  *   node tests/non-prod.mjs --adb <adb bin> --flowr <flowr-ce bin (adb-platform)>
+ *
+ * AQL v0.13: the `BRANCH "b"` statement modifier this script uses is removed; branches
+ * become namespaces (BRANCH / FORK / MERGE, see .ai/BRANCH_NAMESPACES.md). The branch
+ * steps fail until the script is reworked for that; the rest is v0.13 AQL.
  */
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -103,14 +107,14 @@ do:
 ` });
   await tool('execute_flow', { namespace: 't', name: 'writer', memory_branch: 'dev' });
   let onPod = '';
-  for (let i = 0; i < 100 && !onPod.includes('from-the-run'); i++) { onPod = await text(podUrl, 'RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot" BRANCH "dev"'); await sleep(100); }
+  for (let i = 0; i < 100 && !onPod.includes('from-the-run'); i++) { onPod = await text(podUrl, 'RECALL FROM SEMANTIC NAMESPACE "acme--bot" BRANCH "dev"'); await sleep(100); }
   check('the run writes on the pod', onPod.includes('from-the-run'), onPod);
   check('and reads its parent from prod', onPod.includes('from-prod'), onPod);
-  check('prod\'s main is unchanged', !(await text(prodUrl, 'RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot"')).includes('from-the-run'));
-  check('prod still reads the branch by forwarding', (await text(prodUrl, 'RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot" BRANCH "dev"')).includes('from-the-run'));
-  check('the pod has no main', (await aql(podUrl, 'RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot"')).success === false);
+  check('prod\'s main is unchanged', !(await text(prodUrl, 'RECALL FROM SEMANTIC NAMESPACE "acme--bot"')).includes('from-the-run'));
+  check('prod still reads the branch by forwarding', (await text(prodUrl, 'RECALL FROM SEMANTIC NAMESPACE "acme--bot" BRANCH "dev"')).includes('from-the-run'));
+  check('the pod has no main', (await aql(podUrl, 'RECALL FROM SEMANTIC NAMESPACE "acme--bot"')).success === false);
   r = await api('POST', '/agents/bot/branches/dev/promote', { new_agent: { id: 'bot2' }, allow_stale: true });
-  check('promote reads the branch from the pod', r.status === 201 && (await text(prodUrl, 'RECALL FROM SEMANTIC ALL NAMESPACE "acme--bot2"')).includes('from-the-run'), JSON.stringify(r));
+  check('promote reads the branch from the pod', r.status === 201 && (await text(prodUrl, 'RECALL FROM SEMANTIC NAMESPACE "acme--bot2"')).includes('from-the-run'), JSON.stringify(r));
 } catch (e) {
   console.error(e);
   failures++;

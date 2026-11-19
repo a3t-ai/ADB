@@ -81,7 +81,6 @@ pub enum PartCall {
     Scan { modifiers: Modifiers },
     Load { predicate: Predicate, limit: usize },
     Store { memory: MemoryType, key: String, payload: Value, scope: Scope, namespace: Option<String>, ttl_ms: Option<u64>, in_scope: Option<String> },
-    StoreFact { payload: Value, multi: bool, scope: Scope, namespace: Option<String>, ttl_ms: Option<u64>, in_scope: Option<String> },
     Update { memory: MemoryType, predicate: Predicate, data: Value, in_scope: Option<String>, namespace: Option<String> },
     Forget { memory: MemoryType, predicate: Predicate, in_scope: Option<String>, namespace: Option<String> },
     Link { from_type: MemoryType, from_id: String, to_type: MemoryType, to_id: String, link_type: String, weight: Option<f32>, remote_target: bool },
@@ -128,9 +127,6 @@ pub async fn serve_part(e: &LocalEngine, call: PartCall) -> Result<PartReply, St
         PartCall::Store { memory, key, payload, scope, namespace, ttl_ms, in_scope } => {
             PartReply::Record(w.store(memory, &key, payload, scope, namespace.as_deref(), dur(ttl_ms), in_scope.as_deref()).await.map_err(err)?)
         }
-        PartCall::StoreFact { payload, multi, scope, namespace, ttl_ms, in_scope } => {
-            PartReply::Record(w.store_fact(payload, multi, scope, namespace.as_deref(), dur(ttl_ms), in_scope.as_deref()).await.map_err(err)?)
-        }
         PartCall::Update { memory, predicate, data, in_scope, namespace } => PartReply::Count(w.update(memory, &predicate, data, in_scope.as_deref(), namespace.as_deref()).await.map_err(err)?),
         PartCall::Forget { memory, predicate, in_scope, namespace } => PartReply::Count(w.forget(memory, &predicate, in_scope.as_deref(), namespace.as_deref()).await.map_err(err)?),
         PartCall::Link { from_type, from_id, to_type, to_id, link_type, weight, remote_target } => PartReply::Link(if remote_target {
@@ -156,6 +152,12 @@ fn val<T: Serialize>(v: T) -> Result<Value, String> {
 
 /// A partition operation by name, on a partition engine this node owns.
 pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, String> {
+    // AQL v0.13 BRANCH / FORK / MERGE: a router's calls to this partition.
+    if op.starts_with("ns_") {
+        if let Some(r) = crate::namespaces::dispatch(e, op, &a).await {
+            return r;
+        }
+    }
     let s = |n: &str| arg::<String>(&a, n);
     let o = |n: &str| arg::<Option<String>>(&a, n);
     match op {
@@ -166,17 +168,12 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "branch_create" => val(e.branch_create(&s("namespace")?, &s("name")?, o("parent")?.as_deref(), o("created_by")?.as_deref()).await?),
         "branch_drop" => val(e.branch_drop(&s("namespace")?, &s("name")?).await?),
         "branch_list" => val(e.branch_list(o("namespace")?.as_deref()).await?),
-        "branch_create_past" => e.branch_create_past(&s("namespace")?, &s("name")?, o("created_by")?.as_deref(), &arg(&a, "at")?).await,
         "space_stats" => e.space_stats(&s("namespace")?, o("branch")?.as_deref(), Duration::from_millis(arg(&a, "max_age_ms")?)).await,
         "space_records" => e.space_records(&s("namespace")?, arg(&a, "memory")?, o("branch")?.as_deref(), o("after")?.as_deref(), arg(&a, "limit")?).await,
         "branch_conflicts" => e.branch_conflicts(&s("namespace")?, &s("name")?, &arg::<Vec<MemoryType>>(&a, "memories")?).await,
         "branch_merge" => e.branch_merge(&s("namespace")?, &s("name")?, &arg::<Vec<MemoryType>>(&a, "memories")?, arg(&a, "main_offset")?, arg(&a, "resolutions")?, o("by")?.as_deref()).await,
         "branch_rebase" => e.branch_rebase(&s("namespace")?, &s("name")?, arg(&a, "main_offset")?, arg(&a, "resolutions")?).await,
         "merge_revert" => e.merge_revert(&s("namespace")?, &s("merge_id")?, o("by")?.as_deref(), arg(&a, "force_skip")?).await,
-        "parent_rows" => val(e.parent_rows(arg(&a, "memory")?, &s("namespace")?, o("branch")?.as_deref(), arg(&a, "at")?).await?),
-        "branch_place" => val(e.branch_place(&s("namespace")?, &s("name")?, &s("url")?).await?),
-        "branch_pending" => val(e.branch_pending(&s("namespace")?, &s("name")?).await?),
-        "branch_pending_ack" => val(e.branch_pending_ack(&s("namespace")?, &s("name")?, arg(&a, "n")?).await?),
         "tag_create" => val(e.tag_create(&s("namespace")?, &s("name")?, o("created_by")?.as_deref()).await?),
         "tag_drop" => val(e.tag_drop(&s("namespace")?, &s("name")?).await?),
         "tag_list" => val(e.tag_list(o("namespace")?.as_deref()).await?),
@@ -184,10 +181,14 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "layers_set" => val(e.layers_set(&s("namespace")?, arg(&a, "layers")?).await?),
         "layers_dependents" => val(e.layers_dependents(&s("space")?).await?),
         "space_usage" => e.space_usage(o("namespace")?.as_deref()).await,
-        "forget_lineages" => val(e.forget_lineages(arg(&a, "memory")?, &arg::<Vec<String>>(&a, "lineages")?).await?),
         "compact" => e.compact().await,
         // A merged entity's key, for a cluster's reads across partitions (GR-12).
         "alias_of" => val(e.io().0.alias_of(&s("key")?)),
+        // A record's `aliases` changed by a statement the router ran (AQL v0.13).
+        "aliases_changed" => {
+            e.io().0.aliases_changed().await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        }
         // A cluster's watches across partitions (the router's).
         "cq_touched" => val(e.cq_touched(arg(&a, "after")?, &arg::<Vec<(String, adb_cq::WatchSpec)>>(&a, "watches")?, Duration::from_millis(arg(&a, "wait_ms")?)).await?),
         "cq_register" => Ok(json!({ "id": e.cq_register(&arg(&a, "spec")?).await? })),
@@ -207,8 +208,7 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "space_clone" => e.space_clone(&s("namespace")?, &s("into")?).await,
         "space_clone_at" => e.space_clone_at(&s("namespace")?, &s("into")?, &arg(&a, "at")?).await,
         "space_copy_procedures" => e.space_copy_procedures(&s("namespace")?, &s("into")?, arg(&a, "tools")?).await,
-        // Copies between partitions, and what promoting needs.
-        "promote_check" => val(e.promote_check(&s("namespace")?, &s("name")?, arg(&a, "allow_stale")?).await?),
+        // Copies between partitions.
         "copy_out" => val(e.copy_out(&s("namespace")?, o("branch")?.as_deref(), &arg::<Vec<MemoryType>>(&a, "memories")?, arg(&a, "at")?).await?),
         "copy_in" => val(e.copy_in(&s("into")?, arg(&a, "rows")?).await?),
         "resolve_point" => val(e.resolve_point(&s("namespace")?, &arg(&a, "at")?).await?),
@@ -217,8 +217,13 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
             let l = e.local_spaces().ok_or("no table")?;
             val(l.versions(arg(&a, "memory")?, &s("space")?).await.map_err(|e| e.to_string())?)
         }
+        "space_key_versions" => {
+            let l = e.local_spaces().ok_or("no table")?;
+            val(crate::spaces::Spaces::key_versions(&l, arg(&a, "memory")?, &s("space")?, &s("key")?).await.map_err(|e| e.to_string())?)
+        }
         "space_tag" => val(e.local_spaces().ok_or("no table")?.registry.tag(&s("space")?, &s("name")?)),
         "space_layers" => val(e.local_spaces().ok_or("no table")?.registry.layers_of(&s("space")?)),
+        "space_base" => val(e.local_spaces().ok_or("no table")?.registry.base_of(&s("space")?)),
         "space_layered_by" => val(e.local_spaces().ok_or("no table")?.registry.layered_by(&s("space")?)),
         "quotas" => val(e.local_spaces().ok_or("no table")?.registry.quotas()),
         "quota_set" => val(e.quota_set(&s("pattern")?, arg(&a, "max_bytes")?, arg(&a, "max_records")?, arg(&a, "history_days")?).await?),
@@ -241,7 +246,6 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         "w_sub_topic" => val(e.io().0.subscription_topic(&s("subscription")?).await.map_err(|x| x.to_string())?),
         "w_platform" => val(e.io().0.platform(arg(&a, "effect")?).await.map_err(|x| x.to_string())?),
         "w_platform_many" => val(e.io().0.platform_many(arg(&a, "effects")?).await.map_err(|x| x.to_string())?),
-        "w_merge" => val(e.io().0.merge(&s("from")?, &s("into")?).await.map_err(|x| x.to_string())?),
         // A watch's next frames, from this partition's watcher.
         "watch_frames" => {
             let wait = Duration::from_millis(arg::<u64>(&a, "wait_ms")?.min(30_000));
@@ -348,12 +352,12 @@ impl Writes for RemotePartition {
         self.op_typed("alias_of", serde_json::json!({ "key": key })).await
     }
 
-    async fn store(&self, memory_type: MemoryType, key: &str, payload: Value, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {
-        expect!(self.call(PartCall::Store { memory: memory_type, key: key.into(), payload, scope, namespace: namespace.map(String::from), ttl_ms: ms(ttl), in_scope: in_scope.map(String::from) }).await?, Record)
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        self.op_typed::<Value>("aliases_changed", serde_json::json!({})).await.map(|_| ())
     }
 
-    async fn store_fact(&self, payload: Value, multi: bool, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {
-        expect!(self.call(PartCall::StoreFact { payload, multi, scope, namespace: namespace.map(String::from), ttl_ms: ms(ttl), in_scope: in_scope.map(String::from) }).await?, Record)
+    async fn store(&self, memory_type: MemoryType, key: &str, payload: Value, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {
+        expect!(self.call(PartCall::Store { memory: memory_type, key: key.into(), payload, scope, namespace: namespace.map(String::from), ttl_ms: ms(ttl), in_scope: in_scope.map(String::from) }).await?, Record)
     }
 
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
@@ -383,11 +387,7 @@ impl Writes for RemotePartition {
         expect!(self.call(PartCall::Unlink { from_type, from_ids: from_ids.to_vec(), to_type, to_ids: to_ids.to_vec(), link_type: link_type.map(String::from) }).await?, Count)
     }
 
-    // Topics, subscriptions, platform tables and entity merges: run by the owner.
-
-    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
-        self.op_typed("w_merge", serde_json::json!({ "from": from, "into": into })).await
-    }
+    // Topics, subscriptions and platform tables: run by the owner.
 
     async fn publish(&self, topic: &str, payload: Value, ttl: Option<Duration>) -> AdbResult<(String, u64)> {
         self.op_typed("w_publish", serde_json::json!({ "topic": topic, "payload": payload, "ttl_ms": ms(ttl) })).await

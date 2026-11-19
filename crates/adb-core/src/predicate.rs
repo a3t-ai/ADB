@@ -475,9 +475,20 @@ fn value_compare(json: &serde_json::Value, value: &Value) -> Option<i32> {
             let jv = n.as_f64().or_else(|| n.as_i64().map(|i| i as f64));
             jv.and_then(|jv| jv.partial_cmp(f).map(|c| c as i32))
         }
-        (serde_json::Value::String(a), Value::String(b)) => Some(a.cmp(b) as i32),
+        // Two times (RFC 3339, or dates) compare as times, whatever their offsets.
+        (serde_json::Value::String(a), Value::String(b)) => match (as_time(a), as_time(b)) {
+            (Some(x), Some(y)) => Some(x.cmp(&y) as i32),
+            _ => Some(a.cmp(b) as i32),
+        },
         _ => None,
     }
+}
+
+fn as_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().and_then(|d| d.and_hms_opt(0, 0, 0)).map(|t| t.and_utc())
 }
 
 /// Query modifiers
@@ -541,12 +552,13 @@ pub struct Modifiers {
     /// `AS OF t` (AQL v0.10): the records as they were at t
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<TimePoint>,
-    /// `VALID AT t` (AQL v0.10): facts that held at t, as known now
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valid_at: Option<TimePoint>,
     /// `WITH HISTORY` (AQL v0.10): every version, current and replaced
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub with_history: bool,
+    /// `WITH HISTORY BETWEEN t1 AND t2` (AQL v0.13): only versions recorded from t1
+    /// (to `as_of` = t2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_from: Option<TimePoint>,
 }
 
 /// A point in time in a history read (AQL v0.10).

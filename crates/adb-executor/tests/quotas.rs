@@ -22,7 +22,7 @@ async fn quotas_hold_writes_and_usage_is_reported() {
         store(&e, "globex--a", "elsewhere").await.unwrap();
 
         // Reads and FORGET still work, and FORGET frees room.
-        assert!(e.query(r#"RECALL FROM SEMANTIC ALL NAMESPACE "acme--a""#, None).await.unwrap().to_string().contains("second"));
+        assert!(e.query(r#"RECALL FROM SEMANTIC NAMESPACE "acme--a""#, None).await.unwrap().to_string().contains("second"));
         e.query(r#"FORGET FROM SEMANTIC WHERE key = "second" NAMESPACE "acme--a""#, None).await.unwrap();
         store(&e, "acme--a", "third").await.unwrap();
 
@@ -70,10 +70,4 @@ async fn quotas_hold_writes_and_usage_is_reported() {
     assert!(e.quota_drop("flood").await.unwrap());
     store(&e, "flood", "after").await.unwrap();
     assert!(!e.quota_drop("flood").await.unwrap());
-
-    // A branch's writes aren't the org's storage.
-    e.branch_create("acme--a", "dev", None, None).await.unwrap();
-    for i in 0..3 {
-        e.query(&format!(r#"STORE INTO SEMANTIC (key = "b{i}", content = "x") NAMESPACE "acme--a" BRANCH "dev""#), None).await.unwrap();
-    }
 }

@@ -25,10 +25,7 @@ pub const CODES: &[&str] = &[
     "branch_name_invalid",
     "branch_exists",
     "branch_not_found",
-    "branch_needs_namespace",
-    "branch_wrong_namespace",
     "branch_has_children",
-    "branch_pod_unsupported",
     "target_not_empty",
     "promote_into_self",
     "tag_exists",
@@ -47,7 +44,6 @@ pub const CODES: &[&str] = &[
     "transaction_invalid",
     "table_not_found",
     "column_not_found",
-    "wrong_engine",
     "durable_required",
     "forbidden",
     "unauthorized",
@@ -84,16 +80,10 @@ pub fn code_of(message: &str) -> &'static str {
         "branch_exists"
     } else if has("branch name ") && has("use 1–64") {
         "branch_name_invalid"
-    } else if has("needs NAMESPACE: a branch belongs to one memory space") || has("must name it (BRANCH") {
-        "branch_needs_namespace"
     } else if has("has branches of its own: drop them first") {
         "branch_has_children"
-    } else if has("runs in its own pod") || has("moving one to a pod isn't supported") || has("a pod branch can't be a parent") || has("parent chain is longer") {
-        "branch_pod_unsupported"
-    } else if (has("branch ") && has(" belongs to namespace ")) || has("this is a branch of ") || has("this is branch ") {
-        "branch_wrong_namespace"
     } else if has("no branch ") {
-        if has("this engine is a branch itself") { "wrong_engine" } else { "branch_not_found" }
+        "branch_not_found"
     } else if has("exists on this branch (from it or its parent)") {
         "key_on_branch"
     } else if has("already holds") && has("records: promote into a new one") {
@@ -128,8 +118,6 @@ pub fn code_of(message: &str) -> &'static str {
         "column_not_found"
     } else if has("column name ") || has("add columns to ") || has("purge ") && has("name the time") {
         "invalid_value"
-    } else if has("on the org's engine") || has("runs on a branch engine") || has("not a branch engine") || has("is written on the org's engine") || has("a branch engine has no table") {
-        "wrong_engine"
     } else if has("needs a durable engine") || has("need a durable engine") || has("need a data directory") || has("no durable log") || has("no table to compact") {
         "durable_required"
     } else if has("requires a WHERE") || has("WHERE predicate") {
@@ -179,22 +167,11 @@ mod tests {
         ("\"trading\" can't be a layer of itself", "layer_invalid"),
         ("a layer carries SEMANTIC, PROCEDURAL or TOOLS, not Episodic", "layer_invalid"),
         ("layer space \"a|b\": not a valid namespace", "layer_invalid"),
-        ("layers are set on the org's engine", "wrong_engine"),
         ("namespace \"crm\" already has a branch \"try\"", "branch_exists"),
         ("branch name \"bad name\": use 1–64 letters, digits, '-', '_' or '.'", "branch_name_invalid"),
-        ("BRANCH \"try\" needs NAMESPACE: a branch belongs to one memory space", "branch_needs_namespace"),
-        ("every stage of a pipeline on branch \"try\" must name it (BRANCH \"try\")", "branch_needs_namespace"),
         ("branch \"try\" has branches of its own: drop them first", "branch_has_children"),
-        ("branch \"p\" runs in its own pod: branching from it isn't supported yet (B6)", "branch_pod_unsupported"),
-        ("branch \"x\" already has a hosted engine with its own writes: moving one to a pod isn't supported yet (B6)", "branch_pod_unsupported"),
-        ("branch \"x\" has branches of its own: a pod branch can't be a parent yet (B6)", "branch_pod_unsupported"),
-        ("branch \"x\": its parent chain is longer than 64", "branch_pod_unsupported"),
-        ("branch \"try\" belongs to namespace \"crm\", not \"sales\"", "branch_wrong_namespace"),
-        ("this is a branch of \"crm\", not \"sales\"", "branch_wrong_namespace"),
-        ("this is branch \"a\" of \"crm\", not \"b\"", "branch_wrong_namespace"),
         ("no branch \"try\" in namespace \"crm\"", "branch_not_found"),
         ("no branch \"main2\" in namespace \"crm\" to branch from", "branch_not_found"),
-        ("no branch \"x\" here: this engine is a branch itself", "wrong_engine"),
         ("Query execution error: crm|~a exists on this branch (from it or its parent): UPDATE it to change it on the branch", "key_on_branch"),
         ("Query execution error: namespace \"crm2\" already holds 3 records: promote into a new one", "target_not_empty"),
         ("promote into a new namespace, not \"crm\" itself", "promote_into_self"),
@@ -205,11 +182,6 @@ mod tests {
         ("Query execution error: MERGE: no entity alice", "merge_invalid"),
         ("Query execution error: MERGE: a was already merged into b", "merge_invalid"),
         ("Query execution error: LINK: the target record Semantic \"x\" doesn't exist (any more)", "link_target_missing"),
-        ("branches are created on the org's engine", "wrong_engine"),
-        ("forget_lineages runs on a branch engine (FORGET on main reaching it)", "wrong_engine"),
-        ("not a branch engine", "wrong_engine"),
-        ("a new agent is written on the org's engine, not a branch's", "wrong_engine"),
-        ("a branch engine has no table", "wrong_engine"),
         ("memory branches need a durable engine (start ADB with --data-dir)", "durable_required"),
         ("tags need a durable engine (start ADB with --data-dir)", "durable_required"),
         ("embedding settings need a data directory (start ADB with --data-dir)", "durable_required"),
@@ -243,7 +215,6 @@ mod tests {
         ("merge_not_found: no merge \"m1\" in namespace \"crm\"", "merge_not_found"),
         ("revert_conflicts: 1 records changed since the merge: a (force_skip reverts the rest)", "revert_conflicts"),
         ("Query execution error: a history layer of \"bot\" carries EPISODIC only and isn't sealed", "layer_invalid"),
-        ("branch \"try\" runs in its own pod: rebasing one isn't supported yet (B6)", "branch_pod_unsupported"),
         ("Internal error: store: disk full", "internal"),
     ];
 

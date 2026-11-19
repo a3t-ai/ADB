@@ -100,7 +100,7 @@ async fn create_test_executor() -> Mem {
 async fn test_scan_all() {
     let executor = create_test_executor().await;
 
-    let result = executor.execute("SCAN FROM WORKING").await.unwrap();
+    let result = executor.execute("RECALL FROM WORKING").await.unwrap();
 
     assert!(result.success);
     let records = result.get_records().unwrap();
@@ -111,7 +111,7 @@ async fn test_scan_all() {
 async fn test_scan_with_limit() {
     let executor = create_test_executor().await;
 
-    let result = executor.execute("SCAN FROM WORKING LIMIT 2").await.unwrap();
+    let result = executor.execute("RECALL FROM WORKING LIMIT 2").await.unwrap();
 
     assert!(result.success);
     let records = result.get_records().unwrap();
@@ -174,11 +174,11 @@ async fn test_recall_all() {
 async fn test_lookup_by_key() {
     let executor = create_test_executor().await;
 
-    // AQL v0.5 §19: LOOKUP is not valid on WORKING memory
-    assert!(executor.execute(r#"LOOKUP FROM WORKING KEY id = "task-2""#).await.is_err());
+    // AQL v0.13: RECALL works on every memory type, WORKING too (v0.5 refused LOOKUP there).
+    assert!(executor.execute(r#"RECALL FROM WORKING WHERE id = "task-2""#).await.is_ok());
 
     let result = executor
-        .execute(r#"LOOKUP FROM PROCEDURAL KEY id = "oom-fix""#)
+        .execute(r#"RECALL FROM PROCEDURAL WHERE id = "oom-fix""#)
         .await
         .unwrap();
 
@@ -205,7 +205,7 @@ async fn test_store_new_record() {
     assert!(result.success);
 
     // Verify it was stored
-    let scan_result = executor.execute("SCAN FROM WORKING").await.unwrap();
+    let scan_result = executor.execute("RECALL FROM WORKING").await.unwrap();
     let records = scan_result.get_records().unwrap();
     assert_eq!(records.len(), 4); // 3 original + 1 new
 }
@@ -228,7 +228,7 @@ async fn test_forget_with_filter() {
     assert_eq!(count, 1);
 
     // Verify it was deleted
-    let scan_result = executor.execute("SCAN FROM WORKING").await.unwrap();
+    let scan_result = executor.execute("RECALL FROM WORKING").await.unwrap();
     let records = scan_result.get_records().unwrap();
     assert_eq!(records.len(), 2);
 }
@@ -243,7 +243,7 @@ async fn test_load_tools() {
 
     // LOAD requires WHERE clause - use condition that matches all
     let result = executor
-        .execute(r#"LOAD FROM TOOLS WHERE category = "file" LIMIT 2"#)
+        .execute(r#"RECALL FROM TOOLS WHERE category = "file" LIMIT 2"#)
         .await
         .unwrap();
 
@@ -264,7 +264,7 @@ async fn test_pipeline_execution() {
 
     // Pipeline with proper syntax - LOAD requires WHERE clause
     let result = executor
-        .execute(r#"PIPELINE test_pipe TIMEOUT 50ms SCAN FROM WORKING LIMIT 1 | LOAD FROM TOOLS WHERE category = "file" LIMIT 1"#)
+        .execute(r#"PIPELINE test_pipe TIMEOUT 50ms RECALL FROM WORKING LIMIT 1 | RECALL FROM TOOLS WHERE category = "file" LIMIT 1"#)
         .await
         .unwrap();
 
@@ -457,16 +457,16 @@ async fn follow_links_depth_is_capped() {
 #[tokio::test]
 async fn lookup_follow_links_returns_targets() {
     let adb = graph(&["a", "b", "c"], &[("a", "b", 1.0), ("b", "c", 1.0)]).await;
-    let r = reached(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#).await;
+    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE id = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#).await;
     assert_eq!(ids(&r), ["b", "c"]);
 }
 
-/// REFLECT … FOLLOW LINKS honours DEPTH too.
+/// RECALL … FOLLOW LINKS honours DEPTH too (was REFLECT).
 #[tokio::test]
 async fn reflect_follow_links_depth() {
     let adb = graph(&["a", "b", "c"], &[("a", "b", 1.0), ("b", "c", 1.0)]).await;
     let result = adb
-        .execute(r#"REFLECT FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#)
+        .execute(r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next" DEPTH 2"#)
         .await
         .unwrap();
     let text = serde_json::to_string(&result.data).unwrap();
@@ -482,20 +482,20 @@ async fn typed_graph(ids: &[&str], links: &[(&str, &str, &str, f32)]) -> Mem {
     adb
 }
 
-/// AQL v0.8 (GR-2): INBOUND walks links backwards, BOTH either way.
+/// AQL v0.13: FOLLOW LINKS walks links both ways (no OUTBOUND / INBOUND / BOTH).
 #[tokio::test]
-async fn follow_links_inbound_and_both() {
+async fn follow_links_go_both_ways() {
     let adb = graph(&["a", "b", "c", "x"], &[("a", "b", 1.0), ("b", "c", 1.0), ("x", "b", 0.5)]).await;
-    let q = |s: &str| format!(r#"RECALL FROM SEMANTIC WHERE name = "b" FOLLOW LINKS TYPE "next" {s}"#);
-    assert_eq!(ids(&reached(&adb, &q("")).await), ["c"]);
-    assert_eq!(ids(&reached(&adb, &q("INBOUND")).await), ["a", "x"]);
-    assert_eq!(ids(&reached(&adb, &q("BOTH")).await), ["a", "c", "x"]);
+    let from_b = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "b" FOLLOW LINKS TYPE "next""#).await;
+    let mut r = ids(&from_b);
+    r.sort();
+    assert_eq!(r, ["a", "c", "x"]);
     // c ← b ← a, two hops back.
-    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "c" FOLLOW LINKS INBOUND DEPTH 2"#).await;
+    let r = reached(&adb, r#"RECALL FROM SEMANTIC WHERE name = "c" FOLLOW LINKS DEPTH 2"#).await;
     assert_eq!(ids(&r), ["b", "a", "x"]);
 }
 
-/// AQL v0.8 (GR-3): MIN_WEIGHT drops light links; TYPE IN and ALL pick types.
+/// AQL v0.8 (GR-3): WEIGHT (a minimum) drops light links; TYPE ("a", "b") picks types.
 #[tokio::test]
 async fn follow_links_min_weight_and_types() {
     let adb = typed_graph(
@@ -505,90 +505,37 @@ async fn follow_links_min_weight_and_types() {
     .await;
     let q = |s: &str| format!(r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS {s}"#);
     assert_eq!(ids(&reached(&adb, &q(r#"TYPE "knows""#)).await), ["b", "c"]);
-    assert_eq!(ids(&reached(&adb, &q(r#"TYPE "knows" MIN_WEIGHT 0.5"#)).await), ["b"]);
-    assert_eq!(ids(&reached(&adb, &q(r#"TYPE IN ("knows", "works_with") MIN_WEIGHT 0.5"#)).await), ["b", "d"]);
-    assert_eq!(ids(&reached(&adb, &q("ALL")).await), ["b", "d", "c"]);
+    assert_eq!(ids(&reached(&adb, &q(r#"TYPE "knows" WEIGHT 0.5"#)).await), ["b"]);
+    assert_eq!(ids(&reached(&adb, &q(r#"TYPE ("knows", "works_with") WEIGHT 0.5"#)).await), ["b", "d"]);
     assert_eq!(ids(&reached(&adb, &q("")).await), ["b", "d", "c"]);
 }
 
-/// WITH LINKS INBOUND lists the links pointing at a record, with their source.
+/// WITH LINKS lists the links on a record both ways, with their ends; WEIGHT is a
+/// minimum.
 #[tokio::test]
-async fn with_links_inbound_lists_sources() {
+async fn with_links_lists_both_ways() {
     let adb = typed_graph(&["a", "b", "c"], &[("a", "c", "next", 1.0), ("b", "c", "next", 0.2), ("c", "a", "next", 1.0)]).await;
     let result = adb
-        .execute(r#"LOOKUP FROM SEMANTIC KEY id = "c" WITH LINKS ALL INBOUND MIN_WEIGHT 0.5"#)
+        .execute(r#"RECALL FROM SEMANTIC WHERE id = "c" WITH LINKS WEIGHT 0.5"#)
         .await
         .unwrap();
     let records = result.get_records().unwrap();
     let links = records[0].data["links"].as_array().unwrap();
-    assert_eq!(links.len(), 1, "{links:?}");
-    assert_eq!(links[0]["from_id"], "a");
-    assert_eq!(links[0]["to_id"], "c");
+    let mut ends: Vec<(String, String)> = links.iter().map(|l| (l["from_id"].as_str().unwrap().into(), l["to_id"].as_str().unwrap().into())).collect();
+    ends.sort();
+    assert_eq!(ends, [("a".to_string(), "c".to_string()), ("c".to_string(), "a".to_string())], "{links:?}");
 }
 
-/// REFLECT … FOLLOW LINKS TYPE follows only that type.
+/// RECALL … FOLLOW LINKS TYPE follows only that type (was REFLECT).
 #[tokio::test]
 async fn reflect_follow_links_respects_type() {
     let adb = typed_graph(&["a", "b", "c"], &[("a", "b", "next", 1.0), ("a", "c", "other", 1.0)]).await;
-    let result = adb.execute(r#"REFLECT FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next""#).await.unwrap();
+    let result = adb.execute(r#"RECALL FROM SEMANTIC WHERE name = "a" FOLLOW LINKS TYPE "next""#).await.unwrap();
     let text = serde_json::to_string(&result.data).unwrap();
     assert!(text.contains("\"b\"") && !text.contains("\"c\""), "{text}");
 }
 
-async fn keys(adb: &Mem, aql: &str) -> Vec<String> {
-    let result = adb.execute(aql).await.unwrap_or_else(|e| panic!("{aql}: {e}"));
-    result.get_records().unwrap().iter().map(|r| r.id.clone()).collect()
-}
-
-/// P1.4 (P1_GRAPH D2): a fact with an entity object is a link of its predicate;
-/// its entities are created; a new fact for (subject, predicate) supersedes.
-#[tokio::test]
-async fn facts_are_links_between_entities() {
-    let adb = Mem::new().await;
-    let fact = |s: &str, p: &str, o: &str| format!(r#"STORE INTO SEMANTIC FACT (subject = "{s}", predicate = "{p}", object = "{o}", confidence = 0.8)"#);
-    adb.execute(&fact("person:ada", "works_at", "org:acme")).await.unwrap();
-    // Entities made for both ends.
-    assert_eq!(keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "org:acme""#).await, ["org:acme"]);
-    let follow = r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE "works_at""#;
-    assert_eq!(keys(&adb, follow).await, ["org:acme"]);
-    let r = adb.execute(follow).await.unwrap();
-    assert!((r.get_records().unwrap()[0].data["_path_weight"].as_f64().unwrap() - 0.8).abs() < 1e-6);
-
-    // A new fact for (person:ada, works_at) supersedes the old one, link and all.
-    adb.execute(&fact("person:ada", "works_at", "org:globex")).await.unwrap();
-    assert_eq!(keys(&adb, follow).await, ["org:globex"]);
-    assert_eq!(keys(&adb, r#"RECALL FROM SEMANTIC WHERE predicate = "works_at""#).await.len(), 1);
-    // Inbound: who works at globex; nobody at acme any more.
-    assert_eq!(keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "org:globex" FOLLOW LINKS INBOUND"#).await, ["person:ada"]);
-    assert!(keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "org:acme" FOLLOW LINKS INBOUND"#).await.is_empty());
-
-    // MULTI: one fact per object.
-    let multi = |o: &str| format!(r#"STORE INTO SEMANTIC FACT MULTI (subject = "person:ada", predicate = "knows", object = "{o}")"#);
-    adb.execute(&multi("person:bob")).await.unwrap();
-    adb.execute(&multi("person:cy")).await.unwrap();
-    adb.execute(&multi("person:bob")).await.unwrap();
-    let mut known = keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE "knows""#).await;
-    known.sort();
-    assert_eq!(known, ["person:bob", "person:cy"]);
-
-    // Two hops over facts: bob ← ada → globex.
-    adb.execute(&fact("org:globex", "based_in", "city:london")).await.unwrap();
-    let r = keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE IN ("works_at", "based_in") DEPTH 2"#).await;
-    assert_eq!(r, ["org:globex", "city:london"]);
-
-    // A literal value is a fact, not a link.
-    adb.execute(r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "born", value = 1815)"#).await.unwrap();
-    let born = adb.execute(r#"RECALL FROM SEMANTIC WHERE predicate = "born""#).await.unwrap();
-    assert_eq!(born.get_records().unwrap()[0].data["value"], 1815);
-    assert_eq!(keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE "born""#).await.len(), 0);
-
-    // FORGET a fact: its link goes.
-    adb.execute(r#"FORGET FROM SEMANTIC WHERE predicate = "based_in""#).await.unwrap();
-    let r = keys(&adb, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE IN ("works_at", "based_in") DEPTH 2"#).await;
-    assert_eq!(r, ["org:globex"]);
-}
-
-/// FACT is SEMANTIC only, and needs subject, predicate and object or value.
+/// AQL v0.13 has no FACT: the old statements are refused.
 #[tokio::test]
 async fn fact_statements_are_checked() {
     let adb = Mem::new().await;
@@ -704,8 +651,8 @@ async fn window_on_episodic_recall() {
     };
     assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW LAST 2"#).await, [5, 4]);
     assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW LAST 1h"#).await, [5, 4, 3, 2, 1]);
-    assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW SINCE n = 3"#).await, [5, 4, 3]);
-    let mut top = ns(r#"RECALL FROM EPISODIC WHERE pod = "api" WINDOW TOP 2 BY sev"#).await;
+    assert_eq!(ns(r#"RECALL FROM EPISODIC WHERE pod = "api" AND n >= 3"#).await, [5, 4, 3]);
+    let mut top = ns(r#"RECALL FROM EPISODIC WHERE pod = "api" ORDER BY sev DESC LIMIT 2"#).await;
     top.sort();
     assert_eq!(top, [2, 4]);
     // The window first, then ORDER BY and LIMIT over what it kept.
@@ -773,7 +720,7 @@ async fn test_link_creates_link_when_records_exist() {
 
     // LINK statement should succeed
     let result = executor.execute(
-        r#"LINK FROM PROCEDURAL WHERE pattern_id = "oom-fix" TO EPISODIC WHERE incident_id = "inc-001" TYPE "applied_to" WEIGHT 0.95"#
+        r#"LINK FROM PROCEDURAL WHERE pattern_id = "oom-fix" INTO EPISODIC WHERE incident_id = "inc-001" TYPE "applied_to" WEIGHT 0.95"#
     ).await.unwrap();
 
     assert!(result.success, "LINK should succeed when both records exist");
@@ -803,7 +750,7 @@ async fn test_link_fails_when_source_not_found() {
 
     // LINK statement should fail - no source records
     let result = executor.execute(
-        r#"LINK FROM PROCEDURAL WHERE pattern_id = "nonexistent" TO EPISODIC WHERE incident_id = "inc-001" TYPE "applied_to""#
+        r#"LINK FROM PROCEDURAL WHERE pattern_id = "nonexistent" INTO EPISODIC WHERE incident_id = "inc-001" TYPE "applied_to""#
     ).await;
 
     assert!(result.is_err(), "LINK should fail when source records don't exist");
@@ -829,7 +776,7 @@ async fn test_link_fails_when_target_not_found() {
 
     // LINK statement should fail - no target records
     let result = executor.execute(
-        r#"LINK FROM PROCEDURAL WHERE pattern_id = "oom-fix" TO EPISODIC WHERE incident_id = "nonexistent" TYPE "applied_to""#
+        r#"LINK FROM PROCEDURAL WHERE pattern_id = "oom-fix" INTO EPISODIC WHERE incident_id = "nonexistent" TYPE "applied_to""#
     ).await;
 
     assert!(result.is_err(), "LINK should fail when target records don't exist");
@@ -927,8 +874,8 @@ async fn procedures_keep_their_payload_and_namespace() {
     assert_eq!(recs[0].data["priority"], 2);
     assert_eq!(recs[0].data["steps"], json!(["build", "push"]), "node fields stay shaped");
 
-    assert_eq!(ids(adb.execute(r#"LOOKUP FROM PROCEDURAL KEY owner = "sre""#).await.unwrap()), vec!["team-b|~rollback"]);
-    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL ALL NAMESPACE "team-b""#).await.unwrap()), vec!["team-b|~rollback"]);
+    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL WHERE owner = "sre""#).await.unwrap()), vec!["team-b|~rollback"]);
+    assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL NAMESPACE "team-b""#).await.unwrap()), vec!["team-b|~rollback"]);
     assert_eq!(ids(adb.execute(r#"RECALL FROM PROCEDURAL WHERE priority > 1 NAMESPACE "team-a""#).await.unwrap()), vec!["team-a|~deploy"]);
 }
 
@@ -957,7 +904,7 @@ async fn pipeline_timeout_is_a_hard_budget_when_enforced() {
     assert_eq!(steps.len(), 3);
 }
 
-/// S7 (W9): `PATTERN "text"` and `PATTERN $p` with `$p` bound both match
+/// S7 (W9): `LIKE "text"` and `LIKE $p` with `$p` bound on PROCEDURAL both match
 /// procedures by their pattern text; the score is `metadata.confidence`.
 #[tokio::test]
 async fn pattern_takes_a_literal_or_a_bound_variable() {
@@ -966,12 +913,12 @@ async fn pattern_takes_a_literal_or_a_bound_variable() {
     adb.execute(r#"STORE INTO PROCEDURAL (key = "disk", pattern = "node disk pressure eviction")"#).await.unwrap();
     let ids = |r: QueryResult| r.get_records().unwrap().iter().map(|r| r.id.clone()).collect::<Vec<_>>();
 
-    let r = adb.execute(r#"LOOKUP FROM PROCEDURAL PATTERN "pod OOMKilled restart" THRESHOLD 0.5"#).await.unwrap();
+    let r = adb.execute(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.5"#).await.unwrap();
     // The overlap is the match's confidence (F-L2): 3 of 4 words.
     assert_eq!(r.get_records().unwrap()[0].metadata.confidence, Some(0.75));
     assert_eq!(ids(r), vec!["oom"]);
 
     let vars = std::collections::HashMap::from([("p".to_string(), json!("node disk pressure"))]);
-    let r = adb.0.executor().execute_with_vars("LOOKUP FROM PROCEDURAL PATTERN $p THRESHOLD 0.5", &vars).await.unwrap();
+    let r = adb.0.executor().execute_with_vars("RECALL FROM PROCEDURAL LIKE $p CONFIDENCE 0.5", &vars).await.unwrap();
     assert_eq!(ids(r), vec!["disk"]);
 }

@@ -164,6 +164,8 @@ pub struct PartitionStore {
     rows: crate::row_cache::RowCache,
     /// The live records' keys, kept by every apply once built (PF-38).
     live: crate::live_index::LiveIndex,
+    /// The newest episodes of each namespace (newest-first reads by id).
+    recent: crate::recent_index::RecentIndex,
     /// Set while this node takes the lead: a compaction under way gives up between
     /// its steps rather than compete with the takeover (PF-38).
     yield_compaction: std::sync::atomic::AtomicBool,
@@ -946,6 +948,7 @@ impl PartitionStore {
             fields: crate::field_index::FieldIndex::new(),
             rows: crate::row_cache::RowCache::new(),
             live: crate::live_index::LiveIndex::new(),
+            recent: Default::default(),
             yield_compaction: std::sync::atomic::AtomicBool::new(false),
             apply_seq: std::sync::atomic::AtomicU64::new(0),
             layout: std::sync::atomic::AtomicU32::new(SCHEMA_VERSION),
@@ -1513,6 +1516,9 @@ impl PartitionStore {
                     tracing::warn!(error = %e, "live keys not indexed");
                 }
             }
+            if let Err(e) = me.build_recent_episodes().await {
+                tracing::warn!(error = %e, "recent episodes not indexed; newest-first reads scan");
+            }
             let names = me.saved_index_names();
             for (m, f) in &names {
                 if let Err(e) = me.build_field_index(*m, f).await {
@@ -1540,6 +1546,50 @@ impl PartitionStore {
                 Err(e)
             }
         }
+    }
+
+    /// Build the recent-episodes index from one read of the current episodes.
+    pub async fn build_recent_episodes(&self) -> StoreResult<()> {
+        if !self.recent.begin() {
+            return Ok(());
+        }
+        let filter = format!("memory = {} AND kind = 'episode' AND tombstone = false AND superseded_by IS NULL", sql_str(adb_core::log::Memory::Episodic.tag()));
+        match self.scan(Some(&filter)).await {
+            Ok(rows) => {
+                self.recent.finish(&rows);
+                Ok(())
+            }
+            Err(e) => {
+                self.recent.abandon();
+                Err(e)
+            }
+        }
+    }
+
+    /// `namespace`'s newest `k` episodes live at `now`, newest first, by id from the
+    /// recent-episodes index; `None` when the index can't answer (not built, or it
+    /// doesn't hold k of them) — the caller reads as before.
+    pub async fn recent_episodes(&self, namespace: &str, k: usize, now: CommitTs) -> StoreResult<Option<Vec<StoredRow>>> {
+        let Some((ids, older)) = self.recent.newest(namespace) else { return Ok(None) };
+        let mut out = Vec::with_capacity(k);
+        for id in &ids {
+            if out.len() == k {
+                return Ok(Some(out));
+            }
+            match self.get_cached(id).await? {
+                Some(r) if r.is_live(now) => out.push(r),
+                // Expired (its tombstone not applied yet): not in the answer.
+                Some(_) => {}
+                // Not readable here: the full read decides.
+                None => return Ok(None),
+            }
+        }
+        // Every one it holds taken: the answer, unless older ones exist it doesn't hold.
+        Ok((out.len() == k || !older).then_some(out))
+    }
+
+    pub fn recent_episodes_ready(&self) -> bool {
+        self.recent.is_ready()
     }
 
     /// Whether the live-key index is built and not yet taken (PF-38).
@@ -1672,6 +1722,7 @@ impl PartitionStore {
         if put.is_ok() {
             self.fields.apply(&rows);
             self.live.apply(&rows);
+            self.recent.apply(&rows);
             if let Some(l) = inner.links.lock().unwrap().as_mut() {
                 for r in &rows {
                     l.add(&r.id, &r.lineage_id, r.data.subject_id.as_deref(), r.data.object_id.as_deref());

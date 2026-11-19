@@ -67,6 +67,10 @@ function serverDelta(before, after) {
 /** `c` closed-loop clients calling `op(i)` for SECS seconds. */
 async function phase(name, c, op) {
   if (ONLY && !ONLY.test(name)) return { name, c, ops: 0, skipped: true };
+  // Requests the last phase's clients gave up on may still run on the servers: wait
+  // (PERF_SETTLE_MS, default 5 s) so a phase isn't measured against the last one's
+  // queue (18 Nov: mixed at c=512 ran beside leftover FORGETs in every run).
+  await new Promise(r => setTimeout(r, Number(process.env.PERF_SETTLE_MS ?? 5000)));
   const total = c;
   c = share(total);
   if (c === 0) {
@@ -170,13 +174,13 @@ async function adb() {
   }
   keys = Math.max(1, Math.min(keys, ROWS)); ekeys = Math.max(1, ekeys); wkeys = Math.max(1, wkeys);
   const reads = [
-    ['LOOKUP KEY (SEMANTIC)', i => `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 37) % keys}"${ns((i * 37) % keys)}`],
+    ['LOOKUP KEY (SEMANTIC)', i => `RECALL FROM SEMANTIC WHERE id = "${run}f${(i * 37) % keys}"${ns((i * 37) % keys)}`],
     ['RECALL WHERE topic LIMIT 10', i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10${ns(i)}`],
-    ['RECALL ALL ORDER BY n LIMIT 10', i => `RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 10${ns(i)}`],
+    ['RECALL ALL ORDER BY n LIMIT 10', i => `RECALL FROM SEMANTIC ORDER BY n DESC LIMIT 10${ns(i)}`],
     ['AGGREGATE COUNT by topic', i => `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" AGGREGATE COUNT(*) AS c${ns(i)}`],
-    ['RECALL EPISODIC newest 10', i => `RECALL FROM EPISODIC ALL LIMIT 10${ns(i)}`],
-    ['RECALL EPISODIC KEY', i => `RECALL FROM EPISODIC KEY id = "${run}e${(i * 7) % ekeys}"${ns((i * 7) % ekeys)}`],
-    ['RECALL WORKING KEY', i => `RECALL FROM WORKING KEY id = "${run}w${(i * 7) % wkeys}"${ns((i * 7) % wkeys)}`],
+    ['RECALL EPISODIC newest 10', i => `RECALL FROM EPISODIC LIMIT 10${ns(i)}`],
+    ['RECALL EPISODIC KEY', i => `RECALL FROM EPISODIC WHERE id = "${run}e${(i * 7) % ekeys}"${ns((i * 7) % ekeys)}`],
+    ['RECALL WORKING KEY', i => `RECALL FROM WORKING WHERE id = "${run}w${(i * 7) % wkeys}"${ns((i * 7) % wkeys)}`],
   ];
   for (const [name, f] of reads) for (const c of CS) await phase(name, c, i => q(f(i)));
   for (const c of CS) await phase('UPDATE SEMANTIC (existing key)', c, i => q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 53) % keys}" (v = 2, content = "fact ${i} updated")${ns((i * 53) % keys)}`));
@@ -192,7 +196,7 @@ async function adb() {
   for (const c of CS) {
     await phase('mixed 70% read / 25% STORE / 5% UPDATE', c, i => {
       const k = i % 20;
-      if (k < 14) return q(k % 2 ? `LOOKUP FROM SEMANTIC KEY id = "${run}f${(i * 97) % keys}"${ns((i * 97) % keys)}` : `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10${ns(i)}`);
+      if (k < 14) return q(k % 2 ? `RECALL FROM SEMANTIC WHERE id = "${run}f${(i * 97) % keys}"${ns((i * 97) % keys)}` : `RECALL FROM SEMANTIC WHERE topic = "t${i % 20}" LIMIT 10${ns(i)}`);
       if (k < 19) return q(`STORE INTO SEMANTIC (key = "${run}m${c}x${i}", topic = "t${i % 20}", n = 1, content = "mixed ${i}")${ns(i)}`);
       return q(`UPDATE INTO SEMANTIC WHERE id = "${run}f${(i * 31) % keys}" (v = 3)${ns((i * 31) % keys)}`);
     });

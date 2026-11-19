@@ -489,17 +489,19 @@ impl EngineHost {
         for (name, s) in &self.spaces {
             let due = s.journal.writes_due(JOURNAL_COMPACT_AFTER) || s.journal.generation_count().await.is_ok_and(|n| n > 16);
             if due {
-                out.push(JournalCompaction { space: name.clone(), journal: Arc::clone(&s.journal), write_lock: Arc::clone(&s.write_lock) });
+                out.push(JournalCompaction { space: name.clone(), journal: Arc::clone(&s.journal), write_lock: Arc::clone(&s.write_lock), after: None });
             }
         }
         out
     }
 
-    /// Every space's journal, due or not (tests, admin).
+    /// Every space's journal, due or not (tests, admin): each compacts after its
+    /// writer has written what was queued when this was called (a run purged just
+    /// before is then gone from disk too).
     pub fn journals(&self) -> Vec<JournalCompaction> {
         self.spaces
             .iter()
-            .map(|(name, s)| JournalCompaction { space: name.clone(), journal: Arc::clone(&s.journal), write_lock: Arc::clone(&s.write_lock) })
+            .map(|(name, s)| JournalCompaction { space: name.clone(), journal: Arc::clone(&s.journal), write_lock: Arc::clone(&s.write_lock), after: Some((s.written.clone(), s.queued)) })
             .collect()
     }
 
@@ -607,10 +609,19 @@ pub struct JournalCompaction {
     pub space: String,
     journal: Arc<PartitionStore>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Compact only once the writer has written up to this offset (`None`: as it is).
+    after: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
 }
 
 impl JournalCompaction {
     pub async fn run(&self) -> EngineResult<adb_store::CompactStats> {
+        if let Some((written, want)) = &self.after {
+            let (mut w, want) = (written.clone(), *want);
+            tokio::time::timeout(Duration::from_secs(30), w.wait_for(|v| *v >= want))
+                .await
+                .map_err(|_| EngineError::Store(format!("space {}: journal not written after 30 s", self.space)))?
+                .map_err(|_| EngineError::Store(format!("space {}: the journal writer stopped", self.space)))?;
+        }
         let _held = self.write_lock.lock().await;
         // Journal rows are written once and never superseded: no history, and
         // no marker for deleted rows (the writer skips anything at or below the

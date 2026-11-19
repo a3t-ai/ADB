@@ -1,0 +1,103 @@
+# Branches as namespaces (17 Nov 2026)
+
+**Decision (user, 17 Nov):** a memory branch is not its own engine. It is just a
+new namespace, `<ns>@<branch>`, on the same infrastructure as every namespace
+("keep simple, branch is just a new namespace, all same infra"): placed by the
+namespace hash like any other, in whatever partition that is. Partition code
+(owner, in-memory WAL replica, WAL segments and checkpoints on S3, takeover, epoch
+fencing) applies unchanged. (A dedicated branches partition was discussed and set
+aside for now.) Only the branch rules — reads see the parent at the branch point,
+UPDATE/FORGET of an inherited record write an override — stay branch-specific.
+
+Replaces: branch engines (`BranchHost`, `LocalEngine::durable_branch`,
+`<pdir>/branches/…`), branch pods (B6, `placement`, `BranchRemote`), and commit
+3e66286 (branch places on object storage), which those engines made necessary.
+
+## Scope (user, 17 Nov)
+
+"Branching an agent is not ADB's job, that is A3T. ADB branches the agent's
+namespace. No new infra." ADB keeps only:
+
+- **Branch** a namespace (from main, or from another branch, at a point): `ns@b`.
+- **Merge** a branch into main (DB-19 diff, conflicts, merge; rebase DB-11 if it
+  stays cheap).
+- **Fork** a branch into a new namespace: a **full copy** (the branch's view written
+  into the new namespace), or **shallow** (the new namespace reads through to the
+  branch at its point — the same overlay rule, with the new namespace as the child).
+- Drop a branch.
+
+Dropped from ADB: branch pods (B6: `placement`, `BranchRemote`, `branch_place`,
+pending FORGETs), agent promotion (the `promoted_from` episode, carrying layers,
+the `promoted-*` tag — A3T does that on top of fork). Tags and layers (B7) are
+namespace features and stay as they are.
+
+## Layout
+
+- `ns@b` is placed by `routing::partition_of` like any namespace. It is not in the
+  catalog: reads across every namespace (no NAMESPACE) don't see branch records; a
+  branch is reached by naming it.
+- `@` is reserved: a caller's namespace can't contain it; `NAMESPACE "ns" BRANCH "b"`
+  becomes namespace `ns@b` at the engine's entry (the statement is rewritten:
+  `modifiers.namespace = "ns@b"`, `branch = None`) and is routed by that.
+- A branch of a branch: `ns@b1@b2`? No — the parent is in the registry row, the
+  namespace is always `ns@<name>` (names are unique per namespace).
+
+## Registry (unchanged place)
+
+Branch rows stay in the **parent namespace's partition** (`Effect::Register`, kind
+branch): create, list, drop, rebase point, pins for compaction (B4), tags and layers
+(B7) all keep working there. The branch namespace's partition reads a branch's row (parent,
+point) from the parent's partition (local, or the `branch_get` op) and caches it;
+rebase/drop invalidate.
+
+## Rules per namespace
+
+`DurableWrites.parent` / `LanceReads.parent` (engine-wide `ParentView`) become
+`parent_of(namespace)`: `Some(view)` for `ns@b` — source = the parent namespace's
+rows as of the point (`StoreSource` when the parent is in this engine; a remote
+`rows_as_of` on a cluster; a branch of a branch reads its parent branch's view).
+
+- Rows of `ns@b` have ids `ns@b|<scope>~<key>`. The overlay matches the branch's and
+  the parent's rows by the id **without its namespace** (`without_namespace`), not
+  by shared ids. An override of an inherited record is written in `ns@b` with the
+  same bare key; `_branch_deleted` the same.
+- Answers on a branch show the parent's namespace (`ns`) and ids as the branch engine
+  did (callers don't see `@`).
+- FORGET on main of `ns|…k` reaches `ns@*|…k` in each branch namespace's partition (op), as B4.
+- Drop: the branch's rows are forgotten (tombstones, logged), the row unregistered.
+- Fork / merge (DB-19) / rebase (DB-11) / conflicts read `ns@b` and `ns`. A shallow
+  fork is a namespace with a base ref (parent namespace, branch, point): the same
+  overlay rule as a branch.
+
+## Steps
+
+1. Revert 3e66286 (done, 250a9cb). `@` reserved for branches (`BRANCH_SEP`); branch
+   namespaces kept out of the catalog.
+2. Statement rewrite at entry (single node and cluster): BRANCH → `ns@b`.
+3. Per-namespace parent in writes and reads; overlay by namespace-less id.
+4. Registry lookups from the branch namespace's partition (local / op), FORGET-on-main fan-out,
+   drop, fork (full / shallow), rebase, merge.
+5. Remove branch engines, pods, promote, `BranchHost`; tests: branches.rs, merge.rs,
+   namespace_statements (branch links), a cluster test: a branch survives a takeover
+   of its partition (rebuilt from S3 like any namespace).
+
+## Status (18 Nov 2026): done
+
+Built on `base:<ns>` control rows and point tags (`branch.<ns>` / `fork.<ns>`) rather
+than branch rows in the parent's partition; `SpaceView::rows_at` follows the chain of
+bases. Step 5 is done: branch engines (`branch_engine.rs`, `BranchHost`,
+`durable_branch`), branch pods (`branch_remote.rs`, `adb-cli` `branch.rs`,
+`deploy/k8s/adb-branch.yaml`, `ADB_BRANCH_OF` / `ADB_BRANCH`), the non-prod pod
+(`non_prod.rs`, `ADB_NON_PROD_*`), the old registry branch writes, DB-19 merge rows and
+the ops `branch_place`, `branch_pending(_ack)`, `branch_parent_rows`, `branch_forget`,
+`branch_create_past`, `parent_rows`, `forget_lineages`, `promote_check` are removed.
+The branch review API (list, create, drop, conflicts, merge, rebase, revert, promote,
+`space_stats` / `space_records` / `space_changes` with `branch`) runs on branch
+namespaces (`review.rs`). A branch at a past point is `BRANCH FROM … INTO … AS OF`.
+
+An ADB that held old branches: their `br:` registry rows stay in the table and are not
+read (so they pin nothing); `<data dir>/branches/` engines are not opened. Their
+records were the branch engines' own and don't appear anywhere.
+
+Open: `WITH LINKS`, `FOLLOW LINKS` and history (`AS OF`, `WITH HISTORY`) aren't read
+on a branch namespace yet (refused with `unsupported`).

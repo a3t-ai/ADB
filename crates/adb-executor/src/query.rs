@@ -996,7 +996,49 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
 /// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap, its
 /// score in `metadata.confidence`.
 pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
+    if let Some(records) = newest_episodes(store, memory, predicate, modifiers, now).await? {
+        return Ok(records);
+    }
     served(store, "read", |source| read_from(store, memory, predicate, modifiers, now, source), same_records, show_records).await
+}
+
+/// The read shape the recent-episodes index answers: EPISODIC, newest first (no WHERE,
+/// ORDER BY, window, aggregate or scope), one namespace, LIMIT within what it keeps.
+pub fn is_newest_episodes(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> bool {
+    memory == MemoryType::Episodic
+        && match predicate {
+            Predicate::All => true,
+            Predicate::Where { conditions } => conditions.is_empty(),
+            _ => false,
+        }
+        && modifiers.namespace.is_some()
+        && modifiers.limit.is_some_and(|k| k <= adb_store::recent_index::keep())
+        && modifiers.order_by.is_none()
+        && modifiers.window.is_none()
+        && modifiers.aggregate.is_none()
+        && modifiers.scope.is_none()
+        && modifiers.in_scope.is_none()
+        && !is_history(modifiers)
+}
+
+/// `RECALL FROM EPISODIC … LIMIT k` (newest first) by id from the recent-episodes
+/// index, not by reading and sorting the namespace's episodes; `None` when the read
+/// isn't that shape or the index can't answer it.
+async fn newest_episodes(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<Vec<MemoryRecord>>> {
+    if !is_newest_episodes(memory, predicate, modifiers) {
+        return Ok(None);
+    }
+    let (Some(ns), Some(k)) = (modifiers.namespace.as_deref(), modifiers.limit) else { return Ok(None) };
+    let _t = crate::steps::timer("read.newest episodes (index)");
+    let Some(rows) = store.recent_episodes(ns, k, now).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? else {
+        crate::steps::add("read.newest episodes (index miss)", std::time::Duration::ZERO);
+        return Ok(None);
+    };
+    let mut records: Vec<MemoryRecord> = rows.iter().map(record).collect();
+    if let Some(f) = &modifiers.return_fields {
+        project(&mut records, f);
+    }
+    Ok(Some(records))
 }
 
 async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
@@ -1008,30 +1050,7 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
         if c.floor.is_some() {
             return Ok(Answer::Insufficient);
         }
-        // The literal or bound value; an unbound `$name` matches its name (as before).
-        let query = text.as_deref().unwrap_or(pattern_var.trim_start_matches('$'));
-        let threshold = threshold.unwrap_or(0.7);
-        let mut scored: Vec<(f32, Arc<MemoryRecord>)> = c
-            .records
-            .iter()
-            .filter_map(|r| {
-                let s = jaccard(query, r.data["pattern"].as_str().unwrap_or(""));
-                (s >= threshold).then(|| (s, r.clone()))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
-        if let Some(n) = modifiers.limit {
-            scored.truncate(n);
-        }
-        // The overlap score is the match's confidence, as LIKE's similarity is (F-L2).
-        let out = scored
-            .into_iter()
-            .map(|(s, r)| {
-                let mut r = (*r).clone();
-                r.metadata.confidence = Some(s);
-                r
-            })
-            .collect();
+        let out = pattern_match(&c.records, pattern_var, *threshold, text.as_deref(), modifiers.limit);
         return Ok(Answer::of(&c, out));
     }
     let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
@@ -1156,9 +1175,9 @@ async fn aggregate_from(
     Ok(Answer::of(&c, v))
 }
 
-/// Whether a read asks for history (AQL v0.10): `AS OF`, `VALID AT` or `WITH HISTORY`.
+/// Whether a read asks for history: `AS OF` or `WITH HISTORY`.
 pub fn is_history(modifiers: &Modifiers) -> bool {
-    modifiers.as_of.is_some() || modifiers.valid_at.is_some() || modifiers.with_history
+    modifiers.as_of.is_some() || modifiers.with_history
 }
 
 /// A history read's time, at `now` for `AGO`.
@@ -1169,11 +1188,9 @@ fn instant(t: &adb_core::TimePoint, what: &str, now: CommitTs) -> AdbResult<Comm
     })
 }
 
-/// `RECALL` / `LOOKUP` with `AS OF`, `VALID AT` or `WITH HISTORY` (AQL v0.10, L9 /
-/// GR-14) over SEMANTIC or PROCEDURAL, from Lance (the hot cache holds current rows
-/// only). `AS OF t`: each record's version at t, if it held at t; `VALID AT v`: facts
-/// holding at v, from the versions current at `AS OF` (default now); `WITH HISTORY`:
-/// every version recorded by `AS OF`, whatever its validity. Each record carries
+/// `RECALL` with `AS OF` or `WITH HISTORY` (L9) over SEMANTIC or PROCEDURAL, from
+/// Lance (the hot cache holds current rows only). `AS OF t`: each record's version at
+/// t, if it held at t; `WITH HISTORY`: every version recorded by `AS OF`. Each record carries
 /// `_recorded_at` (its version's commit) and `_replaced_at` (when a newer version
 /// replaced it, by `AS OF`; else null). Versions superseded more than
 /// `writes::HISTORY` ago are compacted away; forgotten and expired records have none.
@@ -1182,19 +1199,19 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
         return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY aren't valid on WORKING: it's session state, without versions".into()));
     }
     if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
-        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, VALID AT, WITH HISTORY)".into()));
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, WITH HISTORY)".into()));
     }
     let tx = modifiers.as_of.as_ref().map(|t| instant(t, "AS OF", now)).transpose()?.unwrap_or(now);
-    let valid = modifiers.valid_at.as_ref().map(|t| instant(t, "VALID AT", now)).transpose()?.unwrap_or(tx);
     let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
+    let from = modifiers.history_from.as_ref().map(|t| instant(t, "WITH HISTORY BETWEEN", now)).transpose()?;
     let rows = store.versions(memory.into(), None).await.map_err(store_err)?;
     let micros = |t: CommitTs| serde_json::json!(t.to_datetime().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
     let mut records: Vec<MemoryRecord> = rows
         .iter()
         .filter(|r| in_scope.is_none_or(|s| r.data.scope == s) && namespace.is_none_or(|ns| r.data.namespace.as_deref() == Some(ns)))
         .filter(|r| match modifiers.with_history {
-            true => r.commit_ts <= tx && (modifiers.valid_at.is_none() || r.holds_at(valid)),
-            false => r.is_current_at(tx, valid),
+            true => r.commit_ts <= tx && from.is_none_or(|f| r.commit_ts >= f),
+            false => r.is_current_at(tx, tx),
         })
         .map(|r| {
             let mut rec = record(r);
@@ -1222,16 +1239,56 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     Ok(records)
 }
 
-/// `RECALL` / `LOOKUP` on a branch engine (B2): the branch's view (its rows, then its
-/// parent's as of the point), then the predicate and modifiers as on main.
+/// `PATTERN` (PROCEDURAL): the records whose `pattern` overlaps the query by at
+/// least `threshold` (default 0.7), best first, at most `limit`; the overlap score is
+/// the match's confidence, as LIKE's similarity is (F-L2).
+fn pattern_match(records: &[Arc<MemoryRecord>], pattern_var: &str, threshold: Option<f32>, text: Option<&str>, limit: Option<usize>) -> Vec<MemoryRecord> {
+    // The literal or bound value; an unbound `$name` matches its name (as before).
+    let query = text.unwrap_or(pattern_var.trim_start_matches('$'));
+    let threshold = threshold.unwrap_or(0.7);
+    let mut scored: Vec<(f32, &Arc<MemoryRecord>)> = records
+        .iter()
+        .filter_map(|r| {
+            let s = jaccard(query, r.data["pattern"].as_str().unwrap_or(""));
+            (s >= threshold).then_some((s, r))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
+    if let Some(n) = limit {
+        scored.truncate(n);
+    }
+    scored
+        .into_iter()
+        .map(|(s, r)| {
+            let mut r = (**r).clone();
+            r.metadata.confidence = Some(s);
+            r
+        })
+        .collect()
+}
+
+/// `RECALL` on a branch namespace: the branch's view (its rows, then its base's as of
+/// the point), then the predicate and modifiers as on main.
 pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
     if is_history(modifiers) {
-        return Err(AdbError::UnsupportedOperation("AS OF, VALID AT and WITH HISTORY are not read on a branch yet".into()));
+        return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY are not read on a branch yet".into()));
     }
-    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
-        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN are not read on a branch yet".into()));
+    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() {
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS and WITH LINKS are not read on a branch yet".into()));
     }
     let in_scope = modifiers.in_scope.as_deref();
+    // PATTERN ranks the branch's view as main ranks its records.
+    if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
+        if memory != MemoryType::Procedural {
+            return Ok(Vec::new());
+        }
+        let records: Vec<Arc<MemoryRecord>> = rows.iter().filter(|r| in_scope.is_none_or(|s| r.data.scope == s)).map(|r| Arc::new(record(r))).collect();
+        let mut out = pattern_match(&records, pattern_var, *threshold, text.as_deref(), modifiers.limit);
+        if let Some(f) = &modifiers.return_fields {
+            project(&mut out, f);
+        }
+        return Ok(out);
+    }
     let mut records: Vec<MemoryRecord> = rows
         .iter()
         .filter(|r| in_scope.is_none_or(|s| r.data.scope == s))
@@ -1299,7 +1356,15 @@ async fn load_from(store: &PartitionStore, predicate: &Predicate, limit: usize, 
     if c.floor.is_some() {
         return Ok(Answer::Insufficient);
     }
-    let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, predicate)).cloned().collect();
+    // `task` / `task_type` rank the tools (their relevance to it); the other
+    // conditions filter.
+    let filter = match predicate {
+        Predicate::Where { conditions } => Predicate::Where {
+            conditions: conditions.iter().filter(|c| !matches!(c, Condition::Simple { field, .. } if field == "task" || field == "task_type")).cloned().collect(),
+        },
+        p => p.clone(),
+    };
+    let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(MemoryType::Tools, r, &filter)).cloned().collect();
     let task = match predicate {
         Predicate::Where { conditions } => conditions.iter().find_map(|c| match c {
             Condition::Simple { field, value: Value::String(s), .. } if field == "task" || field == "task_type" => Some(s.clone()),

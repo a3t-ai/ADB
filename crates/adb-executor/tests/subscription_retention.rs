@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-use adb_executor::{Engine, LocalEngine};
+use adb_executor::{Engine, LocalEngine, Writes};
+use adb_gateway::{SubSpec, Target};
 use serde_json::Value;
 
 /// The tests set process-wide settings: one at a time.
@@ -17,6 +18,12 @@ async fn q(engine: &LocalEngine, aql: &str) -> Value {
 
 async fn subscribe(engine: &LocalEngine, aql: &str) -> String {
     q(engine, aql).await["data"]["subscription"].as_str().unwrap().to_string()
+}
+
+/// A subscription through the engine's API (scope subscriptions, a start offset and
+/// acks are the server's API in AQL v0.13, not statements).
+async fn subscribe_api(engine: &LocalEngine, target: Target, from: Option<u64>) -> String {
+    engine.io().0.subscribe(SubSpec { target, kinds: Vec::new(), filter: None }, from).await.unwrap().0
 }
 
 /// Enough writes for the log to be trimmed past every subscriber (Lance makes them
@@ -41,7 +48,7 @@ async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let gw = engine.gateway().unwrap();
 
-    let scope_sub = subscribe(&engine, r#"SUBSCRIBE SCOPE "team:r""#).await;
+    let scope_sub = subscribe_api(&engine, Target::Scope("team:r".into()), None).await;
     let topic_sub = subscribe(&engine, r#"SUBSCRIBE TOPIC "news""#).await;
     q(&engine, r#"STORE INTO SEMANTIC (key = "kept", v = 1) IN SCOPE "team:r""#).await;
     q(&engine, r#"STORE INTO SEMANTIC (key = "gone", v = 1) IN SCOPE "team:r""#).await;
@@ -77,8 +84,8 @@ async fn a_subscriber_behind_the_log_gets_a_reset_with_current_state() {
     assert_eq!(reset.changes[0].value.as_ref().unwrap()["headline"], "one");
     assert!(reset.changes[0].offset.is_some_and(|o| o > 1));
 
-    // SUBSCRIBE … FROM OFFSET past retention registers and starts with a reset.
-    let old = subscribe(&engine, r#"SUBSCRIBE TOPIC "news" FROM OFFSET 1"#).await;
+    // A subscription from an offset past retention registers and starts with a reset.
+    let old = subscribe_api(&engine, Target::Topic("news".into()), Some(1)).await;
     let b = gw.next(&old, None, 10, Duration::from_millis(300)).await.unwrap();
     assert_eq!(b.reset.expect("reset").changes.len(), 1);
 }
@@ -96,7 +103,7 @@ async fn an_idle_subscription_is_dropped_and_a_read_one_kept() {
     tokio::time::sleep(Duration::from_millis(1200)).await;
     gw.next(&read, None, 10, Duration::ZERO).await.unwrap();
     let p = q(&engine, r#"PUBLISH TOPIC "busy" (n = 1)"#).await["data"]["offset"].as_u64().unwrap();
-    q(&engine, &format!(r#"ACK "{acked}" OFFSET {p}"#)).await;
+    engine.io().0.ack(&acked, p).await.unwrap();
 
     assert_eq!(engine.drop_idle_subscriptions().await.unwrap(), vec![idle.clone()]);
     assert!(gw.registry().get(&idle).is_none());

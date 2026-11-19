@@ -15,10 +15,22 @@ pub enum ExecutionPlan {
     Subscription(SubscriptionPlan),
     /// Pipeline of operations
     Pipeline(PipelinePlan),
-    /// Reflect (multi-source query with optional link traversal)
-    Reflect(ReflectPlan),
+    /// BRANCH / FORK / MERGE on namespaces (AQL v0.13)
+    Namespace(NamespacePlan),
     /// Fan-out operation across ALL memory types
     FanOut(FanOutPlan),
+}
+
+/// BRANCH / FORK / MERGE (AQL v0.13 §5).
+#[derive(Debug, Clone)]
+pub enum NamespacePlan {
+    /// `into` reads through to `from` as it was at the point (now, or `as_of`).
+    Branch { from: String, into: String, as_of: Option<adb_core::TimePoint> },
+    /// `into` gets a full copy of `from` as it was at the point.
+    Fork { from: String, into: String, as_of: Option<adb_core::TimePoint> },
+    /// `from`'s changes since the two parted, into `into`; `prefer`: Some(true) the
+    /// source wins conflicts, Some(false) the target, None a conflict fails.
+    Merge { from: String, into: String, prefer: Option<bool> },
 }
 
 /// A subscription statement, planned (E_SUBSCRIPTIONS.md).
@@ -115,8 +127,6 @@ pub enum Operation {
     UpdateLink,
     /// Remove links (AQL v0.7 UNLINK)
     Unlink,
-    /// Merge one SEMANTIC entity into another (AQL v0.10 MERGE ENTITY)
-    Merge,
 }
 
 impl std::fmt::Display for Operation {
@@ -132,7 +142,6 @@ impl std::fmt::Display for Operation {
             Self::Link => write!(f, "LINK"),
             Self::UpdateLink => write!(f, "UPDATE LINK"),
             Self::Unlink => write!(f, "UNLINK"),
-            Self::Merge => write!(f, "MERGE ENTITY"),
         }
     }
 }
@@ -200,15 +209,6 @@ pub struct StoreData {
     pub in_scope: Option<String>,
     /// TTL
     pub ttl: Option<Duration>,
-    /// AQL v0.8 `FACT [MULTI]`: the payload is a fact (P1_GRAPH D2)
-    pub fact: Option<FactPlan>,
-}
-
-/// `STORE … FACT [MULTI]`.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct FactPlan {
-    /// One current fact per (subject, predicate, object) rather than per (subject, predicate)
-    pub multi: bool,
 }
 
 /// Link operation data
@@ -322,17 +322,6 @@ impl StepPlan {
         Self { operation: if unlink { Operation::Unlink } else { Operation::UpdateLink }, ..Self::link(link_data) }
     }
 
-    /// MERGE ENTITY `from` INTO `into` (SEMANTIC)
-    pub fn merge(from: &str, into: &str) -> Self {
-        Self {
-            operation: Operation::Merge,
-            memory_type: MemoryType::Semantic,
-            predicate: Predicate::All,
-            modifiers: Modifiers::default(),
-            data: Some(serde_json::json!({ "from": from, "into": into })),
-        }
-    }
-
     /// Create a new link plan
     pub fn link(link_data: LinkData) -> Self {
         Self {
@@ -352,14 +341,13 @@ impl serde::Serialize for StoreData {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StoreData", 7)?;
+        let mut state = serializer.serialize_struct("StoreData", 6)?;
         state.serialize_field("key", &self.key)?;
         state.serialize_field("payload", &self.payload)?;
         state.serialize_field("scope", &format!("{:?}", self.scope))?;
         state.serialize_field("namespace", &self.namespace)?;
         state.serialize_field("in_scope", &self.in_scope)?;
         state.serialize_field("ttl_ms", &self.ttl.map(|d| d.as_millis() as u64))?;
-        state.serialize_field("fact", &self.fact)?;
         state.end()
     }
 }

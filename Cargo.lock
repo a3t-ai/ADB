@@ -22,6 +22,7 @@ dependencies = [
  "clap",
  "flowr-storage",
  "futures",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -198,6 +199,7 @@ dependencies = [
  "adb-core",
  "adb-executor",
  "aql-parser",
+ "aql-planner",
  "async-trait",
  "serde",
  "serde_json",
@@ -450,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "aql-parser"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "pest",
  "pest_derive",

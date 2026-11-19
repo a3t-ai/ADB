@@ -97,7 +97,7 @@ try {
   const f0 = followers()[0];
   const w = await query(f0, 'STORE INTO SEMANTIC (key = "via-follower", v = 1)');
   check('a write sent to a follower is acknowledged (passed to the leader)', w.success, JSON.stringify(w).slice(0, 300));
-  const back = await query(lead, 'LOOKUP FROM SEMANTIC KEY id = "via-follower"');
+  const back = await query(lead, 'RECALL FROM SEMANTIC WHERE id = "via-follower"');
   check('the leader holds it', found(back), JSON.stringify(back).slice(0, 300));
 
   // 2 + 3. Read-your-writes on every node, rounds of STORE then immediate LOOKUPs:
@@ -113,7 +113,7 @@ try {
     if (after == null) noPoint++;
     last = Math.max(last, after ?? 0);
     for (const n of nodes) {
-      const r = await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`, undefined, { after });
+      const r = await query(n, `RECALL FROM SEMANTIC WHERE id = "${key}"`, undefined, { after });
       reads++;
       if (!found(r)) { misses++; if (misses < 5) console.log(`  node ${n.id} missed ${key}: ${JSON.stringify(r).slice(0, 200)}`); }
       if (servedBy(r) === 'follower') byFollower++;
@@ -128,7 +128,7 @@ try {
     const s = await query(nodes[i % 3], `STORE INTO SEMANTIC (key = "${key}", topic = "fr2", content = "strict read ${i}")`);
     if (!s.success) { strictMisses++; continue; }
     for (const n of followers()) {
-      if (!found(await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`, undefined, { strict: true }))) strictMisses++;
+      if (!found(await query(n, `RECALL FROM SEMANTIC WHERE id = "${key}"`, undefined, { strict: true }))) strictMisses++;
     }
   }
   check(`strict reads on followers see the write with no token (50 writes, ${Date.now() - t1} ms)`, strictMisses === 0, `${strictMisses} misses`);
@@ -150,7 +150,7 @@ try {
     let i = 0;
     while (!stop) {
       const n = nodes[(ri + i++) % 3];
-      try { const r = await query(n, 'LOOKUP FROM SEMANTIC KEY id = "via-follower"'); if (found(r)) readOk++; else readErrors++; } catch { readErrors++; }
+      try { const r = await query(n, 'RECALL FROM SEMANTIC WHERE id = "via-follower"'); if (found(r)) readOk++; else readErrors++; } catch { readErrors++; }
     }
   });
   await sleep(2000);
@@ -168,7 +168,7 @@ try {
   for (const key of acked) {
     for (const n of nodes) {
       let ok = false;
-      for (let t = 0; t < 3 && !ok; t++) { try { ok = found(await query(n, `LOOKUP FROM SEMANTIC KEY id = "${key}"`, undefined, { strict: true })); } catch {} if (!ok) await sleep(300); }
+      for (let t = 0; t < 3 && !ok; t++) { try { ok = found(await query(n, `RECALL FROM SEMANTIC WHERE id = "${key}"`, undefined, { strict: true })); } catch {} if (!ok) await sleep(300); }
       if (!ok) { lost++; break; }
     }
   }

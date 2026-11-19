@@ -15,7 +15,6 @@ use adb_cluster::map::{Assignment, ControlCmd, NodeId, Partition, PartitionMap};
 use adb_executor::partitioned::PartitionedEngine;
 use adb_executor::remote::Placement;
 use adb_executor::Engine;
-use adb_server::branch_remote::flight_action;
 use arrow_array::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -60,6 +59,21 @@ async fn query(http: &reqwest::Client, node: &str, token: &str, aql: &str) -> (u
 
 fn records(v: &Value) -> Vec<Value> {
     v.pointer("/data/data/records").and_then(|r| r.as_array()).cloned().unwrap_or_default().iter().map(|r| r["data"].clone()).collect()
+}
+
+
+/// One Flight action on the ADB at `url`, with `token` as the bearer.
+async fn flight_action(url: &str, token: Option<&str>, kind: &str, body: Value) -> Result<Value, String> {
+    use futures::StreamExt;
+    let channel = tonic::transport::Channel::from_shared(url.to_string()).map_err(|e| format!("{url}: {e}"))?.connect().await.map_err(|e| format!("connect {url}: {e}"))?;
+    let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel).max_decoding_message_size(256 << 20).max_encoding_message_size(64 << 20);
+    let mut req = tonic::Request::new(arrow_flight::Action { r#type: kind.into(), body: body.to_string().into() });
+    if let Some(t) = token {
+        req.metadata_mut().insert("authorization", format!("Bearer {t}").parse().unwrap());
+    }
+    let mut s = client.do_action(req).await.map_err(|e| format!("{kind} on {url}: {}", e.message()))?.into_inner();
+    let r = s.next().await.ok_or(format!("{kind} on {url}: no answer"))?.map_err(|e| format!("{kind} on {url}: {}", e.message()))?;
+    serde_json::from_slice(&r.body).map_err(|e| format!("{kind} on {url}: {e}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -108,11 +122,11 @@ async fn any_node_over_http_and_flight() {
         assert_eq!(s, 200, "{v}");
     }
     for node in &nodes[1..] {
-        let (_, v) = query(&http, &node.http, TOKEN, r#"RECALL FROM SEMANTIC ALL ORDER BY n ASC"#).await;
+        let (_, v) = query(&http, &node.http, TOKEN, r#"RECALL FROM SEMANTIC ORDER BY n ASC"#).await;
         assert_eq!(records(&v).iter().map(|r| r["owner"].clone()).collect::<Vec<_>>(), ns.iter().map(|n| json!(n)).collect::<Vec<_>>(), "{v}");
     }
     // AQL over Flight through another node.
-    let r = flight_action(&nodes[2].flight, Some(TOKEN), "aql", json!({ "query": r#"RECALL FROM SEMANTIC ALL NAMESPACE "demo--y""# })).await.unwrap();
+    let r = flight_action(&nodes[2].flight, Some(TOKEN), "aql", json!({ "query": r#"RECALL FROM SEMANTIC NAMESPACE "demo--y""# })).await.unwrap();
     assert_eq!(r["data"]["data"]["count"], 1, "{r}");
 
     // Records above axum's default body limit (2 MB): written on the partition's
@@ -125,7 +139,7 @@ async fn any_node_over_http_and_flight() {
         let store = flight_action(&nodes[via].flight, Some(TOKEN), "aql", json!({ "query": format!(r#"STORE INTO WORKING (key = "{key}", note = "{big}") NAMESPACE "demo--big""#) }));
         let r = tokio::time::timeout(Duration::from_secs(30), store).await.unwrap_or_else(|_| panic!("{key}: a 3 MB write is acknowledged (the replica takes it)")).unwrap();
         assert_eq!(r["success"], true, "{key}: {}", r.to_string().chars().take(300).collect::<String>());
-        let r = flight_action(&nodes[(via + 2) % 3].flight, Some(TOKEN), "aql", json!({ "query": format!(r#"RECALL FROM WORKING KEY id = "{key}" NAMESPACE "demo--big""#) })).await.unwrap();
+        let r = flight_action(&nodes[(via + 2) % 3].flight, Some(TOKEN), "aql", json!({ "query": format!(r#"RECALL FROM WORKING WHERE id = "{key}" NAMESPACE "demo--big""#) })).await.unwrap();
         assert_eq!(r["data"]["data"]["records"][0]["data"]["note"].as_str().map(str::len), Some(3 << 20), "{key}");
     }
 
@@ -157,13 +171,12 @@ async fn any_node_over_http_and_flight() {
     assert!(seen.contains(&format!("id: {offset}")), "{seen}");
     let missing = http.get(format!("{away}/subscriptions/nope/events")).bearer_auth(TOKEN).send().await.unwrap();
     assert_eq!(missing.status(), 404);
-    let (s, v) = query(&http, away, TOKEN, &format!(r#"ACK "{sub}" OFFSET {offset}"#)).await;
-    assert_eq!(s, 200, "{v}");
+    // (AQL v0.13 has no ACK statement: acks are the server's API.)
     let (s, v) = query(&http, away, TOKEN, &format!(r#"UNSUBSCRIBE "{sub}""#)).await;
     assert_eq!(s, 200, "{v}");
-    // WATCH on a namespace, through any node: it runs on the namespace's partition and
-    // its id names that partition; frames through MCP and SSE on other nodes; UNWATCH.
-    let (s, v) = query(&http, &nodes[0].http, TOKEN, r#"WATCH RECALL FROM SEMANTIC ALL NAMESPACE "demo--w" DEBOUNCE 50ms"#).await;
+    // A live query (SUBSCRIBE RECALL) on a namespace, through any node: it runs on the namespace's partition and
+    // its id names that partition; frames through MCP and SSE on other nodes; UNSUBSCRIBE.
+    let (s, v) = query(&http, &nodes[0].http, TOKEN, r#"SUBSCRIBE RECALL FROM SEMANTIC NAMESPACE "demo--w""#).await;
     assert_eq!(s, 200, "{v}");
     let cq = v.pointer("/data/data/cq_id").and_then(Value::as_str).unwrap_or_else(|| panic!("a watch id: {v}")).to_string();
     let p = engines[0].partition_of("demo--w");
@@ -188,19 +201,22 @@ async fn any_node_over_http_and_flight() {
         seen.push_str(&String::from_utf8_lossy(&chunk));
     }
     assert_eq!(http.get(format!("{}/watches/{p}.nope/events", nodes[2].http)).bearer_auth(TOKEN).send().await.unwrap().status(), 404);
-    let (s, v) = query(&http, &nodes[0].http, TOKEN, &format!(r#"UNWATCH "{cq}""#)).await;
-    assert_eq!((s, v.pointer("/data/data/unwatched").cloned()), (200, Some(json!(true))), "{v}");
+    let (s, v) = query(&http, &nodes[0].http, TOKEN, &format!(r#"UNSUBSCRIBE "{cq}""#)).await;
+    assert_eq!((s, v.pointer("/data/data/unsubscribed").cloned()), (200, Some(json!(true))), "{v}");
     let (s, v) = query(&http, &nodes[0].http, TOKEN, r#"FORGET FROM SEMANTIC WHERE key = "w1" NAMESPACE "demo--w""#).await;
     assert_eq!(s, 200, "{v}");
 
-    // MERGE ENTITY without a namespace, sent to a node that may not own its partition.
+    // An alias (AQL v0.13, was MERGE ENTITY) without a namespace, sent to a node that
+    // may not own its partition: UPDATE the survivor's aliases, FORGET the duplicate.
     for k in ["person:ada", "person:ada-lovelace"] {
         let (s, v) = query(&http, away, TOKEN, &format!(r#"STORE INTO SEMANTIC (key = "{k}", name = "Ada")"#)).await;
         assert_eq!(s, 200, "{v}");
     }
-    let (s, v) = query(&http, away, TOKEN, r#"MERGE ENTITY "person:ada" INTO "person:ada-lovelace""#).await;
+    let (s, v) = query(&http, away, TOKEN, r#"UPDATE INTO SEMANTIC WHERE key = "person:ada-lovelace" (aliases = ["person:ada"])"#).await;
     assert_eq!(s, 200, "{v}");
-    let (_, v) = query(&http, away, TOKEN, r#"LOOKUP FROM SEMANTIC KEY id = "person:ada-lovelace""#).await;
+    let (s, v) = query(&http, away, TOKEN, r#"FORGET FROM SEMANTIC WHERE key = "person:ada""#).await;
+    assert_eq!(s, 200, "{v}");
+    let (_, v) = query(&http, away, TOKEN, r#"RECALL FROM SEMANTIC WHERE key = "person:ada-lovelace""#).await;
     assert_eq!(records(&v)[0]["aliases"], json!(["person:ada"]), "{v}");
     // Out of the way of the scope checks below (they read every namespace-less row).
     let (s, v) = query(&http, away, TOKEN, r#"FORGET FROM SEMANTIC WHERE key = "person:ada-lovelace""#).await;
@@ -223,22 +239,22 @@ async fn any_node_over_http_and_flight() {
     assert!(flight_action(&nodes[other].flight, None, "list_tables", json!({})).await.is_err());
 
     // A scoped token: no NAMESPACE → inside a3t-shared--*; another namespace → 403.
-    let (s, v) = query(&http, &nodes[1].http, SCOPED, r#"RECALL FROM SEMANTIC ALL ORDER BY n ASC"#).await;
+    let (s, v) = query(&http, &nodes[1].http, SCOPED, r#"RECALL FROM SEMANTIC ORDER BY n ASC"#).await;
     assert_eq!(s, 200, "{v}");
     let owners: Vec<Value> = records(&v).iter().map(|r| r["owner"].clone()).collect();
     assert_eq!(owners, vec![json!("a3t-shared--bot"), json!("a3t-shared--ops")], "{v}");
-    let (s, v) = query(&http, &nodes[1].http, SCOPED, r#"RECALL FROM SEMANTIC ALL NAMESPACE "demo--y""#).await;
+    let (s, v) = query(&http, &nodes[1].http, SCOPED, r#"RECALL FROM SEMANTIC NAMESPACE "demo--y""#).await;
     assert_eq!((s, v["code"].clone()), (403, json!("forbidden")), "{v}");
     let (s, v) = query(&http, &nodes[1].http, SCOPED, r#"FORGET FROM SEMANTIC WHERE key = "k""#).await;
     assert_eq!(s, 200, "{v}");
-    let (_, v) = query(&http, &nodes[0].http, TOKEN, r#"RECALL FROM SEMANTIC ALL"#).await;
+    let (_, v) = query(&http, &nodes[0].http, TOKEN, r#"RECALL FROM SEMANTIC"#).await;
     assert_eq!(records(&v).iter().map(|r| r["owner"].clone()).collect::<Vec<_>>(), vec![json!("demo--y")], "the scoped FORGET stayed in scope: {v}");
     let (s, _) = query(&http, &nodes[1].http, SCOPED, r#"SUBSCRIBE TOPIC "news""#).await;
     assert_eq!(s, 403, "topics are no namespace's");
 
     // The internal routes need the cluster's token.
-    let r = http.post(format!("{}/internal/query", nodes[0].http)).json(&json!({ "aql": "RECALL FROM SEMANTIC ALL", "reach": "All" })).send().await.unwrap();
+    let r = http.post(format!("{}/internal/query", nodes[0].http)).json(&json!({ "aql": "RECALL FROM SEMANTIC", "reach": "All" })).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 401);
-    let r = http.post(format!("{}/internal/query", nodes[0].http)).bearer_auth(SCOPED).json(&json!({ "aql": "RECALL FROM SEMANTIC ALL", "reach": "All" })).send().await.unwrap();
+    let r = http.post(format!("{}/internal/query", nodes[0].http)).bearer_auth(SCOPED).json(&json!({ "aql": "RECALL FROM SEMANTIC", "reach": "All" })).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 403, "a scoped token reaches /query only");
 }

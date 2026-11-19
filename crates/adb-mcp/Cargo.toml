@@ -8,6 +8,7 @@ description = "ADB MCP server interface"
 [dependencies]
 adb-core = { path = "../adb-core" }
 adb-executor = { path = "../adb-executor" }
+aql-planner = { path = "../aql-planner" }
 aql-parser.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util"] }
 async-trait.workspace = true

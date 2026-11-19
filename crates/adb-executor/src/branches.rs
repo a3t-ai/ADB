@@ -30,21 +30,6 @@ pub struct Branch {
     pub point_ts: i64,
     #[serde(default)]
     pub created_by: Option<String>,
-    /// B6: the branch engine runs in its own ADB process at this Flight URL (`None`:
-    /// hosted in the org's process, `<data dir>/branches/`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placement: Option<String>,
-    /// B6: FORGETs on main the branch's pod hasn't applied yet (it was unreachable,
-    /// e.g. hibernating): it pulls them when it starts, before it serves.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_forgets: Vec<PendingForget>,
-}
-
-/// Lineages FORGET removed on main, for a branch to erase from its own engine (B6).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingForget {
-    pub memory: adb_core::MemoryType,
-    pub lineages: Vec<String>,
 }
 
 impl Branch {
@@ -73,6 +58,47 @@ pub struct Tag {
 impl Tag {
     pub fn id_of(namespace: &str, name: &str) -> String {
         format!("tag:{namespace}/{name}")
+    }
+}
+
+/// AQL v0.13 BRANCH / FORK (`.ai/BRANCH_NAMESPACES.md`): namespace `namespace` was
+/// made from `from` as it was at `point_ts`. A branch reads through to it there (its own
+/// records first, by key); a fork holds a copy and only remembers where it came from
+/// (for MERGE). The point is held by the tag `tag` on `from`, which keeps the versions
+/// it reads through compaction, wherever `from` lives. `base:<namespace>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Base {
+    pub id: String,
+    pub namespace: String,
+    pub from: String,
+    pub kind: BaseKind,
+    pub tag: String,
+    pub point_ts: i64,
+    /// The source's log offset at the point (0 when branched AS OF a time).
+    #[serde(default)]
+    pub point_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseKind {
+    Branch,
+    Fork,
+}
+
+impl Base {
+    pub fn id_of(namespace: &str) -> String {
+        format!("base:{namespace}")
+    }
+
+    /// The tag on `from` that holds the point of `namespace`'s base.
+    pub fn tag_of(namespace: &str) -> String {
+        let safe: String = namespace.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect();
+        format!("base.{}", safe.chars().take(58).collect::<String>())
+    }
+
+    pub fn point(&self) -> CommitTs {
+        CommitTs(self.point_ts)
     }
 }
 
@@ -186,12 +212,13 @@ pub fn check_name(name: &str) -> Result<(), String> {
 /// log, as subscriptions are.
 #[derive(Default)]
 pub struct Branches {
-    by_id: RwLock<BTreeMap<String, Branch>>,
-    /// B7: tags and layers, the other control rows of kind `branch` (by id prefix).
+    /// B7: tags and layers, control rows of kind `branch` (by id prefix).
     tags: RwLock<BTreeMap<String, Tag>>,
     layers: RwLock<BTreeMap<String, Layers>>,
     /// DB-4: storage limits.
     quotas: RwLock<BTreeMap<String, Quota>>,
+    /// AQL v0.13: the namespaces made by BRANCH / FORK, by `base:<namespace>`.
+    bases: RwLock<BTreeMap<String, Base>>,
 }
 
 /// What a `branch`-kind control row holds, by its id's prefix.
@@ -203,16 +230,20 @@ fn control(value: &serde_json::Value) -> Option<Control> {
         serde_json::from_value(value.clone()).ok().map(Control::Layers)
     } else if id.starts_with("quota:") {
         serde_json::from_value(value.clone()).ok().map(Control::Quota)
+    } else if id.starts_with("base:") {
+        serde_json::from_value(value.clone()).ok().map(Control::Base)
     } else {
-        serde_json::from_value(value.clone()).ok().map(Control::Branch)
+        // `br:` rows of the branch engines AQL v0.13 replaced: left in the table, unread
+        // (a branch is now a namespace with a `base:` row).
+        None
     }
 }
 
 enum Control {
-    Branch(Branch),
     Tag(Tag),
     Layers(Layers),
     Quota(Quota),
+    Base(Base),
 }
 
 impl Branches {
@@ -227,9 +258,6 @@ impl Branches {
 
     fn put(&self, c: Option<Control>) {
         match c {
-            Some(Control::Branch(b)) => {
-                self.by_id.write().unwrap().insert(b.id.clone(), b);
-            }
             Some(Control::Tag(t)) => {
                 self.tags.write().unwrap().insert(t.id.clone(), t);
             }
@@ -238,6 +266,9 @@ impl Branches {
             }
             Some(Control::Quota(q)) => {
                 self.quotas.write().unwrap().insert(q.id.clone(), q);
+            }
+            Some(Control::Base(b)) => {
+                self.bases.write().unwrap().insert(b.id.clone(), b);
             }
             None => {}
         }
@@ -249,14 +280,24 @@ impl Branches {
             match effect {
                 Effect::Register(n) if n.data.kind == Kind::Branch => self.put(control(&n.data.value)),
                 Effect::Unregister { id } => {
-                    self.by_id.write().unwrap().remove(&id.0);
                     self.tags.write().unwrap().remove(&id.0);
                     self.layers.write().unwrap().remove(&id.0);
                     self.quotas.write().unwrap().remove(&id.0);
+                    self.bases.write().unwrap().remove(&id.0);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// The base of a namespace made by BRANCH or FORK.
+    pub fn base_of(&self, namespace: &str) -> Option<Base> {
+        self.bases.read().unwrap().get(&Base::id_of(namespace)).cloned()
+    }
+
+    /// The namespaces this engine holds that were branched or forked from `from`.
+    pub fn based_on(&self, from: &str) -> Vec<Base> {
+        self.bases.read().unwrap().values().filter(|b| b.from == from).cloned().collect()
     }
 
     /// DB-4: every quota.
@@ -294,63 +335,13 @@ impl Branches {
         out
     }
 
-    pub fn get(&self, namespace: &str, name: &str) -> Option<Branch> {
-        self.by_id.read().unwrap().get(&Branch::id_of(namespace, name)).cloned()
-    }
-
-    /// The branches of `namespace` (all of them when `None`), by id.
-    pub fn list(&self, namespace: Option<&str>) -> Vec<Branch> {
-        self.by_id.read().unwrap().values().filter(|b| namespace.is_none_or(|ns| b.namespace == ns)).cloned().collect()
-    }
-
-    /// `name` and its ancestors up to `main`, nearest first (B2 walks them).
-    pub fn chain(&self, namespace: &str, name: &str) -> Result<Vec<Branch>, String> {
-        let by_id = self.by_id.read().unwrap();
-        let mut out = Vec::new();
-        let mut cur = name.to_string();
-        while cur != MAIN {
-            let b = by_id.get(&Branch::id_of(namespace, &cur)).ok_or_else(|| format!("no branch {cur:?} in namespace {namespace:?}"))?;
-            if out.len() > 64 {
-                return Err(format!("branch {name:?}: its parent chain is longer than 64"));
-            }
-            out.push(b.clone());
-            cur = b.parent.clone();
-        }
-        Ok(out)
-    }
-
-    /// Whether any branch of `namespace` has `name` as its parent.
-    pub fn has_children(&self, namespace: &str, name: &str) -> bool {
-        self.by_id.read().unwrap().values().any(|b| b.namespace == namespace && b.parent == name)
-    }
-
-    /// The oldest branch point of `namespace`'s branches: compaction keeps the history
-    /// they read (B4).
-    pub fn oldest_point(&self, namespace: &str) -> Option<CommitTs> {
-        self.by_id.read().unwrap().values().filter(|b| b.namespace == namespace).map(Branch::point).min()
-    }
-
-    /// Compaction pins (B4) of the engine that is `of` — `None` for the org (whose
-    /// readers are the branches cut from `main`), or a branch `(namespace, name)`
-    /// (read by its own child branches): per namespace, the oldest point read.
-    pub fn pins(&self, of: Option<(&str, &str)>) -> std::collections::HashMap<String, CommitTs> {
+    /// Compaction pins (B4): per namespace, its oldest tag's point. A branch's or
+    /// fork's point is a tag on its source (`branch.<ns>`), and pinned layers read tags.
+    pub fn pins(&self) -> std::collections::HashMap<String, CommitTs> {
         let mut out = std::collections::HashMap::<String, CommitTs>::new();
-        for b in self.by_id.read().unwrap().values() {
-            let reads_it = match of {
-                None => b.parent == MAIN,
-                Some((ns, name)) => b.namespace == ns && b.parent == name,
-            };
-            if reads_it {
-                let e = out.entry(b.namespace.clone()).or_insert(b.point());
-                *e = (*e).min(b.point());
-            }
-        }
-        // Tags are points of the org's spaces (pinned layers read them).
-        if of.is_none() {
-            for t in self.tags.read().unwrap().values() {
-                let e = out.entry(t.namespace.clone()).or_insert(CommitTs(t.point_ts));
-                *e = (*e).min(CommitTs(t.point_ts));
-            }
+        for t in self.tags.read().unwrap().values() {
+            let e = out.entry(t.namespace.clone()).or_insert(CommitTs(t.point_ts));
+            *e = (*e).min(CommitTs(t.point_ts));
         }
         out
     }
@@ -370,43 +361,25 @@ mod tests {
     }
 
     #[test]
-    fn chains_walk_to_main() {
+    fn tags_pin_and_old_branch_rows_are_left_unread() {
         let b = Branches::default();
-        let mk = |name: &str, parent: &str, off: u64| Branch {
-            id: Branch::id_of("crm", name),
-            namespace: "crm".into(),
-            name: name.into(),
-            parent: parent.into(),
-            point_offset: off,
-            point_ts: off as i64,
-            created_by: None,
-            placement: None,
-            pending_forgets: Vec::new(),
-        };
-        {
-            let mut m = b.by_id.write().unwrap();
-            for x in [mk("a", "main", 10), mk("b", "a", 20)] {
-                m.insert(x.id.clone(), x);
-            }
-        }
-        let c = b.chain("crm", "b").unwrap();
-        assert_eq!(c.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["b", "a"]);
-        assert!(b.chain("crm", "nope").is_err());
-        assert!(b.has_children("crm", "a"));
-        assert_eq!(b.oldest_point("crm"), Some(CommitTs(10)));
-        assert_eq!(b.pins(None).get("crm"), Some(&CommitTs(10)));
-        assert_eq!(b.pins(Some(("crm", "a"))).get("crm"), Some(&CommitTs(20)));
-        assert!(b.pins(Some(("crm", "b"))).is_empty());
-        // A tag pins its space on the org (pinned layers read it), not on a branch.
-        b.tags.write().unwrap().insert(Tag::id_of("compliance", "v1"), Tag {
-            id: Tag::id_of("compliance", "v1"),
-            namespace: "compliance".into(),
-            name: "v1".into(),
-            point_offset: 5,
-            point_ts: 5,
-            created_by: None,
+        // A `br:` row of the branch engines (before AQL v0.13), as the table may hold it.
+        let old = serde_json::json!({
+            "id": "br:crm/try", "namespace": "crm", "name": "try", "parent": "main",
+            "point_offset": 10, "point_ts": 10, "placement": "http://pod:3001",
+            "pending_forgets": [{ "memory": "semantic", "lineages": ["semantic:crm|a"] }],
         });
-        assert_eq!(b.pins(None).get("compliance"), Some(&CommitTs(5)));
-        assert!(b.pins(Some(("crm", "a"))).get("compliance").is_none());
+        assert!(control(&old).is_none(), "left unread");
+        assert!(serde_json::from_value::<Branch>(old).is_ok(), "and still decodes as a Branch");
+        b.put(control(&serde_json::json!({
+            "id": Tag::id_of("compliance", "v1"), "namespace": "compliance", "name": "v1",
+            "point_offset": 5, "point_ts": 5,
+        })));
+        b.put(control(&serde_json::json!({
+            "id": Tag::id_of("compliance", "v0"), "namespace": "compliance", "name": "v0",
+            "point_offset": 3, "point_ts": 3,
+        })));
+        assert_eq!(b.pins().get("compliance"), Some(&CommitTs(3)), "the oldest tag");
+        assert!(b.pins().get("crm").is_none());
     }
 }

@@ -19,7 +19,6 @@ use adb_mcp::McpServer;
 use clap::{Parser, Subcommand};
 
 mod alloc;
-mod branch;
 mod cluster;
 mod cluster_mark;
 mod import;
@@ -123,8 +122,45 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// `ADB_DATA_NICE` (default 5; 0 leaves it): the niceness of the data runtime's
+/// threads — requests, applies, compaction and every thread they start (Lance,
+/// DataFusion inherit it). The control plane's threads stay at the process's own, so
+/// a node saturated by requests still heartbeats in time: at 90–100% CPU the control
+/// threads were starved past the 3 s lease and the leader moved a live node's
+/// partitions (Hetzner p14). Lowering priority needs no privilege; raising it would.
+fn data_nice() -> i32 {
+    std::env::var("ADB_DATA_NICE").ok().and_then(|v| v.parse().ok()).filter(|n: &i32| (0..=19).contains(n)).unwrap_or(5)
+}
+
+#[cfg(unix)]
+fn lower_this_thread(nice: i32) {
+    if nice > 0 {
+        // On Linux, PRIO_PROCESS with 0 sets the calling thread's niceness.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lower_this_thread(_nice: i32) {}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The control runtime first, from this thread: its threads keep normal priority
+    // (threads started from a lowered one inherit its niceness).
+    let _ = adb_cluster::control::runtime();
+    let nice = data_nice();
+    // This thread too: it runs the startup (`block_on`), whose threads (WAL writers,
+    // Lance's CPU pool) inherit its niceness.
+    lower_this_thread(nice);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(move || lower_this_thread(nice))
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     // A client command: no engine of its own.
     if let Some(Commands::ImportLancedb { path, flight, replace }) = &cli.command {
@@ -164,16 +200,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let engine: Arc<dyn Engine> = match &cli.data_dir {
-        // B6: a memory branch in its own pod (ADB_BRANCH_OF, ADB_BRANCH).
-        Some(dir) if branch::config()?.is_some() => branch::open(dir, branch::config()?.expect("checked")).await?,
-        // DB-2: one pod hosting every dev and QA branch (ADB_NON_PROD_OF, ADB_NON_PROD_URL).
-        Some(dir) if adb_server::non_prod::NonProdConfig::from_env()?.is_some() => {
-            let config = adb_server::non_prod::NonProdConfig::from_env()?.expect("checked");
-            Arc::new(adb_server::non_prod::NonProdPod::open(dir, config).await?)
-        }
         Some(dir) => {
             let (engine, replayed) = LocalEngine::durable(dir).await?;
-            engine.set_branch_remote(branch::remote());
             tracing::info!(
                 dir = %dir.display(),
                 records = replayed.records,
@@ -276,14 +304,20 @@ async fn serve_embed(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::
     // The worker embeds with its own model, never through a pool.
     std::env::remove_var("ADB_EMBED_URL");
     let embedder = adb_embed::Embedder::from_env().ok_or("serve-embed needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?;
-    async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, headers: axum::http::HeaderMap, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        // A database node's deferred vectors: behind every request someone waits on.
+        let background = headers.get(adb_embed::PRIORITY_HEADER).is_some_and(|v| v.as_bytes() == b"background");
         let texts: Vec<String> = match req.get("input") {
             Some(serde_json::Value::String(s)) => vec![s.clone()],
             Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
             _ => Vec::new(),
         };
         let _t = adb_core::steps::timer("embed.served by this worker");
-        match e.embed_here(texts).await {
+        let r = match background {
+            true => e.embed_here_background(texts).await,
+            false => e.embed_here(texts).await,
+        };
+        match r {
             Ok(v) => {
                 let data: Vec<serde_json::Value> = v.into_iter().enumerate().map(|(i, e)| serde_json::json!({ "object": "embedding", "index": i, "embedding": e })).collect();
                 (axum::http::StatusCode::OK, axum::Json(serde_json::json!({ "object": "list", "model": e.model(), "data": data })))

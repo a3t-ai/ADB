@@ -191,7 +191,7 @@ try {
   flightUrl = `http://127.0.0.1:${flightPort}`;
   const adbProc = start(args.adb, ['--data-dir', join(tmp, 'adb'), 'serve-http', '--port', String(adbPort), '--flight-port', String(flightPort)], { ADB_AUTH_TOKEN: TOKEN });
   await waitHealthy(adbUrl, 'ADB', adbProc);
-  const open = await fetch(`${adbUrl}/query`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'RECALL FROM SEMANTIC ALL' }) });
+  const open = await fetch(`${adbUrl}/query`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'RECALL FROM SEMANTIC' }) });
   check('ADB refuses a request without the token (401)', open.status === 401, String(open.status));
 
   // Console: resource + flow, into the shared registry.
@@ -216,7 +216,7 @@ try {
   check('request 1: the runtime ran the flow and replied', out(r1)?.echo === 'hello runtime', JSON.stringify(r1));
   check('request 1: status completed', /complete/i.test(JSON.stringify(r1?.status ?? '')), JSON.stringify(r1?.status));
   check('request 1: reply names the canvas', r1?.canvas === `${CANVAS.ns}/${CANVAS.name}`, r1?.canvas);
-  const m1 = await aql(adbUrl, 'LOOKUP FROM SEMANTIC KEY id = "echo-r-1"');
+  const m1 = await aql(adbUrl, 'RECALL FROM SEMANTIC WHERE id = "echo-r-1"');
   check('request 1: memory stored in ADB', m1.records?.[0]?.data?.content === 'hello runtime', JSON.stringify(m1));
 
   // Kill the runtime; a request arrives while it is down; a fresh pod (empty disk) takes over.

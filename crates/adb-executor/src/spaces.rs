@@ -26,8 +26,15 @@ pub trait Spaces: Send + Sync {
     /// Every version of `space`'s rows of `memory`, once its partition has applied
     /// what it committed.
     async fn versions(&self, memory: Memory, space: &str) -> AdbResult<Vec<StoredRow>>;
+    /// Every version of one key (`bare`: without its namespace) of `space` — what a
+    /// keyed check needs, not the whole space.
+    async fn key_versions(&self, memory: Memory, space: &str, bare: &str) -> AdbResult<Vec<StoredRow>> {
+        Ok(self.versions(memory, space).await?.into_iter().filter(|r| adb_store::without_namespace(adb_store::key_of(&r.lineage_id)) == bare).collect())
+    }
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<Tag>>;
     async fn layers_of(&self, space: &str) -> AdbResult<Vec<Layer>>;
+    /// AQL v0.13: what `space` was branched or forked from, if it was.
+    async fn base_of(&self, space: &str) -> AdbResult<Option<crate::branches::Base>>;
     /// Every space (in any partition) reading `space` as a layer.
     async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>>;
     /// The org's quotas (DB-4): in a cluster, kept once in the system partition.
@@ -57,12 +64,25 @@ impl Spaces for LocalSpaces {
         store.versions(memory, Some(&format!("namespace = {}", adb_store::sql_str(space)))).await.map_err(|e| AdbError::Internal(format!("store: {e}")))
     }
 
+    async fn key_versions(&self, memory: Memory, space: &str, bare: &str) -> AdbResult<Vec<StoredRow>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        if let Some(b) = &self.barrier {
+            b.wait_for_committed().await;
+        }
+        let lineage = adb_store::row_id(memory, &adb_store::namespaced(Some(space), bare));
+        store.versions_of(memory, &[lineage]).await.map_err(|e| AdbError::Internal(format!("store: {e}")))
+    }
+
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<Tag>> {
         Ok(self.registry.tag(space, name))
     }
 
     async fn layers_of(&self, space: &str) -> AdbResult<Vec<Layer>> {
         Ok(self.registry.layers_of(space))
+    }
+
+    async fn base_of(&self, space: &str) -> AdbResult<Option<crate::branches::Base>> {
+        Ok(self.registry.base_of(space))
     }
 
     async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {
@@ -92,6 +112,13 @@ impl SpaceView {
         Self { local: Arc::new(local), remote: Arc::new(OnceLock::new()) }
     }
 
+    /// A view that reads every space through `spaces` (a router's own, while it lives).
+    pub fn routed(spaces: &Arc<dyn Spaces>) -> Self {
+        let v = Self::new(LocalSpaces { store: None, barrier: None, registry: Arc::new(Branches::default()) });
+        v.set_remote(Arc::downgrade(spaces));
+        v
+    }
+
     /// Read other spaces through `spaces` from now on (set once, by the router).
     pub fn set_remote(&self, spaces: Weak<dyn Spaces>) {
         let _ = self.remote.set(spaces);
@@ -114,6 +141,73 @@ impl SpaceView {
 
     pub async fn layers_of(&self, space: &str) -> AdbResult<Vec<Layer>> {
         self.source().layers_of(space).await
+    }
+
+    pub async fn base_of(&self, space: &str) -> AdbResult<Option<crate::branches::Base>> {
+        self.source().base_of(space).await
+    }
+
+    /// AQL v0.13: `space` as it was at `at` — its own records then, and, for a branch,
+    /// its base's as they were at the branch point (or `at`, if earlier), one per key,
+    /// with this space's ids. Forgotten-on-the-branch records (`_branch_deleted`) hide
+    /// the base's. `in_scope` narrows to one named scope.
+    /// The current row of key `bare` in `space` as [`Self::rows_at`] would show it
+    /// (its own, else its bases' at their points; a branch's delete marker hides it),
+    /// looked up by key at each level, not by reading the spaces.
+    pub async fn key_at(&self, memory: adb_core::log::Memory, space: &str, bare: &str, at: adb_core::log::CommitTs, now: adb_core::log::CommitTs) -> AdbResult<Option<StoredRow>> {
+        let mut level = space.to_string();
+        let mut point = at;
+        for _ in 0..16 {
+            if let Some(r) = self.source().key_versions(memory, &level, bare).await?.into_iter().find(|r| r.is_current_at(point, now)) {
+                return Ok((!crate::namespaces::branch_deleted(&r)).then_some(r));
+            }
+            match self.base_of(&level).await? {
+                Some(b) if b.kind == crate::branches::BaseKind::Branch => {
+                    point = point.min(b.point());
+                    level = b.from;
+                }
+                _ => return Ok(None),
+            }
+        }
+        Err(AdbError::Internal(format!("namespace {space:?}: its bases go more than 16 deep")))
+    }
+
+    pub async fn rows_at(&self, memory: adb_core::log::Memory, space: &str, at: adb_core::log::CommitTs, now: adb_core::log::CommitTs) -> AdbResult<Vec<StoredRow>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut level = space.to_string();
+        let mut point = at;
+        // Walk the chain of bases: own rows first, then each base's at its point.
+        for _ in 0..16 {
+            for mut r in self.versions(memory, &level).await? {
+                if !r.is_current_at(point, now) {
+                    continue;
+                }
+                let bare = adb_store::without_namespace(adb_store::key_of(&r.lineage_id)).to_string();
+                if !seen.insert(bare.clone()) {
+                    continue;
+                }
+                if crate::namespaces::branch_deleted(&r) {
+                    continue;
+                }
+                if level != space {
+                    let here = adb_store::row_id(memory, &adb_store::namespaced(Some(space), &bare));
+                    if r.id == r.lineage_id {
+                        r.id = here.clone();
+                    }
+                    r.lineage_id = here;
+                }
+                out.push(r);
+            }
+            match self.base_of(&level).await? {
+                Some(b) if b.kind == crate::branches::BaseKind::Branch => {
+                    point = point.min(b.point());
+                    level = b.from;
+                }
+                _ => return Ok(out),
+            }
+        }
+        Err(AdbError::Internal(format!("namespace {space:?}: its bases go more than 16 deep")))
     }
 
     pub async fn layered_by(&self, space: &str) -> AdbResult<Vec<String>> {

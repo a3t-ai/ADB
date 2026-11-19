@@ -377,9 +377,7 @@ struct SnapshotReq {
 impl Conn {
     async fn call<Req: Serialize, Resp: DeserializeOwned, E: DeserializeOwned>(&self, path: &str, body: &Req, timeout: Duration) -> Result<Result<Resp, E>, Unreachable<TC>> {
         let bytes = rmp_serde::to_vec_named(body).map_err(unreachable)?;
-        let r = self
-            .http
-            .post(format!("{}/control/raft/{path}", self.base))
+        let r = crate::identity::tag(self.http.post(format!("{}/control/raft/{path}", self.base)))
             .timeout(timeout)
             .header("content-type", "application/msgpack")
             .body(bytes)
@@ -496,6 +494,7 @@ pub fn router(raft: ControlRaft) -> Router {
         .route("/control/raft/pre_vote", post(pre_vote))
         .route("/control/raft/transfer", post(transfer))
         .route("/control/raft/snapshot", post(snapshot))
+        .layer(axum::middleware::from_fn(crate::identity::guard))
         .with_state(raft)
 }
 

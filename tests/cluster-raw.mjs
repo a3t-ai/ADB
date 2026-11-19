@@ -55,7 +55,7 @@ async function writer(w) {
       note('write', e);
       // Unknown whether it landed: read back what is there before writing this key again.
       try {
-        const d = await q(NODES[(turn + 1) % NODES.length], `LOOKUP FROM SEMANTIC KEY id = "${key}" NAMESPACE "${ns}"`);
+        const d = await q(NODES[(turn + 1) % NODES.length], `RECALL FROM SEMANTIC WHERE id = "${key}" NAMESPACE "${ns}"`);
         const c = (d?.data?.records ?? d?.records)?.[0]?.data?.c;
         if (typeof c === 'number') value[j] = c;
       } catch {}
@@ -66,7 +66,7 @@ async function writer(w) {
     // Read back at once, through another node than the write's.
     const rnode = NODES[(NODES.indexOf(wnode) + 1 + (round % (NODES.length - 1))) % NODES.length];
     try {
-      const d = await q(rnode, `LOOKUP FROM SEMANTIC KEY id = "${key}" NAMESPACE "${ns}"`);
+      const d = await q(rnode, `RECALL FROM SEMANTIC WHERE id = "${key}" NAMESPACE "${ns}"`);
       const c = (d?.data?.records ?? d?.records)?.[0]?.data?.c;
       const by = d?.metadata?.served_by ?? 'owner';
       served.set(by, (served.get(by) ?? 0) + 1);

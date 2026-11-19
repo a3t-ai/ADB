@@ -281,6 +281,11 @@ impl MemoryRecord {
             // Simple field - look in data map, or check special fields
             match parts[0] {
                 "id" => Some(serde_json::Value::String(self.id.clone())),
+                // The record's own times and version when its data doesn't carry them
+                // (AQL v0.13: `WHERE created_at BETWEEN …`).
+                f @ ("created_at" | "accessed_at" | "updated_at" | "version") if self.data.get(f).is_none() => {
+                    self.resolve_metadata_field(if f == "updated_at" { "accessed_at" } else { f })
+                }
                 _ => self.data.get(parts[0]).cloned(),
             }
         } else {

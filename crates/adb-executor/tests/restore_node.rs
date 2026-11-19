@@ -16,7 +16,7 @@ const READS: &[&str] = &[
     r#"RECALL FROM EPISODIC WHERE campaign = "summer""#,
     r#"RECALL FROM EPISODIC WHERE campaign = "autumn""#,
     r#"RECALL FROM SEMANTIC WHERE active = true RETURN concept, content"#,
-    r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS ALL DEPTH 2"#,
+    r#"RECALL FROM SEMANTIC WHERE key = "person:ada" FOLLOW LINKS DEPTH 2"#,
 ];
 
 fn stable(mut v: Value) -> Value {
@@ -55,7 +55,9 @@ async fn a_node_is_rebuilt_from_object_storage_and_the_log_after_it() {
         a.query(&format!(r#"STORE INTO EPISODIC (bid_id = "s{i}", campaign = "summer", n = {i})"#), None).await.unwrap();
     }
     a.query(r#"STORE INTO SEMANTIC (key = "acme", concept = "acme", content = "Acme renews on 1 Nov", active = true)"#, None).await.unwrap();
-    a.query(r#"STORE INTO SEMANTIC FACT (subject = "person:ada", predicate = "works_at", object = "org:acme", confidence = 0.9)"#, None).await.unwrap();
+    a.query(r#"STORE INTO SEMANTIC (key = "person:ada")"#, None).await.unwrap();
+    a.query(r#"STORE INTO SEMANTIC (key = "org:acme")"#, None).await.unwrap();
+    a.query(r#"LINK FROM SEMANTIC WHERE key = "person:ada" INTO SEMANTIC WHERE key = "org:acme" TYPE "works_at" WEIGHT 0.9"#, None).await.unwrap();
     a.query(r#"STORE INTO SEMANTIC (key = "old", concept = "old", content = "to forget", active = true)"#, None).await.unwrap();
     a.query(r#"FORGET FROM SEMANTIC WHERE key = "old""#, None).await.unwrap();
     a.platform_write(Effect::TableInsert { table: "users".into(), rows: vec![user("u1", "Ada"), user("u2", "Bob")] }).await.unwrap();

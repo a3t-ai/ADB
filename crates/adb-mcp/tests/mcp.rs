@@ -146,7 +146,7 @@ async fn remember_updates_a_key_in_use_and_store_refuses_it() {
     let (err, v) = call(&s, "remember", json!({"content": "Acme renews on 1 Dec", "key": "acme"})).await;
     assert!(!err, "second remember of a key must update it: {v}");
     assert_eq!(v["updated_existing_key"], json!("acme"), "{v}");
-    let (_, v) = call(&s, "aql_query", json!({"query": r#"LOOKUP FROM SEMANTIC KEY id = "acme""#})).await;
+    let (_, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE id = "acme""#})).await;
     let rec = &v["data"]["records"][0];
     assert_eq!(rec["data"]["content"], json!("Acme renews on 1 Dec"), "{v}");
     assert_eq!(rec["data"]["account"], json!("acme"), "fields not given are kept: {v}");
@@ -190,7 +190,7 @@ async fn link_twice_reweights_and_unlink_removes() {
         let (err, v) = call(&s, "link", a).await;
         assert!(!err, "{v}");
     }
-    let (_, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "fix" WITH LINKS ALL"#})).await;
+    let (_, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "fix" WITH LINKS"#})).await;
     let links = v["data"]["records"][0]["data"]["links"].as_array().cloned().unwrap_or_default();
     assert_eq!(links.len(), 1, "{v}");
     assert!((links[0]["weight"].as_f64().unwrap() - 0.8).abs() < 1e-6, "{v}");
@@ -239,23 +239,31 @@ async fn watch_tools_follow_a_query() {
     assert_eq!(v["frames"][0]["added"][0]["id"], "acme", "{v}");
     assert!(v["from"].as_u64().unwrap() > offset);
     let (err, v) = call(&s, "unwatch", json!({"cq_id": id})).await;
-    assert!(!err && v["data"]["unwatched"] == json!(true), "{v}");
+    assert!(!err && v["data"]["unsubscribed"] == json!(true), "{v}");
 }
 
-/// P1.4: `remember` with subject + predicate stores a fact, which supersedes and
-/// can be followed as a link.
+/// AQL v0.13 (no facts): `remember` with subject + predicate + object is a LINK of
+/// TYPE predicate between the two records (both must exist); with a value, a field.
 #[tokio::test]
 async fn remember_stores_facts() {
     let s = server().await;
-    let fact = |o: &str| json!({"content": format!("Ada works at {o}"), "subject": "person:ada", "predicate": "works_at", "object": o, "confidence": 0.9});
-    let (err, v) = call(&s, "remember", fact("org:acme")).await;
+    for k in ["person:ada", "org:acme"] {
+        let (err, v) = call(&s, "aql_query", json!({"query": format!(r#"STORE INTO SEMANTIC (key = "{k}")"#)})).await;
+        assert!(!err, "{v}");
+    }
+    let (err, v) = call(&s, "remember", json!({"content": "Ada works at Acme", "subject": "person:ada", "predicate": "works_at", "object": "org:acme"})).await;
     assert!(!err, "{v}");
-    let (err, v) = call(&s, "remember", fact("org:globex")).await;
+    let (err, v) = call(&s, "remember", json!({"content": "Ada is 36", "subject": "person:ada", "predicate": "age", "value": 36})).await;
     assert!(!err, "{v}");
-    let (err, v) = call(&s, "aql_query", json!({"query": r#"LOOKUP FROM SEMANTIC KEY id = "person:ada" FOLLOW LINKS TYPE "works_at""#})).await;
+    let (err, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "person:ada" FOLLOW LINKS TYPE "works_at""#})).await;
     assert!(!err, "{v}");
     assert_eq!(v["data"]["count"], json!(1), "{v}");
-    assert_eq!(v["data"]["records"][0]["id"], json!("org:globex"), "{v}");
+    assert_eq!(v["data"]["records"][0]["data"]["key"], json!("org:acme"), "{v}");
+    let (err, v) = call(&s, "aql_query", json!({"query": r#"RECALL FROM SEMANTIC WHERE key = "person:ada""#})).await;
+    assert!(!err && v["data"]["records"][0]["data"]["age"] == json!(36), "{v}");
+    // An end that doesn't exist: refused (no silent stubs).
+    let (err, _) = call(&s, "remember", json!({"content": "x", "subject": "person:nobody", "predicate": "p", "object": "org:acme"})).await;
+    assert!(err);
     // A fact is SEMANTIC.
     let (err, _) = call(&s, "remember", json!({"content": "x", "memory_type": "episodic", "subject": "a", "predicate": "p", "object": "b"})).await;
     assert!(err);

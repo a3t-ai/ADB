@@ -137,7 +137,9 @@ impl Executor {
                 self.execute_step(&self.bind_variables_in_step(step, &bindings)).await?
             }
             ExecutionPlan::Pipeline(pipeline) => self.execute_pipeline(pipeline, bindings).await?,
-            ExecutionPlan::Reflect(reflect) => self.execute_reflect(reflect).await?,
+            ExecutionPlan::Namespace(_) => {
+                return Err(ExecutorError::InvalidOperation("BRANCH / FORK / MERGE run on the engine (they work across namespaces)".into()))
+            }
             ExecutionPlan::FanOut(fanout) => self.execute_fanout(fanout).await?,
             ExecutionPlan::Subscription(sub) => self.execute_subscription(sub).await?,
         };
@@ -167,22 +169,22 @@ impl Executor {
             Operation::Recall => self.execute_recall(step).await?,
             Operation::Lookup => self.execute_lookup(step).await?,
             Operation::Load => self.execute_load(step).await?,
-            Operation::Store => self.execute_store(step).await?,
-            Operation::Update => self.execute_update(step).await?,
+            Operation::Store | Operation::Update => {
+                let r = match step.operation {
+                    Operation::Store => self.execute_store(step).await?,
+                    _ => self.execute_update(step).await?,
+                };
+                // AQL v0.13: a record's other keys (`aliases`) take effect at once.
+                let payload = step.data.as_ref().and_then(|d| d.get("payload").or(Some(d)));
+                if step.memory_type == MemoryType::Semantic && payload.is_some_and(|p| p.get("aliases").is_some()) {
+                    self.writes.aliases_changed().await?;
+                }
+                r
+            }
             Operation::Forget => self.execute_forget(step).await?,
             Operation::Link => self.execute_link(step).await?,
             Operation::UpdateLink => self.execute_link_edit(step, false).await?,
             Operation::Unlink => self.execute_link_edit(step, true).await?,
-            Operation::Merge => {
-                let start = Instant::now();
-                let data = step.data.as_ref().ok_or_else(|| ExecutorError::MissingData("merge data".to_string()))?;
-                let key = |k: &str| data.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                if let Some(ns) = &step.modifiers.namespace {
-                    return Err(ExecutorError::InvalidOperation(format!("MERGE in NAMESPACE {ns:?} isn't supported yet (NS-L1): MERGE works on records without a namespace")));
-                }
-                let n = self.writes.merge(&key("from"), &key("into")).await?;
-                QueryResult::count(n, start.elapsed().as_millis() as u64)
-            }
         };
 
         let mut result = result;
@@ -278,8 +280,8 @@ impl Executor {
                 bound_step.predicate = Predicate::Pattern { pattern_var: pattern_var.clone(), threshold: *threshold, text: Some(text) };
             }
         }
-        // `AS OF $t` / `VALID AT $t` (AQL v0.10): the bound value is the time.
-        for t in [&mut bound_step.modifiers.as_of, &mut bound_step.modifiers.valid_at].into_iter().flatten() {
+        // `AS OF $t`: the bound value is the time.
+        for t in bound_step.modifiers.as_of.iter_mut() {
             if let adb_core::TimePoint::Variable { name } = t {
                 if let Some(serde_json::Value::String(time)) = bindings.get(name.as_str()).map(|v| v.to_json()) {
                     *t = adb_core::TimePoint::At { time };
@@ -517,13 +519,25 @@ impl Executor {
         select: &adb_core::LinkSelect,
     ) -> ExecutorResult<HashMap<(MemoryType, String), Vec<adb_core::Link>>> {
         let mut ids: HashMap<MemoryType, Vec<String>> = HashMap::new();
+        // AQL v0.13: links stored to or from a record's other keys (`aliases`) are its
+        // links too: alias id → the record's id.
+        let mut alias_of: HashMap<(MemoryType, String), String> = HashMap::new();
         for r in records {
             ids.entry(r.memory_type).or_default().push(r.id.clone());
+            if let Some(aliases) = r.data.get("aliases").and_then(|a| a.as_array()) {
+                let ns = adb_store::namespace_of(&r.id).map(String::from).or_else(|| r.metadata.namespace.clone());
+                for a in aliases.iter().filter_map(|a| a.as_str()) {
+                    let id = adb_store::namespaced(ns.as_deref(), a);
+                    ids.entry(r.memory_type).or_default().push(id.clone());
+                    alias_of.insert((r.memory_type, id), r.id.clone());
+                }
+            }
         }
-        let mut out = HashMap::new();
+        let mut out: HashMap<(MemoryType, String), Vec<adb_core::Link>> = HashMap::new();
         for (memory, ids) in ids {
             for (id, links) in self.reads.links_touching(memory, &ids, select).await? {
-                out.insert((memory, id), links);
+                let owner = alias_of.get(&(memory, id.clone())).cloned().unwrap_or(id);
+                out.entry((memory, owner)).or_default().extend(links);
             }
         }
         Ok(out)
@@ -641,6 +655,15 @@ impl Executor {
 
     async fn execute_recall(&self, step: &StepPlan) -> ExecutorResult<QueryResult> {
         let start = Instant::now();
+        // A key that is another record's alias reads that record (AQL v0.13).
+        let resolved;
+        let step = match self.alias_of_end(step.memory_type, &step.predicate, step.modifiers.namespace.as_deref()).await? {
+            Some(p) => {
+                resolved = StepPlan { predicate: p, ..step.clone() };
+                &resolved
+            }
+            None => step,
+        };
 
         // For aggregation, we need records WITHOUT field projection applied
         // So we recall with predicate and filters, but apply RETURN later
@@ -751,7 +774,10 @@ impl Executor {
         let resolved;
         let step = match (&step.memory_type, &step.predicate) {
             (MemoryType::Semantic, Predicate::Key { field, value: adb_core::Value::String(k) }) if matches!(field.as_str(), "id" | "key") => {
-                match self.writes.alias_resolve(k).await? {
+                // Aliases are kept by record id: the key in the statement's namespace
+                // (the planner has qualified it already; the survivor's id is too).
+                let id = adb_store::namespaced(step.modifiers.namespace.as_deref(), k);
+                match self.writes.alias_resolve(&id).await? {
                     Some(to) => {
                         resolved = StepPlan { predicate: Predicate::Key { field: field.clone(), value: adb_core::Value::String(to) }, ..step.clone() };
                         &resolved
@@ -891,14 +917,7 @@ impl Executor {
             .and_then(|v| v.as_u64())
             .map(std::time::Duration::from_millis);
 
-        let record = match data.get("fact") {
-            // STORE … FACT [MULTI] (P1_GRAPH D2): the writes give it its key.
-            Some(fact) if !fact.is_null() => {
-                let multi = fact.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
-                self.writes.store_fact(payload, multi, scope, namespace, ttl, in_scope).await?
-            }
-            _ => self.writes.store(step.memory_type, key, payload, scope, namespace, ttl, in_scope).await?,
-        };
+        let record = self.writes.store(step.memory_type, key, payload, scope, namespace, ttl, in_scope).await?;
 
         Ok(QueryResult::stored(
             record,
@@ -977,11 +996,14 @@ impl Executor {
         let to_predicate = self.build_predicate_from_conditions(data.get("to_conditions"))?;
 
         // Look up source records using step.memory_type and step.predicate (within
-        // the statement's NAMESPACE, AQL v0.12).
+        // the statement's NAMESPACE, AQL v0.12). An end named by another key of a
+        // record (its `aliases`, AQL v0.13) is that record.
         let within = link_scope(step);
+        let from_predicate = self.alias_end(step.memory_type, &step.predicate, within.namespace.as_deref()).await?;
+        let to_predicate = self.alias_end(to_type, &to_predicate, within.namespace.as_deref()).await?;
         let source_records = self
             .reads
-            .lookup_with_modifiers(step.memory_type, &step.predicate, &within)
+            .lookup_with_modifiers(step.memory_type, &from_predicate, &within)
             .await?;
 
         if source_records.is_empty() {
@@ -1049,6 +1071,40 @@ impl Executor {
     }
 
     /// Build a predicate from serialized conditions array
+    /// A link end `key = v` (or `id = v`) on SEMANTIC naming another key of a record
+    /// (an alias): the record's own key instead.
+    async fn alias_end(&self, memory: MemoryType, predicate: &Predicate, namespace: Option<&str>) -> ExecutorResult<Predicate> {
+        Ok(self.alias_of_end(memory, predicate, namespace).await?.unwrap_or_else(|| predicate.clone()))
+    }
+
+    /// [`Self::alias_end`]: `Some` when the key is an alias (the record's own key then).
+    async fn alias_of_end(&self, memory: MemoryType, predicate: &Predicate, namespace: Option<&str>) -> ExecutorResult<Option<Predicate>> {
+        if memory != MemoryType::Semantic {
+            return Ok(None);
+        }
+        let Predicate::Where { conditions } = predicate else { return Ok(None) };
+        let [adb_core::Condition::Simple { field, operator: adb_core::Operator::Eq, value: adb_core::Value::String(v), logical_op }] = conditions.as_slice() else {
+            return Ok(None);
+        };
+        if !matches!(field.as_str(), "key" | "id") {
+            return Ok(None);
+        }
+        match self.writes.alias_resolve(&adb_store::namespaced(namespace, v)).await? {
+            Some(to) => Ok(Some(Predicate::Where {
+                conditions: vec![adb_core::Condition::Simple {
+                    field: field.clone(),
+                    operator: adb_core::Operator::Eq,
+                    value: adb_core::Value::String(match field.as_str() {
+                        "id" => to,
+                        _ => adb_store::unscoped(&to).to_string(),
+                    }),
+                    logical_op: *logical_op,
+                }],
+            })),
+            None => Ok(None),
+        }
+    }
+
     fn build_predicate_from_conditions(&self, conditions_value: Option<&serde_json::Value>) -> ExecutorResult<Predicate> {
         let conditions_arr = conditions_value
             .and_then(|v| v.as_array())

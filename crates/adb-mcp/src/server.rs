@@ -112,9 +112,16 @@ impl McpServer {
             "forget" => self.run(forget(&args)).await,
             "link" => self.run(link(&args)).await,
             "unlink" => self.run(unlink(&args)).await,
-            "subscribe" => self.run(subscribe(&args)).await,
+            "subscribe" => match subscribe(&args) {
+                Ok(Sub::Aql(q)) => self.run(Ok(q)).await,
+                Ok(Sub::Plan(p)) => self.engine.subscription(p).await,
+                Err(e) => Err(e),
+            },
             "publish" => self.run(publish(&args)).await,
-            "ack" => self.run(ack(&args)).await,
+            "ack" => match ack(&args) {
+                Ok(p) => self.engine.subscription(p).await,
+                Err(e) => Err(e),
+            },
             "unsubscribe" => self.run(unsubscribe(&args)).await,
             "next_events" => self.next_events(&args).await,
             "watch" => self.watch(&args).await,
@@ -171,14 +178,14 @@ impl McpServer {
     }
 
     /// Run AQL built by a shortcut tool.
-    /// `remember` sets a fact: a new key is stored, a key in use is updated (a new
+    /// `remember` sets a memory: a new key is stored, a key in use is updated (a new
     /// version, history kept) — unlike `STORE` / `store_memory`, which refuse a key
     /// in use (D3 S4).
     async fn remember(&self, args: &Value) -> Result<Value, String> {
         let aql = remember(args)?;
-        // A fact has its own key (subject, predicate) and supersedes by itself.
-        let fact = args.get("subject").is_some() && args.get("predicate").is_some();
-        let Some(key) = args.get("key").and_then(Value::as_str).filter(|_| !fact) else {
+        // subject + predicate is a LINK or an UPDATE of the subject: no key of its own.
+        let relation = args.get("subject").is_some() && args.get("predicate").is_some();
+        let Some(key) = args.get("key").and_then(Value::as_str).filter(|_| !relation) else {
             return self.run(Ok(aql)).await;
         };
         match self.engine.query(&aql, None).await {
@@ -229,7 +236,8 @@ fn obj(args: &Value, name: &str) -> serde_json::Map<String, Value> {
     args.get(name).and_then(Value::as_object).cloned().unwrap_or_default()
 }
 
-/// ClawDB `store_memory`: `STORE INTO <type> (fields) [SCOPE s] [NAMESPACE "ns"]`.
+/// ClawDB `store_memory`: `STORE INTO <type> (fields) [NAMESPACE "ns"]`. AQL v0.13 has
+/// no SCOPE private|shared|cluster: a `scope` of those is accepted and has no effect.
 fn store_memory(args: &Value) -> Result<String, String> {
     let mt = memory_type(args, "memory_type", None)?;
     let data = args.get("data").and_then(Value::as_object).ok_or("Missing or invalid: data (must be object)")?;
@@ -238,9 +246,8 @@ fn store_memory(args: &Value) -> Result<String, String> {
     }
     let mut q = format!("STORE INTO {mt} {}", payload(data)?);
     if let Some(scope) = args.get("scope").and_then(Value::as_str) {
-        match scope {
-            "private" | "shared" | "cluster" => q.push_str(&format!(" SCOPE {scope}")),
-            other => return Err(format!("Invalid scope: {other}")),
+        if !["private", "shared", "cluster"].contains(&scope) {
+            return Err(format!("Invalid scope: {scope}"));
         }
     }
     if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
@@ -267,31 +274,42 @@ fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args.get(name).and_then(Value::as_str).ok_or(format!("Missing required: {name}"))
 }
 
-/// `SUBSCRIBE TOPIC "t" | SCOPE "s" [KINDS …] [WHERE …] [FROM OFFSET n]`.
-fn subscribe(args: &Value) -> Result<String, String> {
-    let mut q = match (args.get("topic").and_then(Value::as_str), args.get("scope").and_then(Value::as_str)) {
-        (Some(t), None) => format!("SUBSCRIBE TOPIC {}", quote(t)),
-        (None, Some(s)) => format!("SUBSCRIBE SCOPE {}", quote(s)),
-        _ => return Err("subscribe needs exactly one of topic or scope".into()),
-    };
-    if let Some(kinds) = args.get("kinds").and_then(Value::as_array).filter(|k| !k.is_empty()) {
-        let kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
-        if let Some(bad) = kinds.iter().find(|k| !["entity", "fact", "edge", "episode", "tool", "event"].contains(k)) {
-            return Err(format!("unknown kind {bad}"));
-        }
-        q.push_str(&format!(" KINDS {}", kinds.join(", ")));
-    }
+/// A subscription: an AQL `SUBSCRIBE TOPIC "t" [WHERE …] [NAMESPACE …]`, or — for what
+/// AQL v0.13 leaves to the API (a scope's change feed, KINDS, a start offset) — the
+/// plan itself.
+enum Sub {
+    Aql(String),
+    Plan(aql_planner::SubscriptionPlan),
+}
+
+fn subscribe(args: &Value) -> Result<Sub, String> {
     let conds: Vec<String> = obj(args, "filter")
         .iter()
         .map(|(k, v)| Ok(format!("{} = {}", tools::field(k)?, literal(v))))
         .collect::<Result<_, String>>()?;
-    if !conds.is_empty() {
-        q.push_str(&format!(" WHERE {}", conds.join(" AND ")));
+    let filter = if conds.is_empty() { String::new() } else { format!(" WHERE {}", conds.join(" AND ")) };
+    let kinds: Vec<String> = args.get("kinds").and_then(Value::as_array).map(|k| k.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+    if let Some(bad) = kinds.iter().find(|k| !["entity", "fact", "edge", "episode", "tool", "event"].contains(&k.as_str())) {
+        return Err(format!("unknown kind {bad}"));
     }
-    if let Some(n) = args.get("from_offset").and_then(Value::as_u64) {
-        q.push_str(&format!(" FROM OFFSET {n}"));
-    }
-    Ok(q)
+    let from = args.get("from_offset").and_then(Value::as_u64);
+    let ns = args.get("namespace").and_then(Value::as_str).map(|n| format!(" NAMESPACE {}", quote(n))).unwrap_or_default();
+    let target = match (args.get("topic").and_then(Value::as_str), args.get("scope").and_then(Value::as_str)) {
+        (Some(t), None) if kinds.is_empty() && from.is_none() => return Ok(Sub::Aql(format!("SUBSCRIBE TOPIC {}{filter}{ns}", quote(t)))),
+        (Some(t), None) => aql_planner::SubscriptionTarget::Topic(aql_planner::namespaced_topic(args.get("namespace").and_then(Value::as_str), t)),
+        (None, Some(s)) => aql_planner::SubscriptionTarget::Scope(s.to_string()),
+        _ => return Err("subscribe needs exactly one of topic or scope".into()),
+    };
+    // The filter's conditions, as the planner reads a WHERE.
+    let filter = match filter.is_empty() {
+        true => None,
+        false => match aql_planner::Planner::new().plan(&aql_parser::parse(&format!("SUBSCRIBE TOPIC \"_\"{filter}")).map_err(|e| e.to_string())?) {
+            Ok(aql_planner::ExecutionPlan::Subscription(aql_planner::SubscriptionPlan::Subscribe { filter, .. })) => filter,
+            Ok(_) => None,
+            Err(e) => return Err(e.to_string()),
+        },
+    };
+    Ok(Sub::Plan(aql_planner::SubscriptionPlan::Subscribe { target, kinds, filter, from }))
 }
 
 /// `PUBLISH TOPIC "t" (fields) [TTL d]`.
@@ -312,9 +330,14 @@ fn publish(args: &Value) -> Result<String, String> {
     Ok(q)
 }
 
-fn ack(args: &Value) -> Result<String, String> {
+/// ACK is the API's in AQL v0.13: the plan, run by the engine.
+fn ack(args: &Value) -> Result<aql_planner::SubscriptionPlan, String> {
     let offset = args.get("offset").and_then(Value::as_u64).ok_or("Missing required: offset")?;
-    Ok(format!("ACK {} OFFSET {offset}", quote(str_arg(args, "subscription")?)))
+    Ok(aql_planner::SubscriptionPlan::Ack {
+        subscription: str_arg(args, "subscription")?.to_string(),
+        offset,
+        namespace: args.get("namespace").and_then(Value::as_str).map(String::from),
+    })
 }
 
 fn unsubscribe(args: &Value) -> Result<String, String> {
@@ -326,25 +349,23 @@ fn remember(args: &Value) -> Result<String, String> {
     let content = args.get("content").and_then(Value::as_str).ok_or("Missing required: content")?;
     let mut fields = obj(args, "fields");
     fields.insert("content".into(), json!(content));
-    // With subject + predicate: a fact (AQL v0.8 STORE … FACT, P1.4).
-    if let (Some(subject), Some(predicate)) = (args.get("subject"), args.get("predicate")) {
+    // With subject + predicate (AQL v0.13 has no facts): a relationship is a LINK of
+    // TYPE predicate between the two records; a value is a field of the subject.
+    if let (Some(subject), Some(predicate)) = (args.get("subject").and_then(Value::as_str), args.get("predicate").and_then(Value::as_str)) {
         if mt != "SEMANTIC" {
-            return Err("A fact (subject + predicate) is SEMANTIC".into());
+            return Err("subject + predicate is SEMANTIC".into());
         }
-        fields.insert("subject".into(), subject.clone());
-        fields.insert("predicate".into(), predicate.clone());
-        for f in ["object", "value", "confidence", "valid_from", "valid_to"] {
-            if let Some(v) = args.get(f) {
-                fields.insert(f.into(), v.clone());
-            }
-        }
-        let multi = if args.get("multi").and_then(Value::as_bool).unwrap_or(false) { " MULTI" } else { "" };
-        let mut q = format!("STORE INTO SEMANTIC FACT{multi} {}", payload(&fields)?);
-        if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
-            q.push_str(&format!(" NAMESPACE {}", quote(ns)));
-        }
-        q.push_str(&in_scope(args));
-        return Ok(q);
+        let ns = args.get("namespace").and_then(Value::as_str).map(|n| format!(" NAMESPACE {}", quote(n))).unwrap_or_default();
+        return match (args.get("object").and_then(Value::as_str), args.get("value")) {
+            (Some(object), _) => Ok(format!(
+                "LINK FROM SEMANTIC WHERE key = {} INTO SEMANTIC WHERE key = {} TYPE {}{ns}",
+                quote(subject),
+                quote(object),
+                quote(predicate)
+            )),
+            (None, Some(v)) => Ok(format!("UPDATE INTO SEMANTIC WHERE key = {} ({} = {}){ns}", quote(subject), tools::field(predicate)?, literal(v))),
+            (None, None) => Err("subject + predicate needs object (a link) or value (a field)".into()),
+        };
     }
     if let Some(key) = args.get("key").and_then(Value::as_str) {
         fields.insert("key".into(), json!(key));
@@ -389,7 +410,7 @@ fn recall(args: &Value) -> Result<String, String> {
         }
         let mut q = format!("RECALL FROM {mt} LIKE $q");
         if let Some(c) = args.get("min_confidence").and_then(Value::as_f64) {
-            q.push_str(&format!(" MIN_CONFIDENCE {c:?}"));
+            q.push_str(&format!(" CONFIDENCE {c:?}"));
         }
         if let Some(ns) = args.get("namespace").and_then(Value::as_str) {
             q.push_str(&format!(" NAMESPACE {}", quote(ns)));
@@ -417,7 +438,7 @@ fn link(args: &Value) -> Result<String, String> {
     let to_t = memory_type(args, "to_type", None)?;
     let s = |n: &str| args.get(n).and_then(Value::as_str).ok_or(format!("Missing required: {n}"));
     let mut q = format!(
-        "LINK FROM {from_t} WHERE key = {} TO {to_t} WHERE key = {} TYPE {}",
+        "LINK FROM {from_t} WHERE key = {} INTO {to_t} WHERE key = {} TYPE {}",
         quote(s("from_key")?),
         quote(s("to_key")?),
         quote(s("link_type")?)
@@ -433,7 +454,7 @@ fn unlink(args: &Value) -> Result<String, String> {
     let from_t = memory_type(args, "from_type", None)?;
     let to_t = memory_type(args, "to_type", None)?;
     let s = |n: &str| args.get(n).and_then(Value::as_str).ok_or(format!("Missing required: {n}"));
-    let mut q = format!("UNLINK FROM {from_t} WHERE key = {} TO {to_t} WHERE key = {}", quote(s("from_key")?), quote(s("to_key")?));
+    let mut q = format!("UNLINK FROM {from_t} WHERE key = {} INTO {to_t} WHERE key = {}", quote(s("from_key")?), quote(s("to_key")?));
     if let Some(t) = args.get("link_type").and_then(Value::as_str) {
         q.push_str(&format!(" TYPE {}", quote(t)));
     }
@@ -476,7 +497,7 @@ fn get_prompt(params: Option<&Value>) -> Result<Value, String> {
                  2. remember the event \"Called Acme about renewal\" in EPISODIC with key \"acme-call-1\".\n\
                  3. recall SEMANTIC memories containing \"renews\".\n\
                  4. link the fact to the event with link_type \"discussed_in\".\n\
-                 5. run aql_query: RECALL FROM SEMANTIC WHERE key = \"acme-renewal\" WITH LINKS ALL\n\
+                 5. run aql_query: RECALL FROM SEMANTIC WHERE key = \"acme-renewal\" WITH LINKS\n\
                  6. forget the fact by key, then recall again and confirm it is gone.\n\
                  7. call get_stats." } }]
         })),

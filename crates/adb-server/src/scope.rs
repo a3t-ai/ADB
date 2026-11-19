@@ -1,6 +1,5 @@
 //! Scoped access (DB-3): a token limited to named namespaces, read or read and write, so
-//! one org's token can't touch another's memory and the non-prod pod's token can't write
-//! prod namespaces.
+//! one org's token can't touch another's memory and a read-only token can't write.
 //!
 //! `ADB_SCOPED_TOKENS` is a JSON list:
 //! `[{"name": "acme", "token": "…", "write": ["acme--*"], "read": ["shared-*"]}]`. A pattern
@@ -53,12 +52,9 @@ enum Reach {
 
 fn reach_of(action: &str) -> Option<Reach> {
     Some(match action {
-        "branch_list" | "tag_list" | "layers_get" | "branch_conflicts" | "space_stats" | "space_records" | "space_changes" | "branch_parent_rows" | "branch_pending" | "space_usage"
-        // A pod acks what it erased: it only trims that branch's own list, so a read-only
-        // pod token (DB-2) can do it.
-        | "branch_pending_ack" => Reach::Read("namespace"),
+        "branch_list" | "tag_list" | "layers_get" | "branch_conflicts" | "space_stats" | "space_records" | "space_changes" | "space_usage" => Reach::Read("namespace"),
         "layers_dependents" => Reach::Read("space"),
-        "branch_create" | "branch_drop" | "branch_merge" | "branch_rebase" | "merge_revert" | "tag_create" | "tag_drop" | "branch_place" => Reach::Write("namespace"),
+        "branch_create" | "branch_drop" | "branch_merge" | "branch_rebase" | "merge_revert" | "tag_create" | "tag_drop" => Reach::Write("namespace"),
         "branch_promote" | "space_clone" => Reach::Copy,
         "layers_set" => Reach::Layers,
         _ => return None,
@@ -80,7 +76,7 @@ impl Scope {
 
     /// Every stage of a statement must name a namespace this token opens.
     pub fn check_aql(&self, aql: &str) -> Result<(), String> {
-        let touches = adb_executor::branch_engine::statement_namespaces(aql).map_err(|e| format!("{e} is not open to the {} token", self.name))?;
+        let touches = adb_executor::namespaces::statement_namespaces(aql).map_err(|e| format!("{e} is not open to the {} token", self.name))?;
         for (namespace, write) in touches {
             match namespace {
                 Some(ns) => self.check(&ns, write)?,
@@ -97,26 +93,15 @@ impl Scope {
     /// Kinds that belong to no namespace (topics, subscriptions, MERGE ENTITY, WATCH
     /// without NAMESPACE) stay closed to a scoped token.
     pub fn reach_for(&self, aql: &str) -> Result<adb_cluster::routing::Reach, String> {
-        use aql_parser::Statement as S;
-        let stmt = aql_parser::parse(aql).map_err(|_| format!("a statement that doesn't parse is not open to the {} token", self.name))?;
-        let stages: Vec<&S> = match &stmt {
-            S::Pipeline(p) => p.stages.iter().collect(),
-            other => vec![other],
-        };
+        // Per stage (and per namespace a stage reads or writes): its NAMESPACE and
+        // whether it writes. Kinds that name no namespace stay closed.
+        let touched = adb_executor::namespaces::statement_namespaces(aql).map_err(|what| match what.as_str() {
+            "a statement that doesn't parse" => format!("a statement that doesn't parse is not open to the {} token", self.name),
+            _ => format!("this kind of statement is not open to the {} token", self.name),
+        })?;
         let mut writes = false;
-        for s in stages {
-            let (ns, w) = match s {
-                S::Recall(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Lookup(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Load(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Scan(x) => (x.modifiers.namespace.as_deref(), false),
-                S::Store(x) => (x.modifiers.namespace.as_deref(), true),
-                S::Update(x) => (x.modifiers.namespace.as_deref(), true),
-                S::Forget(x) => (x.modifiers.namespace.as_deref(), true),
-                S::Link(_) | S::UpdateLink(_) | S::Unlink(_) => (None, true),
-                _ => return Err(format!("this kind of statement is not open to the {} token", self.name)),
-            };
-            if let Some(ns) = ns {
+        for (ns, w) in touched {
+            if let Some(ns) = ns.as_deref() {
                 self.check(ns, w)?;
             }
             writes |= w;
@@ -130,7 +115,7 @@ impl Scope {
         if action == "aql" {
             return self.check_aql(body.get("query").and_then(|q| q.as_str()).unwrap_or_default());
         }
-        // Every namespace's branches: for a token that reads them all (the non-prod pod).
+        // Every namespace's branches: for a token that reads them all.
         if action == "branch_list" && body.get("namespace").is_none() && self.read.iter().chain(&self.write).any(|p| p == "*") {
             return Ok(());
         }
@@ -177,12 +162,12 @@ mod tests {
     fn statements_must_name_an_open_namespace() {
         let s = acme();
         assert!(s.check_aql(r#"STORE INTO SEMANTIC (key = "k") NAMESPACE "acme--bot""#).is_ok());
-        assert!(s.check_aql(r#"RECALL FROM SEMANTIC ALL NAMESPACE "shared""#).is_ok());
+        assert!(s.check_aql(r#"RECALL FROM SEMANTIC NAMESPACE "shared""#).is_ok());
         for refused in [
             r#"STORE INTO SEMANTIC (key = "k") NAMESPACE "shared""#,
-            r#"RECALL FROM SEMANTIC ALL NAMESPACE "globex--bot""#,
+            r#"RECALL FROM SEMANTIC NAMESPACE "globex--bot""#,
             r#"FORGET FROM SEMANTIC WHERE key = "k" NAMESPACE "globex--bot""#,
-            r#"RECALL FROM SEMANTIC ALL"#,
+            r#"RECALL FROM SEMANTIC"#,
             r#"SUBSCRIBE TOPIC "news""#,
             r#"not aql at all"#,
         ] {

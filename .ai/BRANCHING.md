@@ -1,3 +1,7 @@
+> **Superseded 18 Nov 2026 for B2–B6:** branch engines, branch pods and the `BRANCH`
+> modifier are removed; a branch is the namespace `<ns>@<name>` (`.ai/BRANCH_NAMESPACES.md`).
+> B7 (tags, layers) and the branch review API stay. The rest of this file is history.
+
 # Memory branching, layers and tags (agents as repos)
 
 The spec covers A3T, FlowR and ADB together and lives in flowr-system:

@@ -157,9 +157,6 @@ impl Writes for ReadOnlyWrites {
     async fn store(&self, _: MemoryType, _: &str, _: Value, _: Scope, _: Option<&str>, _: Option<Duration>, _: Option<&str>) -> AdbResult<MemoryRecord> {
         not_leader()
     }
-    async fn store_fact(&self, _: Value, _: bool, _: Scope, _: Option<&str>, _: Option<Duration>, _: Option<&str>) -> AdbResult<MemoryRecord> {
-        not_leader()
-    }
     async fn update(&self, _: MemoryType, _: &Predicate, _: Value, _: Option<&str>, _: Option<&str>) -> AdbResult<u64> {
         not_leader()
     }
@@ -173,9 +170,6 @@ impl Writes for ReadOnlyWrites {
         not_leader()
     }
     async fn unlink(&self, _: MemoryType, _: &[String], _: MemoryType, _: &[String], _: Option<&str>) -> AdbResult<u64> {
-        not_leader()
-    }
-    async fn merge(&self, _: &str, _: &str) -> AdbResult<u64> {
         not_leader()
     }
     fn alias_of(&self, key: &str) -> Option<String> {

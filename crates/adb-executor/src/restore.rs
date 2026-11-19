@@ -127,7 +127,6 @@ pub async fn restore_from_object_storage(dir: &Path, cold: &str, before_epoch: O
 /// [`restore_from_object_storage`] for partition `partition` of a cluster node.
 pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, partition: PartitionId, before_epoch: Option<u64>) -> Result<RestoreStats, String> {
     use crate::writes::segments as seg;
-    use adb_log::Log;
     let at = |what: &str| format!("restore from object storage ({what})");
     let log_dir = format!("p{}", partition.0);
     let fence = seg::Fence::load(cold, partition, before_epoch).await.map_err(|e| format!("{}: {e}", at("epochs")))?;
@@ -143,7 +142,31 @@ pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, parti
         }
     };
     let floor = point.as_ref().map(|(_, p)| p.floor).unwrap_or(0);
-    let wal = adb_log::LocalWal::open(partition, adb_log::WalConfig::new(dir.join(&log_dir))).map_err(|e| format!("{}: {e}", at("log")))?;
+    let (segments, records, ends_at) = append_segments(dir, cold, partition, &fence, floor).await?;
+    stats.segments += segments;
+    stats.segment_records += records;
+    stats.log_ends_at = ends_at;
+    tracing::info!(floor, ?stats, "node restored from object storage alone");
+    Ok(stats)
+}
+
+/// The WAL segments on object storage above what `dir`'s log holds (and above
+/// `floor`), appended to it in order: what an owner of an epoch below `before_epoch`
+/// shipped. For a directory that already holds the partition up to some offset — a
+/// reader promoted by a takeover — only the segments above it are fetched.
+/// Returns (segments read, records appended, the log's last offset).
+pub async fn append_segments_from_object_storage(dir: &Path, cold: &str, partition: PartitionId, before_epoch: Option<u64>) -> Result<(usize, usize, u64), String> {
+    use crate::writes::segments as seg;
+    let fence = seg::Fence::load(cold, partition, before_epoch).await.map_err(|e| format!("restore from object storage (epochs): {e}"))?;
+    append_segments(dir, cold, partition, &fence, 0).await
+}
+
+async fn append_segments(dir: &Path, cold: &str, partition: PartitionId, fence: &crate::writes::segments::Fence, floor: u64) -> Result<(usize, usize, u64), String> {
+    use crate::writes::segments as seg;
+    use adb_log::Log;
+    let at = |what: &str| format!("restore from object storage ({what})");
+    let wal = adb_log::LocalWal::open(partition, adb_log::WalConfig::new(dir.join(format!("p{}", partition.0)))).map_err(|e| format!("{}: {e}", at("log")))?;
+    let held = wal.last_offset().0.max(floor);
     // By first offset: each record is taken once, from the first allowed segment
     // holding it (every allowed copy of an offset is the same acked record).
     let segments = seg::list_segments(cold, partition).await.map_err(|e| format!("{}: {e}", at("segments")))?;
@@ -151,14 +174,15 @@ pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, parti
     // after another made a takeover take seconds (Hetzner, 15 Nov).
     use futures::StreamExt;
     let fetches = std::env::var("ADB_RESTORE_FETCHES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(16);
-    let wanted: Vec<_> = segments.into_iter().filter(|s| fence.admits(s.epoch) && s.last > floor && s.first <= fence.limit(s.epoch)).collect();
+    let wanted: Vec<_> = segments.into_iter().filter(|s| fence.admits(s.epoch) && s.last > held && s.first <= fence.limit(s.epoch)).collect();
     let mut fetched = futures::stream::iter(wanted.into_iter().map(|s| async move { seg::read_segment(cold, partition, s).await.map(|r| (s, r)) })).buffered(fetches);
     // Queued, not waited on one by one: a group sync covers each batch; the last is
     // waited on below.
+    let (mut read, mut appended) = (0usize, 0usize);
     let mut last_wait = None;
     while let Some(next) = fetched.next().await {
         let (s, records) = next.map_err(|e| format!("{}: {e}", at("segment")))?;
-        stats.segments += 1;
+        read += 1;
         for r in records {
             // Held by the checkpoint or an earlier segment; or written after this
             // epoch lost the partition (never acked).
@@ -169,14 +193,11 @@ pub async fn restore_partition_from_object_storage(dir: &Path, cold: &str, parti
                 return Err(at(&format!("gap in the WAL segments: offset {} follows {}", r.offset.0, wal.last_offset().0)));
             }
             last_wait = Some(wal.enqueue(r, false).map_err(|e| format!("{}: {e}", at("appending a record")))?);
-            stats.segment_records += 1;
+            appended += 1;
         }
     }
     if let Some(w) = last_wait {
         w.await.map_err(|e| format!("{}: {e}", at("appending a record")))?;
     }
-    stats.log_ends_at = wal.last_offset().0;
-    drop(wal);
-    tracing::info!(floor, ?stats, "node restored from object storage alone");
-    Ok(stats)
+    Ok((read, appended, wal.last_offset().0))
 }

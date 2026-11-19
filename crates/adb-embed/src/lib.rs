@@ -16,7 +16,7 @@
 pub mod peers;
 
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 
 use fastembed::{InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel};
 use half::f16;
@@ -147,53 +147,88 @@ const LOCAL_BATCH: usize = 64;
 /// worker, its thread (tokenising, the session's own steps) capped STORE at ~600/s on
 /// 8 vCPUs while the other cores idled (AWS r7).
 struct LocalModel {
-    jobs: mpsc::Sender<Job>,
+    lanes: Arc<Lanes>,
 }
+
+/// The two queues of jobs: foreground (a writer or a reader waiting), background
+/// (vectors that follow a commit: deferred embeddings, the backfill). A worker takes
+/// foreground jobs whenever any wait, and never mixes background texts into their
+/// call: a foreground request waits for at most the background call in progress, not
+/// for the backlog (Hetzner p15: SEMANTIC writes waited 2.3 s behind a million
+/// deferred episodes).
+struct Lanes {
+    queues: std::sync::Mutex<[std::collections::VecDeque<Job>; 2]>,
+    ready: std::sync::Condvar,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+const FOREGROUND: usize = 0;
+const BACKGROUND: usize = 1;
 
 impl LocalModel {
     fn start(models: Vec<TextEmbedding>) -> Result<Self, String> {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let lanes = Arc::new(Lanes { queues: Default::default(), ready: std::sync::Condvar::new(), closed: Default::default() });
         for (i, mut model) in models.into_iter().enumerate() {
-            let rx = Arc::clone(&rx);
+            let lanes = Arc::clone(&lanes);
             std::thread::Builder::new()
                 .name(format!("adb-embed-{i}"))
-                .spawn(move || {
-                    // Ends when the embedder (every sender) is dropped.
-                    loop {
-                        let jobs = {
-                            let Ok(q) = rx.lock() else { return };
-                            let Ok(first) = q.recv() else { return };
-                            let mut n = first.0.len();
-                            let mut jobs = vec![first];
+                .spawn(move || loop {
+                    // Ends when the embedder is dropped and nothing is left queued.
+                    let jobs = {
+                        let mut q = lanes.queues.lock().unwrap();
+                        loop {
+                            let lane = match (q[FOREGROUND].is_empty(), q[BACKGROUND].is_empty()) {
+                                (false, _) => FOREGROUND,
+                                (true, false) => BACKGROUND,
+                                (true, true) => {
+                                    if lanes.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    q = lanes.ready.wait(q).unwrap();
+                                    continue;
+                                }
+                            };
+                            let mut n = 0;
+                            let mut jobs = Vec::new();
                             while n < LOCAL_BATCH {
-                                match q.try_recv() {
-                                    Ok(j) => {
+                                match q[lane].pop_front() {
+                                    Some(j) => {
                                         n += j.0.len();
                                         jobs.push(j);
                                     }
-                                    Err(_) => break,
+                                    None => break,
                                 }
                             }
-                            jobs
-                        };
-                        for j in &jobs {
-                            adb_core::steps::add("embed.queue wait", j.2.elapsed());
+                            break jobs;
                         }
-                        adb_core::steps::value("embed.texts per model call", jobs.iter().map(|j| j.0.len() as u64).sum());
-                        let _t = adb_core::steps::timer("embed.model call");
-                        run(&mut model, jobs);
+                    };
+                    for j in &jobs {
+                        adb_core::steps::add("embed.queue wait", j.2.elapsed());
                     }
+                    adb_core::steps::value("embed.texts per model call", jobs.iter().map(|j| j.0.len() as u64).sum());
+                    let _t = adb_core::steps::timer("embed.model call");
+                    run(&mut model, jobs);
                 })
                 .map_err(|e| format!("embedding thread: {e}"))?;
         }
-        Ok(Self { jobs: tx })
+        Ok(Self { lanes })
     }
 
-    fn submit(&self, texts: Vec<String>) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, String> {
+    fn submit(&self, texts: Vec<String>, background: bool) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, String> {
         let (done, wait) = tokio::sync::oneshot::channel();
-        self.jobs.send((texts, done, std::time::Instant::now())).map_err(|_| "embedding thread stopped".to_string())?;
+        if self.lanes.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("embedding thread stopped".to_string());
+        }
+        self.lanes.queues.lock().unwrap()[if background { BACKGROUND } else { FOREGROUND }].push_back((texts, done, std::time::Instant::now()));
+        self.lanes.ready.notify_one();
         Ok(wait)
+    }
+}
+
+impl Drop for LocalModel {
+    fn drop(&mut self) {
+        self.lanes.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.lanes.ready.notify_all();
     }
 }
 
@@ -355,10 +390,19 @@ impl Embedder {
     /// Embed `texts` on this node's own model (never a peer's); an endpoint's as
     /// [`Embedder::embed`].
     pub async fn embed_here(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_here_as(texts, false).await
+    }
+
+    /// [`Self::embed_here`] in the background lane: after every foreground request.
+    pub async fn embed_here_background(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_here_as(texts, true).await
+    }
+
+    async fn embed_here_as(&self, texts: Vec<String>, background: bool) -> Result<Vec<Vec<f32>>, String> {
         match &self.backend {
             Backend::Local(model) => {
                 peers::LOCAL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let r = match model.submit(texts) {
+                let r = match model.submit(texts, background) {
                     Ok(wait) => wait.await.map_err(|_| "embedding thread stopped".to_string()).and_then(|r| r),
                     Err(e) => Err(e),
                 };
@@ -373,7 +417,7 @@ impl Embedder {
                     let mut done = false;
                     for _ in 0..urls.len() {
                         let url = &urls[next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % urls.len()];
-                        match http_embed(client, url, None, &self.model, chunk).await {
+                        match http_embed(client, url, None, &self.model, chunk, background).await {
                             Ok(v) => {
                                 out.extend(v);
                                 done = true;
@@ -386,13 +430,13 @@ impl Embedder {
                         return Err(format!("embedding pool: {last}"));
                     }
                 }
-                adb_core::steps::add("embed.pool round trip", t.elapsed());
+                adb_core::steps::add(if background { "embed.pool round trip (background)" } else { "embed.pool round trip" }, t.elapsed());
                 Ok(out)
             }
             Backend::Http { client, url, key } => {
                 let mut out = Vec::with_capacity(texts.len());
                 for chunk in texts.chunks(HTTP_BATCH) {
-                    out.extend(http_embed(client, url, key.as_deref(), &self.model, chunk).await?);
+                    out.extend(http_embed(client, url, key.as_deref(), &self.model, chunk, false).await?);
                 }
                 Ok(out)
             }
@@ -406,64 +450,43 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let Backend::Local(model) = &self.backend else { return Err("embed_blocking: not a local model".into()) };
-        model.submit(texts.to_vec())?.blocking_recv().map_err(|_| "embedding thread stopped".to_string())?
+        model.submit(texts.to_vec(), false)?.blocking_recv().map_err(|_| "embedding thread stopped".to_string())?
     }
 
     /// Embed `texts`: unit-length vectors of the configured dimension.
     pub async fn embed(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        let out = self.embed_raw(texts).await?;
+        let out = self.embed_raw(texts, false).await?;
+        self.check_dim(out)
+    }
+
+    /// [`Self::embed`] for vectors nobody is waiting on (deferred embeddings, the
+    /// backfill): the background lane, after every foreground request.
+    pub async fn embed_background(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let out = self.embed_raw(texts, true).await?;
+        self.check_dim(out)
+    }
+
+    fn check_dim(&self, out: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String> {
         if let Some(v) = out.iter().find(|v| v.len() != self.dim) {
             return Err(format!("embedding: the model returned {} dimensions, not {}", v.len(), self.dim));
         }
         Ok(out)
     }
 
-    async fn embed_raw(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        match &self.backend {
-            Backend::Local(_) => {
-                // A less busy node of the replica set embeds them, when there is one.
-                let t = std::time::Instant::now();
-                if let Some(v) = peers::try_peer(self, &texts).await {
-                    adb_core::steps::add("embed.on a peer (round trip)", t.elapsed());
-                    return Ok(v);
-                }
-                let t = std::time::Instant::now();
-                let r = self.embed_here(texts).await;
-                adb_core::steps::add("embed.here (queue + model)", t.elapsed());
-                r
+    async fn embed_raw(self: &Arc<Self>, texts: Vec<String>, background: bool) -> Result<Vec<Vec<f32>>, String> {
+        if let (Backend::Local(_), false) = (&self.backend, background) {
+            // A less busy node of the replica set embeds them, when there is one.
+            let t = std::time::Instant::now();
+            if let Some(v) = peers::try_peer(self, &texts).await {
+                adb_core::steps::add("embed.on a peer (round trip)", t.elapsed());
+                return Ok(v);
             }
-            Backend::Pool { client, urls, next } => {
-                let t = std::time::Instant::now();
-                let mut out = Vec::with_capacity(texts.len());
-                for chunk in texts.chunks(HTTP_BATCH) {
-                    let mut last = String::new();
-                    let mut done = false;
-                    for _ in 0..urls.len() {
-                        let url = &urls[next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % urls.len()];
-                        match http_embed(client, url, None, &self.model, chunk).await {
-                            Ok(v) => {
-                                out.extend(v);
-                                done = true;
-                                break;
-                            }
-                            Err(e) => last = e,
-                        }
-                    }
-                    if !done {
-                        return Err(format!("embedding pool: {last}"));
-                    }
-                }
-                adb_core::steps::add("embed.pool round trip", t.elapsed());
-                Ok(out)
-            }
-            Backend::Http { client, url, key } => {
-                let mut out = Vec::with_capacity(texts.len());
-                for chunk in texts.chunks(HTTP_BATCH) {
-                    out.extend(http_embed(client, url, key.as_deref(), &self.model, chunk).await?);
-                }
-                Ok(out)
-            }
+            let t = std::time::Instant::now();
+            let r = self.embed_here_as(texts, false).await;
+            adb_core::steps::add("embed.here (queue + model)", t.elapsed());
+            return r;
         }
+        self.embed_here_as(texts, background).await
     }
 }
 
@@ -471,7 +494,11 @@ impl Embedder {
 const HTTP_BATCH: usize = 64;
 
 /// `POST <url>/embeddings` (the OpenAI wire format), vectors in input order.
-async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+/// The header `adb serve-embed` reads: `background` queues the request behind every
+/// foreground one.
+pub const PRIORITY_HEADER: &str = "x-adb-embed-priority";
+
+async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, model: &str, texts: &[String], background: bool) -> Result<Vec<Vec<f32>>, String> {
     #[derive(Deserialize)]
     struct Item {
         #[serde(default)]
@@ -483,6 +510,9 @@ async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, mode
         data: Vec<Item>,
     }
     let mut req = client.post(format!("{url}/embeddings")).json(&serde_json::json!({ "model": model, "input": texts }));
+    if background {
+        req = req.header(PRIORITY_HEADER, "background");
+    }
     if let Some(k) = key {
         req = req.bearer_auth(k);
     }

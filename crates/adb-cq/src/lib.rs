@@ -89,14 +89,12 @@ fn memory_of(t: MemoryType) -> Memory {
 }
 
 impl WatchSet {
-    /// The watch set of a statement `WATCH` may wrap; anything else is refused.
+    /// The watch set of a live query (`SUBSCRIBE RECALL …`, AQL v0.13); anything but
+    /// a RECALL is refused.
     pub fn of(statement: &Statement) -> Result<Self, String> {
         let (memory, modifiers, like): (Option<MemoryType>, &Modifiers, bool) = match statement {
             Statement::Recall(r) => (Some(r.memory_type), &r.modifiers, matches!(r.predicate, aql_parser::ast::Predicate::Like { .. })),
-            Statement::Lookup(l) => (Some(l.memory_type), &l.modifiers, false),
-            Statement::Scan(s) => (Some(MemoryType::Working), &s.modifiers, false),
-            Statement::Load(l) => (Some(MemoryType::Tools), &l.modifiers, false),
-            _ => return Err("WATCH takes RECALL, LOOKUP, SCAN or LOAD".into()),
+            _ => return Err("a live query is a RECALL (SUBSCRIBE RECALL …)".into()),
         };
         let all = matches!(memory, Some(MemoryType::All)) || modifiers.with_links.is_some() || modifiers.follow_links.is_some();
         let memories = (!all).then(|| memory.map(memory_of).into_iter().collect());
@@ -699,7 +697,7 @@ mod tests {
         let runner = Arc::new(Fake { unwatched: Mutex::new(Vec::new()) });
         let (_tx, rx) = watch::channel(0);
         let w = Watcher::with_idle(log, rx, runner.clone(), 0, Duration::from_millis(50));
-        let spec = WatchSpec::new(aql_parser::parse("RECALL FROM SEMANTIC ALL").unwrap(), HashMap::new(), None).unwrap();
+        let spec = WatchSpec::new(aql_parser::parse("RECALL FROM SEMANTIC").unwrap(), HashMap::new(), None).unwrap();
         w.add("a", spec.clone()).await.unwrap();
         w.add("b", spec).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -715,9 +713,9 @@ mod tests {
         let s = p(r#"RECALL FROM SEMANTIC IN SCOPE "team:a" WHERE topic = "x""#);
         assert_eq!(s.memories, Some([Memory::Semantic].into()));
         assert_eq!(s.scope.as_deref(), Some("team:a"));
-        assert!(p("RECALL FROM SEMANTIC ALL WITH LINKS ALL").memories.is_none(), "links: every memory type");
+        assert!(p("RECALL FROM SEMANTIC WITH LINKS").memories.is_none(), "links: every memory type");
         assert!(p("RECALL FROM SEMANTIC LIKE $q LIMIT 3").like);
-        assert!(p("RECALL FROM SEMANTIC ALL ORDER BY n DESC").ordered);
+        assert!(p("RECALL FROM SEMANTIC ORDER BY n DESC").ordered);
         assert!(!s.ordered);
         assert!(WatchSet::of(&aql_parser::parse(r#"STORE INTO SEMANTIC (key = "a")"#).unwrap()).is_err());
     }

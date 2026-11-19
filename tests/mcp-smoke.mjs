@@ -119,7 +119,7 @@ try {
   check('3. recall finds the fact', r.data?.data?.count === 1 && r.data.data.records[0].data.account === 'acme', JSON.stringify(r.data));
   r = await tool('link', { from_type: 'SEMANTIC', from_key: 'acme-renewal', to_type: 'EPISODIC', to_key: 'acme-call-1', link_type: 'discussed_in' });
   check('4. link fact → event', !r.isError, JSON.stringify(r.data));
-  r = await tool('aql_query', { query: 'RECALL FROM SEMANTIC WHERE key = "acme-renewal" WITH LINKS ALL' });
+  r = await tool('aql_query', { query: 'RECALL FROM SEMANTIC WHERE key = "acme-renewal" WITH LINKS' });
   check('5. aql_query with links', !r.isError, JSON.stringify(r.data));
   r = await tool('forget', { memory_type: 'SEMANTIC', key: 'acme-renewal' });
   check('6. forget the fact', !r.isError, JSON.stringify(r.data));
@@ -134,7 +134,7 @@ try {
   r = await tool('recall_memory', { memory_type: 'WORKING', filter: { task: 'draft reply' } });
   check('recall_memory (ClawDB)', r.data?.data?.count === 1, JSON.stringify(r.data));
   r = await tool('aql_query', { query: 'FORGET FROM WORKING' });
-  check('bad AQL is an error with a clear message', r.isError && /WHERE predicate/.test(r.data), String(r.data));
+  check('bad AQL is an error with a clear message', r.isError && /WHERE/.test(r.data), String(r.data));
 } catch (e) {
   check('session', false, e.message);
 } finally {

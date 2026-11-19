@@ -42,6 +42,11 @@ pub fn matches(pattern: &str, namespace: &str) -> bool {
     }
 }
 
+/// Separates a memory branch's name from its namespace: branch `b` of namespace `ns`
+/// is the namespace `ns@b`, placed and stored like any namespace
+/// (`.ai/BRANCH_NAMESPACES.md`). Reserved for branches.
+pub const BRANCH_SEP: char = '@';
+
 /// The partition `namespace` lives in.
 pub fn partition_of(map: &PartitionMap, namespace: &str) -> Partition {
     // An exact pin beats any prefix; among prefixes the longest wins.

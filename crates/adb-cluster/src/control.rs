@@ -269,6 +269,7 @@ impl ControlNode {
         Router::new()
             .route("/control/heartbeat", post(heartbeat))
             .route("/control/map", get(map))
+            .layer(axum::middleware::from_fn(crate::identity::guard))
             .with_state(Arc::clone(self))
             .merge(craft::router(self.raft.clone()))
     }
@@ -348,7 +349,7 @@ impl ControlClient {
             loop {
                 tick.tick().await;
                 let hb = Heartbeat { node, addr: addr.clone(), flight: flight.clone(), load: load() };
-                match http.post(format!("{target}/control/heartbeat")).json(&hb).send().await {
+                match crate::identity::tag(http.post(format!("{target}/control/heartbeat"))).json(&hb).send().await {
                     Ok(r) if r.status().is_success() => match r.json::<PartitionMap>().await {
                         Ok(map) => {
                             *ok.lock().unwrap() = Some(std::time::Instant::now());

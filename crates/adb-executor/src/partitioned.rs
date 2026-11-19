@@ -119,6 +119,8 @@ pub struct PartitionedEngine {
     opening: std::sync::Mutex<BTreeSet<Partition>>,
     /// Takeovers done here (tests, metrics).
     taken_over: std::sync::atomic::AtomicU64,
+    /// Takeovers that started from this node's reader (no full restore).
+    from_reader: std::sync::atomic::AtomicU64,
     takeovers: Arc<tokio::sync::Semaphore>,
     /// Namespace → partition, as recorded in [`CATALOG`] (refreshed before every
     /// statement spanning partitions: other nodes add namespaces too).
@@ -289,6 +291,13 @@ impl crate::spaces::Spaces for RouterSpaces {
         }
     }
 
+    async fn key_versions(&self, memory: adb_core::log::Memory, space: &str, bare: &str) -> AdbResult<Vec<adb_store::StoredRow>> {
+        match self.handle_of(space).await? {
+            Handle::Local(e) => crate::spaces::Spaces::key_versions(&local_spaces(&e)?, memory, space, bare).await,
+            h => h.op_as("space_key_versions", json!({ "memory": memory, "space": space, "key": bare })).await.map_err(AdbError::Internal),
+        }
+    }
+
     async fn tag(&self, space: &str, name: &str) -> AdbResult<Option<crate::branches::Tag>> {
         match self.handle_of(space).await? {
             Handle::Local(e) => local_spaces(&e)?.tag(space, name).await,
@@ -303,6 +312,13 @@ impl crate::spaces::Spaces for RouterSpaces {
         }
     }
 
+    async fn base_of(&self, space: &str) -> AdbResult<Option<crate::branches::Base>> {
+        match self.handle_of(space).await? {
+            Handle::Local(e) => local_spaces(&e)?.base_of(space).await,
+            h => h.op_as("space_base", json!({ "space": space })).await.map_err(AdbError::Internal),
+        }
+    }
+
     async fn quotas(&self) -> AdbResult<Vec<crate::branches::Quota>> {
         let node = self.node()?;
         // The system partition's owner reads its registry; any other node its copy
@@ -310,10 +326,15 @@ impl crate::spaces::Spaces for RouterSpaces {
         if let Some(e) = node.system_local() {
             return local_spaces(&e)?.quotas().await;
         }
-        // Younger than `ADB_CATALOG_TTL_MS` (the background keeps it so): no call.
-        let ttl = Duration::from_millis(std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000));
-        if let Some((t, q)) = node.quota_rules.read().unwrap().as_ref() {
-            if t.elapsed() < ttl {
+        // The copy here, however old: the background (`quotas_due`) refreshes it every
+        // `ADB_CATALOG_TTL_MS`. A write never waits for a call to the system partition
+        // — a quota change taking effect a second late is fine; a fetch on the write
+        // path whenever the copy aged past the TTL was not. Fetched here only when the
+        // node has no copy yet, or with `ADB_CATALOG_TTL_MS=0` (asking for every
+        // check to see the latest rules).
+        let strict = std::env::var("ADB_CATALOG_TTL_MS").ok().and_then(|v| v.parse::<u64>().ok()) == Some(0);
+        if !strict {
+            if let Some((_, q)) = node.quota_rules.read().unwrap().as_ref() {
                 return Ok(q.clone());
             }
         }
@@ -427,6 +448,7 @@ impl PartitionedEngine {
             parts: Default::default(),
             opening: Default::default(),
             taken_over: Default::default(),
+            from_reader: Default::default(),
             takeovers: Arc::new(tokio::sync::Semaphore::new(takeovers())),
             catalog: Default::default(),
             catalog_at: Default::default(),
@@ -514,6 +536,11 @@ impl PartitionedEngine {
     /// How many partition takeovers this node has started (tests, metrics).
     pub fn takeovers_started(&self) -> u64 {
         self.taken_over.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many of them started from this node's reader of the partition (tests, metrics).
+    pub fn takeovers_from_reader(&self) -> u64 {
+        self.from_reader.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether this node has a reader of `p` ready (tests, metrics).
@@ -605,30 +632,89 @@ impl PartitionedEngine {
         if !was_replica {
             tracing::warn!(partition = p, epoch, "taking over a partition this node never replicated: only what object storage holds; acknowledged writes the old owner had not shipped are not here");
         }
-        let mut ends_at = 0;
-        if let Some(cold) = &cold {
-            let st = crate::restore::restore_partition_from_object_storage(pdir, cold, adb_core::log::PartitionId(p), Some(epoch)).await?;
-            ends_at = st.log_ends_at;
-        }
         let role = if p == self.sys() { PartitionRole::system(p) } else { PartitionRole::memory(p) };
-        let mut appended = 0;
-        if !tail.is_empty() && tail_epoch < epoch {
-            let wal = LocalEngine::open_partition_wal(pdir, role).await?;
-            for r in tail {
-                let last = adb_log::Log::last_offset(&*wal).0;
-                if r.offset.0 <= last {
-                    continue;
+        let tail = if tail_epoch < epoch { tail } else { Vec::new() };
+        let pid = adb_core::log::PartitionId(p);
+        // This node's reader of `p` already holds the partition up to what it last
+        // applied (checkpoint + every committed record since): the takeover starts from
+        // it, and object storage gives only the segments above it. A full restore
+        // replays everything since the last checkpoint — with a node's worth of
+        // partitions at once, a minute of waiting for every request (Hetzner p13).
+        let mut from_reader = false;
+        if let Some(cold) = &cold {
+            if self.promote_reader(p, pdir).await {
+                match crate::restore::append_segments_from_object_storage(pdir, cold, pid, Some(epoch)).await {
+                    Ok(_) => from_reader = true,
+                    Err(e) => tracing::warn!(partition = p, error = %e, "the promoted reader doesn't continue into object storage's segments; restoring in full"),
                 }
-                if r.offset.0 != last + 1 {
-                    return Err(format!("taking over partition {p}: object storage ends at {last}, this replica's tail starts at {}: acknowledged writes would be lost", r.offset.0));
-                }
-                adb_log::Log::append(&*wal, r).await.map_err(|e| format!("taking over partition {p}: {e}"))?;
-                appended += 1;
             }
-            ends_at = adb_log::Log::last_offset(&*wal).0;
         }
-        tracing::info!(partition = p, epoch, from_object_storage = cold.is_some(), tail_records = appended, log_ends_at = ends_at, took_ms = t0.elapsed().as_millis() as u64, "partition taken over");
+        let (appended, ends_at) = loop {
+            if !from_reader {
+                if pdir.exists() {
+                    std::fs::remove_dir_all(pdir).map_err(|e| format!("taking over partition {p}: {e}"))?;
+                }
+                if let Some(cold) = &cold {
+                    crate::restore::restore_partition_from_object_storage(pdir, cold, pid, Some(epoch)).await?;
+                }
+            }
+            match append_tail(pdir, role, &tail).await {
+                Ok(done) => break done,
+                Err(gap) if from_reader => {
+                    tracing::warn!(partition = p, error = %gap, "the promoted reader doesn't meet this replica's tail; restoring in full");
+                    from_reader = false;
+                }
+                Err(gap) => return Err(format!("taking over partition {p}: {gap}")),
+            }
+        };
+        if from_reader {
+            self.from_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        tracing::info!(partition = p, epoch, from_reader, from_object_storage = cold.is_some(), tail_records = appended, log_ends_at = ends_at, took_ms = t0.elapsed().as_millis() as u64, "partition taken over");
         Ok(())
+    }
+
+    /// Hand this node's ready reader of `p` to its takeover: its directory becomes the
+    /// partition's (`pdir`), synced to disk (a reader's copy is never synced: it was a
+    /// cache). `false` when there is none, or it can't be handed over cleanly.
+    async fn promote_reader(&self, p: Partition, pdir: &std::path::Path) -> bool {
+        let r = {
+            let mut readers = self.readers.lock().unwrap();
+            match readers.remove(&p) {
+                Some(ReaderSlot::Ready(r)) => r,
+                Some(other) => {
+                    readers.insert(p, other);
+                    return false;
+                }
+                None => return false,
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let base = r.base().to_path_buf();
+        let Some(dir) = r.retire(Duration::from_secs(5)).await else {
+            tracing::warn!(partition = p, "the reader's reads didn't finish; the takeover restores in full");
+            return false;
+        };
+        drop(r);
+        if pdir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(pdir) {
+                tracing::warn!(partition = p, error = %e, "the partition's old directory stays; the takeover restores in full");
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::rename(&dir, pdir).and_then(|_| sync_tree(pdir)) {
+            tracing::warn!(partition = p, error = %e, "the reader's directory couldn't become the partition's; the takeover restores in full");
+            return false;
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        // A write the reader's table had in flight (a compaction) may recreate its old
+        // path: gone again a minute later, as a rebuilt reader's old directory is.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = std::fs::remove_dir_all(base);
+        });
+        tracing::info!(partition = p, took_ms = t0.elapsed().as_millis() as u64, "reader promoted: the takeover starts from it");
+        true
     }
 
     /// The reader of memory partition `p`, if this node reads it rather than owns it
@@ -646,8 +732,7 @@ impl PartitionedEngine {
         {
             let mut readers = self.readers.lock().unwrap();
             if self.owns(p) {
-                // Owned now (a takeover): its reader is of no more use.
-                readers.remove(&p);
+                // Owned now: its takeover promotes the reader (or drops it once open).
                 return None;
             }
             match readers.get(&p) {
@@ -671,8 +756,11 @@ impl PartitionedEngine {
                     tracing::info!(partition = p, took_ms = t0.elapsed().as_millis() as u64, "reader ready");
                     readers.insert(p, ReaderSlot::Ready(r));
                 }
-                Ok(_) => {
+                Ok(r) => {
+                    // Owned meanwhile: the reader is of no use, nor its directory.
                     readers.remove(&p);
+                    drop(r);
+                    let _ = std::fs::remove_dir_all(me.dir.join("parts").join(format!("reader-p{p}")));
                 }
                 Err(e) => {
                     tracing::warn!(partition = p, error = %e, "reader not built; reads go to the owner, retried later");
@@ -732,8 +820,29 @@ impl PartitionedEngine {
     }
 
     /// Open partition `p` (taking it over first when this node holds an older epoch):
-    /// called once per partition, through its slot.
+    /// called once per partition, through its slot. Every request for `p` waits on this
+    /// open, so one that takes long says so (every 10 s, with the step it is in) instead
+    /// of leaving them waiting in silence.
     async fn open_part(&self, p: Partition) -> Result<Arc<LocalEngine>, String> {
+        let step: Arc<std::sync::Mutex<&'static str>> = Arc::new(std::sync::Mutex::new("start"));
+        let watchdog = {
+            let step = Arc::clone(&step);
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let at = *step.lock().unwrap();
+                    tracing::warn!(partition = p, step = at, waited_s = t0.elapsed().as_secs(), "partition open slow: every request for it waits");
+                }
+            })
+        };
+        let r = self.open_part_steps(p, &step).await;
+        watchdog.abort();
+        r
+    }
+
+    async fn open_part_steps(&self, p: Partition, step: &std::sync::Mutex<&'static str>) -> Result<Arc<LocalEngine>, String> {
+        let at = |s: &'static str| *step.lock().unwrap() = s;
         let sys = self.sys();
         let pdir = self.dir.join("parts").join(format!("p{p}"));
         // Step 7: owned at an epoch this directory doesn't hold — taken over from another
@@ -743,6 +852,7 @@ impl PartitionedEngine {
         if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
             let held = std::fs::read_to_string(pdir.join("owner.epoch")).ok().and_then(|s| s.trim().parse::<u64>().ok());
             if held != Some(epoch) {
+                at("take over");
                 Box::pin(self.take_over(p, epoch, &pdir)).await?;
             }
         }
@@ -750,6 +860,7 @@ impl PartitionedEngine {
         if p != sys {
             // Cluster-wide settings (one embedding model, one set of cache rules): the
             // system partition's, copied before a partition opens.
+            at("system settings");
             let settings: Value = match self.system_local() {
                 Some(s) => dispatch_op(&s, "settings", json!({})).await?,
                 // Boxed: opening a partition may reach the system partition's handle.
@@ -763,6 +874,7 @@ impl PartitionedEngine {
             }
         }
         let role = if p == sys { PartitionRole::system(p) } else { PartitionRole::memory(p) };
+        at("open engine");
         let (e, _) = match (&self.cluster, crate::replication::replicas()) {
             // A cluster owner: every record also on the partition's replica (step 5).
             (Some(_), n) if n > 0 => {
@@ -777,10 +889,30 @@ impl PartitionedEngine {
         // A cluster owner records its epoch on object storage before taking writes, then
         // here (a restart at the same epoch opens what it has).
         if let (Some(_), Some(epoch)) = (&self.cluster, epoch) {
-            e.begin_epoch(epoch).await?;
+            at("begin epoch (object storage)");
+            // It takes the sequencer first: a write holding it stalls the open.
+            let holder = e.durable_writes().cloned().map(|d| {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        if let Some((site, held)) = d.sequencer_holder() {
+                            tracing::warn!(partition = p, site, held_s = held.as_secs(), "the open waits for the sequencer");
+                        }
+                    }
+                })
+            });
+            let begun = e.begin_epoch(epoch).await;
+            if let Some(h) = holder {
+                h.abort();
+            }
+            begun?;
             std::fs::write(pdir.join("owner.epoch"), epoch.to_string()).map_err(|e| format!("owner epoch: {e}"))?;
             self.replicas.clear(p);
         }
+        // A reader of `p` the open didn't take (owned without a takeover): no more use,
+        // nor anything left in its directory.
+        drop(self.readers.lock().unwrap().remove(&p));
+        let _ = std::fs::remove_dir_all(self.dir.join("parts").join(format!("reader-p{p}")));
         // Layer spaces in other partitions are read from there.
         e.set_spaces(Arc::downgrade(&self.spaces));
         let e = Arc::new(e);
@@ -860,7 +992,9 @@ impl PartitionedEngine {
 
     /// Record `namespace` in the catalog (before its first write commits).
     async fn note(&self, namespace: &str) -> Result<(), String> {
-        if self.catalog.read().unwrap().contains_key(namespace) {
+        // A branch (`ns@b`) is reached by naming it, never by a read across every
+        // namespace: not in the catalog.
+        if namespace.contains(routing::BRANCH_SEP) || self.catalog.read().unwrap().contains_key(namespace) {
             return Ok(());
         }
         let p = self.partition_of(namespace);
@@ -930,6 +1064,31 @@ impl PartitionedEngine {
 
     /// Run `aql` within `reach` (see the module docs).
     pub async fn query_in(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
+        // AQL v0.13: a script runs statement by statement, each with its USE applied.
+        if aql_parser::is_script(aql) {
+            return crate::engine::run_script(aql, None, |stmt| async move { Box::pin(self.query_in(&stmt, variables, reach)).await }).await;
+        }
+        if let Some((stmt, list)) = crate::engine::across_namespaces(aql) {
+            return crate::engine::read_across(&stmt, &list, |one| async move { Box::pin(self.query_in(&one, variables, reach)).await }).await;
+        }
+        // AQL v0.13 BRANCH / FORK / MERGE: each step on the partition of its namespace.
+        if let Some(stmt) = crate::engine::namespace_statement(aql) {
+            for (ns, writes) in crate::namespaces::statement_namespaces(aql)? {
+                if let Some(ns) = ns.filter(|ns| !reach.allows(ns)) {
+                    return Err(out_of_reach(&ns).to_string());
+                }
+                let _ = writes;
+            }
+            let started = std::time::Instant::now();
+            let v = crate::engine::namespace_statement_on(&RouterNs(Arc::clone(self)), stmt, variables).await?;
+            return Ok(to_wire(&crate::QueryResult::subscription(v, started.elapsed().as_millis() as u64)));
+        }
+        if let Some(ns) = crate::engine::namespace_drop(aql) {
+            if !reach.allows(&ns) {
+                return Err(out_of_reach(&ns).to_string());
+            }
+            crate::namespaces::before_drop(&RouterNs(Arc::clone(self)), &ns).await?;
+        }
         if let Some(r) = Box::pin(self.watch_routed(aql, variables, reach)).await {
             return r;
         }
@@ -1009,21 +1168,24 @@ impl PartitionedEngine {
         }
     }
 
-    /// `WATCH` / `UNWATCH` (W6) on a cluster, `None` for any other statement. A watch
-    /// runs on the owner of its query's namespace's partition, and its id names that
-    /// partition (`<partition>.<id>`), so UNWATCH and its frames (MCP watch_changes,
-    /// SSE) reach it from any node.
+    /// A live query (`SUBSCRIBE RECALL …`) and its UNSUBSCRIBE (W6) on a cluster;
+    /// `None` for any other statement (a topic's UNSUBSCRIBE too). A live query runs
+    /// on the owner of its namespace's partition, and its id names that partition
+    /// (`<partition>.<id>`), so UNSUBSCRIBE and its frames (MCP watch_changes, SSE)
+    /// reach it from any node; one without a namespace, or across several, runs on
+    /// the system partition (`c.<id>`).
     async fn watch_routed(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Option<Result<Value, String>> {
         use aql_parser::ast::Statement;
-        let first = aql.trim_start().split(|c: char| c.is_whitespace()).next().unwrap_or_default();
-        if !first.eq_ignore_ascii_case("WATCH") && !first.eq_ignore_ascii_case("UNWATCH") {
-            return None;
-        }
         // A statement that doesn't parse: the router's executor reports it.
-        let stmt = aql_parser::parse(aql).ok()?;
+        let stmt = crate::engine::watch_statement(aql)?;
         Some(match stmt {
-            Statement::Watch(w) => {
-                let Some(ns) = touches_of(&w.query).0 else {
+            Statement::Subscribe(_) => {
+                let query = crate::engine::live_query(&stmt)?;
+                let single = match &query {
+                    Statement::Recall(r) if r.modifiers.namespaces.is_empty() => r.modifiers.namespace.clone(),
+                    _ => None,
+                };
+                let Some(ns) = single else {
                     return Some(match self.system_handle().await {
                         Ok(Handle::Local(_)) => Box::pin(self.cluster_watch(aql, variables, reach)).await,
                         Ok(Handle::Remote(r)) => r.op("cluster_watch", json!({ "aql": aql, "variables": variables, "reach": reach })).await,
@@ -1039,18 +1201,17 @@ impl PartitionedEngine {
                     v
                 })
             }
-            Statement::Unwatch(u) => {
-                if let Some(id) = u.query_id.strip_prefix(crate::cluster_watch::PREFIX) {
+            Statement::Unsubscribe(u) => {
+                if let Some(id) = u.subscription.strip_prefix(crate::cluster_watch::PREFIX) {
                     return Some(match self.system_handle().await {
                         Ok(Handle::Local(_)) => self.cluster_unwatch(id).await,
                         Ok(Handle::Remote(r)) => r.op("cluster_unwatch", json!({ "id": id })).await,
                         Err(e) => Err(e),
                     });
                 }
-                let Some((p, id)) = split_cq_id(&u.query_id) else {
-                    return Some(Err(format!("unknown watch {}: a cluster's watch ids are <partition>.<id>", u.query_id)));
-                };
-                let local = format!("UNWATCH {}", serde_json::to_string(id).unwrap_or_default());
+                // Not a live query's id: a topic subscription's, for the planner.
+                let (p, id) = split_cq_id(&u.subscription)?;
+                let local = format!("UNSUBSCRIBE {}", serde_json::to_string(id).unwrap_or_default());
                 Box::pin(self.query_on(p, &local)).await.map(|mut v| {
                     prefix_cq_ids(&mut v, p);
                     v
@@ -1255,13 +1416,10 @@ impl PartitionedEngine {
     /// `WATCH` across partitions (no NAMESPACE, or several), on the system partition's
     /// owner: registered there with the call's scope, its snapshot taken across.
     pub(crate) async fn cluster_watch(self: &Arc<Self>, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Result<Value, String> {
-        use aql_parser::ast::{StartPosition, Statement};
         let started = std::time::Instant::now();
-        let Statement::Watch(w) = aql_parser::parse(aql).map_err(|e| e.to_string())? else { return Err("not a WATCH".into()) };
-        if let StartPosition::Offset(n) = w.start {
-            return Err(format!("WATCH … FROM OFFSET {n}: a new watch starts now; resume an existing one by its id (GET /watches/{{id}}/events?from=, MCP watch_changes)"));
-        }
-        let mut spec = adb_cq::WatchSpec::new(*w.query, variables.cloned().unwrap_or_default(), w.debounce)?;
+        let stmt = aql_parser::parse(aql).map_err(|e| e.to_string())?;
+        let query = crate::engine::live_query(&stmt).ok_or("not a live query (SUBSCRIBE RECALL …)")?;
+        let mut spec = adb_cq::WatchSpec::new(query, variables.cloned().unwrap_or_default(), None)?;
         spec.across = Some(serde_json::to_value(reach).map_err(|e| e.to_string())?);
         // Refuse a query that fails before anything is committed.
         self.run_across(&spec.statement, &spec.variables, reach).await?;
@@ -1286,7 +1444,7 @@ impl PartitionedEngine {
             self.system_op("cq_unregister", json!({ "id": id })).await?;
             cw.remove(id);
         }
-        let v = json!({ "cq_id": format!("{}{id}", crate::cluster_watch::PREFIX), "unwatched": existed });
+        let v = json!({ "cq_id": format!("{}{id}", crate::cluster_watch::PREFIX), "unsubscribed": existed });
         Ok(to_wire(&crate::QueryResult::subscription(v, started.elapsed().as_millis() as u64)))
     }
 
@@ -1334,8 +1492,52 @@ impl PartitionedEngine {
 
 /// The one namespace every stage of `aql` names (`None`: none, or several), and
 /// whether it writes; a named namespace outside `reach` is refused.
+/// Append a replica's sealed tail to the partition's log in `pdir` (records it already
+/// holds are skipped): (records appended, the log's last offset). A gap — the log ends
+/// before the tail starts — would lose acknowledged writes: an error.
+async fn append_tail(pdir: &std::path::Path, role: PartitionRole, tail: &[adb_core::log::LogRecord]) -> Result<(u64, u64), String> {
+    let wal = LocalEngine::open_partition_wal(pdir, role).await?;
+    let mut appended = 0;
+    for r in tail {
+        let last = adb_log::Log::last_offset(&*wal).0;
+        if r.offset.0 <= last {
+            continue;
+        }
+        if r.offset.0 != last + 1 {
+            return Err(format!("the log ends at {last}, this replica's tail starts at {}: acknowledged writes would be lost", r.offset.0));
+        }
+        adb_log::Log::append(&*wal, r.clone()).await.map_err(|e| e.to_string())?;
+        appended += 1;
+    }
+    Ok((appended, adb_log::Log::last_offset(&*wal).0))
+}
+
+/// fsync every file and directory under `dir` (and `dir`'s parent, for its new name).
+fn sync_tree(dir: &std::path::Path) -> std::io::Result<()> {
+    fn walk(d: &std::path::Path) -> std::io::Result<()> {
+        for e in std::fs::read_dir(d)? {
+            let e = e?;
+            let path = e.path();
+            if e.file_type()?.is_dir() {
+                walk(&path)?;
+            } else {
+                std::fs::File::open(&path)?.sync_all()?;
+            }
+        }
+        std::fs::File::open(d)?.sync_all()
+    }
+    walk(dir)?;
+    if let Some(parent) = dir.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), String> {
-    let touches = touches(aql);
+    // Parsed once for both questions (it was parsed twice, then again by the
+    // executor: every read through the router paid for three parses).
+    let stmt = aql_parser::parse(aql).ok();
+    let touches = touches_in(stmt.as_ref());
     for (ns, _) in &touches {
         if let Some(ns) = ns {
             if !reach.allows(ns) {
@@ -1344,7 +1546,7 @@ fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), 
         }
     }
     // A namespace's topics (AQL v0.12) are on the system partition, within the scope.
-    if let Some(ns) = topic_namespace(aql) {
+    if let Some(ns) = stmt.as_ref().and_then(topic_namespace_of) {
         if !reach.allows(&ns) {
             return Err(out_of_reach(&ns).to_string());
         }
@@ -1361,25 +1563,86 @@ fn single_namespace(aql: &str, reach: &Reach) -> Result<(Option<String>, bool), 
 /// UNLINK, MERGE, SUBSCRIBE, …) count as none named: they run within the call's scope
 /// through the router. A statement that doesn't parse goes to the router's executor,
 /// which reports the parse error.
-fn touches(aql: &str) -> Vec<(Option<String>, bool)> {
+fn touches_in(stmt: Option<&aql_parser::Statement>) -> Vec<(Option<String>, bool)> {
     use aql_parser::Statement as S;
-    let Ok(stmt) = aql_parser::parse(aql) else { return vec![(None, false)] };
+    let Some(stmt) = stmt else { return vec![(None, false)] };
     let of = touches_of;
-    match &stmt {
+    match stmt {
         S::Pipeline(p) => p.stages.iter().map(of).collect(),
         other => vec![of(other)],
     }
 }
 
 /// The NAMESPACE a topic statement names (SUBSCRIBE, PUBLISH, ACK, UNSUBSCRIBE).
-fn topic_namespace(aql: &str) -> Option<String> {
+fn topic_namespace_of(stmt: &aql_parser::Statement) -> Option<String> {
     use aql_parser::Statement as S;
-    match aql_parser::parse(aql).ok()? {
-        S::Subscribe(x) => x.namespace,
-        S::Publish(x) => x.modifiers.namespace,
-        S::Ack(x) => x.namespace,
-        S::Unsubscribe(x) => x.namespace,
+    match stmt {
+        S::Subscribe(x) => x.namespace.clone(),
+        S::Publish(x) => x.modifiers.namespace.clone(),
+        S::Unsubscribe(x) => x.namespace.clone(),
         _ => None,
+    }
+}
+
+/// [`crate::namespaces::NsOps`] on a cluster: each operation on the partition that
+/// holds its namespace (here, or one call to its owner).
+struct RouterNs(Arc<PartitionedEngine>);
+
+impl RouterNs {
+    async fn on<T, F, Fut>(&self, namespace: &str, op: &str, args: Value, local: F) -> Result<T, String>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(Arc<LocalEngine>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        match self.0.handle_of(namespace).await? {
+            Handle::Local(e) => local(e).await,
+            h => h.op_as(op, args).await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::namespaces::NsOps for RouterNs {
+    async fn exists(&self, namespace: &str) -> Result<bool, String> {
+        self.on(namespace, "ns_exists", json!({ "namespace": namespace }), |e| async move { crate::namespaces::LocalNs(&e).exists(namespace).await }).await
+    }
+    async fn tag_at(&self, namespace: &str, name: &str, at: Option<adb_core::log::CommitTs>) -> Result<crate::branches::Tag, String> {
+        self.on(namespace, "ns_tag_at", json!({ "namespace": namespace, "name": name, "at": at }), |e| async move { crate::namespaces::LocalNs(&e).tag_at(namespace, name, at).await }).await
+    }
+    async fn tag_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
+        self.on(namespace, "ns_tag_drop", json!({ "namespace": namespace, "name": name }), |e| async move { crate::namespaces::LocalNs(&e).tag_drop(namespace, name).await }).await
+    }
+    async fn tags(&self, namespace: &str) -> Result<Vec<crate::branches::Tag>, String> {
+        self.on(namespace, "ns_tags", json!({ "namespace": namespace }), |e| async move { crate::namespaces::LocalNs(&e).tags(namespace).await }).await
+    }
+    async fn base_of(&self, namespace: &str) -> Result<Option<crate::branches::Base>, String> {
+        self.on(namespace, "space_base", json!({ "space": namespace }), |e| async move { crate::namespaces::LocalNs(&e).base_of(namespace).await }).await
+    }
+    async fn base_set(&self, namespace: &str, base: Option<crate::branches::Base>) -> Result<(), String> {
+        let args = json!({ "namespace": namespace, "base": base });
+        let r: Result<Value, String> = self.on(namespace, "ns_base_set", args, |e| async move { crate::namespaces::LocalNs(&e).base_set(namespace, base).await.map(|_| Value::Null) }).await;
+        r.map(|_| ())
+    }
+    async fn materialise(&self, namespace: &str, rows: Vec<adb_store::StoredRow>) -> Result<u64, String> {
+        let args = json!({ "namespace": namespace, "rows": rows });
+        self.on(namespace, "ns_materialise", args, |e| async move { crate::namespaces::LocalNs(&e).materialise(namespace, rows).await }).await
+    }
+    async fn merge_apply(&self, namespace: &str, writes: Vec<crate::writes::MergeWrite>) -> Result<u64, String> {
+        let args = json!({ "namespace": namespace, "writes": writes });
+        self.on(namespace, "ns_merge_apply", args, |e| async move { crate::namespaces::LocalNs(&e).merge_apply(namespace, writes).await }).await
+    }
+    async fn record_put(&self, namespace: &str, id: &str, value: Value) -> Result<(), String> {
+        let args = json!({ "namespace": namespace, "id": id, "value": value });
+        let r: Result<Value, String> = self.on(namespace, "ns_record_put", args, |e| async move { crate::namespaces::LocalNs(&e).record_put(namespace, id, value).await.map(|_| Value::Null) }).await;
+        r.map(|_| ())
+    }
+    async fn records(&self, namespace: &str, prefix: &str) -> Result<Vec<Value>, String> {
+        self.on(namespace, "ns_records", json!({ "namespace": namespace, "prefix": prefix }), |e| async move { crate::namespaces::LocalNs(&e).records(namespace, prefix).await }).await
+    }
+    async fn rows_at(&self, memory: adb_core::log::Memory, namespace: &str, at: adb_core::log::CommitTs) -> Result<Vec<adb_store::StoredRow>, String> {
+        let view = crate::spaces::SpaceView::routed(&self.0.spaces);
+        view.rows_at(memory, namespace, at, adb_core::log::CommitTs::from_datetime(adb_core::time::now())).await.map_err(|e| e.to_string())
     }
 }
 
@@ -1389,18 +1652,14 @@ fn touches_of(s: &aql_parser::Statement) -> (Option<String>, bool) {
     {
         match s {
             S::Recall(x) => (x.modifiers.namespace.clone(), false),
-            S::Lookup(x) => (x.modifiers.namespace.clone(), false),
-            S::Load(x) => (x.modifiers.namespace.clone(), false),
-            S::Scan(x) => (x.modifiers.namespace.clone(), false),
             S::Store(x) => (x.modifiers.namespace.clone(), true),
             S::Update(x) => (x.modifiers.namespace.clone(), true),
             S::Forget(x) => (x.modifiers.namespace.clone(), true),
-            // A watch is on its query's namespace (its partition registers it); the
-            // owner runs it — WATCH isn't a read a reader answers.
-            S::Watch(w) => (touches_of(&w.query).0, false),
+            // A live query is on its RECALL's namespace (its partition registers it);
+            // the owner runs it — it isn't a read a reader answers.
+            S::Subscribe(aql_parser::ast::SubscribeStmt { target: aql_parser::ast::SubscribeTarget::Query(r), .. }) => (r.modifiers.namespace.clone(), false),
             // A link's two ends are in its NAMESPACE (AQL v0.12): one partition.
             S::Link(x) => (x.namespace.clone(), true),
-            S::UpdateLink(x) => (x.namespace.clone(), true),
             S::Unlink(x) => (x.namespace.clone(), true),
             _ => (None, true),
         }
@@ -1643,11 +1902,6 @@ impl Writes for Routed {
         t.writes.store(memory_type, key, payload, scope, namespace, ttl, in_scope).await
     }
 
-    async fn store_fact(&self, payload: Value, multi: bool, scope: Scope, namespace: Option<&str>, ttl: Option<Duration>, in_scope: Option<&str>) -> AdbResult<MemoryRecord> {
-        let t = self.write_target(namespace).await?;
-        t.writes.store_fact(payload, multi, scope, namespace, ttl, in_scope).await
-    }
-
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         let n = self
             .each(namespace, |t| {
@@ -1717,16 +1971,27 @@ impl Writes for Routed {
         Ok(found.into_iter().flatten().next())
     }
 
-    /// MERGE ENTITY without a namespace: the entities without one, in their partition.
-    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
-        self.write_target(None).await?.writes.merge(from, into).await
+    /// A statement run here (no namespace: across partitions) set a record's `aliases`:
+    /// each partition in reach reloads its own, as an owner does after its own statement.
+    /// Without it a key that became an alias was not found until the partition reopened.
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        self.each(None, |t| async move { t.writes.aliases_changed().await }).await?;
+        Ok(())
     }
+
 }
 
 #[async_trait]
 impl Engine for Arc<PartitionedEngine> {
     async fn query(&self, aql: &str, variables: Option<&HashMap<String, Value>>) -> Result<Value, String> {
         Box::pin(self.query_in(aql, variables, &Reach::All)).await
+    }
+
+    async fn subscription(&self, plan: aql_planner::SubscriptionPlan) -> Result<Value, String> {
+        self.catalog_recent().await?;
+        let io = Arc::new(Routed { node: Arc::clone(self), reach: Reach::All });
+        let executor = Executor::with_io(Arc::clone(&io) as Arc<dyn Writes>, io as Arc<dyn Reads>);
+        executor.execute_plan(&aql_planner::ExecutionPlan::Subscription(plan)).await.map(|r| to_wire(&r)).map_err(|e| e.to_string())
     }
 
     async fn query_reach(&self, aql: &str, variables: Option<&HashMap<String, Value>>, reach: &Reach) -> Option<Result<Value, String>> {
@@ -1797,72 +2062,59 @@ impl Engine for Arc<PartitionedEngine> {
 
     // ---- one namespace: its partition
 
-    async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
-        self.note(namespace).await?;
-        self.op_ns(namespace, "branch_create", json!({ "namespace": namespace, "name": name, "parent": parent, "created_by": created_by })).await
+    async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, _created_by: Option<&str>) -> Result<crate::branches::Branch, String> {
+        crate::review::create(&RouterNs(Arc::clone(self)), namespace, name, parent).await
     }
 
     async fn branch_drop(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        self.op_ns(namespace, "branch_drop", json!({ "namespace": namespace, "name": name })).await
+        let child = crate::review::branch_ns(namespace, name);
+        if crate::namespaces::NsOps::base_of(&RouterNs(Arc::clone(self)), &child).await?.is_none() {
+            return Ok(false);
+        }
+        Box::pin(self.query(&format!("FORGET FROM ALL NAMESPACE {}", serde_json::to_string(&child).unwrap_or_default()), None)).await?;
+        Ok(true)
     }
 
     async fn branch_list(&self, namespace: Option<&str>) -> Result<Vec<crate::branches::Branch>, String> {
         match namespace {
-            Some(ns) => self.op_ns(ns, "branch_list", json!({ "namespace": ns })).await,
-            None => Ok(self.op_all::<Vec<crate::branches::Branch>>("branch_list", json!({ "namespace": null })).await?.into_iter().flatten().collect()),
+            Some(ns) => crate::review::list(&RouterNs(Arc::clone(self)), ns).await,
+            None => Err("branch_list names its namespace".into()),
         }
     }
 
-    async fn branch_create_past(&self, namespace: &str, name: &str, created_by: Option<&str>, at: &crate::branches::PointRef) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_create_past", json!({ "namespace": namespace, "name": name, "created_by": created_by, "at": at })).await
-    }
-
+    /// On the partition of the space read: a branch is the namespace `<ns>@<branch>`.
     async fn space_stats(&self, namespace: &str, branch: Option<&str>, max_age: Duration) -> Result<Value, String> {
-        self.op_ns(namespace, "space_stats", json!({ "namespace": namespace, "branch": branch, "max_age_ms": max_age.as_millis() as u64 })).await
+        let space = crate::review::branch_ns(namespace, branch.unwrap_or_default());
+        self.op_ns(&space, "space_stats", json!({ "namespace": namespace, "branch": branch, "max_age_ms": max_age.as_millis() as u64 })).await
     }
 
     async fn space_records(&self, namespace: &str, memory: MemoryType, branch: Option<&str>, after: Option<&str>, limit: usize) -> Result<Value, String> {
-        self.op_ns(namespace, "space_records", json!({ "namespace": namespace, "memory": memory, "branch": branch, "after": after, "limit": limit })).await
+        let space = crate::review::branch_ns(namespace, branch.unwrap_or_default());
+        self.op_ns(&space, "space_records", json!({ "namespace": namespace, "memory": memory, "branch": branch, "after": after, "limit": limit })).await
     }
 
     /// A space's change stream: served by the node owning its partition.
-    async fn space_gateway(&self, namespace: &str, branch: Option<&str>) -> Result<Arc<adb_gateway::Gateway>, String> {
+    async fn space_gateway(&self, namespace: &str) -> Result<Arc<adb_gateway::Gateway>, String> {
         match self.handle_of(namespace).await? {
-            Handle::Local(e) => e.space_gateway(namespace, branch).await,
+            Handle::Local(e) => e.space_gateway(namespace).await,
             Handle::Remote(r) => Err(format!("not_owner:0:{}: namespace {namespace:?}'s changes are served by its owner", r.addr)),
         }
     }
 
     async fn branch_conflicts(&self, namespace: &str, name: &str, memories: &[MemoryType]) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_conflicts", json!({ "namespace": namespace, "name": name, "memories": memories })).await
+        crate::review::conflicts(&RouterNs(Arc::clone(self)), namespace, name, memories).await
     }
 
     async fn branch_merge(&self, namespace: &str, name: &str, memories: &[MemoryType], main_offset: u64, resolutions: Vec<crate::merge::Resolution>, by: Option<&str>) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_merge", json!({ "namespace": namespace, "name": name, "memories": memories, "main_offset": main_offset, "resolutions": resolutions, "by": by })).await
+        crate::review::merge(&RouterNs(Arc::clone(self)), namespace, name, memories, main_offset, resolutions, by).await
     }
 
     async fn branch_rebase(&self, namespace: &str, name: &str, main_offset: u64, resolutions: Vec<crate::merge::Resolution>) -> Result<Value, String> {
-        self.op_ns(namespace, "branch_rebase", json!({ "namespace": namespace, "name": name, "main_offset": main_offset, "resolutions": resolutions })).await
+        crate::review::rebase(&RouterNs(Arc::clone(self)), namespace, name, main_offset, resolutions).await
     }
 
     async fn merge_revert(&self, namespace: &str, merge_id: &str, by: Option<&str>, force_skip: bool) -> Result<Value, String> {
-        self.op_ns(namespace, "merge_revert", json!({ "namespace": namespace, "merge_id": merge_id, "by": by, "force_skip": force_skip })).await
-    }
-
-    async fn parent_rows(&self, memory: MemoryType, namespace: &str, branch: Option<&str>, at: i64) -> Result<Vec<adb_store::StoredRow>, String> {
-        self.op_ns(namespace, "parent_rows", json!({ "memory": memory, "namespace": namespace, "branch": branch, "at": at })).await
-    }
-
-    async fn branch_place(&self, namespace: &str, name: &str, url: &str) -> Result<crate::branches::Branch, String> {
-        self.op_ns(namespace, "branch_place", json!({ "namespace": namespace, "name": name, "url": url })).await
-    }
-
-    async fn branch_pending(&self, namespace: &str, name: &str) -> Result<Vec<crate::branches::PendingForget>, String> {
-        self.op_ns(namespace, "branch_pending", json!({ "namespace": namespace, "name": name })).await
-    }
-
-    async fn branch_pending_ack(&self, namespace: &str, name: &str, n: usize) -> Result<(), String> {
-        self.op_ns(namespace, "branch_pending_ack", json!({ "namespace": namespace, "name": name, "n": n })).await
+        crate::review::revert(&RouterNs(Arc::clone(self)), namespace, merge_id, by, force_skip).await
     }
 
     async fn tag_create(&self, namespace: &str, name: &str, created_by: Option<&str>) -> Result<crate::branches::Tag, String> {
@@ -1899,33 +2151,8 @@ impl Engine for Arc<PartitionedEngine> {
     // the source's, materialised in the target's (not one transaction: a copy that
     // fails half way is repeated into a fresh namespace)
 
-    async fn branch_promote(&self, namespace: &str, name: &str, into: &str, allow_stale: bool) -> Result<Value, String> {
-        self.note(into).await?;
-        if self.partition_of(namespace) == self.partition_of(into) {
-            return self.op_ns(namespace, "branch_promote", json!({ "namespace": namespace, "name": name, "into": into, "allow_stale": allow_stale })).await;
-        }
-        let (src, dst) = (self.handle_of(namespace).await?, self.handle_of(into).await?);
-        let branch: crate::branches::Branch = src.op_as("promote_check", json!({ "namespace": namespace, "name": name, "allow_stale": allow_stale })).await?;
-        let all = [MemoryType::Semantic, MemoryType::Procedural, MemoryType::Tools];
-        let rows: Value = src.op("copy_out", json!({ "namespace": namespace, "branch": name, "memories": all, "at": now() })).await?;
-        let n: u64 = dst.op_as("copy_in", json!({ "into": into, "rows": rows })).await?;
-        // D1, as on one engine: the new agent carries the old one's layers, reads its
-        // episodes as of now (a history layer, read from the old one's partition), and
-        // its first record says where it came from.
-        let old_layers: Vec<crate::branches::Layer> = src.op_as("layers_get", json!({ "namespace": namespace })).await?;
-        let safe: String = into.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).take(55).collect();
-        let tag = format!("promoted-{safe}");
-        src.op("tag_create", json!({ "namespace": namespace, "name": tag, "created_by": null })).await?;
-        let mut layers = vec![crate::branches::Layer { space: namespace.to_string(), mode: crate::branches::LayerMode::History, tag: Some(tag), memories: vec![MemoryType::Episodic], sealed: false }];
-        layers.extend(old_layers);
-        dst.op("layers_set", json!({ "namespace": into, "layers": layers })).await?;
-        let s = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".into());
-        let aql = format!(
-            "STORE INTO EPISODIC (event = \"promoted_from\", from_namespace = {}, from_branch = {}, point_offset = \"{}\", point_ts = \"{}\") NAMESPACE {}",
-            s(namespace), s(name), branch.point_offset, branch.point_ts, s(into)
-        );
-        dst.op("query", json!({ "aql": aql, "variables": null })).await?;
-        Ok(json!({ "namespace": into, "records": n, "from": { "namespace": namespace, "branch": name } }))
+    async fn branch_promote(&self, namespace: &str, name: &str, into: &str, _allow_stale: bool) -> Result<Value, String> {
+        crate::review::promote(&RouterNs(Arc::clone(self)), namespace, name, into).await
     }
 
     async fn space_clone(&self, namespace: &str, into: &str) -> Result<Value, String> {
@@ -1967,12 +2194,6 @@ impl Engine for Arc<PartitionedEngine> {
         // Layer spaces are read from their own partitions (RouterSpaces).
         self.note(namespace).await?;
         self.op_ns(namespace, "layers_set", json!({ "namespace": namespace, "layers": layers })).await
-    }
-
-    // ---- every partition
-
-    async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> Result<u64, String> {
-        Ok(self.op_all::<u64>("forget_lineages", json!({ "memory": memory, "lineages": lineages })).await?.into_iter().sum())
     }
 
     // ---- quotas: kept once, in the system partition (every partition reads them)
@@ -2043,9 +2264,8 @@ mod watch_routing_tests {
 
     #[test]
     fn a_watch_names_its_query_namespace_and_ids_carry_the_partition() {
-        let stmt = aql_parser::parse(r#"WATCH RECALL FROM SEMANTIC ALL NAMESPACE "demo--w" DEBOUNCE 50ms"#).expect("parses");
-        let aql_parser::ast::Statement::Watch(w) = stmt else { panic!("a WATCH: {stmt:?}") };
-        assert_eq!(touches_of(&w.query).0.as_deref(), Some("demo--w"), "{:?}", w.query);
+        let stmt = aql_parser::parse(r#"SUBSCRIBE RECALL FROM SEMANTIC NAMESPACE "demo--w""#).expect("parses");
+        assert_eq!(touches_of(&stmt).0.as_deref(), Some("demo--w"), "{stmt:?}");
         assert_eq!(split_cq_id("12.abc"), Some((12, "abc")));
         assert_eq!(split_cq_id("abc"), None);
         assert_eq!(split_cq_id("12."), None);

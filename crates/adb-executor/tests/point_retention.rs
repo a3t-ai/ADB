@@ -42,17 +42,17 @@ async fn an_offset_that_left_the_log_needs_its_time_and_a_recent_one() {
     flood(&engine).await;
 
     // No time: the log can't say what the offset was.
-    let e = engine.branch_create_past("crm", "no-time", None, &PointRef { offset: Some(offset), ..Default::default() }).await.unwrap_err();
+    let e = engine.space_clone_at("crm", "crm-no-time", &PointRef { offset: Some(offset), ..Default::default() }).await.unwrap_err();
     assert_eq!(adb_core::codes::code_of(&e), "point_too_old", "{e}");
 
     // Older than the versions kept.
     let old = ts - 91 * 86_400 * 1_000_000;
-    let e = engine.branch_create_past("crm", "too-old", None, &PointRef { offset: Some(offset), ts: Some(old), ..Default::default() }).await.unwrap_err();
+    let e = engine.space_clone_at("crm", "crm-old", &PointRef { offset: Some(offset), ts: Some(old), ..Default::default() }).await.unwrap_err();
     assert_eq!(adb_core::codes::code_of(&e), "point_too_old", "{e}");
-    assert!(engine.space_clone_at("crm", "crm-old", &PointRef { offset: Some(offset), ts: Some(old), ..Default::default() }).await.is_err());
 
     // With the memory point's time: it reads what that point held.
-    engine.branch_create_past("crm", "with-time", None, &PointRef { offset: Some(offset), ts: Some(ts), ..Default::default() }).await.unwrap();
-    let read = q(&engine, r#"RECALL FROM SEMANTIC ALL NAMESPACE "crm" BRANCH "with-time" LIMIT 10"#).await.to_string();
+    // (A branch at a past point is AQL's BRANCH … AS OF a time.)
+    engine.space_clone_at("crm", "crm-with-time", &PointRef { offset: Some(offset), ts: Some(ts), ..Default::default() }).await.unwrap();
+    let read = q(&engine, r#"RECALL FROM SEMANTIC NAMESPACE "crm-with-time" LIMIT 10"#).await.to_string();
     assert!(read.contains("original") && !read.contains("changed later"), "{read}");
 }

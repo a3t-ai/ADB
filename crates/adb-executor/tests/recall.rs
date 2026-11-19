@@ -73,9 +73,9 @@ async fn like_ranks_by_meaning_and_honours_the_modifiers() {
         let r = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "crm" LIMIT 2"#, "Acme").await;
         assert_eq!(keys(&r).len(), 2);
         assert!(!keys(&r).contains(&"other-ns".to_string()));
-        // MIN_CONFIDENCE cuts the unrelated ones.
+        // CONFIDENCE cuts the unrelated ones.
         let all = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "crm" LIMIT 10"#, "Acme contract renewal").await;
-        let strict = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "crm" MIN_CONFIDENCE 0.75 LIMIT 10"#, "Acme contract renewal").await;
+        let strict = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "crm" CONFIDENCE 0.75 LIMIT 10"#, "Acme contract renewal").await;
         assert!(keys(&strict).len() < keys(&all).len(), "{:?} vs {:?}", keys(&strict), keys(&all));
         assert_eq!(keys(&strict).first().map(String::as_str), Some("acme-renewal"));
         // UPDATE re-embeds.

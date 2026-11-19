@@ -12,7 +12,7 @@
  *
  * After the last round, every subscriber must hold the same offsets, in order, with
  * the same payloads; every acknowledged PUBLISH must be among them; and a fresh
- * subscription `FROM OFFSET 1` must see exactly the same sequence (the log oracle).
+ * subscription read from offset 1 must see exactly the same sequence (the log oracle).
  *
  *   node tests/subscriptions-crash.mjs --adb target/debug/adb [--rounds 10]
  */
@@ -177,7 +177,7 @@ for (let round = 1; round <= rounds; round++) {
   console.log(`round ${round}/${rounds}: ${acked.length} publishes acknowledged; seen A ${A.order.length}, B ${B.order.length}, C ${C.order.length}`);
 }
 
-// Final: drain everyone to the tip, plus a fresh FROM OFFSET 1 oracle.
+// Final: drain everyone to the tip, plus a fresh oracle read from offset 1.
 const adb = await start();
 const drain = async (sub, seen, from) => {
   for (;;) {
@@ -188,7 +188,8 @@ const drain = async (sub, seen, from) => {
   }
 };
 const O = new Seen('oracle');
-const oracle = (await query(adb.url, `SUBSCRIBE TOPIC "${TOPIC}" FROM OFFSET 1`)).subscription;
+// (AQL v0.13: a subscription starts now; reading it `from` 1 replays the log.)
+const oracle = (await query(adb.url, `SUBSCRIBE TOPIC "${TOPIC}"`)).subscription;
 await drain(subs.A, A, A.last + 1);
 await drain(subs.B, B, undefined);
 await drain(subs.C, C, C.last + 1);

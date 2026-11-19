@@ -51,6 +51,9 @@ pub trait ReaderSource: Send + Sync {
     async fn commit_offset(&self) -> Result<u64, String>;
 }
 
+/// A reader handed to a takeover answers nothing more.
+const RETIRED: &str = "reader retired: the partition was taken over here";
+
 fn stale_ok() -> Duration {
     Duration::from_millis(std::env::var("ADB_READ_STALE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
@@ -72,7 +75,10 @@ struct Open {
 /// One partition's reader on a node that doesn't own it.
 pub struct Reader {
     partition: Partition,
-    open: tokio::sync::RwLock<Open>,
+    /// Its directory (`g{gen}` under it is the open one).
+    base: PathBuf,
+    /// `None` once retired (handed to a takeover).
+    open: tokio::sync::RwLock<Option<Open>>,
     source: Arc<dyn ReaderSource>,
     /// When the owner last answered a tail pull.
     heard: std::sync::Mutex<Option<Instant>>,
@@ -124,10 +130,11 @@ impl Reader {
     pub async fn open(base: PathBuf, partition: Partition, cold: Option<String>, source: Arc<dyn ReaderSource>) -> Result<Arc<Self>, String> {
         let _ = std::fs::remove_dir_all(&base);
         let (open, replica) = build(&base, 0, partition, cold.as_deref()).await?;
-        let dir = base;
+        let dir = base.clone();
         let r = Arc::new(Self {
             partition,
-            open: tokio::sync::RwLock::new(open),
+            base,
+            open: tokio::sync::RwLock::new(Some(open)),
             source,
             heard: Default::default(),
             asking: Default::default(),
@@ -162,7 +169,7 @@ impl Reader {
     async fn upto(&self) -> Result<u64, String> {
         let stale = stale_ok();
         if !stale.is_zero() && self.heard.lock().unwrap().is_some_and(|t| t.elapsed() <= stale) {
-            return Ok(self.open.read().await.log.last_offset().0);
+            return Ok(self.open.read().await.as_ref().ok_or(RETIRED)?.log.last_offset().0);
         }
         self.owner_offset().await
     }
@@ -182,7 +189,7 @@ impl Reader {
         *self.read_at.lock().unwrap() = Instant::now();
         let upto = self.upto().await?;
         let open = self.open.read().await;
-        open.reads.query(aql, variables, LogOffset(upto)).await
+        open.as_ref().ok_or(RETIRED)?.reads.query(aql, variables, LogOffset(upto)).await
     }
 
     /// This reader's reads, once it holds everything committed now.
@@ -190,12 +197,53 @@ impl Reader {
         *self.read_at.lock().unwrap() = Instant::now();
         let upto = self.upto().await?;
         let open = self.open.read().await;
+        let open = open.as_ref().ok_or(RETIRED)?;
         open.reads.caught_up(LogOffset(upto), Duration::from_secs(10)).await?;
         Ok(open.reads.reads())
     }
 
     pub fn partition(&self) -> Partition {
         self.partition
+    }
+
+    /// Stop following and hand over the reader's directory, its log closed: its log
+    /// and table hold every committed record up to the log's last offset (a takeover by
+    /// this node starts from them instead of object storage). Reads in flight finish
+    /// first (up to `wait`); `None` if they don't, or it was retired already. After
+    /// this the reader answers no reads.
+    pub async fn retire(&self, wait: Duration) -> Option<PathBuf> {
+        let task = self.task.lock().unwrap().take();
+        if let Some(t) = task {
+            t.abort();
+            // Cancelled at its next await: nothing more is appended or applied.
+            let _ = t.await;
+        }
+        let Open { reads, log, gen, .. } = self.open.write().await.take()?;
+        let dir = self.base.join(format!("g{gen}"));
+        // The log's directory lock goes with its last holder: the reads hold the log,
+        // and reads in flight hold the reads.
+        let until = Instant::now() + wait;
+        let free = |n: usize| n <= 1;
+        while !free(Arc::strong_count(&reads)) {
+            if Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(reads);
+        while !free(Arc::strong_count(&log)) {
+            if Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(log);
+        Some(dir)
+    }
+
+    /// The reader's directory.
+    pub fn base(&self) -> &std::path::Path {
+        &self.base
     }
 }
 
@@ -209,6 +257,7 @@ async fn follow(me: std::sync::Weak<Reader>, dir: PathBuf, cold: Option<String>,
         let Some(r) = me.upgrade() else { return };
         let (log, floor) = {
             let o = r.open.read().await;
+            let Some(o) = o.as_ref() else { return };
             (Arc::clone(&o.log), o.floor)
         };
         let from = log.last_offset().0 + 1;
@@ -277,10 +326,18 @@ async fn follow(me: std::sync::Weak<Reader>, dir: PathBuf, cold: Option<String>,
 /// Build the reader again in a new directory from the latest checkpoint, then swap it
 /// in (reads in flight finish on the old one) and remove the old directory.
 async fn rebuild_reader(r: &Arc<Reader>, base: &std::path::Path, cold: &str) -> Result<crate::Replica, String> {
-    let gen = r.open.read().await.gen + 1;
+    let gen = r.open.read().await.as_ref().ok_or(RETIRED)?.gen + 1;
     let _ = std::fs::remove_dir_all(base.join(format!("g{gen}")));
     let (open, replica) = build(base, gen, r.partition, Some(cold)).await?;
-    let old = std::mem::replace(&mut *r.open.write().await, open);
+    let old = {
+        let mut slot = r.open.write().await;
+        // Retired meanwhile (a takeover has the directory): the new build isn't used.
+        let Some(old) = slot.replace(open) else {
+            *slot = None;
+            return Err(RETIRED.into());
+        };
+        old
+    };
     // Reads still on the old one finish first: its directory goes a minute later.
     let old_dir = base.join(format!("g{}", old.gen));
     tokio::spawn(async move {

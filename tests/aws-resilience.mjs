@@ -72,7 +72,7 @@ await Promise.all(Array.from({ length: 32 }, async () => {
   while (keys.length) {
     const k = keys.pop();
     try {
-      const d = await q(leader, `LOOKUP FROM SEMANTIC KEY id = "${k}"`);
+      const d = await q(leader, `RECALL FROM SEMANTIC WHERE id = "${k}"`);
       if (!d || (Array.isArray(d.records) && d.records.length === 0)) missing++;
     } catch { missing++; }
     checked++;

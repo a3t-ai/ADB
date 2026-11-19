@@ -42,7 +42,13 @@ pub(crate) struct SeqGuard<'a, L: Log> {
     g: tokio::sync::MutexGuard<'a, Sequencer<L>>,
     held: &'static str,
     t: std::time::Instant,
+    holder: &'a SeqHolder,
 }
+
+/// Who holds the sequencer now (its site) and since when: a write path that stalls
+/// says what it is waiting behind ([`DurableWrites::sequencer_holder`]).
+#[derive(Default)]
+pub(crate) struct SeqHolder(std::sync::Mutex<Option<(&'static str, std::time::Instant)>>);
 
 impl<L: Log> std::ops::Deref for SeqGuard<'_, L> {
     type Target = Sequencer<L>;
@@ -59,22 +65,25 @@ impl<L: Log> std::ops::DerefMut for SeqGuard<'_, L> {
 
 impl<L: Log> Drop for SeqGuard<'_, L> {
     fn drop(&mut self) {
+        *self.holder.0.lock().unwrap() = None;
         crate::steps::add(self.held, self.t.elapsed());
         crate::steps::add("seq.held (all sites)", self.t.elapsed());
     }
 }
 
-async fn seq_timed<'a, L: Log>(m: &'a Mutex<Sequencer<L>>, wait: &'static str, held: &'static str) -> SeqGuard<'a, L> {
+async fn seq_timed<'a, L: Log>(m: &'a Mutex<Sequencer<L>>, holder: &'a SeqHolder, wait: &'static str, held: &'static str) -> SeqGuard<'a, L> {
     let t0 = std::time::Instant::now();
     let g = m.lock().await;
     crate::steps::add(wait, t0.elapsed());
     crate::steps::add("seq.wait (all sites)", t0.elapsed());
-    SeqGuard { g, held, t: std::time::Instant::now() }
+    let t = std::time::Instant::now();
+    *holder.0.lock().unwrap() = Some((held, t));
+    SeqGuard { g, held, t, holder }
 }
 
 macro_rules! seq_lock {
     ($self:ident) => {
-        seq_timed(&$self.seq, concat!("seq.wait @", line!()), concat!("seq.held @", line!())).await
+        seq_timed(&$self.seq, &$self.seq_holder, concat!("seq.wait @", line!()), concat!("seq.held @", line!())).await
     };
 }
 
@@ -96,23 +105,6 @@ pub trait Writes: Send + Sync {
         ttl: Option<Duration>,
         in_scope: Option<&str>,
     ) -> AdbResult<MemoryRecord>;
-
-    /// `STORE INTO SEMANTIC FACT [MULTI]` (P1_GRAPH D2): `payload` has `subject`,
-    /// `predicate` and `object` (an entity key) or `value`. One current fact per
-    /// (subject, predicate) — or per (subject, predicate, object) with `multi` — so
-    /// a new one supersedes the old. Missing entities at its ends are created.
-    #[allow(clippy::too_many_arguments)]
-    async fn store_fact(
-        &self,
-        _payload: serde_json::Value,
-        _multi: bool,
-        _scope: Scope,
-        _namespace: Option<&str>,
-        _ttl: Option<Duration>,
-        _in_scope: Option<&str>,
-    ) -> AdbResult<MemoryRecord> {
-        Err(AdbError::UnsupportedOperation("facts need a durable engine".into()))
-    }
 
     /// `in_scope`: only records in that named scope (`IN SCOPE`); `None`: every scope.
     /// `namespace`: only records of that namespace (`NAMESPACE`; NS: keys repeat across
@@ -163,13 +155,13 @@ pub trait Writes: Send + Sync {
         link_type: Option<&str>,
     ) -> AdbResult<u64>;
 
-    /// AQL v0.10 MERGE ENTITY (GR-12): SEMANTIC entity `from` merges into `into`.
-    /// Returns how many facts and links moved.
-    async fn merge(&self, _from: &str, _into: &str) -> AdbResult<u64> {
-        Err(needs_table("MERGE"))
+    /// AQL v0.13: a record's `aliases` field was written — the alias map follows.
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        Ok(())
     }
 
-    /// The entity a merged entity's key is now an alias of (GR-12).
+    /// The entity a merged entity's record id (its key, with its namespace) is now an
+    /// alias of (GR-12).
     fn alias_of(&self, _key: &str) -> Option<String> {
         None
     }
@@ -226,6 +218,18 @@ const EXPIRE_BATCH: usize = 1000;
 /// Memory types whose keys are unique among current records (D3 S4): the
 /// long-term, versioned ones. WORKING (scratchpad) and TOOLS (registrations)
 /// keep replace-by-key.
+/// One key of an AQL v0.13 MERGE ([`DurableWrites::merge_apply`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MergeWrite {
+    pub memory: Memory,
+    /// The record's key without its namespace (or a table id of it).
+    pub key: String,
+    /// The target namespace's own record of the key now, if it has one.
+    pub current: Option<adb_store::StoredRow>,
+    /// What the key becomes (the source's record), or `None`: removed.
+    pub source: Option<adb_store::StoredRow>,
+}
+
 pub fn unique_keys(memory: MemoryType) -> bool {
     matches!(memory, MemoryType::Semantic | MemoryType::Episodic | MemoryType::Procedural)
 }
@@ -560,6 +564,48 @@ fn sub_idle() -> Duration {
     std::env::var("ADB_SUB_IDLE").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(SUB_IDLE)
 }
 
+/// Memory types whose STORE doesn't wait for its vector (`ADB_EMBED_DEFER`: a comma
+/// list of memory types, e.g. `episodic`; default none — every STORE waits for its
+/// vector). A deferred record is committed and answered at once; its vector follows
+/// ([`DurableWrites::embed_deferred`]). A LIKE read in between doesn't rank it by
+/// meaning yet; key, time and field reads see it at once.
+///
+/// Off by default (user, 18 Nov): STORE EPISODIC then ran 7× faster (16k/s against
+/// 2.2k/s on 3 nodes, Hetzner p15), but each episode is written twice (the record,
+/// then its vector) and the catch-up after a burst took the nodes' CPU from reads
+/// (−46 to −66% until the vectors were in). On by deployment once the catch-up is
+/// paced.
+pub fn defer_embedding(memory: MemoryType) -> bool {
+    static SET: std::sync::OnceLock<Vec<MemoryType>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let v = std::env::var("ADB_EMBED_DEFER").unwrap_or_default();
+        v.split(',')
+            .filter_map(|m| match m.trim().to_ascii_lowercase().as_str() {
+                "episodic" => Some(MemoryType::Episodic),
+                "semantic" => Some(MemoryType::Semantic),
+                "procedural" => Some(MemoryType::Procedural),
+                _ => None,
+            })
+            .collect()
+    })
+    .contains(&memory)
+}
+
+/// Records waiting for a deferred vector at most; more wait for the backfill scan.
+const EMBED_SOON_MAX: usize = 200_000;
+/// Texts per embedding call of [`DurableWrites::embed_deferred`]: small enough that a
+/// foreground request waits little behind one on a worker, large enough to batch.
+const EMBED_SOON_BATCH: usize = 32;
+
+/// Deferred-embedding calls in flight at once per node (`ADB_EMBED_DEFER_PARALLEL`,
+/// default 2): background work, in the model's background lane.
+fn embed_parallel() -> usize {
+    std::env::var("ADB_EMBED_DEFER_PARALLEL").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(2)
+}
+
+/// How long after the last deferred record the backfill scan waits.
+const BACKFILL_AFTER_DEFERRED: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) fn retain_max() -> u64 {
     std::env::var("ADB_LOG_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MAX)
 }
@@ -599,24 +645,6 @@ fn kind_of(memory: MemoryType) -> Kind {
     }
 }
 
-/// DB-19: the platform table that records every merge and revert (append-only).
-pub const MERGES: &str = "adb_merges";
-pub const MERGE_COLUMNS: [&str; 9] = ["id", "kind", "namespace", "branch", "by", "at", "offset", "entries", "of"];
-
-/// One record change of a merge (or a revert): replace `main` (the main row it expects
-/// to be current) with `value`, add `value` as a new lineage (`main` none, `template`
-/// gives the row's shape), or end the lineage (`value` none).
-#[derive(Debug, Clone)]
-pub struct MergeOp {
-    pub memory: MemoryType,
-    pub lineage: String,
-    pub main: Option<adb_store::StoredRow>,
-    pub value: Option<serde_json::Value>,
-    pub template: Option<adb_store::StoredRow>,
-    /// For an add that re-creates an ended lineage: its last version.
-    pub prev_version: Option<u32>,
-}
-
 fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
     RowData {
         tenant_id: TENANT.into(),
@@ -643,6 +671,10 @@ fn row(memory: MemoryType, kind: Kind, value: serde_json::Value) -> RowData {
 /// Writes through the log.
 pub struct DurableWrites<L: Log> {
     seq: Mutex<Sequencer<L>>,
+    /// Who holds `seq` now.
+    seq_holder: SeqHolder,
+    /// A cluster owner before its epoch began: nothing is shipped yet.
+    epoch_pending: std::sync::atomic::AtomicBool,
     /// The sequencer's log, shared: trimming and FORGET redaction use it without the
     /// sequencer (they need no ordering; holding it stalled every write).
     log: Arc<L>,
@@ -654,8 +686,6 @@ pub struct DurableWrites<L: Log> {
     /// Live subscriptions (stage E), following registrations as they commit.
     subs: Arc<Registry>,
     branches: Arc<crate::branches::Branches>,
-    /// On a branch engine (B2 / B3): the parent its writes are read against.
-    parent: Option<crate::branch_engine::ParentView>,
     /// Platform tables (stage G), applied by their own applier (PF-4).
     platform: Option<Arc<adb_platform::PlatformStore>>,
     /// PF-4: tickets for the platform applier, in log order (set by `attach_platform`).
@@ -710,6 +740,15 @@ pub struct DurableWrites<L: Log> {
     key_offsets: std::sync::Mutex<KeyOffsets>,
     /// Records waiting for a vector (PF-51): memory, row id, text.
     backfill_queue: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
+    /// Records stored without waiting for their vector ([`defer_embedding`]): (memory,
+    /// record id, text), embedded by [`DurableWrites::embed_deferred`] as soon as it
+    /// wakes. Bounded: past [`EMBED_SOON_MAX`] a record waits for the backfill scan.
+    embed_soon: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
+    embed_wake: Arc<tokio::sync::Notify>,
+    /// When a record was last queued for its vector: the backfill scan waits while
+    /// the deferred embedder has work (both scanning and embedding the same rows
+    /// burned the nodes' CPU, Hetzner p15).
+    deferred_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// A submitted record failed to commit: this engine takes no more writes and
     /// restarts (as when it loses the lead).
     poisoned: Arc<std::sync::atomic::AtomicBool>,
@@ -729,10 +768,6 @@ pub struct DurableWrites<L: Log> {
     /// instead of scanning the table; each is checked against the table before it
     /// expires (an UPDATE may have moved its TTL, a FORGET removed it).
     timers: std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>,
-    /// Validity timers (AQL v0.10, GR-14): `(valid_from or valid_to, row lineage id)`
-    /// of facts whose bound is still ahead, seeded at open; the tick commits a
-    /// `Validity` event for each once it passes (checked against the table first).
-    bounds: std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>,
     /// Lineages forgotten since the last compaction: their payloads are redacted
     /// from the log by the next one (W5).
     forgotten: Arc<std::sync::Mutex<std::collections::HashSet<(Memory, String)>>>,
@@ -741,8 +776,6 @@ pub struct DurableWrites<L: Log> {
     usage: Mutex<Option<std::collections::HashMap<String, (u64, u64)>>>,
     /// B4: the commit times compaction must keep readable (branch points), per namespace.
     pins: std::sync::OnceLock<Pins>,
-    /// B4, on the org's engine: its branch engines, which a FORGET on main reaches too.
-    branch_host: std::sync::OnceLock<Arc<crate::branch_engine::BranchHost>>,
     /// Entity aliases (GR-12): a merged entity's key → the entity it merged into,
     /// from the survivors' `aliases` fields at open, kept by MERGE and FORGET.
     aliases: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -847,7 +880,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         if ids.is_empty() {
             return Ok(None);
         }
-        let mut fields = match data {
+        let fields = match data {
             serde_json::Value::Object(map) => map.clone(),
             other => {
                 let mut m = serde_json::Map::new();
@@ -855,9 +888,6 @@ impl<L: Log + 'static> DurableWrites<L> {
                 m
             }
         };
-        if memory_type == MemoryType::Semantic {
-            normalize_validity(&mut fields, None)?;
-        }
         let mut current = Vec::new();
         if supersedes(memory_type) {
             for key in &ids {
@@ -936,6 +966,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             ids.extend(self.entity_facts(&ids, in_scope).await?);
         }
         let m: Memory = memory_type.into();
+        // A record that is now another's alias leaves its links to that record: the
+        // slow path does that (rare).
+        if memory_type == MemoryType::Semantic && ids.iter().any(|id| self.alias_of(id).is_some()) {
+            return Ok(None);
+        }
         let mut keys: Vec<(Memory, String)> = ids.iter().map(|k| (m, k.clone())).collect();
         if memory_type == MemoryType::Semantic {
             keys.extend(entities.iter().map(|k| (m, refs_key(k))));
@@ -969,25 +1004,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         crate::steps::lap("forget.4 submit under lock", &mut t);
         self.committed(record.offset.0, wait).await?;
         crate::steps::lap("forget.5 commit wait", &mut t);
-        self.forget_on_branches(memory_type, &ids).await?;
-        crate::steps::lap("forget.6 branches", &mut t);
         Ok(Some(ids.len() as u64))
-    }
-
-    /// A FORGET on main reaches every branch's own engine (B4): forgotten means gone
-    /// everywhere. A branch in a pod that can't be reached now erases them when it
-    /// starts (B6).
-    async fn forget_on_branches(&self, memory_type: MemoryType, ids: &[String]) -> AdbResult<()> {
-        if let Some(host) = self.branch_host.get() {
-            let unreachable = host.forget(memory_type, ids).await.map_err(|e| {
-                AdbError::Internal(format!("forgotten on main, but a branch still holds a copy: {e}"))
-            })?;
-            for b in unreachable {
-                let pending = crate::branches::PendingForget { memory: memory_type, lineages: ids.to_vec() };
-                self.branch_change(&b.namespace, &b.name, |b| b.pending_forgets.push(pending)).await?;
-            }
-        }
-        Ok(())
     }
 
     /// Commit `batch` under the sequencer (see [`Self::platform_many`]).
@@ -1266,22 +1283,6 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok((off, ts))
     }
 
-    pub async fn branch_create(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>) -> AdbResult<crate::branches::Branch> {
-        self.branch_create_at(namespace, name, parent, created_by, None).await
-    }
-
-    /// As [`Self::branch_create`], with the branch point given (a branch of a branch:
-    /// its point is on the parent branch's own log, not the org's).
-    pub async fn branch_create_at(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>, point: Option<(u64, CommitTs)>) -> AdbResult<crate::branches::Branch> {
-        self.branch_create_in(namespace, name, parent, created_by, point, None).await
-    }
-
-    /// DB-9: cut a branch of main at a past point (a tag or an offset). The point is
-    /// checked and the branch's pin registered under the sequencer's lock.
-    pub async fn branch_create_past(&self, namespace: &str, name: &str, created_by: Option<&str>, at: &crate::branches::PointRef) -> AdbResult<crate::branches::Branch> {
-        self.branch_create_in(namespace, name, None, created_by, None, Some(at)).await
-    }
-
     /// DB-9: the (offset, time) a past point names.
     pub async fn resolve_point(&self, namespace: &str, at: &crate::branches::PointRef) -> AdbResult<(u64, CommitTs)> {
         let seq = seq_lock!(self);
@@ -1309,44 +1310,6 @@ impl<L: Log + 'static> DurableWrites<L> {
             return Err(AdbError::QueryError(format!("point_too_old: offset {off} is older than the {} days of versions kept: use a tag", HISTORY.as_secs() / 86_400)));
         }
         Ok((off, ts))
-    }
-
-    async fn branch_create_in(&self, namespace: &str, name: &str, parent: Option<&str>, created_by: Option<&str>, point: Option<(u64, CommitTs)>, at: Option<&crate::branches::PointRef>) -> AdbResult<crate::branches::Branch> {
-        use crate::branches::{check_name, Branch, MAIN};
-        check_name(name).map_err(AdbError::QueryError)?;
-        let parent = parent.filter(|p| !p.is_empty()).unwrap_or(MAIN);
-        if parent != MAIN && self.branches.get(namespace, parent).is_none() {
-            return Err(AdbError::QueryError(format!("no branch {parent:?} in namespace {namespace:?} to branch from")));
-        }
-        if self.branches.get(namespace, name).is_some() {
-            return Err(AdbError::QueryError(format!("namespace {namespace:?} already has a branch {name:?}")));
-        }
-        let mut seq = seq_lock!(self);
-        let (point_offset, point_ts) = match (point, at) {
-            (Some(p), _) => p,
-            (None, Some(a)) => self.point_of(&seq, namespace, a).await?,
-            (None, None) => self.last_point(&seq).await?,
-        };
-        let id = RecordId(Branch::id_of(namespace, name));
-        let b = Branch {
-            id: id.0.clone(),
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            parent: parent.to_string(),
-            point_offset,
-            point_ts: point_ts.0,
-            created_by: created_by.map(String::from),
-            placement: None,
-            pending_forgets: Vec::new(),
-        };
-        self.register_branch(&mut seq, &b).await?;
-        Ok(b)
-    }
-
-    /// Log `b` as the branch's control row (a new one, or its new state: the row of
-    /// that id is replaced).
-    async fn register_branch(&self, seq: &mut Sequencer<L>, b: &crate::branches::Branch) -> AdbResult<()> {
-        self.register_control(seq, &b.id, &b.namespace, serde_json::to_value(b).unwrap_or_default()).await
     }
 
     /// A `branch`-kind control row (a branch, tag or layer list, by its id's prefix).
@@ -1429,7 +1392,7 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// the sequencer lock, so a flood can't slip past between check and write. Branch engines
     /// have none: their writes aren't the org's storage.
     async fn check_quota(&self, namespace: Option<&str>, bytes: u64) -> AdbResult<()> {
-        let Some(ns) = namespace.filter(|_| self.parent.is_none()) else { return Ok(()) };
+        let Some(ns) = namespace else { return Ok(()) };
         let view = self.space_view();
         let quotas: Vec<_> = view.quotas().await?.into_iter().filter(|q| q.covers(ns)).collect();
         if quotas.is_empty() {
@@ -1491,6 +1454,123 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(t)
     }
 
+    /// AQL v0.13 BRANCH / FORK: a tag on `namespace` at `at` (now when `None`): it holds
+    /// the point a branch reads through to. A past point must be within the history
+    /// kept (`HISTORY`).
+    pub async fn tag_create_at(&self, namespace: &str, name: &str, at: Option<CommitTs>) -> AdbResult<crate::branches::Tag> {
+        let mut seq = seq_lock!(self);
+        let (last_offset, last_ts) = self.last_point(&seq).await?;
+        let (point_offset, point_ts) = match at {
+            Some(t) if t.0 < last_ts.0 => {
+                let kept_from = CommitTs::from_datetime(time::now()).0 - HISTORY.as_micros() as i64;
+                if t.0 < kept_from {
+                    return Err(AdbError::QueryError(format!("AS OF: older than the {} days of versions kept", HISTORY.as_secs() / 86_400)));
+                }
+                (0, t.0)
+            }
+            _ => (last_offset, last_ts.0),
+        };
+        let t = crate::branches::Tag {
+            id: crate::branches::Tag::id_of(namespace, name),
+            namespace: namespace.into(),
+            name: name.into(),
+            point_offset,
+            point_ts,
+            created_by: None,
+        };
+        self.register_control(&mut seq, &t.id, namespace, serde_json::to_value(&t).unwrap_or_default()).await?;
+        Ok(t)
+    }
+
+    /// AQL v0.13 MERGE: write into `namespace` (its own records) in one log record:
+    /// per op, the source's record for a key (a new version of the namespace's own
+    /// record of that key, or a new record), or `None` to remove the namespace's own
+    /// record of that key. A link's two ends are re-pointed into `namespace`.
+    pub async fn merge_apply(&self, namespace: &str, ops: Vec<MergeWrite>) -> AdbResult<u64> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let mut seq = seq_lock!(self);
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let ts = seq.begin();
+        // An id of the table (`<memory tag>:<record id>`) or a record id, in `namespace`.
+        let here = |id: &str| adb_store::namespaced(Some(namespace), adb_store::without_namespace(adb_store::key_of(id)));
+        let mut effects = Vec::new();
+        for op in &ops {
+            let lineage = here(&op.key);
+            match (&op.current, &op.source) {
+                (cur, Some(src)) => {
+                    let mut data = src.data.clone();
+                    data.namespace = Some(namespace.to_string());
+                    for e in [&mut data.subject_id, &mut data.object_id].into_iter().flatten() {
+                        *e = here(e);
+                    }
+                    let new = |id: RecordId, version: u32| NewRow { id, lineage_id: RecordId(lineage.clone()), version, data: data.clone() };
+                    effects.push(match cur {
+                        Some(c) => Effect::Supersede { old: RecordId(adb_store::key_of(&c.id).to_string()), new: new(seq.new_id(ts), c.version + 1) },
+                        None => match data.kind {
+                            Kind::Edge => Effect::PutEdge(new(RecordId(lineage.clone()), 1)),
+                            Kind::Fact => Effect::PutFact(new(RecordId(lineage.clone()), 1)),
+                            Kind::Tool => Effect::PutTool(new(RecordId(lineage.clone()), 1)),
+                            Kind::Episode => Effect::PutEpisode(new(RecordId(lineage.clone()), 1)),
+                            _ => Effect::PutEntity(new(RecordId(lineage.clone()), 1)),
+                        },
+                    });
+                }
+                (Some(_), None) => effects.push(Effect::Forget { memory: op.memory, lineage_id: RecordId(lineage) }),
+                (None, None) => {}
+            }
+        }
+        let n = effects.len() as u64;
+        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
+        self.keys_gone(&effects);
+        self.note_forgotten(effects.iter().filter_map(|e| match e {
+            Effect::Forget { memory, lineage_id } => Some((*memory, lineage_id.0.clone())),
+            _ => None,
+        }));
+        self.to_store(&record).await;
+        Ok(n)
+    }
+
+    /// A control record of `namespace` (`id`, e.g. `merge:<ns>/<id>`): a merge's
+    /// entries, for its revert. Kept in the table like branch rows.
+    pub async fn record_put(&self, namespace: &str, id: &str, value: serde_json::Value) -> AdbResult<()> {
+        let mut seq = seq_lock!(self);
+        let mut v = value;
+        if let Some(m) = v.as_object_mut() {
+            m.insert("id".into(), serde_json::Value::String(id.to_string()));
+        }
+        self.register_control(&mut seq, id, namespace, v).await
+    }
+
+    /// The control records whose id starts with `prefix`.
+    pub async fn records(&self, prefix: &str) -> AdbResult<Vec<serde_json::Value>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let rows = store.current(Some("kind = 'branch'"), CommitTs::from_datetime(time::now())).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
+        Ok(rows.into_iter().map(|r| r.data.value).filter(|v| v.get("id").and_then(|i| i.as_str()).is_some_and(|i| i.starts_with(prefix))).collect())
+    }
+
+    /// AQL v0.13: record `b` (`base:<namespace>`), or drop it (`None` for `namespace`).
+    pub async fn base_set(&self, namespace: &str, b: Option<&crate::branches::Base>) -> AdbResult<()> {
+        let mut seq = seq_lock!(self);
+        match b {
+            Some(b) => self.register_control(&mut seq, &b.id, &b.namespace, serde_json::to_value(b).unwrap_or_default()).await,
+            None => {
+                let ts = seq.begin();
+                let effect = Effect::Unregister { id: RecordId(crate::branches::Base::id_of(namespace)) };
+                let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
+                self.branches.apply(&record);
+                self.to_store(&record).await;
+                Ok(())
+            }
+        }
+    }
+
     /// B7: drop a tag (refused while a pinned layer reads it).
     pub async fn tag_drop(&self, namespace: &str, name: &str) -> AdbResult<bool> {
         if self.branches.tag(namespace, name).is_none() {
@@ -1516,9 +1596,6 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// TOOLS only.
     pub async fn layers_set(&self, namespace: &str, layers: Vec<crate::branches::Layer>) -> AdbResult<crate::branches::Layers> {
         use crate::branches::LayerMode;
-        if self.parent.is_some() {
-            return Err(AdbError::QueryError("layers are set on the org's engine".into()));
-        }
         let view = self.space_view();
         for l in &layers {
             if l.space == namespace {
@@ -1602,40 +1679,12 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
     }
 
-    /// Change a branch's control row (B6: placement, pending FORGETs) under the
-    /// sequencer lock. `None` when there is no such branch.
-    pub async fn branch_change(&self, namespace: &str, name: &str, change: impl FnOnce(&mut crate::branches::Branch)) -> AdbResult<Option<crate::branches::Branch>> {
-        let mut seq = seq_lock!(self);
-        let Some(mut b) = self.branches.get(namespace, name) else { return Ok(None) };
-        change(&mut b);
-        self.register_branch(&mut seq, &b).await?;
-        Ok(Some(b))
-    }
-
-    /// Drop a branch (its own writes stay in the log until compaction; B4 erases them).
-    pub async fn branch_drop(&self, namespace: &str, name: &str) -> AdbResult<bool> {
-        if self.branches.get(namespace, name).is_none() {
-            return Ok(false);
-        }
-        if self.branches.has_children(namespace, name) {
-            return Err(AdbError::QueryError(format!("branch {name:?} has branches of its own: drop them first")));
-        }
-        let mut seq = seq_lock!(self);
-        let ts = seq.begin();
-        let effect = Effect::Unregister { id: RecordId(crate::branches::Branch::id_of(namespace, name)) };
-        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-        self.branches.apply(&record);
-        self.to_store(&record).await;
-        Ok(true)
-    }
-
     pub fn branches(&self) -> &Arc<crate::branches::Branches> {
         &self.branches
     }
 
-    /// Make this a branch engine's writes (B3): reads for targets and key checks go
-    /// through the overlay; a parent record changed or deleted gets a row in this table.
-    /// What compaction keeps for open branches (B4); set once when the engine opens.
+    /// What compaction keeps for tags, and so for the branches and forks whose points
+    /// they hold (B4); set once when the engine opens.
     pub fn set_pins(&self, pins: Pins) {
         let _ = self.pins.set(pins);
     }
@@ -1646,9 +1695,6 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// (NS ids); links and control rows are not copied. `namespace` must hold no
     /// records yet. Returns how many records were written.
     pub async fn materialise(&self, namespace: &str, rows: Vec<adb_store::StoredRow>) -> AdbResult<u64> {
-        if self.parent.is_some() {
-            return Err(AdbError::QueryError("a new agent is written on the org's engine, not a branch's".into()));
-        }
         if !adb_store::valid_namespace(namespace) {
             return Err(AdbError::QueryError(format!("namespace {namespace:?}: can't be empty or contain '|' or '~'")));
         }
@@ -1702,139 +1748,6 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(n)
     }
 
-    /// DB-19: apply merge `ops` to `namespace`'s main records in one log record, with
-    /// `merge_row` appended to the append-only platform table [`MERGES`] in the same
-    /// record. Each op names the main row it expects to replace (or none): if main moved
-    /// since, nothing is written and the lineages that moved are returned as
-    /// `merge_stale`. Returns the record's offset and, per op, the row it wrote (`after`).
-    pub async fn merge_rows(&self, ops: Vec<MergeOp>, mut merge_row: serde_json::Map<String, serde_json::Value>) -> AdbResult<(u64, Vec<Option<String>>)> {
-        if self.parent.is_some() {
-            return Err(AdbError::QueryError("merges are written on the org's engine, not a branch's".into()));
-        }
-        let Some(store) = &self.store else { return Err(needs_table("merge")) };
-        let platform = self.platform.as_ref().ok_or_else(|| needs_table("merge"))?;
-        let mut seq = seq_lock!(self);
-        if let Some(b) = self.barrier() {
-            b.wait_for_committed().await;
-        }
-        let ts = seq.begin();
-        // Main as it is now, under the sequencer lock: nothing can move it until we log.
-        let mut stale = Vec::new();
-        for op in &ops {
-            let now = store
-                .current_version(op.memory.into(), adb_store::key_of(&op.lineage), ts)
-                .await
-                .map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-            if now.as_ref().map(|r| &r.id) != op.main.as_ref().map(|r| &r.id) {
-                stale.push(op.lineage.clone());
-            }
-        }
-        if !stale.is_empty() {
-            return Err(AdbError::QueryError(format!("merge_stale: main changed {} since the conflicts were read: {}", stale.len(), stale.join(", "))));
-        }
-        let mut effects = Vec::new();
-        let mut after = Vec::new();
-        let mut keys = Vec::new();
-        for op in &ops {
-            match (&op.main, &op.value) {
-                (Some(m), Some(v)) => {
-                    let mut data = m.data.clone();
-                    data.value = v.clone();
-                    data.text = v.get("content").and_then(|c| c.as_str()).map(String::from);
-                    data.embedding = None;
-                    // The bare key, as UPDATE writes it (the store adds the memory prefix).
-                    let new = NewRow { id: seq.new_id(ts), lineage_id: RecordId(adb_store::key_of(&m.lineage_id).to_string()), version: m.version + 1, data };
-                    after.push(Some(new.id.0.clone()));
-                    effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&m.id).to_string()), new });
-                }
-                (None, Some(v)) => {
-                    let template = op.template.as_ref().ok_or_else(|| AdbError::Internal(format!("merge: no row to add for {}", op.lineage)))?;
-                    let mut data = template.data.clone();
-                    data.value = v.clone();
-                    data.text = v.get("content").and_then(|c| c.as_str()).map(String::from);
-                    data.embedding = None;
-                    // A lineage that had versions (re-added by a revert) continues them.
-                    let (id, version) = match op.prev_version {
-                        Some(p) => (seq.new_id(ts), p + 1),
-                        None => (RecordId(adb_store::key_of(&op.lineage).to_string()), 1),
-                    };
-                    let new = NewRow { id, lineage_id: RecordId(adb_store::key_of(&op.lineage).to_string()), version, data };
-                    if unique_keys(op.memory) {
-                        keys.push(((new.data.memory, new.lineage_id.0.clone()), new.data.ttl_at));
-                    }
-                    after.push(Some(new.id.0.clone()));
-                    effects.push(match new.data.kind {
-                        Kind::Fact => Effect::PutFact(new),
-                        Kind::Tool => Effect::PutTool(new),
-                        Kind::Episode => Effect::PutEpisode(new),
-                        _ => Effect::PutEntity(new),
-                    });
-                }
-                (Some(m), None) => {
-                    after.push(None);
-                    effects.push(Effect::Expire { memory: m.data.memory, lineage_id: RecordId(adb_store::key_of(&m.lineage_id).to_string()) });
-                }
-                (None, None) => after.push(None),
-            }
-        }
-        let entries: Vec<serde_json::Value> = ops
-            .iter()
-            .zip(&after)
-            .map(|(op, a)| serde_json::json!({ "memory": op.memory, "lineage": op.lineage, "before": op.main, "after": a, "template": op.main.is_none().then_some(op.template.clone()).flatten() }))
-            .collect();
-        merge_row.insert("entries".into(), serde_json::Value::String(serde_json::Value::Array(entries).to_string()));
-        merge_row.insert("at".into(), serde_json::json!(time::now().to_rfc3339()));
-        let table = vec![
-            Effect::TableCreate { table: MERGES.into(), columns: MERGE_COLUMNS.iter().map(|c| c.to_string()).collect() },
-            Effect::TableAppendOnly { table: MERGES.into() },
-            Effect::TableInsert { table: MERGES.into(), rows: vec![merge_row] },
-        ];
-        // Applied here, in order: everything the platform applier holds goes first (PF-4).
-        self.platform_settled(self.platform_last.load(std::sync::atomic::Ordering::SeqCst)).await;
-        platform.validate_all(&table).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
-        effects.extend(table);
-        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        self.platform_last.store(record.offset.0, std::sync::atomic::Ordering::SeqCst);
-        self.platform_applied.send_modify(|a| *a = (*a).max(record.offset.0));
-        platform.apply(&record).await.map_err(|e| AdbError::QueryError(e.to_string()))?;
-        self.live.lock().unwrap().extend(keys);
-        self.to_store(&record).await;
-        Ok((record.offset.0, after))
-    }
-
-    /// DB-11: on a branch engine, make `value` the branch's own row of `lineage` (a
-    /// rebase's edited resolution): a new version of its own row, or its first own row
-    /// over the parent's (`template`).
-    pub async fn branch_set_row(&self, memory: MemoryType, lineage: &str, value: serde_json::Value, template: &adb_store::StoredRow) -> AdbResult<u64> {
-        let Some(store) = &self.store else { return Err(needs_table("rebase")) };
-        let key = adb_store::key_of(lineage).to_string();
-        let mut seq = seq_lock!(self);
-        if let Some(b) = self.barrier() {
-            b.wait_for_committed().await;
-        }
-        let ts = seq.begin();
-        let own = store.current_version(memory.into(), &key, ts).await.map_err(|e| AdbError::Internal(format!("store: {e}")))?;
-        let mut data = own.as_ref().unwrap_or(template).data.clone();
-        data.text = value.get("content").and_then(|c| c.as_str()).map(String::from);
-        data.value = value;
-        data.embedding = None;
-        let version = own.as_ref().unwrap_or(template).version + 1;
-        let new = NewRow { id: seq.new_id(ts), lineage_id: RecordId(key), version, data };
-        let effect = match &own {
-            Some(o) => Effect::Supersede { old: RecordId(adb_store::key_of(&o.id).to_string()), new },
-            None => match new.data.kind {
-                Kind::Fact => Effect::PutFact(new),
-                Kind::Tool => Effect::PutTool(new),
-                Kind::Episode => Effect::PutEpisode(new),
-                _ => Effect::PutEntity(new),
-            },
-        };
-        let record = seq.append_record(ts, None, vec![effect]).await.map_err(log_err)?;
-        self.to_store(&record).await;
-        Ok(record.offset.0)
-    }
-
-    /// The org's branch engines (B4): a FORGET on main erases their copies too.
     /// Lineages forgotten but not yet redacted from the log (shared with
     /// [`RedactingLog`]).
     pub(crate) fn forgotten_set(&self) -> Arc<std::sync::Mutex<std::collections::HashSet<(Memory, String)>>> {
@@ -1877,69 +1790,32 @@ impl<L: Log + 'static> DurableWrites<L> {
         Ok(n)
     }
 
-    pub fn set_branch_host(&self, host: Arc<crate::branch_engine::BranchHost>) {
-        let _ = self.branch_host.set(host);
+    /// AQL v0.13: whether `namespace` is a branch (BRANCH FROM … INTO it): its writes
+    /// follow the branch rules against its base's records.
+    fn branch_ns<'a>(&self, namespace: Option<&'a str>) -> Option<&'a str> {
+        namespace.filter(|ns| self.branches.base_of(ns).is_some_and(|b| b.kind == crate::branches::BaseKind::Branch))
     }
 
-    /// B4: erase `lineages` (keys of `memory`) from this engine's own table, log and
-    /// history — a branch engine's copies of records FORGET removed on main. Only the
-    /// lineages it holds rows of (or edges to) are written. Returns how many.
-    pub async fn forget_lineages(&self, memory: MemoryType, lineages: &[String]) -> AdbResult<u64> {
-        let Some(store) = &self.store else { return Ok(0) };
-        if lineages.is_empty() {
-            return Ok(0);
-        }
-        let m = Memory::from(memory);
-        let by_row: std::collections::HashMap<String, &String> = lineages.iter().map(|k| (adb_store::row_id(m, k), k)).collect();
-        let mut seq = seq_lock!(self);
-        if let Some(b) = self.barrier() {
-            b.wait_for_committed().await;
-        }
-        let mut held = std::collections::BTreeSet::new();
-        let quoted: Vec<String> = by_row.keys().map(|r| adb_store::sql_str(r)).collect();
-        for chunk in quoted.chunks(500) {
-            let set = chunk.join(", ");
-            let filter = format!("lineage_id IN ({set}) OR subject_id IN ({set}) OR object_id IN ({set})");
-            for r in store.scan(Some(&filter)).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? {
-                for id in [Some(&r.lineage_id), r.data.subject_id.as_ref(), r.data.object_id.as_ref()].into_iter().flatten() {
-                    if let Some(k) = by_row.get(id) {
-                        held.insert((*k).clone());
-                    }
-                }
-            }
-        }
-        if held.is_empty() {
-            return Ok(0);
-        }
-        let ts = seq.begin();
-        let effects: Vec<Effect> = held.iter().map(|k| Effect::Forget { memory: m, lineage_id: RecordId(k.clone()) }).collect();
-        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
-        self.keys_gone(&effects);
-        self.note_forgotten(held.iter().map(|k| (m, k.clone())));
-        self.to_store(&record).await;
-        drop(seq);
-        Ok(held.len() as u64)
-    }
-
-    pub fn set_parent(&mut self, parent: Option<crate::branch_engine::ParentView>) {
-        self.parent = parent;
-    }
-
-    /// On a branch engine: the branch's view of `memory` matching `predicate`, each row
-    /// with `true` when it is in this (the branch's) table.
-    async fn branch_targets(&self, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs) -> AdbResult<Vec<(adb_store::StoredRow, bool)>> {
-        let (Some(store), Some(parent)) = (&self.store, &self.parent) else { return Ok(Vec::new()) };
-        let rows = crate::branch_engine::view(store, &self.barrier(), parent, memory, now).await?;
+    /// The view of the branch namespace `branch_ns` (AQL v0.13) of `memory` matching
+    /// `predicate`, each row with `true` when the branch itself holds it (else
+    /// inherited from its base). None without a branch.
+    async fn branch_targets_in(&self, memory: MemoryType, predicate: &Predicate, in_scope: Option<&str>, now: CommitTs, branch_ns: Option<&str>) -> AdbResult<Vec<(adb_store::StoredRow, bool)>> {
+        let Some(ns) = branch_ns else { return Ok(Vec::new()) };
+        let rows = self.space_view().rows_at(memory.into(), ns, now, now).await?;
         Ok(rows
             .into_iter()
+            .map(|r| {
+                let mine = r.data.namespace.as_deref() == Some(ns);
+                (r, mine)
+            })
             .filter(|(r, _)| in_scope.is_none_or(|s| r.data.scope == s))
             .filter(|(r, _)| crate::query::matches(memory, &crate::query::record(r), predicate))
             .collect())
     }
 
-    /// UPDATE / FORGET on a branch engine (B3), under the sequencer lock: the branch's
-    /// own row gets a new version; a parent's record gets an override row here in its
-    /// lineage (the parent untouched). FORGET writes `_branch_deleted` the same way.
+    /// UPDATE / FORGET in a branch namespace, under the sequencer lock: the branch's
+    /// own row gets a new version; a record inherited from its base gets an override
+    /// row in the branch (the base untouched). FORGET writes `_branch_deleted` the same way.
     #[allow(clippy::too_many_arguments)]
     async fn branch_write(
         &self,
@@ -1950,8 +1826,9 @@ impl<L: Log + 'static> DurableWrites<L> {
         in_scope: Option<&str>,
         fields: &serde_json::Map<String, serde_json::Value>,
         vector: Option<Vec<half::f16>>,
+        branch_ns: Option<&str>,
     ) -> AdbResult<u64> {
-        let rows = self.branch_targets(memory, predicate, in_scope, ts).await?;
+        let rows = self.branch_targets_in(memory, predicate, in_scope, ts, branch_ns).await?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1960,6 +1837,10 @@ impl<L: Log + 'static> DurableWrites<L> {
             let mut new = next_version(cur, fields, seq.new_id(ts));
             if vector.is_some() {
                 new.data.embedding = vector.clone();
+            }
+            // An inherited record's override is the branch namespace's own.
+            if let (false, Some(ns)) = (*mine, branch_ns) {
+                new.data.namespace = Some(ns.to_string());
             }
             effects.push(match (mine, memory) {
                 (true, _) => Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new },
@@ -2196,6 +2077,11 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// between just gets a vector it no longer needs. Returns how many.
     pub async fn embed_backfill(&self, batch: usize) -> AdbResult<u64> {
         let (Some(_), Some(embedder)) = (&self.store, &self.embedder) else { return Ok(0) };
+        // Rows waiting for a deferred vector are the deferred embedder's: no scan for
+        // them while it has work, or had some lately (they'd be found and embedded twice).
+        if self.embeds_queued() > 0 || self.deferred_at.lock().unwrap().is_some_and(|t| t.elapsed() < BACKFILL_AFTER_DEFERRED) {
+            return Ok(0);
+        }
         // PF-51: one scan fills a queue (memory, row id, text) and the batches come from
         // it; the table is scanned again only when the queue is empty. Scanning every
         // unembedded row for each batch of 64 pinned the leader's CPU for hours with
@@ -2214,7 +2100,12 @@ impl<L: Log + 'static> DurableWrites<L> {
         if todo.is_empty() {
             return Ok(0);
         }
-        let vectors = embedder.embed(todo.iter().map(|(_, _, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+        let vectors = embedder.embed_background(todo.iter().map(|(_, _, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+        self.commit_vectors(&todo, vectors).await
+    }
+
+    /// Commit `vectors` for `todo`'s records as one record of `Embed` effects.
+    async fn commit_vectors(&self, todo: &[(Memory, String, String)], vectors: Vec<Vec<f32>>) -> AdbResult<u64> {
         let effects: Vec<Effect> = todo
             .iter()
             .zip(vectors)
@@ -2226,6 +2117,64 @@ impl<L: Log + 'static> DurableWrites<L> {
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         self.to_store(&record).await;
         Ok(n)
+    }
+
+    /// Queue a stored record's text for its vector ([`defer_embedding`]).
+    fn embed_later(&self, memory: Memory, id: String, text: String) {
+        {
+            let mut q = self.embed_soon.lock().unwrap();
+            if q.len() >= EMBED_SOON_MAX {
+                tracing::debug!("deferred embeddings queue full: the backfill scan embeds the rest");
+                return;
+            }
+            q.push_back((memory, id, text));
+        }
+        *self.deferred_at.lock().unwrap() = Some(std::time::Instant::now());
+        self.embed_wake.notify_one();
+    }
+
+    /// Woken when a record is queued for its vector.
+    pub fn embed_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.embed_wake)
+    }
+
+    /// Records waiting for a deferred vector.
+    pub fn embeds_queued(&self) -> usize {
+        self.embed_soon.lock().unwrap().len()
+    }
+
+    /// Embed the queued records ([`defer_embedding`]) and commit their vectors, in
+    /// batches of [`EMBED_SOON_BATCH`], up to `ADB_EMBED_DEFER_PARALLEL` at a time.
+    /// Returns how many got a vector. A batch the model fails is left to the backfill
+    /// scan (the rows have no vector, which is what it looks for).
+    pub async fn embed_deferred(&self) -> AdbResult<u64> {
+        let Some(embedder) = &self.embedder else {
+            self.embed_soon.lock().unwrap().clear();
+            return Ok(0);
+        };
+        let mut done = 0;
+        loop {
+            let batches: Vec<Vec<(Memory, String, String)>> = {
+                let mut q = self.embed_soon.lock().unwrap();
+                let mut out = Vec::new();
+                while out.len() < embed_parallel() && !q.is_empty() {
+                    let n = EMBED_SOON_BATCH.min(q.len());
+                    out.push(q.drain(..n).collect());
+                }
+                out
+            };
+            if batches.is_empty() {
+                return Ok(done);
+            }
+            let calls = batches.iter().map(|b| embedder.embed_background(b.iter().map(|(_, _, t)| t.clone()).collect()));
+            let results = futures::future::join_all(calls).await;
+            for (batch, r) in batches.iter().zip(results) {
+                match r {
+                    Ok(vectors) => done += self.commit_vectors(batch, vectors).await?,
+                    Err(e) => tracing::warn!(error = %e, records = batch.len(), "deferred embedding failed; the backfill scan will retry"),
+                }
+            }
+        }
     }
 
     fn key_taken(&self, memory: Memory, key: &str, now: CommitTs) -> bool {
@@ -2304,27 +2253,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             .collect();
         steps.push(("ttl timers", t_step.elapsed()));
         let t_step = std::time::Instant::now();
-        // Bounds after the last commit: one that passed while ADB was down has no
-        // event yet, and gets it on the first tick. Only facts with a bound are read
-        // (PF-38: every live fact was decoded here, ~1.6M rows at a takeover).
-        let after = stats.last_commit_ts.map_or(i64::MIN, |t| t.0);
-        let bounded = datafusion::prelude::col("kind")
-            .eq(datafusion::prelude::lit("fact"))
-            .and(adb_store::filter::field_text("valid_from").is_not_null().or(adb_store::filter::field_text("valid_to").is_not_null()));
-        let bounds = store
-            .live_expr(Some(bounded), CommitTs::from_datetime(time::now()))
-            .await
-            .map_err(|e| AdbError::Internal(format!("store: {e}")))?
-            .into_iter()
-            .flat_map(|r| validity_bounds(&r.data.value).into_iter().filter(|t| *t > after).map(move |t| (t, r.lineage_id.clone())))
-            .collect();
-        steps.push(("validity bounds", t_step.elapsed()));
-        let t_step = std::time::Instant::now();
         let aliases = load_aliases(&store).await?;
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), parent: None, platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), branch_host: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), bounds: std::sync::Mutex::new(bounds), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), embed_soon: Default::default(), embed_wake: Default::default(), deferred_at: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).
@@ -2437,6 +2370,44 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// GR-13: the facts about the entities among `ids` (as subject or object), every
     /// version, not already in `ids`: forgetting an entity forgets them too, in the
     /// same record. With `in_scope`, only facts of that scope.
+    /// The links of the SEMANTIC records `ids` that are now aliases of other records,
+    /// as new links of those records (ends re-pointed; ones they have already, or that
+    /// would join a record to itself, skipped).
+    async fn links_to_survivors(&self, seq: &mut Sequencer<L>, ts: CommitTs, ids: &[String]) -> AdbResult<Vec<Effect>> {
+        let Some(store) = &self.store else { return Ok(Vec::new()) };
+        let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(to) = self.alias_of(id) else { continue };
+            let end = adb_store::sql_str(&adb_store::row_id(Memory::Semantic, id));
+            let edges = store.live(Some(&format!("kind = 'edge' AND (subject_id = {end} OR object_id = {end})")), ts).await.map_err(err)?;
+            let to_row = adb_store::row_id(Memory::Semantic, &to);
+            let theirs: std::collections::HashSet<(String, String, Option<String>)> = {
+                let mine = adb_store::sql_str(&to_row);
+                store
+                    .live(Some(&format!("kind = 'edge' AND (subject_id = {mine} OR object_id = {mine})")), ts)
+                    .await
+                    .map_err(err)?
+                    .into_iter()
+                    .map(|e| (e.data.subject_id.unwrap_or_default(), e.data.object_id.unwrap_or_default(), e.data.link_type))
+                    .collect()
+            };
+            for e in edges {
+                let swap = |x: &Option<String>| x.as_deref().map(|v| if adb_store::sql_str(v) == end { to.clone() } else { adb_store::key_of(v).to_string() });
+                let mut d = e.data.clone();
+                d.subject_id = swap(&e.data.subject_id);
+                d.object_id = swap(&e.data.object_id);
+                let n = NewRow { id: seq.new_id(ts), lineage_id: RecordId(String::new()), version: 1, data: d };
+                let q = adb_store::qualified(&n);
+                if q.data.subject_id == q.data.object_id || theirs.contains(&(q.data.subject_id.clone().unwrap_or_default(), q.data.object_id.clone().unwrap_or_default(), q.data.link_type.clone())) {
+                    continue;
+                }
+                out.push(Effect::PutEdge(NewRow { lineage_id: n.id.clone(), ..n }));
+            }
+        }
+        Ok(out)
+    }
+
     async fn entity_facts(&self, ids: &[String], in_scope: Option<&str>) -> AdbResult<Vec<String>> {
         let Some(store) = &self.store else { return Ok(Vec::new()) };
         let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
@@ -2469,7 +2440,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         let Some(store) = &self.store else { return Ok(0) };
         let now = CommitTs::from_datetime(time::now());
         let due = |set: &std::sync::Mutex<std::collections::BTreeSet<(i64, String)>>| set.lock().unwrap().first().is_some_and(|(t, _)| *t <= now.0);
-        if !due(&self.timers) && !due(&self.bounds) {
+        if !due(&self.timers) {
             return Ok(0);
         }
         let mut seq = seq_lock!(self);
@@ -2491,27 +2462,6 @@ impl<L: Log + 'static> DurableWrites<L> {
             if let Some(r) = store.ttl_version(lineage).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? {
                 if r.data.ttl_at.is_some_and(|t| t <= ts) {
                     effects.push(Effect::Expire { memory: r.data.memory, lineage_id: RecordId(r.key().to_string()) });
-                }
-            }
-        }
-        let bounds: Vec<(i64, String)> = {
-            let mut bounds = self.bounds.lock().unwrap();
-            let mut out = Vec::new();
-            while out.len() < EXPIRE_BATCH && bounds.first().is_some_and(|(t, _)| *t <= ts.0) {
-                out.push(bounds.pop_first().expect("checked"));
-            }
-            out
-        };
-        for (t, lineage) in &bounds {
-            // Still the live version's bound (a newer version or FORGET may have moved it).
-            let Some(r) = store.ttl_version(lineage).await.map_err(|e| AdbError::Internal(format!("store: {e}")))? else { continue };
-            if r.data.kind != Kind::Fact || effects.iter().any(|e| matches!(e, Effect::Expire { lineage_id, .. } if lineage_id.0 == r.key())) {
-                continue;
-            }
-            let (from, to) = adb_core::time::validity(&r.data.value);
-            for (bound, holds) in [(from, true), (to, false)] {
-                if bound == Some(*t) {
-                    effects.push(Effect::Validity { memory: r.data.memory, lineage_id: RecordId(r.key().to_string()), holds });
                 }
             }
         }
@@ -2915,19 +2865,11 @@ impl<L: Log + 'static> DurableWrites<L> {
         self.last_off.fetch_max(record.offset.0, std::sync::atomic::Ordering::SeqCst);
         self.last_ts.fetch_max(record.commit_ts.0, std::sync::atomic::Ordering::SeqCst);
         let (Some(_), Some(applier)) = (&self.store, &self.applier) else { return };
-        // TTL timers (W9.12) for records written with one; validity timers for facts
-        // with a bound ahead (AQL v0.10).
+        // TTL timers (W9.12) for records written with one.
         for e in &record.effects {
             if let Effect::PutEntity(n) | Effect::PutFact(n) | Effect::PutEpisode(n) | Effect::PutTool(n) | Effect::Supersede { new: n, .. } = e {
                 if let Some(t) = n.data.ttl_at {
                     self.timers.lock().unwrap().insert((t.0, adb_store::row_id(n.data.memory, &n.lineage_id.0)));
-                }
-                if n.data.kind == Kind::Fact {
-                    let lineage = adb_store::row_id(n.data.memory, &n.lineage_id.0);
-                    let mut bounds = self.bounds.lock().unwrap();
-                    for t in validity_bounds(&n.data.value).into_iter().filter(|t| *t > record.commit_ts.0) {
-                        bounds.insert((t, lineage.clone()));
-                    }
                 }
             }
         }
@@ -3060,24 +3002,20 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     ) -> AdbResult<MemoryRecord> {
         check_scope(memory_type, in_scope)?;
         let mut t = std::time::Instant::now();
-        // Embedded before the sequencer, so the model doesn't serialise writes (T4).
-        let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
-            true => self.vector_of(crate::reads::embed_text(memory_type, &payload)).await,
+        // Embedded before the sequencer, so the model doesn't serialise writes (T4) —
+        // or after the commit, without the writer waiting ([`defer_embedding`]).
+        let text = match crate::reads::lance_owned(memory_type) && self.store.is_some() && self.embedder.is_some() {
+            true => crate::reads::embed_text(memory_type, &payload),
             false => None,
         };
-        crate::steps::lap("store.1 embed", &mut t);
-        // A branch engine's records belong to its namespace (B3).
-        let namespace = match &self.parent {
-            Some(p) => match namespace {
-                Some(ns) if ns != p.namespace => return Err(AdbError::QueryError(format!("branch {:?} belongs to namespace {:?}, not {ns:?}", p.branch, p.namespace))),
-                _ => Some(p.namespace.as_str()),
-            },
-            None => namespace,
+        let defer = text.is_some() && defer_embedding(memory_type);
+        let vector = match defer {
+            true => None,
+            false => self.vector_of(text.clone()).await,
         };
-        if self.parent.is_none() {
-            let bare = scoped_key(None, in_scope, &store_id(memory_type, key, &payload))?;
-            self.check_sealed(memory_type, namespace, &bare, None, CommitTs::from_datetime(time::now())).await?;
-        }
+        crate::steps::lap("store.1 embed", &mut t);
+        let bare = scoped_key(None, in_scope, &store_id(memory_type, key, &payload))?;
+        self.check_sealed(memory_type, namespace, &bare, None, CommitTs::from_datetime(time::now())).await?;
         let bytes = payload.to_string().len() as u64;
         self.writable()?;
         crate::steps::lap("store.2 sealed check", &mut t);
@@ -3087,9 +3025,12 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         self.check_quota(namespace, bytes).await?;
         let ts = seq.begin();
         let id = RecordId(scoped_key(namespace, in_scope, &store_id(memory_type, key, &payload))?);
-        if self.parent.is_some() && caller_keyed(memory_type, &payload) {
-            let seen = self.branch_targets(memory_type, &Predicate::Where { conditions: Vec::new() }, None, ts).await?;
-            if seen.iter().any(|(r, _)| adb_store::key_of(&r.lineage_id) == id.0) {
+        let branch_ns = self.branch_ns(namespace);
+        // A key the branch inherits can't be stored again: one keyed lookup through the
+        // branch and its bases (it read every row of the branch's view per STORE).
+        if let (Some(ns), true) = (branch_ns, caller_keyed(memory_type, &payload)) {
+            let bare = adb_store::without_namespace(&id.0);
+            if self.space_view().key_at(memory_type.into(), ns, bare, ts, ts).await?.is_some() {
                 return Err(AdbError::QueryError(format!("{} exists on this branch (from it or its parent): UPDATE it to change it on the branch", id.0)));
             }
         }
@@ -3136,129 +3077,9 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         crate::steps::lap("store.7 quota note + release", &mut t);
         self.committed(record.offset.0, wait).await?;
         crate::steps::lap("store.8 commit wait", &mut t);
-        Ok(stored)
-    }
-
-    async fn store_fact(
-        &self,
-        mut payload: serde_json::Value,
-        multi: bool,
-        scope: Scope,
-        namespace: Option<&str>,
-        ttl: Option<Duration>,
-        in_scope: Option<&str>,
-    ) -> AdbResult<MemoryRecord> {
-        let memory = MemoryType::Semantic;
-        check_scope(memory, in_scope)?;
-        let field = |f: &str| payload.get(f).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from);
-        let (Some(subject), Some(predicate)) = (field("subject"), field("predicate")) else {
-            return Err(AdbError::InvalidSyntax("FACT needs subject and predicate".into()));
-        };
-        // The ends' record ids in the fact's scope (E-L12); a merged entity's key
-        // names the entity it merged into (GR-12).
-        let subject_id = scoped_key(namespace, in_scope, &subject)?;
-        let subject_id = self.alias_of(&subject_id).unwrap_or(subject_id);
-        let object_id = field("object").map(|o| scoped_key(namespace, in_scope, &o)).transpose()?;
-        let object_id = object_id.map(|o| self.alias_of(&o).unwrap_or(o));
-        let subject = adb_store::unscoped(&subject_id).to_string();
-        let object = object_id.as_deref().map(|o| adb_store::unscoped(o).to_string());
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("subject".into(), serde_json::json!(subject));
-            if let Some(o) = &object {
-                obj.insert("object".into(), serde_json::json!(o));
-            }
+        if let (true, Some(text)) = (defer, text) {
+            self.embed_later(memory_type.into(), new.lineage_id.0.clone(), text);
         }
-        let value = payload.get("value").cloned();
-        let shown = match (&object, &value) {
-            (Some(o), _) => o.clone(),
-            (None, Some(v)) => v.as_str().map(String::from).unwrap_or_else(|| v.to_string()),
-            (None, None) => return Err(AdbError::InvalidSyntax("FACT needs object or value".into())),
-        };
-        let bare_key = fact_key(&subject, &predicate, multi.then_some(shown.as_str()));
-        if self.parent.is_none() {
-            let fk = adb_store::scoped_id(in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
-            self.check_sealed(memory, namespace, &fk, Some((subject.as_str(), predicate.as_str())), CommitTs::from_datetime(time::now())).await?;
-        }
-        let key = adb_store::space_id(namespace, in_scope.unwrap_or(adb_store::DEFAULT_SCOPE), &bare_key);
-        if let Some(obj) = payload.as_object_mut() {
-            normalize_validity(obj, None)?;
-            // On STORE a null bound is no bound.
-            obj.retain(|k, v| !(matches!(k.as_str(), "valid_from" | "valid_to") && v.is_null()));
-        }
-        let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("key".into(), serde_json::json!(bare_key));
-            obj.entry("content").or_insert_with(|| serde_json::json!(format!("{subject} {predicate} {shown}")));
-        }
-        let vector = match self.store.is_some() {
-            true => self.vector_of(crate::reads::embed_text(memory, &payload)).await,
-            false => None,
-        };
-        let fact_bytes = payload.to_string().len() as u64;
-        let mut seq = seq_lock!(self);
-        self.check_quota(namespace, fact_bytes).await?;
-        let ts = seq.begin();
-        let shaped = |kind: Kind, value: serde_json::Value| {
-            let mut d = row(memory, kind, value);
-            d.visibility = scope.into();
-            d.namespace = namespace.map(String::from);
-            if let Some(s) = in_scope {
-                d.scope = s.to_string();
-            }
-            d
-        };
-        let mut data = shaped(Kind::Fact, payload);
-        data.subject_id = Some(subject_id.clone());
-        data.predicate = Some(predicate.clone());
-        data.object_id = object_id.clone();
-        data.link_type = Some(predicate);
-        data.weight = Some(confidence);
-        data.embedding = vector;
-        data.ttl_at = ttl.map(|d| CommitTs(ts.0 + d.as_micros() as i64));
-        let mut effects = Vec::new();
-        // Entities at the fact's ends, created when missing (stubs: key and name).
-        let mut entities: Vec<String> = Vec::new();
-        for e in std::iter::once(&subject_id).chain(object_id.iter()) {
-            if !self.key_taken(memory.into(), e, ts) && !entities.contains(e) {
-                entities.push(e.clone());
-                let id = RecordId(e.clone());
-                let bare = adb_store::unscoped(e);
-                let stub = shaped(Kind::Entity, serde_json::json!({ "key": bare, "name": bare }));
-                effects.push(Effect::PutEntity(NewRow { id: id.clone(), lineage_id: id, version: 1, data: stub }));
-            }
-        }
-        let new = match (self.key_taken(memory.into(), &key, ts), &self.store) {
-            (true, Some(store)) => {
-                if let Some(b) = self.barrier() {
-                    b.wait_for_committed().await;
-                }
-                let cur = store
-                    .current_version(memory.into(), &key, ts)
-                    .await
-                    .map_err(|e| AdbError::Internal(format!("store: {e}")))?
-                    .ok_or_else(|| AdbError::Internal(format!("fact {key}: no current version in Lance")))?;
-                let new = NewRow { id: seq.new_id(ts), lineage_id: RecordId(key.clone()), version: cur.version + 1, data };
-                effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&cur.id).to_string()), new: new.clone() });
-                new
-            }
-            _ => {
-                let id = RecordId(key.clone());
-                let new = NewRow { id: id.clone(), lineage_id: id, version: 1, data };
-                effects.push(Effect::PutFact(new.clone()));
-                new
-            }
-        };
-        let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
-        if self.store.is_some() {
-            let mut live = self.live.lock().unwrap();
-            live.insert((memory.into(), key.clone()), new.data.ttl_at);
-            for e in entities {
-                live.insert((memory.into(), e), None);
-            }
-        }
-        let stored = crate::query::record(&adb_store::StoredRow::from_new(&adb_store::qualified(&new), ts, 0, 0));
-        self.to_store(&record).await;
-        self.note_stored(namespace, fact_bytes).await;
         Ok(stored)
     }
 
@@ -3269,7 +3090,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             false => None,
         };
         self.writable()?;
-        if self.parent.is_none() && self.store.is_some() {
+        let branch_ns = self.branch_ns(namespace);
+        if branch_ns.is_none() && self.store.is_some() {
             if crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
                 if let Some(n) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
                     return Ok(n);
@@ -3282,8 +3104,8 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         let mut seq = seq_lock!(self);
         tracing::debug!(target: "adb::write", ?memory_type, lock_us = t0.elapsed().as_micros() as u64, "update locked");
         let ts = seq.begin();
-        if self.parent.is_some() {
-            let mut fields = match &data {
+        if branch_ns.is_some() {
+            let fields = match &data {
                 serde_json::Value::Object(map) => map.clone(),
                 other => {
                     let mut m = serde_json::Map::new();
@@ -3291,16 +3113,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                     m
                 }
             };
-            if memory_type == MemoryType::Semantic {
-                normalize_validity(&mut fields, None)?;
-            }
-            return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, vector).await;
+            return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, vector, branch_ns).await;
         }
         let ids = self.targets(memory_type, predicate, ts, false, in_scope, namespace).await?;
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut fields = match &data {
+        let fields = match &data {
             serde_json::Value::Object(map) => map.clone(),
             other => {
                 let mut m = serde_json::Map::new();
@@ -3308,9 +3127,6 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                 m
             }
         };
-        if memory_type == MemoryType::Semantic {
-            normalize_validity(&mut fields, None)?;
-        }
         if let (Some(store), true) = (&self.store, supersedes(memory_type)) {
             // `targets` waited for the applier, so the current versions read here
             // are the ones this update follows.
@@ -3353,22 +3169,23 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
 
     async fn forget(&self, memory_type: MemoryType, predicate: &Predicate, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
         self.writable()?;
-        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_none() {
+        let branch_ns = self.branch_ns(namespace);
+        if self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_none() {
             slow_write_allowed(memory_type, "FORGET")?;
         }
-        if self.parent.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
+        if branch_ns.is_none() && self.store.is_some() && crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
             if let Some(n) = self.forget_prepared(memory_type, predicate, in_scope, namespace).await? {
                 return Ok(n);
             }
         }
         let mut seq = seq_lock!(self);
         let ts = seq.begin();
-        // On a branch engine (B3): a delete marker hides the record on the branch; the
-        // parent keeps it (erasing data for good is FORGET on main).
-        if self.parent.is_some() {
+        // In a branch namespace: a delete marker hides the record on the branch; the
+        // base keeps it (erasing data for good is FORGET on the base).
+        if branch_ns.is_some() {
             let mut fields = serde_json::Map::new();
             fields.insert("_branch_deleted".into(), serde_json::Value::Bool(true));
-            return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, None).await;
+            return self.branch_write(&mut seq, ts, memory_type, predicate, in_scope, &fields, None, branch_ns).await;
         }
         let mut ids = self.targets(memory_type, predicate, ts, true, in_scope, namespace).await?;
         if ids.is_empty() {
@@ -3377,8 +3194,13 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         if memory_type == MemoryType::Semantic {
             ids.extend(self.entity_facts(&ids, in_scope).await?);
         }
-        let effects: Vec<Effect> =
-            ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }).collect();
+        // AQL v0.13: a record whose key is now another record's alias leaves its links
+        // to that record (they named it; the alias reaches it) — in the same write.
+        let mut effects: Vec<Effect> = Vec::new();
+        if memory_type == MemoryType::Semantic {
+            effects.extend(self.links_to_survivors(&mut seq, ts, &ids).await?);
+        }
+        effects.extend(ids.iter().map(|id| Effect::Forget { memory: memory_type.into(), lineage_id: RecordId(id.clone()) }));
         self.usage_stale().await;
         let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
         self.keys_gone(&effects);
@@ -3388,8 +3210,17 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         drop(seq);
         // Hidden from every read from the commit on; the bytes leave disk at the next
         // compaction (user, 7 Nov: no read may miss a FORGET; disk removal can wait).
-        self.forget_on_branches(memory_type, &ids).await?;
         Ok(removed)
+    }
+
+    async fn aliases_changed(&self) -> AdbResult<()> {
+        let Some(store) = &self.store else { return Ok(()) };
+        if let Some(b) = self.barrier() {
+            b.wait_for_committed().await;
+        }
+        let fresh = load_aliases(store).await?;
+        *self.aliases.lock().unwrap() = fresh;
+        Ok(())
     }
 
     fn alias_of(&self, key: &str) -> Option<String> {
@@ -3398,149 +3229,6 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             return None;
         }
         aliases.get(key).cloned()
-    }
-
-    async fn merge(&self, from: &str, into: &str) -> AdbResult<u64> {
-        let Some(store) = &self.store else { return Err(needs_table("MERGE")) };
-        if [from, into].iter().any(|k| k.contains(adb_store::SCOPE_SEP)) {
-            return Err(AdbError::UnsupportedOperation("MERGE of entities in a named scope (E-L12-a): MERGE works in the default scope".into()));
-        }
-        let memory = Memory::Semantic;
-        let err = |e: adb_store::StoreError| AdbError::Internal(format!("store: {e}"));
-        let mut seq = seq_lock!(self);
-        let ts = seq.begin();
-        // Every earlier record is in Lance first.
-        if let Some(b) = self.barrier() {
-            b.wait_for_committed().await;
-        }
-        if let Some(to) = self.alias_of(from) {
-            return Err(AdbError::QueryError(format!("MERGE: {from} was already merged into {to}")));
-        }
-        let into = self.alias_of(into).unwrap_or_else(|| into.to_string());
-        if from == into {
-            return Err(AdbError::QueryError(format!("MERGE: {from} is {into}")));
-        }
-        let entity = |key: String| async move {
-            match store.current_version(memory, &key, ts).await {
-                Ok(Some(r)) if r.data.kind == Kind::Entity => Ok(r),
-                Ok(_) => Err(AdbError::QueryError(format!("MERGE: no entity {key}"))),
-                Err(e) => Err(err(e)),
-            }
-        };
-        let (dup, survivor) = (entity(from.to_string()).await?, entity(into.clone()).await?);
-        let end = adb_store::sql_str(&adb_store::row_id(memory, from));
-        let about = |kind: &str| format!("kind = '{kind}' AND (subject_id = {end} OR object_id = {end})");
-
-        // The duplicate's facts, written again about the survivor: of two facts for
-        // one key, the newer is current (the older stays as history, user 30 Oct).
-        let mut facts = store.live(Some(&about("fact")), ts).await.map_err(err)?;
-        facts.sort_by_key(|r| r.commit_ts);
-        let mut effects = Vec::new();
-        // New key → the newest of the duplicate's facts that land on it. A fact whose
-        // key doesn't change (the duplicate is its single-valued object) gets a new
-        // version; the others move to a new key, and their old one is forgotten.
-        let mut moved: Vec<(String, RowData, CommitTs)> = Vec::new();
-        for f in &facts {
-            let (key, d) = moved_fact(&f.data, f.key(), from, &into);
-            if key != f.key() {
-                effects.push(Effect::Forget { memory, lineage_id: RecordId(f.key().to_string()) });
-            }
-            moved.retain(|(k, ..)| *k != key);
-            moved.push((key, d, f.commit_ts));
-        }
-        // Its links, moved to the survivor (the old ones go with the entity).
-        let edges = store.live(Some(&about("edge")), ts).await.map_err(err)?;
-        let theirs: std::collections::HashSet<(String, String, Option<String>)> = {
-            let mine = adb_store::sql_str(&adb_store::row_id(memory, &into));
-            let f = format!("kind = 'edge' AND (subject_id = {mine} OR object_id = {mine})");
-            store.live(Some(&f), ts).await.map_err(err)?.into_iter().map(|e| (e.data.subject_id.unwrap_or_default(), e.data.object_id.unwrap_or_default(), e.data.link_type)).collect()
-        };
-        let mut new_edges = Vec::new();
-        for e in &edges {
-            let swap = |id: &Option<String>| match id.as_deref() {
-                Some(i) if adb_store::sql_str(i) == end => into.clone(),
-                Some(i) => adb_store::key_of(i).to_string(),
-                None => String::new(),
-            };
-            let (s, o) = (swap(&e.data.subject_id), swap(&e.data.object_id));
-            let mut d = e.data.clone();
-            d.subject_id = Some(s);
-            d.object_id = Some(o);
-            let n = NewRow { id: seq.new_id(ts), lineage_id: RecordId(String::new()), version: 1, data: d };
-            let q = adb_store::qualified(&n);
-            if q.data.subject_id == q.data.object_id || theirs.contains(&(q.data.subject_id.clone().unwrap_or_default(), q.data.object_id.clone().unwrap_or_default(), q.data.link_type.clone())) {
-                continue;
-            }
-            new_edges.push(NewRow { lineage_id: n.id.clone(), ..n });
-        }
-        // The survivor takes the duplicate's key (and aliases) as aliases, and the
-        // fields it doesn't have.
-        let mut aliases = aliases_of(&survivor.data.value);
-        for a in std::iter::once(from.to_string()).chain(aliases_of(&dup.data.value)) {
-            if !aliases.contains(&a) {
-                aliases.push(a);
-            }
-        }
-        let mut fields = serde_json::Map::new();
-        if let (Some(d), Some(s)) = (dup.data.value.as_object(), survivor.data.value.as_object()) {
-            for (k, v) in d {
-                if !s.contains_key(k) && k != "aliases" {
-                    fields.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        fields.insert("aliases".into(), serde_json::json!(aliases));
-        let survivor_next = next_version(&survivor, &fields, seq.new_id(ts));
-        effects.push(Effect::Forget { memory, lineage_id: RecordId(from.to_string()) });
-        effects.push(Effect::Supersede { old: RecordId(adb_store::key_of(&survivor.id).to_string()), new: survivor_next });
-
-        let mut n = 0u64;
-        let mut put_keys = Vec::new();
-        for (key, d, at) in moved {
-            let in_place = facts.iter().any(|f| f.key() == key);
-            match store.current_version(memory, &key, ts).await.map_err(err)? {
-                // The survivor's own fact is newer: it stays.
-                Some(cur) if !in_place && cur.commit_ts >= at => {}
-                Some(cur) => {
-                    effects.push(Effect::Supersede {
-                        old: RecordId(adb_store::key_of(&cur.id).to_string()),
-                        new: NewRow { id: seq.new_id(ts), lineage_id: RecordId(key.clone()), version: cur.version + 1, data: d },
-                    });
-                    n += 1;
-                }
-                None => {
-                    put_keys.push((key.clone(), d.ttl_at));
-                    let id = RecordId(key);
-                    effects.push(Effect::PutFact(NewRow { id: id.clone(), lineage_id: id, version: 1, data: d }));
-                    n += 1;
-                }
-            }
-        }
-        n += new_edges.len() as u64;
-        effects.extend(new_edges.into_iter().map(Effect::PutEdge));
-        let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
-        self.keys_gone(&effects);
-        {
-            let mut live = self.live.lock().unwrap();
-            for (k, ttl) in put_keys {
-                live.insert((memory, k), ttl);
-            }
-            let mut a = self.aliases.lock().unwrap();
-            for to in a.values_mut().filter(|to| to.as_str() == from) {
-                *to = into.clone();
-            }
-            for alias in &aliases {
-                a.insert(alias.clone(), into.clone());
-            }
-        }
-        let gone = effects.iter().filter_map(|e| match e {
-            Effect::Forget { memory, lineage_id } => Some((*memory, lineage_id.0.clone())),
-            _ => None,
-        });
-        self.note_forgotten(gone);
-        self.to_store(&record).await;
-        drop(seq);
-        Ok(n)
     }
 
     async fn link(
@@ -3700,7 +3388,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             tokio::select! {
                 // Committed by another write's holder.
                 r = &mut rx => return r.unwrap_or_else(|_| Err(AdbError::Internal("platform write dropped".into()))),
-                seq = seq_timed(&self.seq, concat!("seq.wait @", line!()), concat!("seq.held @", line!())) => {
+                seq = seq_timed(&self.seq, &self.seq_holder, concat!("seq.wait @", line!()), concat!("seq.held @", line!())) => {
                     let mut seq = seq;
                     let batch: Vec<PlatformPending> = {
                         let mut q = self.platform_queue.lock().unwrap();
@@ -3783,38 +3471,6 @@ fn supersedes(memory: MemoryType) -> bool {
     !matches!(memory, MemoryType::Working)
 }
 
-/// A fact's `valid_from` / `valid_to`, the bounds it has (AQL v0.10).
-fn validity_bounds(value: &serde_json::Value) -> Vec<i64> {
-    let (from, to) = adb_core::time::validity(value);
-    from.into_iter().chain(to).collect()
-}
-
-/// `valid_from` / `valid_to` in `fields` checked and stored in one form (RFC 3339,
-/// UTC: `time::format_instant`); `null` stays (UPDATE removes the bound).
-/// With `whole`, the record they'll be part of: `valid_from` must be before `valid_to`.
-pub fn normalize_validity(fields: &mut serde_json::Map<String, serde_json::Value>, whole: Option<&serde_json::Value>) -> AdbResult<()> {
-    for f in ["valid_from", "valid_to"] {
-        match fields.get(f) {
-            None | Some(serde_json::Value::Null) => {}
-            Some(serde_json::Value::String(s)) => {
-                let t = time::parse_instant(s).ok_or_else(|| AdbError::InvalidSyntax(format!("{f}: \"{s}\" is not a date (\"2026-11-01\") or an RFC 3339 time")))?;
-                fields.insert(f.into(), serde_json::json!(time::format_instant(t)));
-            }
-            Some(other) => return Err(AdbError::InvalidSyntax(format!("{f}: a date or time string, not {other}"))),
-        }
-    }
-    let mut merged = whole.cloned().unwrap_or(serde_json::json!({}));
-    adb_core::merge_fields(&mut merged, fields);
-    if let (Some(from), Some(to)) = adb_core::time::validity(&merged) {
-        if from >= to {
-            return Err(AdbError::InvalidSyntax("valid_from must be before valid_to".into()));
-        }
-    }
-    Ok(())
-}
-
-/// A fact's key: one current fact per (subject, predicate), or per (subject,
-/// predicate, object) for a `MULTI` predicate.
 /// An entity's `aliases` (GR-12): the keys of the entities merged into it.
 /// Entity aliases (GR-12) from the live entities' `aliases` fields: alias → entity.
 pub(crate) async fn load_aliases(store: &PartitionStore) -> AdbResult<std::collections::HashMap<String, String>> {
@@ -3823,52 +3479,13 @@ pub(crate) async fn load_aliases(store: &PartitionStore) -> AdbResult<std::colle
         .await
         .map_err(|e| AdbError::Internal(format!("store: {e}")))?
         .iter()
-        .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (a, r.key().to_string())))
+        // By record id: the alias in its entity's namespace.
+        .flat_map(|r| aliases_of(&r.data.value).into_iter().map(move |a| (adb_store::namespaced(adb_store::namespace_of(r.key()), &a), r.key().to_string())))
         .collect())
 }
 
 fn aliases_of(value: &serde_json::Value) -> Vec<String> {
     value.get("aliases").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
-}
-
-/// `d`, a fact about entity `from` as the table holds it, as a fact about `into`:
-/// bare ends with `from` replaced, its payload and default `content` to match.
-/// Returns its key (one per (subject, predicate) unless the old key had the object).
-fn moved_fact(d: &RowData, key: &str, from: &str, into: &str) -> (String, RowData) {
-    let mut d = d.clone();
-    let bare = |id: &Option<String>| id.as_deref().map(|i| adb_store::key_of(i).to_string());
-    let swap = |id: Option<String>| id.map(|i| if i == from { into.to_string() } else { i });
-    let (old_s, old_o) = (bare(&d.subject_id).unwrap_or_default(), bare(&d.object_id));
-    let (subject, object) = (swap(Some(old_s.clone())).unwrap_or_default(), swap(old_o.clone()));
-    let predicate = d.predicate.clone().unwrap_or_default();
-    let shown = |o: &Option<String>| o.clone().unwrap_or_else(|| d.value.get("value").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).unwrap_or_default());
-    let multi = key != fact_key(&old_s, &predicate, None);
-    let new_key = fact_key(&subject, &predicate, multi.then(|| shown(&object)).as_deref());
-    let old_content = format!("{old_s} {predicate} {}", shown(&old_o));
-    let new_content = format!("{subject} {predicate} {}", shown(&object));
-    if let Some(v) = d.value.as_object_mut() {
-        v.insert("subject".into(), serde_json::json!(subject));
-        if let Some(o) = &object {
-            v.insert("object".into(), serde_json::json!(o));
-        }
-        v.insert("key".into(), serde_json::json!(new_key));
-        if v.get("content").and_then(|c| c.as_str()) == Some(old_content.as_str()) {
-            v.insert("content".into(), serde_json::json!(new_content));
-            d.text = Some(new_content);
-            // Embedded again by the backfill.
-            d.embedding = None;
-        }
-    }
-    d.subject_id = Some(subject);
-    d.object_id = object;
-    (new_key, d)
-}
-
-pub fn fact_key(subject: &str, predicate: &str, object: Option<&str>) -> String {
-    match object {
-        Some(o) => format!("fact:{subject}|{predicate}|{o}"),
-        None => format!("fact:{subject}|{predicate}"),
-    }
 }
 
 /// The version after `cur` with `fields` merged in, under the new row id `id`.
@@ -3920,10 +3537,11 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
             for (end, memory, id) in [("source", from_type, from_id), ("target", to_type, to_id)].into_iter().filter(|(end, _, _)| check_target || *end == "source") {
                 let key = adb_core::Predicate::Key { field: "id".into(), value: adb_core::Value::String(id.to_string()) };
-                // On a branch engine: the branch's view (the parent at the branch point
-                // and the branch's own rows), as its reads see the ends.
-                let missing = if self.parent.is_some() {
-                    self.branch_targets(memory, &key, None, ts).await?.is_empty()
+                // A branch namespace's end may be inherited from its base (AQL v0.13):
+                // the branch's view, as its reads see the ends.
+                let branch_ns = self.branch_ns(adb_store::namespace_of(id));
+                let missing = if branch_ns.is_some() {
+                    self.branch_targets_in(memory, &key, None, ts, branch_ns).await?.is_empty()
                 } else {
                     crate::query::read(store, memory, &key, &Default::default(), ts).await?.is_empty()
                 };

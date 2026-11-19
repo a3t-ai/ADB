@@ -1,4 +1,4 @@
-//! MVP W6: continuous queries (`W6_WATCH.md`) through the engine — `WATCH` returns a
+//! MVP W6: continuous queries (`W6_WATCH.md`) through the engine — `SUBSCRIBE RECALL …` (was WATCH) returns a
 //! snapshot, the watcher's frames keep it equal to re-running the query.
 
 use std::time::Duration;
@@ -10,7 +10,7 @@ async fn q(engine: &LocalEngine, aql: &str) -> Value {
     engine.query(aql, None).await.unwrap_or_else(|e| panic!("{aql}: {e}"))
 }
 
-/// `WATCH`: (cq_id, snapshot offset, result).
+/// `SUBSCRIBE RECALL …`: (cq_id, snapshot offset, result).
 async fn watch(engine: &LocalEngine, aql: &str) -> (String, u64, Value) {
     let r = q(engine, aql).await;
     let d = &r["data"];
@@ -95,7 +95,7 @@ async fn watch_sends_diffs_as_the_result_changes() {
     q(&engine, r#"STORE INTO SEMANTIC (key = "b1", topic = "billing", content = "invoices go out on the 1st")"#).await;
     q(&engine, r#"STORE INTO SEMANTIC (key = "o1", topic = "ops", content = "deploys on tuesday")"#).await;
     let watched = r#"RECALL FROM SEMANTIC WHERE topic = "billing""#;
-    let (id, offset, snap) = watch(&engine, &format!("WATCH {watched} DEBOUNCE 50ms")).await;
+    let (id, offset, snap) = watch(&engine, &format!("SUBSCRIBE {watched}")).await;
     assert_eq!(records_of(&snap).len(), 1, "{snap}");
 
     q(&engine, r#"STORE INTO SEMANTIC (key = "b2", topic = "billing", content = "late fee is 2%")"#).await;
@@ -133,13 +133,14 @@ async fn watch_sends_diffs_as_the_result_changes() {
     }
     assert_eq!(same_set(client), same_set(records_of(&fresh)));
 
-    let r = q(&engine, &format!(r#"UNWATCH "{id}""#)).await;
-    assert_eq!(r["data"]["unwatched"], true, "{r}");
+    let r = q(&engine, &format!(r#"UNSUBSCRIBE "{id}""#)).await;
+    assert_eq!(r["data"]["unsubscribed"], true, "{r}");
     assert!(w.next(&id, None, 1, Duration::ZERO).await.is_err());
-    // Refusals: a write, FROM OFFSET, a debounce out of range.
-    assert!(engine.query(r#"WATCH STORE INTO SEMANTIC (key = "x")"#, None).await.is_err());
-    assert!(engine.query("WATCH RECALL FROM SEMANTIC ALL FROM OFFSET 3", None).await.unwrap_err().contains("starts now"));
-    assert!(engine.query("WATCH RECALL FROM SEMANTIC ALL DEBOUNCE 5s", None).await.unwrap_err().contains("DEBOUNCE"));
+    // Refusals: a write; FROM OFFSET and DEBOUNCE are not AQL (a live query starts
+    // now; how often it re-runs is a server setting).
+    assert!(engine.query(r#"SUBSCRIBE STORE INTO SEMANTIC (key = "x")"#, None).await.is_err());
+    assert!(engine.query("SUBSCRIBE RECALL FROM SEMANTIC FROM OFFSET 3", None).await.is_err());
+    assert!(engine.query("SUBSCRIBE RECALL FROM SEMANTIC DEBOUNCE 5s", None).await.is_err());
 }
 
 /// The gate: random writes against several watches; a client applying the frames
@@ -150,14 +151,14 @@ async fn frame_stream_equals_rerunning_the_query() {
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let queries = [
         r#"RECALL FROM SEMANTIC WHERE topic = "t1""#,
-        r#"RECALL FROM SEMANTIC IN SCOPE "team:a" ALL"#,
-        r#"RECALL FROM SEMANTIC ALL ORDER BY n DESC LIMIT 3"#,
-        r#"RECALL FROM EPISODIC ALL"#,
-        r#"RECALL FROM SEMANTIC WHERE topic = "t2" WITH LINKS ALL"#,
+        r#"RECALL FROM SEMANTIC IN SCOPE "team:a""#,
+        r#"RECALL FROM SEMANTIC ORDER BY n DESC LIMIT 3"#,
+        r#"RECALL FROM EPISODIC"#,
+        r#"RECALL FROM SEMANTIC WHERE topic = "t2" WITH LINKS"#,
     ];
     let mut watches = Vec::new();
     for qy in &queries {
-        let (id, off, snap) = watch(&engine, &format!("WATCH {qy} DEBOUNCE 50ms")).await;
+        let (id, off, snap) = watch(&engine, &format!("SUBSCRIBE {qy}")).await;
         watches.push((id, off, records_of(&snap)));
     }
     // A deterministic pseudo-random sequence of writes.
@@ -189,7 +190,7 @@ async fn frame_stream_equals_rerunning_the_query() {
             5 if live.len() >= 2 => {
                 let a = &live[rnd(live.len() as u64) as usize];
                 q(&engine, &format!(r#"STORE INTO EPISODIC (key = "e{i}", content = "event {i}")"#)).await;
-                q(&engine, &format!(r#"LINK FROM SEMANTIC WHERE key = "{a}" TO EPISODIC WHERE key = "e{i}" TYPE "about""#)).await;
+                q(&engine, &format!(r#"LINK FROM SEMANTIC WHERE key = "{a}" INTO EPISODIC WHERE key = "e{i}" TYPE "about""#)).await;
             }
             _ => {}
         }
@@ -218,7 +219,7 @@ async fn watches_survive_restart_and_resume_with_reset() {
     let (id, offset) = {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
         q(&engine, r#"STORE INTO SEMANTIC (key = "a", topic = "x")"#).await;
-        let (id, offset, _) = watch(&engine, r#"WATCH RECALL FROM SEMANTIC WHERE topic = "x" DEBOUNCE 50ms"#).await;
+        let (id, offset, _) = watch(&engine, r#"SUBSCRIBE RECALL FROM SEMANTIC WHERE topic = "x""#).await;
         (id, offset)
     };
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -244,7 +245,7 @@ async fn watches_survive_restart_and_resume_with_reset() {
 async fn forget_scrubs_buffered_frames() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    let (id, offset, _) = watch(&engine, r#"WATCH RECALL FROM SEMANTIC ALL DEBOUNCE 50ms"#).await;
+    let (id, offset, _) = watch(&engine, r#"SUBSCRIBE RECALL FROM SEMANTIC"#).await;
     q(&engine, r#"STORE INTO SEMANTIC (key = "card", content = "SECRET-4111")"#).await;
     let (frames, _) = drain(&engine, &id, offset, Duration::from_millis(400)).await;
     assert!(serde_json::to_string(&frames).unwrap().contains("SECRET-4111"));
