@@ -102,7 +102,7 @@ adb-engine = { path = "crates/adb-engine" }
 flowr-storage = { path = "../flowr-system/shared/flowr-storage", default-features = false }
 # AQL parser comes from the AQL repo (one grammar for AQL and ADB). For local
 # development against a sibling checkout, see .cargo/config.toml.example.
-aql-parser = { git = "https://github.com/srirammails/AQL.git", branch = "main" }
+aql-parser = { git = "https://github.com/a3t-ai/AQL.git", branch = "main" }
 aql-planner = { path = "crates/aql-planner" }
 adb-executor = { path = "crates/adb-executor" }
 adb-server = { path = "crates/adb-server" }

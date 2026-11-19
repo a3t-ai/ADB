@@ -1,4 +1,4 @@
 # Local development against a sibling AQL checkout (../AQL), including AQL
 # changes that are not pushed yet. Copy to .cargo/config.toml (gitignored).
-[patch."https://github.com/srirammails/AQL.git"]
+[patch."https://github.com/a3t-ai/AQL.git"]
 aql-parser = { path = "../AQL/crates/aql-parser" }

@@ -5,7 +5,7 @@ as a service; this repo also builds the local dev server.
 
 - Architecture: [`.ai/ARCHITECTURE.md`](.ai/ARCHITECTURE.md) · delivery plan:
   [`.ai/DELIVERY_PLAN.md`](.ai/DELIVERY_PLAN.md) · AQL spec and parser: the
-  [AQL repo](https://github.com/srirammails/AQL)
+  [AQL repo](https://github.com/a3t-ai/AQL)
 - Status: **delivery stage A** — the drop-in server and MCP interface run on the
   in-memory engine (data is not persisted yet; the durable engine is stages C–D).
 

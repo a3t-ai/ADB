@@ -16,7 +16,7 @@ COPY . .
 # A local AQL checkout, when given, patches the git dependency (as .cargo/config.toml does
 # for local development).
 RUN if [ -f /AQL/crates/aql-parser/Cargo.toml ]; then \
-      mkdir -p .cargo && printf '[patch."https://github.com/srirammails/AQL.git"]\naql-parser = { path = "/AQL/crates/aql-parser" }\n' > .cargo/config.toml; \
+      mkdir -p .cargo && printf '[patch."https://github.com/a3t-ai/AQL.git"]\naql-parser = { path = "/AQL/crates/aql-parser" }\n' > .cargo/config.toml; \
     fi
 RUN cargo build --release -p adb-cli
 
