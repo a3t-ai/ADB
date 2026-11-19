@@ -24,9 +24,9 @@ exclude = ["third_party/lance"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
-authors = ["ADB Contributors"]
-repository = "https://github.com/adb/adb"
+license = "Elastic-2.0"
+authors = ["A3T"]
+repository = "https://github.com/a3t-ai/ADB"
 rust-version = "1.91"
 
 [workspace.dependencies]

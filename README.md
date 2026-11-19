@@ -86,4 +86,8 @@ The FlowR test runs A3T's `a3t-test-resource` flow in a real FlowR-CE against AD
 
 ## Licence
 
-Business support licence, as FlowR (text to be added).
+ADB is licensed under the [Elastic License 2.0](LICENSE) (ELv2). You may use, copy, modify
+and distribute it, including in production and in your own products, except that you may not
+provide ADB to others as a hosted or managed service, circumvent licence-key functionality, or
+remove licensing notices. See [NOTICE](NOTICE) for third-party code: `third_party/lance` is a
+modified copy of Lance under the Apache License 2.0.

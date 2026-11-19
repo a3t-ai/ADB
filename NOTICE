@@ -1,0 +1,10 @@
+ADB (Agent Database)
+Copyright 2026 A3T
+
+Licensed under the Elastic License 2.0 (ELv2); see LICENSE.
+
+This repository includes third-party code under its own licence:
+
+- third_party/lance: a modified copy of Lance (https://github.com/lance-format/lance),
+  Copyright The Lance Authors, licensed under the Apache License 2.0; see
+  third_party/lance/LICENSE. A3T's changes to it are also under the Apache License 2.0.
