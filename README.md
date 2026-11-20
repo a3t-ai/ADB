@@ -1,323 +1,260 @@
-# ADB — Agent Database
+# ADB: the database for AI agent memory
 
-Memory for AI agents, queried in **AQL** (Agent Query Language). Part of A3T, offered
-as a service; this repo also builds the local dev server.
+ADB gives AI agents a long-term memory they can query: what happened, what is true,
+how to do things, and what they are working on now. Agents talk to it in **AQL**, a
+small query language that says what the agent wants. They can also use it through
+**MCP** without writing any code. It runs as one binary on a laptop, or as a
+cluster on object storage.
 
-- Architecture: [`.ai/ARCHITECTURE.md`](.ai/ARCHITECTURE.md) · delivery plan:
-  [`.ai/DELIVERY_PLAN.md`](.ai/DELIVERY_PLAN.md) · AQL spec and parser: the
-  [AQL repo](https://github.com/a3t-ai/AQL)
-- One binary: a single node for local development, or a cluster over object storage
-  (S3). Data is kept on disk with `--data-dir`; without it ADB uses a temporary
-  directory and forgets everything when it stops.
+[![Licence: ELv2](https://img.shields.io/badge/licence-Elastic%202.0-blue)](LICENSE)
+[![AQL playground](https://img.shields.io/badge/AQL-playground-6f42c1)](https://a3t-ai.github.io/AQL)
 
-## Install
+![The ADB Console: an AQL query and its result](docs/images/console-query.png)
 
-Prebuilt binaries are not published yet: build from source or with Docker.
+## Why ADB
 
-**From source.** Needs stable Rust and `protoc` (`apt install protobuf-compiler`).
+An agent forgets everything outside its context window. To give it a memory, teams
+usually stitch several systems together:
+- a vector database for similarity search;
+- Postgres for facts;
+- Redis for the current task;
+- a queue for events;
+- sometimes a graph store.
+
+Then they write the glue between them. Every agent ends up with its own version of
+"memory". Nothing stays consistent across those systems. A deleted fact can still
+come back from one of them, and nobody can say what an agent knew at a given moment.
+
+ADB is one database built for this job:
+
+- **Memory types built in.** `WORKING` is the current task, `EPISODIC` is what
+  happened, `SEMANTIC` is facts, `PROCEDURAL` is how to do things, and `TOOLS` is
+  what an agent can use. Each type has the behaviour it needs, and they share one
+  query language.
+- **One query for meaning, filters and relations.** Similarity search (`LIKE`),
+  field filters, ordering, aggregates and graph links (`LINK`, `FOLLOW LINKS`) work
+  together in one AQL statement. There's no second system to keep in sync.
+- **Forget means forget.** `FORGET` records a tombstone that every later read
+  respects, on every node. Nothing is physically deleted until an explicit purge, so
+  there is an audit trail of what was removed and when.
+- **Live memory.** `SUBSCRIBE` keeps a query's result current and streams topic
+  messages over server-sent events. Agents react to changes instead of polling.
+- **Safe experiments.** Namespaces keep one agent's or tenant's memory apart.
+  `BRANCH`, `FORK` and `MERGE` let an agent try changes on a copy and merge them back.
+- **Works with any agent.** ADB has a built-in MCP server for Claude Code, Claude
+  Desktop and other MCP clients, AQL over HTTP, and Arrow Flight for bulk data.
+- **Embeddings your way.** Use the built-in local model, OpenAI, or any
+  OpenAI-compatible endpoint, and switch at runtime. Vectors are made in the
+  background, optionally on separate compute nodes, so writes never wait for a model.
+- **Small to large.** A single node keeps data in a local directory. A cluster keeps
+  data on S3, so nodes need only small disks, and you add nodes to scale.
+
+## Quick start
+
+**1. Build.** You need stable Rust and `protoc` (`apt install protobuf-compiler`).
+There are no prebuilt binaries yet.
 
 ```bash
 git clone https://github.com/a3t-ai/ADB && cd ADB
-cargo build --release -p adb-cli --features console   # binary: target/release/adb
+cargo build --release -p adb-cli --features console
 ```
 
-`--features console` adds the [ADB Console](#adb-console) web UI. Leave it out for a
-binary without any UI.
+Or with Docker:
+`docker build -t adb --build-arg ADB_FEATURES=console .`
 
-**Docker.**
+**2. Run.**
 
 ```bash
-docker build -t adb --build-arg ADB_FEATURES=console .
-docker run -p 3000:3000 -p 3001:3001 -v adb-data:/data adb \
-  adb serve-http --port 3000 --data-dir /data
+./target/release/adb serve-http --data-dir ./adb-data
 ```
 
-ADB uses the AQL parser from the AQL repo. To develop against a local AQL checkout
-next to this one (`../AQL`), copy `.cargo/config.toml.example` to `.cargo/config.toml`.
+ADB now serves HTTP and MCP on port 3000 and Arrow Flight on 3001. Open
+**http://localhost:3000/ui** for the console.
 
-## Start a node
-
-```bash
-export ADB_AUTH_TOKEN=$(openssl rand -hex 24)   # optional; without it ADB is open
-adb serve-http --data-dir ./adb-data
-```
-
-| Flag | Default | |
-|---|---|---|
-| `--data-dir <dir>` (or `ADB_DATA_DIR`) | a temporary directory | Where data is kept. Without it, data is lost when ADB stops |
-| `--host <ip>` | `0.0.0.0` | Address to listen on (`127.0.0.1` keeps ADB local) |
-| `--port <n>` | `3000` | HTTP: AQL, MCP, live updates, admin, the console |
-| `--flight-port <n>` | `3001` | Arrow Flight; `0` turns it off |
-
-`adb serve` (no `--http`) instead runs MCP on stdin/stdout for a single local agent,
-with no network port: see [MCP](#mcp).
-
-## ADB Console
-
-![ADB Console: overview of a 3-node cluster, with every connection point](docs/images/console-overview.png)
-
-Open **`http://localhost:3000/ui`** in a browser (the node's address and HTTP port).
-If the node has a token, paste it into the token field and press **Connect**; the
-page keeps it for the browser tab only.
-
-| Tab | What you get |
-|---|---|
-| Overview | Health, mode, uptime, auth, storage; every connection point of this node; copy-ready snippets for curl, an MCP client, Python (Arrow Flight) and the CLI |
-| Query | AQL editor (Ctrl/⌘+Enter runs), `$variables` as JSON, history, result as a table or JSON |
-| Settings | The embedding setting (provider, model, where it runs), hot-cache rules, compact now |
-| Cluster | Nodes, which node owns and replicates each partition, compute nodes |
-| Metrics | Latency percentiles (p50/p90/p99) and counters, with a filter and auto-refresh |
-
-| Query | Cluster |
-|---|---|
-| ![AQL editor with a variable and the result as a table](docs/images/console-query.png) | ![Nodes and the owner of each of 64 partitions](docs/images/console-cluster.png) |
-| **Settings** | **Metrics** |
-| ![Embedding setting and hot cache rules](docs/images/console-settings.png) | ![Query latencies p50/p90/p99 and counters](docs/images/console-metrics.png) |
-
-The console is a build feature (`console`), off by default: a binary built without
-it serves no `/ui`. The page itself is open, as it holds no data; everything it shows
-is read with the token, like any other client. To reach a node on another machine
-privately, forward its port: `ssh -L 3000:localhost:3000 <host>`.
-
-## Connecting
-
-| Protocol | Where | For | Auth |
-|---|---|---|---|
-| [HTTP + AQL](#http-and-aql) | `POST http://<host>:3000/query` | Any AQL statement, JSON in and out | Bearer token |
-| [Live updates (SSE)](#live-updates-sse) | `GET /subscriptions/:id/events`, `GET /watches/:id/events` | Topic messages; a query's result kept current | Bearer token |
-| [MCP](#mcp) | `http://<host>:3000/mcp` (also `/mcp/sse`), or `adb serve` on stdio | Agents and AI tools (Claude Code, Claude Desktop, others) | Bearer token (HTTP) |
-| [Arrow Flight](#arrow-flight) | `grpc://<host>:3001` | Bulk reads and writes as Arrow, SQL, AQL | Bearer token |
-| [CLI](#cli) | `adb sql`, `adb query` | One statement from a shell | `ADB_AUTH_TOKEN` |
-| [Health and metrics](#health-and-metrics) | `/health`, `/metrics`, `/admin/stats/metrics` | Probes and monitoring | `/health` open |
-
-With a token set, every call sends `Authorization: Bearer <token>`. Only `/health`
-(and `/ui`) answer without it.
-
-### HTTP and AQL
-
-```bash
-curl -s http://localhost:3000/query \
-  -H "Authorization: Bearer $ADB_AUTH_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"query": "STORE INTO SEMANTIC (key = \"acme-renewal\", content = \"Acme renews on 1 Nov\", account = \"acme\") NAMESPACE \"crm\""}'
-
-curl -s http://localhost:3000/query \
-  -H "Authorization: Bearer $ADB_AUTH_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"query": "RECALL FROM SEMANTIC WHERE account = $a NAMESPACE \"crm\" LIMIT 10", "variables": {"a": "acme"}}'
-```
-
-The answer is `{success, data, error?, code?, execution_time_ms}`; for a read,
-`data.data.records` holds the rows. `NAMESPACE` keeps one app's or tenant's memory
-apart from another's. Without it, statements use the `default` namespace.
-
-ADB also answers ClawDB's API, so a ClawDB client (or an A3T `clawdb` resource) can
-point at `http://<host>:3000` unchanged.
-
-### Live updates (SSE)
-
-**Topics.** `SUBSCRIBE TOPIC` returns a subscription id; read its messages as
-server-sent events:
-
-```bash
-curl -s http://localhost:3000/query -H "Authorization: Bearer $ADB_AUTH_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"query": "SUBSCRIBE TOPIC \"orders\" NAMESPACE \"shop\""}'          # → data.data.subscription
-curl -N http://localhost:3000/subscriptions/<subscription>/events -H "Authorization: Bearer $ADB_AUTH_TOKEN"
-# elsewhere:
-curl -s http://localhost:3000/query -H "Authorization: Bearer $ADB_AUTH_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"query": "PUBLISH TOPIC \"orders\" (id = \"o-1\", status = \"paid\") NAMESPACE \"shop\""}'
-```
-
-**A query kept current.** `SUBSCRIBE RECALL …` returns the result now and a `cq_id`;
-`/watches/<cq_id>/events` then sends a `reset` (the whole result) and a `diff` for
-each change.
-
-Both streams number their events: send `Last-Event-ID` (or `?from=<offset>` for
-watches) when reconnecting to carry on where you stopped.
-
-### MCP
-
-ADB is an MCP server with memory tools: `remember`, `recall`, `forget`, `link`,
-`unlink`, `aql_query`, `watch`/`watch_changes`/`unwatch`, `publish`/`subscribe`/
-`next_events`/`ack`/`unsubscribe`, `get_stats` (and ClawDB's `store_memory`,
-`recall_memory`). It also offers a memory guide (`adb://guide/memory`), the AQL
-grammar (`adb://aql/grammar`) and a `memory_smoke_test` prompt.
-
-```bash
-# Claude Code, ADB as a local process (no network, no token)
-claude mcp add adb -- /path/to/adb serve --data-dir ~/.adb
-
-# Claude Code, a running ADB over HTTP
-claude mcp add --transport http adb http://localhost:3000/mcp \
-  --header "Authorization: Bearer $ADB_AUTH_TOKEN"
-```
-
-Other clients take the same two forms: a command (`adb serve --data-dir <dir>`) for
-stdio, or the URL `http://<host>:3000/mcp` with the `Authorization` header. Clients
-that only speak the older SSE transport use `http://<host>:3000/mcp/sse`.
-
-### Arrow Flight
-
-For moving many rows, or reading results as Arrow tables (pandas, Polars, DuckDB).
-Requests are JSON in a Flight ticket or action:
-
-```python
-import json, pyarrow as pa, pyarrow.flight as fl
-
-c = fl.connect("grpc://localhost:3001")
-opts = fl.FlightCallOptions(headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
-
-# AQL
-r = list(c.do_action(fl.Action("aql", json.dumps({"query": 'RECALL FROM SEMANTIC NAMESPACE "crm" LIMIT 5'}).encode()), opts))
-print(json.loads(r[0].body.to_pybytes()))
-
-# read-only SQL over memory, answered as Arrow
-t = c.do_get(fl.Ticket(json.dumps({"sql": "select id, namespace from memory_current limit 100"})), opts).read_all()
-
-# your own table: create it, write Arrow batches, read them back
-c.do_action(fl.Action("create_table", json.dumps({"table": "notes", "schema": {"id": "string", "text": "string"}}).encode()), opts)
-w, _ = c.do_put(fl.FlightDescriptor.for_path("notes"), pa.schema([("id", pa.string()), ("text", pa.string())]), opts)
-w.write_table(pa.table({"id": ["n1"], "text": ["hello"]})); w.close()
-print(c.do_get(fl.Ticket(json.dumps({"table": "notes"})), opts).read_all().to_pylist())
-```
-
-| Call | Request | Answer |
-|---|---|---|
-| `do_get` | `{"sql", "limit"?}` | Read-only SQL over `memory`, `memory_current`, `memory_raw` and your tables (at most 10,000 rows) |
-| `do_get` | `{"table", "filter"?, "limit"?}` | A table's rows (`filter` is a SQL condition) |
-| `do_put` | descriptor path `[table]` (or `[table, "replace"]`), Arrow batches | Rows added (or the table replaced) |
-| `do_action("aql")` | `{"query", "variables"?}` | Same answer as `POST /query` |
-| `do_action(...)` | `list_tables`, `create_table`, `update`, `delete`, `compact` | See [`flight.rs`](crates/adb-server/src/flight.rs) |
-
-Flight is not Flight SQL: tools that connect through a Flight SQL / JDBC driver
-(DBeaver, BI tools) can't use it yet.
-
-### CLI
-
-```bash
-# read-only SQL against a running node, over Flight
-ADB_AUTH_TOKEN=... adb sql "select namespace, count(*) from memory_current group by namespace" --flight grpc://localhost:3001
-
-# one AQL statement straight on a data directory (only while no node runs on it)
-adb --data-dir ./adb-data query 'RECALL FROM SEMANTIC NAMESPACE "crm" LIMIT 5'
-```
-
-For a running node, send AQL with `POST /query` (or the console's Query tab).
-
-### Health and metrics
-
-| Endpoint | |
-|---|---|
-| `GET /health` | `{status, version}`; always open (liveness probes) |
-| `GET /ready` | Cluster nodes: 200 once the node holds its control-plane lease |
-| `GET /stats` | Records per memory type |
-| `GET /metrics` | Prometheus text; set `ADB_METRICS_OPEN=1` to let a scraper read it without the token |
-| `GET /admin/stats/metrics` | The same metrics as JSON, histograms with p50/p90/p99 |
-| `GET /admin/console` | This node: version, uptime, auth, storage, endpoints, cluster map (console builds) |
-
-## Configuration
-
-Flags set ports and the data directory; everything else is an environment variable
-or a live setting changed over HTTP (or in the console's Settings tab).
-
-### Access
-
-| Variable | |
-|---|---|
-| `ADB_AUTH_TOKEN` | The token for every endpoint except `/health` and `/ui`. Unset: ADB is open (local use only) |
-| `ADB_SCOPED_TOKENS` | Tokens limited to namespaces, JSON: `[{"name": "acme", "token": "…", "write": ["acme-*"], "read": ["shared-*"]}]`. They may only run `/query` statements that name a `NAMESPACE` they cover |
-| `ADB_METRICS_OPEN` | `1`: `/metrics` needs no token |
-
-### Storage
-
-| Setting | |
-|---|---|
-| `--data-dir <dir>` | Where a node keeps its data |
-| `ADB_COLD_URI` | Object storage for the log and checkpoints: `s3://bucket/prefix`, or `file:///path` for tests. Required for a cluster |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT` | Credentials and endpoint for `s3://` (any S3-compatible store) |
-
-### Embeddings (similarity search)
-
-ADB turns text into vectors in the background. Pick the provider at any time; the
-change is applied at once and the vectors are rebuilt in the background when the
-model changes:
-
-```bash
-curl -s -X PUT http://localhost:3000/admin/embedding -H "Authorization: Bearer $ADB_AUTH_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"provider": "openai", "model": "text-embedding-3-small", "dimension": 1536, "api_key_env": "OPENAI_API_KEY"}'
-```
-
-| Field | |
-|---|---|
-| `provider` | `local` (built-in model, the default), `openai`, or `custom` (any endpoint with the OpenAI embeddings API; set `url`) |
-| `model`, `dimension` | The model and its vector size. Local default: `bge-small-en-v1.5`, 384 |
-| `api_key_env` | The name of the environment variable holding the API key. ADB never stores the key itself |
-| `request_dimension` | `true`: ask the endpoint for `dimension` (models that can shorten vectors) |
-| `run_on` | `node` (default) or `compute`: hand the work to compute nodes (`adb serve-compute`, joined with `ADB_COMPUTE_JOIN=http://<node>:3000`) |
-
-The local model is read from `/models/bge-small-en-v1.5`, or `ADB_EMBED_MODEL_DIR`;
-`tests/fetch-model.sh <dir>` downloads it. `ADB_EMBED=off` turns embedding off.
-
-### Hot cache
-
-`GET`/`PUT /admin/cache` with `{max_bytes, rules: [{memory, scope?, keep}]}`: which
-memory stays in RAM. Applied at once.
-
-### Cluster
-
-A cluster is several nodes sharing object storage. Each node runs `adb serve-http`
-with:
-
-| Variable | |
-|---|---|
-| `ADB_NODE_ID` | This node's number (`1`, `2`, …; `from-hostname` takes it from a StatefulSet pod name) |
-| `ADB_CONTROL_PEERS` | The control-plane voters: `1=http://adb-0:3002,2=http://adb-1:3002,3=http://adb-2:3002` |
-| `ADB_CONTROL_PORT` | This node's control-plane port (default `3002`; between nodes only) |
-| `ADB_ADVERTISE`, `ADB_ADVERTISE_FLIGHT` | The HTTP and Flight addresses other nodes reach this one at |
-| `ADB_PARTITIONS` | Memory partitions, fixed for the cluster's life (default 64) |
-| `ADB_COLD_URI` | Required |
-
-Kubernetes manifests: [`deploy/k8s`](deploy/k8s). Clients connect to any node: each
-forwards what it does not own.
-
-## Memory types
-
-| Type | For |
-|---|---|
-| `WORKING` | The current task (short-lived) |
-| `EPISODIC` | Events, conversations, incidents |
-| `SEMANTIC` | Facts and concepts |
-| `PROCEDURAL` | Steps, fixes, patterns |
-| `TOOLS` | Tools an agent can use, with rankings |
-
-## AQL examples
+**3. Give an agent some memory.** Type these into the console's Query tab, or send
+them to `POST /query`:
 
 ```sql
-STORE INTO SEMANTIC (key = "acme-renewal", content = "Acme renews on 1 Nov", account = "acme")
-RECALL FROM SEMANTIC WHERE account = "acme" LIMIT 10
-RECALL FROM EPISODIC WHERE content CONTAINS "outage" ORDER BY severity DESC LIMIT 5
-LINK FROM PROCEDURAL WHERE key = "oom-fix" TO EPISODIC WHERE key = "inc-001" TYPE "applied_to" WEIGHT 0.9
-FORGET FROM WORKING WHERE task = "draft"
-PIPELINE triage TIMEOUT 80ms RECALL FROM WORKING WHERE task = "t1" | RECALL FROM EPISODIC WHERE pod = {pod}
+-- facts, events and a procedure, each in its namespace
+STORE INTO SEMANTIC (key = "acme-renewal", content = "Acme renews its enterprise plan on 1 Nov", account = "acme") NAMESPACE "crm"
+STORE INTO EPISODIC (key = "inc-2041", content = "Checkout pods were OOMKilled during the sale", service = "payments", severity = 2) NAMESPACE "ops"
+STORE INTO PROCEDURAL (key = "oom-fix", content = "Raise the worker memory limit to 2 GiB and restart the pool") NAMESPACE "ops"
+
+-- by meaning, by field, by text
+RECALL FROM SEMANTIC LIKE "when does acme renew" NAMESPACE "crm" LIMIT 3
+RECALL FROM EPISODIC WHERE content CONTAINS "OOMKilled" ORDER BY severity DESC LIMIT 5 NAMESPACE "ops"
+
+-- relate memories, then walk the relation
+LINK FROM PROCEDURAL WHERE key = "oom-fix" INTO EPISODIC WHERE key = "inc-2041" TYPE "fixed" WEIGHT 0.9 NAMESPACE "ops"
+RECALL FROM EPISODIC WHERE key = "inc-2041" NAMESPACE "ops" FOLLOW LINKS DEPTH 1
+
+-- try a change on a branch, then merge it
+BRANCH FROM "crm" INTO "crm-try"
+UPDATE INTO SEMANTIC WHERE key = "acme-renewal" (content = "Acme renews on 15 Nov") NAMESPACE "crm-try"
+MERGE FROM "crm-try" INTO "crm"
+
+-- forget, for every later read
+FORGET FROM SEMANTIC WHERE key = "acme-renewal" NAMESPACE "crm"
 ```
 
-## Tests
+The same from a shell:
 
 ```bash
-cargo test --workspace                                        # unit + HTTP + MCP tests
-node ../AQL/tests/run-tests.mjs --url http://localhost:3000   # AQL conformance (start ADB empty)
-node tests/mcp-smoke.mjs --stdio target/release/adb           # MCP session: also --http / --sse <url>
-node tests/flowr-integration.mjs --adb target/release/adb --flowr <flowr-ce binary>   # FlowR → ADB
-docker compose -f deploy/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test
+curl -s localhost:3000/query -H 'Content-Type: application/json' \
+  -d '{"query": "RECALL FROM EPISODIC LIKE $q NAMESPACE \"ops\" LIMIT 3", "variables": {"q": "pods ran out of memory"}}'
 ```
 
-The FlowR test runs A3T's `a3t-test-resource` flow in a real FlowR-CE against ADB through an
-`mcp` resource set up like A3T's `agent-memory-mcp`. Building FlowR-CE needs `libssl-dev`,
-`pkg-config` and `libclang-dev`.
+**4. Connect an agent over MCP.** For example, Claude Code:
+
+```bash
+claude mcp add adb -- /path/to/adb serve --data-dir ~/.adb
+```
+
+The agent now has `remember`, `recall`, `forget`, `link`, `watch` and `aql_query`
+as tools.
+
+Similarity search needs an embedding model. Download the local one with
+`tests/fetch-model.sh <dir>` and set `ADB_EMBED_MODEL_DIR=<dir>`, or switch to
+OpenAI in the console's Settings tab. The full language is in the
+[AQL repo](https://github.com/a3t-ai/AQL), and you can try it in the browser in the
+[AQL playground](https://a3t-ai.github.io/AQL).
+
+## How it works
+
+```mermaid
+flowchart TB
+  A["Agents and apps<br/>AQL over HTTP, SSE"] --> cluster
+  M["AI tools<br/>MCP"] --> cluster
+  D["Data tools<br/>Arrow Flight"] --> cluster
+  subgraph cluster [ADB cluster: any node takes any request]
+    direction LR
+    N1[Node 1] <-- "each write copied<br/>to a replica" --> N2[Node 2]
+    N2 <--> N3[Node 3]
+    C[["Raft control plane:<br/>who owns which partition"]]
+  end
+  cluster -- texts --> E["Compute nodes<br/>make vectors"]
+  cluster -- "log every second,<br/>checkpoints" --> S[("Object storage (S3)<br/>the durable copy")]
+  E -- "vector files" --> S
+```
+
+- **Partitions.** Memory is split into partitions (64 by default). Each namespace
+  lives in one partition. Each partition has one owner node, and any node accepts a
+  request and forwards it to the owner.
+- **Writes.** The owner sends each write to a second node, the replica. It
+  acknowledges the write once both nodes hold it in memory. Every second, the log
+  goes to object storage as a small segment. Tables are checkpointed there too.
+- **Object storage holds the data.** S3, or any S3-compatible store, keeps the one
+  durable copy. Nodes keep only recent and hot data on local disk, so disks stay
+  small and a new node needs no full copy.
+- **Failover.** A small Raft group decides only who owns which partition. If an
+  owner dies, its replica takes over with every acknowledged write. If both die,
+  another node rebuilds the partition from object storage. In that case it can lose
+  at most the last second of writes.
+- **Reads.** The owner and the replica both serve reads. Hot data is answered from
+  a memory cache. Storage is columnar ([Lance](https://github.com/lancedb/lance)),
+  queried with [Apache DataFusion](https://datafusion.apache.org).
+- **Vectors.** Making vectors is kept off the write path. The node, or a separate
+  compute node, writes them to object storage as files.
+- **A single node** is the same engine without the cluster parts: data in
+  `--data-dir`, each write acknowledged after it reaches the disk.
+
+## ADB Console (web UI)
+
+A web UI built into the binary. It has no other dependencies and works offline.
+Open `http://<node>:3000/ui`, and paste the node's token if it has one.
+
+| Overview | Cluster |
+|---|---|
+| ![Every connection point of a node, with copy-ready snippets](docs/images/console-overview.png) | ![Nodes and the owner of each of 64 partitions](docs/images/console-cluster.png) |
+| **Settings** | **Metrics** |
+| ![Embedding provider and hot cache rules](docs/images/console-settings.png) | ![Query latencies p50/p90/p99 and counters](docs/images/console-metrics.png) |
+
+- **Overview:** health, every connection point of the node, and ready-to-copy
+  snippets for curl, MCP, Python and the CLI.
+- **Query:** an AQL editor with variables and history, shown at the top of this page.
+- **Settings:** the embedding provider and hot cache rules.
+- **Cluster:** nodes and which node owns each partition.
+- **Metrics:** latency percentiles and counters.
+
+The console is a build feature (`--features console`). A binary built without it
+serves no UI.
+
+## Performance
+
+These numbers were measured on 20 Nov 2026 on a 3-node cluster on Hetzner Cloud:
+- **Database nodes:** 3 × CCX33, each with 8 dedicated vCPUs and 32 GB RAM.
+- **Compute nodes:** 2 × CCX33 making vectors with the local model.
+- **Storage:** Hetzner Object Storage.
+- **Load:** 4 load-generator machines sending 1,024 concurrent requests in total,
+  spread over 64 namespaces, for 20 seconds per test.
+
+| Operation | Throughput | p50 | p99 |
+|---|---:|---:|---:|
+| `RECALL` by key (WORKING) | 105,000 /s | 2.8 ms | 82 ms |
+| `RECALL` by key (SEMANTIC) | 103,000 /s | 2.7 ms | 88 ms |
+| `RECALL` newest 10 episodes | 53,000 /s | 2.7 ms | 198 ms |
+| `RECALL … AGGREGATE COUNT` by field | 49,000 /s | 3.0 ms | 126 ms |
+| `RECALL WHERE` field `LIMIT 10` | 29,000 /s | 3.4 ms | 165 ms |
+| `STORE` (WORKING) | 17,000 /s | 39 ms | 395 ms |
+| `STORE` (SEMANTIC, vectors made on compute nodes) | 16,800 /s | 41 ms | 406 ms |
+| `UPDATE` (SEMANTIC) | 13,800 /s | 52 ms | 395 ms |
+| Mixed: 70% reads, 25% `STORE`, 5% `UPDATE` | 16,000 /s | 27 ms | 963 ms |
+| `FORGET` (one key each) | 1,900 /s | 399 ms | 2,065 ms |
+
+- Writes are acknowledged once they are in memory on two nodes, and they reach
+  object storage within a second.
+- `FORGET` is slow today because each one reads the record's earlier versions
+  first. A faster tombstone path is being built.
+- In an earlier run on the same hardware, going from 3 to 5 nodes raised writes
+  1.5–1.6× and reads 1.3–1.4×.
+- The load generator is [`tests/perf-remote.mjs`](tests/perf-remote.mjs).
+
+## Connect
+
+| Protocol | Where | Use it for |
+|---|---|---|
+| AQL over HTTP | `POST :3000/query` | Any AQL statement, JSON in and out |
+| Live updates (SSE) | `GET :3000/subscriptions/:id/events`, `/watches/:id/events` | Topic messages and query results kept current |
+| MCP | `http://:3000/mcp`, or `adb serve` on stdio | Agents and AI tools |
+| Arrow Flight | `grpc://:3001` | Bulk reads and writes as Arrow, SQL, AQL |
+| CLI | `adb sql`, `adb query` | One statement from a shell |
+| Health and metrics | `/health`, `/metrics` (Prometheus) | Probes and monitoring |
+
+Examples for each, including Python over Flight and the MCP setup for each client,
+are in **[docs/connect.md](docs/connect.md)**.
+
+## Configure
+
+| Setting | What it controls |
+|---|---|
+| `--data-dir`, `--port`, `--flight-port`, `--host` | Where data lives and where ADB listens |
+| `ADB_AUTH_TOKEN`, `ADB_SCOPED_TOKENS` | One token for everything, or tokens limited to certain namespaces |
+| `ADB_COLD_URI` + `AWS_*` | Object storage (required for a cluster) |
+| `PUT /admin/embedding` | The embedding provider (local, OpenAI, custom), applied without a restart |
+| `ADB_NODE_ID`, `ADB_CONTROL_PEERS`, … | Running a cluster ([Kubernetes manifests](deploy/k8s)) |
+
+Every setting, with examples, is in **[docs/configuration.md](docs/configuration.md)**.
+
+## Build and test
+
+```bash
+cargo build --release                       # target/release/adb
+cargo test --workspace                      # unit, HTTP and MCP tests
+node ../AQL/tests/run-tests.mjs --url http://localhost:3000   # AQL conformance against an empty node
+node tests/mcp-smoke.mjs --stdio target/release/adb          # an MCP session end to end
+```
+
+To develop against a local AQL checkout next to this one (`../AQL`), copy
+`.cargo/config.toml.example` to `.cargo/config.toml`.
 
 ## Licence
 
-ADB is licensed under the [Elastic License 2.0](LICENSE) (ELv2). You may use, copy, modify
-and distribute it, including in production and in your own products, except that you may not
-provide ADB to others as a hosted or managed service, circumvent licence-key functionality, or
-remove licensing notices. See [NOTICE](NOTICE) for third-party code: `third_party/lance` is a
-modified copy of Lance under the Apache License 2.0.
+ADB is licensed under the [Elastic License 2.0](LICENSE) (ELv2). You may use, copy,
+modify and distribute it, including in production and in your own products. You may
+not:
+- provide ADB to others as a hosted or managed service;
+- circumvent licence-key functionality;
+- remove licensing notices.
+
+See [NOTICE](NOTICE) for third-party code: `third_party/lance` is a modified copy of
+Lance under the Apache License 2.0.
