@@ -1,18 +1,29 @@
-# ADB server image.
+# ADB server image, and the release binary for Linux.
 #
-#   docker build -t adb .                                     # AQL parser from GitHub
-#   docker build -t adb --build-context aql=../AQL .          # AQL parser from a local checkout
-#   docker build -t adb --build-arg ADB_FEATURES=console .    # standalone: with the ADB Console (/ui)
+#   docker build -t adb .                                       # plain: no console, no model
+#   docker build -t adb --build-context aql=../AQL .            # AQL parser from a local checkout
+#   docker build -t adb --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=perf .
+#                                                               # the published image: console + local model
 #
-# A3T's images build without the console: its ADB serves no UI.
+# The binary is built on Ubuntu 22.04, so the same file runs on any Linux with glibc
+# 2.35 or newer (Ubuntu 22.04+, Debian 12+). The release workflow copies it out of
+# the builder stage. A3T's images build without the console: its ADB serves no UI.
 #
 # The `aql` stage below is empty unless a build context of that name replaces it.
 FROM scratch AS aql
 
-FROM rust:1-trixie AS builder
+FROM ubuntu:22.04 AS builder
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake pkg-config libssl-dev protobuf-compiler \
+      ca-certificates curl build-essential cmake pkg-config libssl-dev unzip \
     && rm -rf /var/lib/apt/lists/*
+# Ubuntu 22.04's protoc is too old for Lance: take a release build.
+ARG PROTOC_VERSION=29.3
+RUN arch=$(uname -m | sed 's/aarch64/aarch_64/') \
+    && curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${arch}.zip" \
+    && unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
 WORKDIR /app
 COPY --from=aql . /AQL
 COPY . .
@@ -22,11 +33,24 @@ RUN if [ -f /AQL/crates/aql-parser/Cargo.toml ]; then \
       mkdir -p .cargo && printf '[patch."https://github.com/a3t-ai/AQL.git"]\naql-parser = { path = "/AQL/crates/aql-parser" }\n' > .cargo/config.toml; \
     fi
 ARG ADB_FEATURES=""
-RUN cargo build --release -p adb-cli ${ADB_FEATURES:+--features $ADB_FEATURES}
+# ADB_PROFILE=perf: release optimisation without LTO, the build the published
+# benchmarks ran on (and a fraction of fat LTO's build time and memory).
+ARG ADB_PROFILE=release
+ENV CARGO_INCREMENTAL=0
+RUN cargo build --profile "$ADB_PROFILE" -p adb-cli ${ADB_FEATURES:+--features $ADB_FEATURES} \
+    && cp "target/$ADB_PROFILE/adb" /adb && rm -rf target
+# ADB_MODEL=1: bake the local embedding model in, so similarity search works offline.
+ARG ADB_MODEL=""
+RUN mkdir -p /models && if [ -n "$ADB_MODEL" ]; then bash tests/fetch-model.sh /models/bge-small-en-v1.5; fi
 
-FROM debian:trixie-slim
+FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/adb /usr/local/bin/adb
-EXPOSE 3000
-CMD ["adb", "serve-http", "--port", "3000"]
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /data adb \
+    && mkdir -p /data && chown adb /data
+COPY --from=builder /adb /usr/local/bin/adb
+COPY --from=builder /models /models
+USER adb
+VOLUME /data
+EXPOSE 3000 3001
+CMD ["adb", "serve-http", "--port", "3000", "--data-dir", "/data"]

@@ -4,8 +4,16 @@
 from half a dozen databases. ADB replaces them with one, and a query language agents can
 actually speak.**
 
+[![Status: not for production](https://img.shields.io/badge/status-not%20for%20production-red)](#status)
+[![Release](https://img.shields.io/github/v/release/a3t-ai/ADB?include_prereleases&label=release)](https://github.com/a3t-ai/ADB/releases)
 [![Licence: ELv2](https://img.shields.io/badge/licence-Elastic%202.0-blue)](LICENSE)
 [![AQL playground](https://img.shields.io/badge/AQL-playground-6f42c1)](https://a3t-ai.github.io/AQL)
+
+> [!WARNING]
+> **Not for production.** ADB is a pre-release (v0.1.0). AQL, the APIs and the
+> on-disk format can still change, and data written by one version may not be
+> readable by the next. Use it to build and try things, not to hold data you can't
+> recreate.
 
 ## The problem: agent memory is not one kind of data
 
@@ -153,25 +161,38 @@ FORK FROM "support-agent" INTO "support-agent-eval"
 
 ## Quick start
 
-**1. Build.** You need stable Rust and `protoc` (`apt install protobuf-compiler`).
-There are no prebuilt binaries yet.
+**1. Run ADB.** Pick one.
+
+With Docker (Linux x86_64 and arm64, or Docker Desktop on a Mac). The image has the
+console and the embedding model built in:
+
+```bash
+docker run -d --name adb -p 3000:3000 -p 3001:3001 -v adb-data:/data ghcr.io/a3t-ai/adb:0.1.0
+```
+
+Or download a binary from [Releases](https://github.com/a3t-ai/ADB/releases). There
+are builds for Linux x86_64 and arm64 (glibc 2.35+: Ubuntu 22.04+, Debian 12+) and
+macOS on Apple silicon:
+
+```bash
+curl -fsSL -O https://github.com/a3t-ai/ADB/releases/download/v0.1.0/adb-v0.1.0-linux-x86_64.tar.gz
+tar -xzf adb-v0.1.0-linux-x86_64.tar.gz
+./adb/adb serve-http --data-dir ./adb-data
+```
+
+Or build from source. You need stable Rust and `protoc`
+(`apt install protobuf-compiler`):
 
 ```bash
 git clone https://github.com/a3t-ai/ADB && cd ADB
 cargo build --release -p adb-cli --features console
-```
-
-Or with Docker:
-`docker build -t adb --build-arg ADB_FEATURES=console .`
-
-**2. Run.**
-
-```bash
 ./target/release/adb serve-http --data-dir ./adb-data
 ```
 
-ADB now serves HTTP and MCP on port 3000 and Arrow Flight on 3001. Open
-**http://localhost:3000/ui** for the console.
+**2. Open the console** at **http://localhost:3000/ui**. ADB serves HTTP and MCP on
+port 3000 and Arrow Flight on 3001. To require a token, add
+`-e ADB_AUTH_TOKEN=<secret>` to `docker run`, or set `ADB_AUTH_TOKEN` before
+starting the binary.
 
 **3. Give an agent some memory.** Type these into the console's Query tab, or send
 them to `POST /query`:
@@ -206,18 +227,22 @@ curl -s localhost:3000/query -H 'Content-Type: application/json' \
   -d '{"query": "RECALL FROM EPISODIC LIKE $q NAMESPACE \"ops\" LIMIT 3", "variables": {"q": "pods ran out of memory"}}'
 ```
 
-**4. Connect an agent over MCP.** For example, Claude Code:
+**4. Connect an agent over MCP.** For example, Claude Code, to the running ADB:
 
 ```bash
-claude mcp add adb -- /path/to/adb serve --data-dir ~/.adb
+claude mcp add --transport http adb http://localhost:3000/mcp
 ```
+
+or, with the binary, as a local process (no server needed):
+`claude mcp add adb -- /path/to/adb serve --data-dir ~/.adb`.
 
 The agent now has `remember`, `recall`, `forget`, `link`, `watch` and `aql_query`
 as tools.
 
-Similarity search needs an embedding model. Download the local one with
-`tests/fetch-model.sh <dir>` and set `ADB_EMBED_MODEL_DIR=<dir>`, or switch to
-OpenAI in the console's Settings tab. The full language is in the
+The Docker image has the embedding model built in. With a binary, similarity
+search needs the model: download it with `tests/fetch-model.sh <dir>` from this repo
+and set `ADB_EMBED_MODEL_DIR=<dir>`, or switch to OpenAI in the console's Settings
+tab. The full language is in the
 [AQL repo](https://github.com/a3t-ai/AQL), and you can try it in the browser in the
 [AQL playground](https://a3t-ai.github.io/AQL).
 
@@ -348,6 +373,13 @@ node tests/mcp-smoke.mjs --stdio target/release/adb          # an MCP session en
 
 To develop against a local AQL checkout next to this one (`../AQL`), copy
 `.cargo/config.toml.example` to `.cargo/config.toml`.
+
+## Status
+
+ADB is a pre-release and **not for production**. It has been benchmarked and tested
+for failover on real clusters, but AQL, the APIs and the on-disk format can still
+change between versions, with no migration from one to the next yet. Issues and
+feedback are welcome on [GitHub](https://github.com/a3t-ai/ADB/issues).
 
 ## Licence
 

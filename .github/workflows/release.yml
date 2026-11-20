@@ -1,0 +1,157 @@
+# Release: on a version tag (v*), build ADB for Linux (x86_64, arm64) and macOS (arm64),
+# push the Docker image to ghcr.io/a3t-ai/adb, and publish the binaries as a GitHub
+# release. Every build has the console; the image also has the local embedding model.
+#
+# Linux binaries come out of the Dockerfile's builder stage (Ubuntu 22.04, glibc 2.35),
+# so the image and the downloadable binary are the same file.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (an existing v* tag)"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/a3t-ai/adb
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the image (${{ matrix.arch }})
+        run: |
+          v="${TAG#v}"
+          docker buildx build --platform ${{ matrix.platform }} \
+            --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=perf \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.description="ADB: one database for everything an AI agent remembers (pre-release, not for production)" \
+            --label org.opencontainers.image.licenses=Elastic-2.0 \
+            --label org.opencontainers.image.version="$v" \
+            -t "$IMAGE:$v-${{ matrix.arch }}" --push --provenance=false .
+      - name: Package the binary
+        run: |
+          v="${TAG#v}"
+          docker create --name out "$IMAGE:$v-${{ matrix.arch }}"
+          mkdir -p dist/adb && docker cp out:/usr/local/bin/adb dist/adb/adb
+          cp LICENSE NOTICE README.md dist/adb/
+          f="adb-$TAG-linux-${{ matrix.arch }}.tar.gz"
+          tar -C dist -czf "$f" adb && sha256sum "$f" > "$f.sha256"
+          ./dist/adb/adb --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: adb-*.tar.gz*
+
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Tools
+        run: brew install protobuf
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: cargo build --profile perf -p adb-cli --features console
+      - name: Package the binary
+        run: |
+          mkdir -p dist/adb && cp target/perf/adb dist/adb/adb
+          cp LICENSE NOTICE README.md dist/adb/
+          f="adb-$TAG-macos-arm64.tar.gz"
+          tar -C dist -czf "$f" adb && shasum -a 256 "$f" > "$f.sha256"
+          ./dist/adb/adb --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: adb-*.tar.gz*
+
+  image:
+    needs: linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: One multi-arch tag
+        run: |
+          v="${TAG#v}"
+          docker buildx imagetools create -t "$IMAGE:$v" -t "$IMAGE:latest" "$IMAGE:$v-x86_64" "$IMAGE:$v-arm64"
+
+  release:
+    needs: [linux, macos, image]
+    if: always() && needs.linux.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - id: v
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ADB ${{ env.TAG }} (pre-release, not for production)
+          prerelease: true
+          files: dist/*
+          body: |
+            **Pre-release, not for production.** APIs and the on-disk format may still change between versions.
+
+            ### Docker (Linux x86_64 and arm64; console and embedding model included)
+            ```bash
+            docker run -d --name adb -p 3000:3000 -p 3001:3001 -v adb-data:/data ghcr.io/a3t-ai/adb:${{ steps.v.outputs.version }}
+            ```
+            Then open http://localhost:3000/ui.
+
+            ### Binaries
+            | Platform | File |
+            |---|---|
+            | Linux x86_64 (glibc 2.35+: Ubuntu 22.04+, Debian 12+) | `adb-${{ env.TAG }}-linux-x86_64.tar.gz` |
+            | Linux arm64 (glibc 2.35+) | `adb-${{ env.TAG }}-linux-arm64.tar.gz` |
+            | macOS (Apple silicon) | `adb-${{ env.TAG }}-macos-arm64.tar.gz` |
+
+            ```bash
+            tar -xzf adb-${{ env.TAG }}-linux-x86_64.tar.gz && ./adb/adb serve-http --data-dir ./adb-data
+            ```
+            The binaries include the console. For similarity search, download the embedding model
+            (`tests/fetch-model.sh <dir>` in the repo, then `ADB_EMBED_MODEL_DIR=<dir>`) or choose
+            OpenAI in the console's Settings tab. Each file has a `.sha256` next to it.
