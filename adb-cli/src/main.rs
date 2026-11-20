@@ -60,10 +60,13 @@ enum Commands {
         #[arg(long, default_value_t = 3001)]
         flight_port: u16,
     },
-    /// Run an embedding worker (PF-49): `POST /embeddings` (the OpenAI wire format)
-    /// from the local model. ADB nodes with `ADB_EMBED_URL=http://<host>:<port>[,…]`
-    /// send their texts here and run no model themselves.
-    ServeEmbed {
+    /// Run a compute node: no database, only work the database nodes hand it. Today
+    /// `embed` (`POST /embeddings`, the OpenAI wire format, from the local model).
+    /// It announces itself to the database nodes in `ADB_COMPUTE_JOIN`
+    /// (comma-separated `http://<host>:3000`), as `ADB_ADVERTISE`
+    /// (`http://<HOSTNAME>:<port>` by default); database nodes with
+    /// `ADB_EMBED=compute` then send it their texts and run no model themselves.
+    ServeCompute {
         #[arg(long, default_value = "0.0.0.0")]
         host: IpAddr,
         #[arg(short, long, default_value_t = 3003)]
@@ -188,8 +191,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     alloc::report_every(alloc::report_interval());
     adb_core::steps::spawn_lag_probe();
-    if let Commands::ServeEmbed { host, port } = &command {
-        return serve_embed(*host, *port).await;
+    if let Commands::ServeCompute { host, port } = &command {
+        return serve_compute(*host, *port).await;
     }
 
     // A cluster node (S3 option B, step 8): ADB_NODE_ID set.
@@ -243,7 +246,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ = adb_executor::restart_requested() => tracing::info!("ADB stopping to apply its new settings"),
             }
         }
-        Commands::ImportLancedb { .. } | Commands::ImportFlowrEngine { .. } | Commands::Sql { .. } | Commands::ServeEmbed { .. } => unreachable!("handled before the engine opens"),
+        Commands::ImportLancedb { .. } | Commands::ImportFlowrEngine { .. } | Commands::Sql { .. } | Commands::ServeCompute { .. } => unreachable!("handled before the engine opens"),
         Commands::Query { query } => match engine.query(&query, None).await {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
             Err(e) => {
@@ -298,12 +301,17 @@ mod log_tests {
     }
 }
 
-/// `adb serve-embed`: the local model behind `POST /embeddings` and `/v1/embeddings`.
-async fn serve_embed(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+/// `adb serve-compute`: the local model behind `POST /embeddings` and
+/// `/v1/embeddings`, announced to the database nodes.
+async fn serve_compute(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     use axum::routing::{get, post};
-    // The worker embeds with its own model, never through a pool.
-    std::env::remove_var("ADB_EMBED_URL");
-    let embedder = adb_embed::Embedder::from_env().ok_or("serve-embed needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?;
+    // A compute node embeds with its own model, never through other compute nodes.
+    std::env::remove_var("ADB_COMPUTE_URL");
+    if std::env::var("ADB_EMBED").is_ok_and(|v| v.eq_ignore_ascii_case("compute")) {
+        std::env::remove_var("ADB_EMBED");
+    }
+    let embedder = adb_embed::Embedder::from_env().ok_or("serve-compute needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?;
+    spawn_announcer(Arc::clone(&embedder), port);
     async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, headers: axum::http::HeaderMap, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
         // A database node's deferred vectors: behind every request someone waits on.
         let background = headers.get(adb_embed::PRIORITY_HEADER).is_some_and(|v| v.as_bytes() == b"background");
@@ -331,7 +339,52 @@ async fn serve_embed(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::
         .route("/v1/embeddings", post(embed))
         .with_state(embedder);
     let addr = std::net::SocketAddr::new(host, port);
-    tracing::info!(%addr, workers = adb_embed::workers(), "ADB embedding worker");
+    tracing::info!(%addr, workers = adb_embed::workers(), functions = "embed", "ADB compute node");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).with_graceful_shutdown(async { shutdown_signal().await; }).await?;
     Ok(())
+}
+
+/// A compute node's announcements: to every database node of `ADB_COMPUTE_JOIN`,
+/// every [`adb_embed::compute::ANNOUNCE_EVERY`], with the cluster's `ADB_AUTH_TOKEN`.
+fn spawn_announcer(embedder: Arc<adb_embed::Embedder>, port: u16) {
+    let join: Vec<String> = std::env::var("ADB_COMPUTE_JOIN").unwrap_or_default().split(',').map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).collect();
+    if join.is_empty() {
+        tracing::warn!("ADB_COMPUTE_JOIN is not set: no database node learns of this compute node (unless it names it in ADB_COMPUTE_URL)");
+        return;
+    }
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "127.0.0.1".into());
+    let me = std::env::var("ADB_ADVERTISE").unwrap_or_else(|_| format!("http://{host}:{port}"));
+    let token = adb_server::auth::token_from_env();
+    let http = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(1)).timeout(std::time::Duration::from_secs(3)).build().expect("HTTP client");
+    tracing::info!(advertise = %me, join = ?join, "compute node announcing itself");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(adb_embed::compute::ANNOUNCE_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut down: std::collections::BTreeSet<String> = Default::default();
+        loop {
+            tick.tick().await;
+            let a = adb_embed::compute::Announce {
+                url: me.clone(),
+                functions: vec!["embed".into()],
+                model: embedder.model().to_string(),
+                dimension: embedder.dimension(),
+                workers: adb_embed::workers(),
+                in_flight: adb_embed::local_in_flight(),
+            };
+            let calls = join.iter().map(|db| {
+                let mut req = http.post(format!("{db}/internal/compute")).json(&a);
+                if let Some(t) = &token {
+                    req = req.bearer_auth(t);
+                }
+                async move { (db.clone(), req.send().await.map_err(|e| e.to_string()).and_then(|r| r.error_for_status().map(|_| ()).map_err(|e| e.to_string()))) }
+            });
+            for (db, r) in futures::future::join_all(calls).await {
+                match r {
+                    Ok(()) if down.remove(&db) => tracing::info!(db = %db, "database node hears this compute node again"),
+                    Err(e) if down.insert(db.clone()) => tracing::warn!(db = %db, error = %e, "announcing to a database node failed; retrying"),
+                    _ => {}
+                }
+            }
+        }
+    });
 }

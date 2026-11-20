@@ -209,10 +209,13 @@ async fn recall_like_ranks_by_relevance() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    let s = McpServer::new(Arc::new(engine));
+    let engine = Arc::new(engine);
+    let s = McpServer::new(Arc::clone(&engine) as _);
     for (k, c) in [("renewal", "Acme's contract renews on 1 November"), ("oom", "The payments pod runs out of memory"), ("vpn", "Restart the VPN client to reconnect")] {
         call(&s, "remember", json!({"content": c, "key": k})).await;
     }
+    // Writes don't wait for their vectors: LIKE ranks what has one.
+    engine.vectors_caught_up(std::time::Duration::from_secs(60)).await.unwrap();
     let (err, v) = call(&s, "recall", json!({"like": "when is the acme renewal", "limit": 2})).await;
     assert!(!err, "{v}");
     assert_eq!(v["data"]["records"][0]["id"], json!("renewal"), "{v}");

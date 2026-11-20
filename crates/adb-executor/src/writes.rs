@@ -564,21 +564,22 @@ fn sub_idle() -> Duration {
     std::env::var("ADB_SUB_IDLE").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(SUB_IDLE)
 }
 
-/// Memory types whose STORE doesn't wait for its vector (`ADB_EMBED_DEFER`: a comma
-/// list of memory types, e.g. `episodic`; default none — every STORE waits for its
-/// vector). A deferred record is committed and answered at once; its vector follows
-/// ([`DurableWrites::embed_deferred`]). A LIKE read in between doesn't rank it by
-/// meaning yet; key, time and field reads see it at once.
+/// Memory types whose writes don't wait for their vector (`ADB_EMBED_DEFER`: a comma
+/// list of memory types; default `episodic,semantic,procedural`, every type with
+/// text; `none` makes every write wait). A deferred STORE or UPDATE is committed and
+/// answered once its text is in the vector queue; the vector follows
+/// ([`DurableWrites::embed_deferred`], on compute nodes when the cluster has them).
+/// A LIKE read in between doesn't rank the record by meaning yet; key, time and
+/// field reads see it at once.
 ///
-/// Off by default (user, 18 Nov): STORE EPISODIC then ran 7× faster (16k/s against
-/// 2.2k/s on 3 nodes, Hetzner p15), but each episode is written twice (the record,
-/// then its vector) and the catch-up after a burst took the nodes' CPU from reads
-/// (−46 to −66% until the vectors were in). On by deployment once the catch-up is
-/// paced.
+/// User, 19 Nov 2026: "write doesn't wait; all it needs to know is the text is in
+/// the queue, so vectors will come later. A read misses the vector search, but that
+/// is fine." (Off on 18 Nov while the catch-up took the nodes' CPU from reads,
+/// Hetzner p15b; measured again with compute nodes.)
 pub fn defer_embedding(memory: MemoryType) -> bool {
     static SET: std::sync::OnceLock<Vec<MemoryType>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
-        let v = std::env::var("ADB_EMBED_DEFER").unwrap_or_default();
+        let v = std::env::var("ADB_EMBED_DEFER").unwrap_or_else(|_| "episodic,semantic,procedural".into());
         v.split(',')
             .filter_map(|m| match m.trim().to_ascii_lowercase().as_str() {
                 "episodic" => Some(MemoryType::Episodic),
@@ -589,6 +590,99 @@ pub fn defer_embedding(memory: MemoryType) -> bool {
             .collect()
     })
     .contains(&memory)
+}
+
+/// The deferred-vector queue: (memory, record id, text) in the order written. A
+/// record written again before its vector came keeps only its newest text: an older
+/// one is dropped when taken (its vector would describe text the record no longer
+/// has, and could land after the newer one's).
+#[derive(Default)]
+pub(crate) struct EmbedQueue {
+    items: std::collections::VecDeque<(Memory, String, String, u64)>,
+    /// The newest generation queued per record.
+    newest: std::collections::HashMap<(Memory, String), u64>,
+    next: u64,
+}
+
+impl EmbedQueue {
+    /// Queue a text; `false` when the queue is full.
+    pub(crate) fn push(&mut self, memory: Memory, id: String, text: String) -> bool {
+        if self.items.len() >= EMBED_SOON_MAX {
+            return false;
+        }
+        self.next += 1;
+        self.newest.insert((memory, id.clone()), self.next);
+        self.items.push_back((memory, id, text, self.next));
+        true
+    }
+
+    /// Up to `n` texts to embed, oldest first, without superseded ones.
+    pub(crate) fn take(&mut self, n: usize) -> Vec<(Memory, String, String)> {
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let Some((memory, id, text, g)) = self.items.pop_front() else { break };
+            let key = (memory, id);
+            match self.newest.get(&key) {
+                Some(&newest) if newest == g => {
+                    self.newest.remove(&key);
+                    out.push((key.0, key.1, text));
+                }
+                _ => crate::steps::value("embed.deferred superseded texts dropped", 1),
+            }
+        }
+        out
+    }
+
+    /// Put a batch that couldn't be embedded back at the front, except records
+    /// written again since (their newer text is queued).
+    pub(crate) fn requeue(&mut self, batch: Vec<(Memory, String, String)>) {
+        for (memory, id, text) in batch.into_iter().rev() {
+            let key = (memory, id);
+            if self.newest.contains_key(&key) {
+                continue;
+            }
+            self.next += 1;
+            self.newest.insert(key.clone(), self.next);
+            self.items.push_front((key.0, key.1, text, self.next));
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.items.clear();
+        self.newest.clear();
+    }
+}
+
+#[cfg(test)]
+mod embed_queue_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_written_again_keeps_only_its_newest_text() {
+        let mut q = EmbedQueue::default();
+        q.push(Memory::Episodic, "a".into(), "old".into());
+        q.push(Memory::Episodic, "b".into(), "b1".into());
+        q.push(Memory::Episodic, "a".into(), "new".into());
+        q.push(Memory::Semantic, "a".into(), "other type".into());
+        let got = q.take(10);
+        assert_eq!(got, vec![
+            (Memory::Episodic, "b".to_string(), "b1".to_string()),
+            (Memory::Episodic, "a".to_string(), "new".to_string()),
+            (Memory::Semantic, "a".to_string(), "other type".to_string()),
+        ]);
+        assert!(q.is_empty());
+        // Taken: a later write queues again.
+        q.push(Memory::Episodic, "a".into(), "newer".into());
+        assert_eq!(q.take(1).len(), 1);
+    }
 }
 
 /// Records waiting for a deferred vector at most; more wait for the backfill scan.
@@ -743,7 +837,7 @@ pub struct DurableWrites<L: Log> {
     /// Records stored without waiting for their vector ([`defer_embedding`]): (memory,
     /// record id, text), embedded by [`DurableWrites::embed_deferred`] as soon as it
     /// wakes. Bounded: past [`EMBED_SOON_MAX`] a record waits for the backfill scan.
-    embed_soon: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
+    embed_soon: std::sync::Mutex<EmbedQueue>,
     embed_wake: Arc<tokio::sync::Notify>,
     /// When a record was last queued for its vector: the backfill scan waits while
     /// the deferred embedder has work (both scanning and embedding the same rows
@@ -870,7 +964,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         in_scope: Option<&str>,
         namespace: Option<&str>,
         vector: Option<Vec<half::f16>>,
-    ) -> AdbResult<Option<u64>> {
+    ) -> AdbResult<Option<Vec<String>>> {
         let Some(store) = &self.store else { return Ok(None) };
         let mut t = std::time::Instant::now();
         let snapshot = self.last_off.load(std::sync::atomic::Ordering::SeqCst);
@@ -920,9 +1014,14 @@ impl<L: Log + 'static> DurableWrites<L> {
         }
         let ts = seq.begin();
         let mut effects = Vec::with_capacity(ids.len());
+        // The rows a deferred vector goes to: a superseding UPDATE's new versions (the
+        // key's row is then the old version), else the patched records.
+        let mut embed_ids = ids.clone();
         if supersedes(memory_type) {
+            embed_ids.clear();
             for (key, cur) in ids.iter().zip(&current) {
                 let mut new = next_version(cur, &fields, seq.new_id(ts));
+                embed_ids.push(new.id.0.clone());
                 if let (Kind::Fact, (Some(from), Some(to))) = (new.data.kind, time::validity(&new.data.value)) {
                     if from >= to {
                         return Err(AdbError::InvalidSyntax(format!("{key}: valid_from must be before valid_to")));
@@ -946,7 +1045,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         crate::steps::lap("update.4 submit under lock", &mut t);
         self.committed(record.offset.0, wait).await?;
         crate::steps::lap("update.5 commit wait", &mut t);
-        Ok(Some(ids.len() as u64))
+        Ok(Some(embed_ids))
     }
 
     /// FORGET of named keys as [`Self::update_prepared`]: targets, every version and
@@ -2121,16 +2220,21 @@ impl<L: Log + 'static> DurableWrites<L> {
 
     /// Queue a stored record's text for its vector ([`defer_embedding`]).
     fn embed_later(&self, memory: Memory, id: String, text: String) {
-        {
-            let mut q = self.embed_soon.lock().unwrap();
-            if q.len() >= EMBED_SOON_MAX {
-                tracing::debug!("deferred embeddings queue full: the backfill scan embeds the rest");
-                return;
-            }
-            q.push_back((memory, id, text));
+        if !self.embed_soon.lock().unwrap().push(memory, id, text) {
+            tracing::debug!("deferred embeddings queue full: the backfill scan embeds the rest");
+            return;
         }
         *self.deferred_at.lock().unwrap() = Some(std::time::Instant::now());
         self.embed_wake.notify_one();
+    }
+
+    /// An UPDATE's new text, for each record it changed ([`defer_embedding`]).
+    fn embed_ids_later(&self, memory_type: MemoryType, ids: &[String], text: Option<&str>) {
+        if let Some(text) = text {
+            for id in ids {
+                self.embed_later(memory_type.into(), id.clone(), text.to_string());
+            }
+        }
     }
 
     /// Woken when a record is queued for its vector.
@@ -2158,8 +2262,10 @@ impl<L: Log + 'static> DurableWrites<L> {
                 let mut q = self.embed_soon.lock().unwrap();
                 let mut out = Vec::new();
                 while out.len() < embed_parallel() && !q.is_empty() {
-                    let n = EMBED_SOON_BATCH.min(q.len());
-                    out.push(q.drain(..n).collect());
+                    let b = q.take(EMBED_SOON_BATCH);
+                    if !b.is_empty() {
+                        out.push(b);
+                    }
                 }
                 out
             };
@@ -2168,11 +2274,23 @@ impl<L: Log + 'static> DurableWrites<L> {
             }
             let calls = batches.iter().map(|b| embedder.embed_background(b.iter().map(|(_, _, t)| t.clone()).collect()));
             let results = futures::future::join_all(calls).await;
-            for (batch, r) in batches.iter().zip(results) {
+            let mut failed: Vec<(Memory, String, String)> = Vec::new();
+            let mut error = None;
+            for (batch, r) in batches.into_iter().zip(results) {
                 match r {
-                    Ok(vectors) => done += self.commit_vectors(batch, vectors).await?,
-                    Err(e) => tracing::warn!(error = %e, records = batch.len(), "deferred embedding failed; the backfill scan will retry"),
+                    Ok(vectors) => done += self.commit_vectors(&batch, vectors).await?,
+                    Err(e) => {
+                        failed.extend(batch);
+                        error = Some(e);
+                    }
                 }
+            }
+            // No compute node up, or the model failing: the texts stay queued, in order,
+            // and the embedder tries again on its next wake-up (at most a second).
+            if let Some(e) = error {
+                tracing::warn!(error = %e, records = failed.len(), queued = self.embeds_queued(), "deferred embedding failed; the texts stay queued");
+                self.embed_soon.lock().unwrap().requeue(failed);
+                return Ok(done);
             }
         }
     }
@@ -3084,17 +3202,24 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
     }
 
     async fn update(&self, memory_type: MemoryType, predicate: &Predicate, data: serde_json::Value, in_scope: Option<&str>, namespace: Option<&str>) -> AdbResult<u64> {
-        // New `content` gets a new vector (T5), embedded before the sequencer.
-        let vector = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
-            true => self.vector_of(data.get("content").and_then(|c| c.as_str()).map(String::from)).await,
+        // New `content` gets a new vector (T5): embedded before the sequencer, or after
+        // the commit without the writer waiting ([`defer_embedding`]; not on a branch).
+        let branch_ns = self.branch_ns(namespace);
+        let text = match crate::reads::lance_owned(memory_type) && self.store.is_some() {
+            true => data.get("content").and_then(|c| c.as_str()).filter(|t| !t.trim().is_empty()).map(String::from),
             false => None,
         };
+        let deferred = text.clone().filter(|_| branch_ns.is_none() && self.embedder.is_some() && defer_embedding(memory_type));
+        let vector = match deferred.is_some() {
+            true => None,
+            false => self.vector_of(text).await,
+        };
         self.writable()?;
-        let branch_ns = self.branch_ns(namespace);
         if branch_ns.is_none() && self.store.is_some() {
             if crate::query::keyed(memory_type, predicate, in_scope, namespace).is_some() {
-                if let Some(n) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
-                    return Ok(n);
+                if let Some(embed_ids) = self.update_prepared(memory_type, predicate, &data, in_scope, namespace, vector.clone()).await? {
+                    self.embed_ids_later(memory_type, &embed_ids, deferred.as_deref());
+                    return Ok(embed_ids.len() as u64);
                 }
             } else {
                 slow_write_allowed(memory_type, "UPDATE")?;
@@ -3131,6 +3256,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             // `targets` waited for the applier, so the current versions read here
             // are the ones this update follows.
             let mut effects = Vec::with_capacity(ids.len());
+            let mut embed_ids = Vec::with_capacity(ids.len());
             for key in &ids {
                 let cur = store
                     .current_version(memory_type.into(), key, ts)
@@ -3138,6 +3264,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
                     .map_err(|e| AdbError::Internal(format!("store: {e}")))?
                     .ok_or_else(|| AdbError::Internal(format!("{memory_type:?} {key}: no current version in Lance")))?;
                 let mut new = next_version(&cur, &fields, seq.new_id(ts));
+                embed_ids.push(new.id.0.clone());
                 if let (Kind::Fact, (Some(from), Some(to))) = (new.data.kind, time::validity(&new.data.value)) {
                     if from >= to {
                         return Err(AdbError::InvalidSyntax(format!("{key}: valid_from must be before valid_to")));
@@ -3152,6 +3279,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
             let record = seq.append_record(ts, None, effects.clone()).await.map_err(log_err)?;
             self.to_store(&record).await;
             tracing::debug!(target: "adb::write", ?memory_type, held_us = resolved.as_micros() as u64, log_us = (t0.elapsed() - resolved).as_micros() as u64, "update committed");
+            self.embed_ids_later(memory_type, &embed_ids, deferred.as_deref());
             return Ok(effects.len() as u64);
         }
         let mut effects: Vec<Effect> = ids
@@ -3164,6 +3292,7 @@ impl<L: Log + 'static> Writes for DurableWrites<L> {
         }
         let record = seq.append_record(ts, None, effects).await.map_err(log_err)?;
         self.to_store(&record).await;
+        self.embed_ids_later(memory_type, &ids, deferred.as_deref());
         Ok(ids.len() as u64)
     }
 

@@ -13,6 +13,7 @@
 //! [`DEFAULT_MODEL_DIR`]. `ADB_EMBED_MODEL_DIR` points elsewhere; `ADB_EMBED=off`
 //! turns embedding off (records are then found by filters and text only).
 
+pub mod compute;
 pub mod peers;
 
 use std::path::{Path, PathBuf};
@@ -127,9 +128,9 @@ impl EmbedConfig {
 
 enum Backend {
     Local(LocalModel),
-    /// An embedding pool (`ADB_EMBED_URL`, PF-49): `adb serve-embed` processes on other
-    /// machines, taken in turn; the database nodes then run no model.
-    Pool { client: reqwest::Client, urls: Vec<String>, next: std::sync::atomic::AtomicUsize },
+    /// Compute nodes ([`compute`]): `adb serve-compute` processes on other machines,
+    /// the least busy first; the database nodes then run no model.
+    Compute { client: reqwest::Client },
     Http { client: reqwest::Client, url: String, key: Option<String> },
 }
 
@@ -289,7 +290,7 @@ impl Embedder {
         cfg.check()?;
         match cfg.provider {
             Provider::Local => {
-                if let Some(mut pool) = Self::pool_from_env() {
+                if let Some(mut pool) = Self::compute_from_env() {
                     pool.model = cfg.model.clone();
                     pool.dim = cfg.dimension;
                     return Ok(pool);
@@ -340,16 +341,21 @@ impl Embedder {
         SHARED.get_or_init(Self::from_env).clone()
     }
 
-    /// The embedding pool of `ADB_EMBED_URL` (comma-separated `adb serve-embed` URLs),
-    /// if set: the same model and dimension as the local one, run elsewhere (PF-49).
-    pub fn pool_from_env() -> Option<Self> {
-        let urls: Vec<String> = std::env::var("ADB_EMBED_URL").ok()?.split(',').map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).collect();
-        if urls.is_empty() {
+    /// Embeddings from compute nodes ([`compute`]) when `ADB_EMBED=compute` or
+    /// `ADB_COMPUTE_URL` is set: the same model and dimension as the local one, run
+    /// elsewhere.
+    pub fn compute_from_env() -> Option<Self> {
+        if !compute::enabled() {
             return None;
         }
         let client = reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(500)).timeout(std::time::Duration::from_secs(30)).build().ok()?;
-        tracing::info!(pool = ?urls, model = MODEL, "embeddings from the embedding pool (ADB_EMBED_URL); no model on this node");
-        Some(Self { backend: Backend::Pool { client, urls, next: Default::default() }, model: MODEL.into(), dim: DIM })
+        tracing::info!(named = ?compute::static_urls(), model = MODEL, "embeddings from compute nodes; no model on this node");
+        Some(Self { backend: Backend::Compute { client }, model: MODEL.into(), dim: DIM })
+    }
+
+    /// Whether this embedder runs on compute nodes.
+    pub fn on_compute(&self) -> bool {
+        matches!(self.backend, Backend::Compute { .. })
     }
 
     /// Whether `ADB_EMBED=off` turns embedding off.
@@ -365,7 +371,7 @@ impl Embedder {
             tracing::info!("embeddings off (ADB_EMBED=off)");
             return None;
         }
-        if let Some(pool) = Self::pool_from_env() {
+        if let Some(pool) = Self::compute_from_env() {
             return Some(Arc::new(pool));
         }
         let dir: PathBuf = std::env::var("ADB_EMBED_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(DEFAULT_MODEL_DIR));
@@ -409,28 +415,31 @@ impl Embedder {
                 peers::LOCAL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 r
             }
-            Backend::Pool { client, urls, next } => {
+            Backend::Compute { client } => {
                 let t = std::time::Instant::now();
                 let mut out = Vec::with_capacity(texts.len());
                 for chunk in texts.chunks(HTTP_BATCH) {
-                    let mut last = String::new();
-                    let mut done = false;
-                    for _ in 0..urls.len() {
-                        let url = &urls[next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % urls.len()];
-                        match http_embed(client, url, None, &self.model, chunk, background).await {
+                    let mut tried: Vec<String> = Vec::new();
+                    let mut last = String::from("no compute node is up");
+                    loop {
+                        let Some(lease) = compute::pick(&self.model, self.dim, &tried) else {
+                            return Err(format!("compute nodes: {last}"));
+                        };
+                        match http_embed(client, &lease.url, None, &self.model, chunk, background).await {
                             Ok(v) => {
+                                lease.done();
                                 out.extend(v);
-                                done = true;
                                 break;
                             }
-                            Err(e) => last = e,
+                            Err(e) => {
+                                tracing::debug!(url = %lease.url, error = %e, "compute node failed an embedding; trying another");
+                                tried.push(lease.url.clone());
+                                last = e;
+                            }
                         }
                     }
-                    if !done {
-                        return Err(format!("embedding pool: {last}"));
-                    }
                 }
-                adb_core::steps::add(if background { "embed.pool round trip (background)" } else { "embed.pool round trip" }, t.elapsed());
+                adb_core::steps::add(if background { "compute.embed round trip (background)" } else { "compute.embed round trip" }, t.elapsed());
                 Ok(out)
             }
             Backend::Http { client, url, key } => {
@@ -494,7 +503,7 @@ impl Embedder {
 const HTTP_BATCH: usize = 64;
 
 /// `POST <url>/embeddings` (the OpenAI wire format), vectors in input order.
-/// The header `adb serve-embed` reads: `background` queues the request behind every
+/// The header `adb serve-compute` reads: `background` queues the request behind every
 /// foreground one.
 pub const PRIORITY_HEADER: &str = "x-adb-embed-priority";
 
@@ -531,6 +540,11 @@ async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, mode
         normalize(&mut i.embedding);
         i.embedding
     }).collect())
+}
+
+/// Requests this process's own model is running or has queued.
+pub fn local_in_flight() -> usize {
+    peers::LOCAL_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// ONNX threads per worker (`ADB_EMBED_THREADS`, default 2).

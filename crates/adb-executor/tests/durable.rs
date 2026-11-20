@@ -68,6 +68,8 @@ async fn snapshot(engine: &LocalEngine) -> Vec<Value> {
 
 #[tokio::test]
 async fn restart_rebuilds_identical_state() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
 
     let before = {
@@ -103,6 +105,8 @@ async fn restart_rebuilds_identical_state() {
 
 #[tokio::test]
 async fn ttl_measured_from_commit_time_after_restart() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -118,6 +122,8 @@ async fn ttl_measured_from_commit_time_after_restart() {
 
 #[tokio::test]
 async fn reads_and_failed_writes_are_not_logged() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -156,6 +162,8 @@ fn summary(rows: &[adb_store::StoredRow]) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn lance_table_mirrors_the_engine() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -181,6 +189,8 @@ async fn lance_table_mirrors_the_engine() {
 
 #[tokio::test]
 async fn lance_catches_up_from_the_log() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -203,6 +213,8 @@ async fn lance_catches_up_from_the_log() {
 /// Stage D3: SEMANTIC / EPISODIC reads from Lance answer exactly like the backends.
 #[tokio::test]
 async fn lance_reads_match_backend_reads() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     const EXTRA: &[&str] = &[
         r#"STORE INTO SEMANTIC (concept = "beta", content = "Beta churned", active = false, avg_cpm = 1.5)"#,
         r#"STORE INTO SEMANTIC (concept = "gamma", content = "Gamma upsell", active = true, avg_cpm = 3.2)"#,
@@ -280,6 +292,8 @@ async fn lance_reads_match_backend_reads() {
 /// still has everything (rebuilt from Lance plus the log's tail).
 #[tokio::test]
 async fn log_is_purged_below_lances_durable_offset() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     use std::sync::Arc;
     use adb_core::log::{Epoch, LogOffset, PartitionId};
     use adb_executor::{DurableWrites, Writes};
@@ -345,6 +359,8 @@ async fn log_is_purged_below_lances_durable_offset() {
 /// the watermark on, after which the log is trimmed again.
 #[tokio::test(flavor = "multi_thread")]
 async fn log_is_kept_until_object_storage_holds_it() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     use adb_core::log::{Epoch, LogOffset, PartitionId};
     use adb_executor::{DurableWrites, Writes};
     use adb_log::{Log, LocalWal, WalConfig};
@@ -417,6 +433,8 @@ async fn log_is_kept_until_object_storage_holds_it() {
 
 #[tokio::test]
 async fn reads_see_their_own_writes_with_the_background_applier() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     for i in 0..200 {
@@ -438,6 +456,8 @@ async fn reads_see_their_own_writes_with_the_background_applier() {
 /// schema v3 they were one Lance row: the restart lost WORKING's.
 #[tokio::test]
 async fn same_key_in_two_memory_types_is_two_records() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     {
         let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
@@ -457,6 +477,8 @@ async fn same_key_in_two_memory_types_is_two_records() {
 /// another memory type are untouched.
 #[tokio::test]
 async fn forgetting_a_record_removes_its_links() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     let links = |r: Value| r.to_string().matches(r#""link_type""#).count();
     let with_links = r#"RECALL FROM SEMANTIC WHERE concept = "acme" WITH LINKS"#;
@@ -503,6 +525,8 @@ async fn lance_history(dir: &std::path::Path) -> Vec<adb_store::StoredRow> {
 /// reach the record, and FORGET removes every version.
 #[tokio::test]
 async fn update_supersedes_facts_and_procedures() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     let fact = r#"RECALL FROM SEMANTIC WHERE id = "acme""#;
     {
@@ -555,6 +579,8 @@ async fn update_supersedes_facts_and_procedures() {
 /// superseded version still finds the record, and the whole lineage goes.
 #[tokio::test]
 async fn forget_matches_values_only_in_old_versions() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     for q in [
@@ -586,6 +612,8 @@ async fn forget_matches_values_only_in_old_versions() {
 /// TOOLS keep replace-by-key; STOREs without a key never collide.
 #[tokio::test]
 async fn store_refuses_a_key_in_use() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     async fn seed(engine: &LocalEngine) {
         for q in [
             r#"STORE INTO SEMANTIC (key = "k1", content = "one")"#,
@@ -634,6 +662,8 @@ async fn store_refuses_a_key_in_use() {
 /// has no such field (the MCP guide's recency query), live and after a restart.
 #[tokio::test]
 async fn order_by_created_at_uses_the_records_time() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     let ids = |v: Value| -> Vec<String> { v["data"]["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect() };
     {
@@ -677,6 +707,8 @@ fn files_with(dir: &std::path::Path, needle: &str) -> Vec<String> {
 /// across a restart.
 #[tokio::test]
 async fn forget_hides_at_once_and_compaction_erases() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     let dir = tempfile::tempdir().unwrap();
     let secret = "SECRET-card-4111-1111-1111-1111";
     {
@@ -710,6 +742,8 @@ async fn forget_hides_at_once_and_compaction_erases() {
 /// (here the admin one); the rest of the table and later writes are unaffected.
 #[tokio::test]
 async fn compaction_erases_deleted_platform_rows() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     use adb_core::log::Effect;
     let dir = tempfile::tempdir().unwrap();
     let secret = "pbkdf2-SECRET-HASH-0001";
@@ -735,6 +769,8 @@ async fn compaction_erases_deleted_platform_rows() {
 /// (replay from the log) ends with the same rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_platform_writes_commit_in_groups() {
+    // Exact log-record counts: vectors inline, not as later records (tests/deferred_embedding.rs).
+    std::env::set_var("ADB_EMBED_DEFER", "none");
     use adb_core::log::Effect;
     let dir = tempfile::tempdir().unwrap();
     let row = |k: &str, v: u32| serde_json::json!({"key": k, "value": v.to_string()}).as_object().unwrap().clone();

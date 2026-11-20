@@ -50,6 +50,8 @@ async fn like_ranks_by_meaning_and_honours_the_modifiers() {
             q(&engine, &format!(r#"STORE INTO SEMANTIC (key = "{k}", content = "{c}") NAMESPACE "crm""#)).await;
         }
         q(&engine, r#"STORE INTO SEMANTIC (key = "other-ns", content = "Acme renews in November") NAMESPACE "elsewhere""#).await;
+        // Writes don't wait for their vectors: LIKE ranks what has one.
+        engine.vectors_caught_up(std::time::Duration::from_secs(60)).await.unwrap();
 
         // Paraphrases with few shared words find the right fact first.
         for (question, want) in [
@@ -80,6 +82,7 @@ async fn like_ranks_by_meaning_and_honours_the_modifiers() {
         assert_eq!(keys(&strict).first().map(String::as_str), Some("acme-renewal"));
         // UPDATE re-embeds.
         q(&engine, r#"UPDATE INTO SEMANTIC WHERE key = "vpn-reset" (content = "The office printer needs new toner")"#).await;
+        engine.vectors_caught_up(std::time::Duration::from_secs(60)).await.unwrap();
         let r = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q NAMESPACE "crm" LIMIT 1"#, "printer out of ink").await;
         assert_eq!(keys(&r), ["vpn-reset"]);
     }
@@ -90,6 +93,7 @@ async fn like_ranks_by_meaning_and_honours_the_modifiers() {
     assert_eq!(keys(&r), ["acme-renewal"]);
     // IN SCOPE and a vector query.
     q(&engine, r#"STORE INTO SEMANTIC (key = "scoped", content = "Acme renews in November") IN SCOPE "team:crm""#).await;
+    engine.vectors_caught_up(std::time::Duration::from_secs(60)).await.unwrap();
     let r = like(&engine, r#"RECALL FROM SEMANTIC LIKE $q IN SCOPE "team:crm" LIMIT 5"#, "Acme").await;
     assert_eq!(keys(&r), ["team:crm~scoped"], "a named scope's ids carry it (E-L12)");
 }

@@ -703,8 +703,17 @@ fn spawn_deferred_embedder<L: adb_log::Log + 'static>(writes: std::sync::Weak<Du
             if w.embeds_queued() == 0 {
                 continue;
             }
+            // How far vectors lag behind writes.
+            crate::steps::value("embed.deferred queued", w.embeds_queued() as u64);
             match w.embed_deferred().await {
-                Ok(n) => crate::steps::value("embed.deferred records per drain", n),
+                Ok(n) => {
+                    crate::steps::value("embed.deferred records per drain", n);
+                    // Texts left queued: no compute node up, or the model failing. Not
+                    // again at every write's wake-up: in a second.
+                    if w.embeds_queued() > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
                 Err(e) => tracing::warn!(error = %e, "deferred embedding stopped; retrying"),
             }
         }
@@ -1026,6 +1035,22 @@ impl LocalEngine {
 
     pub fn durable_writes(&self) -> Option<&Arc<DurableWrites<EngineLog>>> {
         self.durable.as_ref()
+    }
+
+    /// Wait until every record written so far has its vector (writes don't wait for
+    /// them, `writes::defer_embedding`): for a `LIKE` read that must rank them all.
+    pub async fn vectors_caught_up(&self, within: std::time::Duration) -> Result<(), String> {
+        let Some(w) = &self.durable else { return Ok(()) };
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if w.embeds_queued() == 0 && w.pending_embeddings().await.map_err(|e| e.to_string())? == 0 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("vectors still pending after {within:?}"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn durable_with(dir: std::path::PathBuf, wal: EngineLog, role: PartitionRole, epoch_owner: bool) -> Result<(Self, ReplayStats), String> {

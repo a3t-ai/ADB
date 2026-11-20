@@ -79,9 +79,21 @@ pub fn routes(node: Arc<PartitionedEngine>) -> Router {
         .route("/internal/query", post(query))
         .route("/internal/partition/:p", post(partition))
         .route("/internal/replicate/:p", post(replicate))
+        .route("/internal/compute", post(compute_announce).get(compute_status))
         .layer(axum::extract::DefaultBodyLimit::max(INTERNAL_BODY_MAX))
         .layer(axum::middleware::from_fn(adb_cluster::identity::guard))
         .with_state(node)
+}
+
+/// A compute node announcing itself (`adb serve-compute`, every 2 s).
+async fn compute_announce(Json(a): Json<adb_embed::compute::Announce>) -> axum::http::StatusCode {
+    adb_embed::compute::heard(a);
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// The compute nodes this node sends work to.
+async fn compute_status() -> Json<Vec<adb_embed::compute::Status>> {
+    Json(adb_embed::compute::status())
 }
 
 /// [`Peers`] over HTTP, with this cluster's token.
