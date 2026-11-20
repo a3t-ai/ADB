@@ -180,7 +180,10 @@ fn endpoints(info: &NodeInfo) -> Value {
         out.push(json!({ "name": "Readiness", "kind": "http", "method": "GET", "path": "/ready", "use": "200 when this node holds its control-plane lease" }));
         out.push(json!({ "name": "Node to node", "kind": "internal", "path": "/internal/*", "use": "Replication and forwarding between ADB nodes only" }));
     }
-    out.push(json!({ "name": "CLI", "kind": "cli", "command": "adb query \"<AQL>\" · adb sql \"<SQL>\" --flight grpc://host:port", "use": "One statement from a shell" }));
+    if info.flight_port != 0 {
+        out.push(json!({ "name": "CLI: SQL", "kind": "cli", "command": "ADB_AUTH_TOKEN=… adb sql \"<SQL>\" --flight grpc://host:port", "use": "Read-only SQL over a running node (memory, memory_current, platform tables)" }));
+    }
+    out.push(json!({ "name": "CLI: AQL", "kind": "cli", "command": "adb --data-dir <dir> query \"<AQL>\"", "use": "One statement on a data directory no node is running on; for a running node use POST /query" }));
     Value::Array(out)
 }
 
