@@ -1843,7 +1843,8 @@ impl PartitionStore {
                     out.insert(log.id.clone(), log);
                 }
                 // The vectors aren't the table's: `apply` hands the file to the vector map.
-                Effect::Vectors { .. } => {}
+                // An old log's inline vector is dropped (the backfill embeds again).
+                Effect::Vectors { .. } | Effect::LegacyEmbed { .. } => {}
                 Effect::UpdateSubCursor { sub_id, cursor } => {
                     if let Some(mut sub) = Self::row(inner, pre, &out, &sub_id.0).await? {
                         if let serde_json::Value::Object(v) = &mut sub.data.value {

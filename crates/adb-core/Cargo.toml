@@ -21,3 +21,4 @@ libc = "0.2"
 prometheus = { version = "=0.13.4", default-features = false }
 
 [dev-dependencies]
+rmp-serde.workspace = true

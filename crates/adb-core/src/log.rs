@@ -317,6 +317,12 @@ pub enum Effect {
     /// every node that applies this loads the file. The vectors themselves don't travel
     /// in the log, and no row of the table changes.
     Vectors { uri: String },
+    /// Before 20 Nov 2026 a vector travelled in the log (`embed`). Decoded so logs
+    /// written then still read (vc-dev's data was kept, user 20 Nov); never written,
+    /// and applied as nothing: the backfill makes those records' vectors again, as
+    /// vector files.
+    #[serde(rename = "embed")]
+    LegacyEmbed { memory: Memory, id: RecordId, embedding: Vec<f16> },
     /// FlowR's engine (stage H, `.ai/H_ENGINE_STORE.md`): the durable changes one
     /// operation made in engine space `space` (`flowr_storage::engine_core::Change`
     /// as JSON, applied in order by `adb-engine`; opaque here).
@@ -412,5 +418,19 @@ mod tests {
         if let Effect::Supersede { new, .. } = &back.effects[0] {
             assert_eq!(new.data.embedding.as_ref().unwrap()[1].to_f32(), -1.25);
         }
+    }
+
+    /// A log written before vector files (`"effect":"embed"`) still decodes.
+    #[test]
+    fn an_old_inline_vector_record_still_decodes() {
+        let old = r#"{"effect":"embed","memory":"semantic","id":"k1","embedding":[14336,48448]}"#;
+        match serde_json::from_str::<Effect>(old).unwrap() {
+            Effect::LegacyEmbed { memory, id, embedding } => {
+                assert_eq!((memory, id.0.as_str(), embedding.len()), (Memory::Semantic, "k1", 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        let packed = rmp_serde::to_vec_named(&serde_json::from_str::<Effect>(old).unwrap()).unwrap();
+        assert!(matches!(rmp_serde::from_slice::<Effect>(&packed).unwrap(), Effect::LegacyEmbed { .. }));
     }
 }

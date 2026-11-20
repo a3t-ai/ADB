@@ -64,6 +64,7 @@ dependencies = [
  "half",
  "libc",
  "prometheus",
+ "rmp-serde",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

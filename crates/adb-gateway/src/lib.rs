@@ -364,7 +364,7 @@ pub async fn deliver(spec: &SubSpec, record: &LogRecord, lineages: &dyn Lineages
                 }
             }
             // New vectors are not a change of any record's content.
-            Effect::Vectors { .. } => continue,
+            Effect::Vectors { .. } | Effect::LegacyEmbed { .. } => continue,
             // Registrations and cursors are not changes anyone subscribes to.
             Effect::Register(_) | Effect::UpdateSubCursor { .. } | Effect::Unregister { .. } => continue,
             // Platform tables (stage G) aren't memory: no subscription sees them.
