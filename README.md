@@ -54,6 +54,8 @@ with no network port: see [MCP](#mcp).
 
 ## ADB Console
 
+![ADB Console: overview of a 3-node cluster, with every connection point](docs/images/console-overview.png)
+
 Open **`http://localhost:3000/ui`** in a browser (the node's address and HTTP port).
 If the node has a token, paste it into the token field and press **Connect**; the
 page keeps it for the browser tab only.
@@ -65,6 +67,12 @@ page keeps it for the browser tab only.
 | Settings | The embedding setting (provider, model, where it runs), hot-cache rules, compact now |
 | Cluster | Nodes, which node owns and replicates each partition, compute nodes |
 | Metrics | Latency percentiles (p50/p90/p99) and counters, with a filter and auto-refresh |
+
+| Query | Cluster |
+|---|---|
+| ![AQL editor with a variable and the result as a table](docs/images/console-query.png) | ![Nodes and the owner of each of 64 partitions](docs/images/console-cluster.png) |
+| **Settings** | **Metrics** |
+| ![Embedding setting and hot cache rules](docs/images/console-settings.png) | ![Query latencies p50/p90/p99 and counters](docs/images/console-metrics.png) |
 
 The console is a build feature (`console`), off by default: a binary built without
 it serves no `/ui`. The page itself is open, as it holds no data; everything it shows
