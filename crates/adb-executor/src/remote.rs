@@ -197,6 +197,8 @@ pub async fn dispatch_op(e: &LocalEngine, op: &str, a: Value) -> Result<Value, S
         // The cluster's SQL view: this partition's memory rows, Arrow IPC.
         "memory_raw" => Ok(json!({ "ipc": crate::sql::to_ipc(&e.memory_raw().await?)? })),
         "embedding" => e.embedding().await,
+        // The cluster's embedding setting, kept by the system partition.
+        "set_embedding" => e.set_embedding(arg(&a, "settings")?).await,
         "cache" => e.cache().await,
         // Cluster-wide settings, copied into a partition before it opens.
         "settings" => Ok(json!({

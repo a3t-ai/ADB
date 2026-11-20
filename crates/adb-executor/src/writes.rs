@@ -808,6 +808,8 @@ pub struct DurableWrites<L: Log> {
     key_offsets: std::sync::Mutex<KeyOffsets>,
     /// Records waiting for a vector (PF-51): memory, row id, text.
     backfill_queue: std::sync::Mutex<std::collections::VecDeque<(Memory, String, String)>>,
+    /// The vector map's model switches the backfill has seen ([`Self::follow_embedding`]).
+    vector_switches: std::sync::atomic::AtomicUsize,
     /// Records stored without waiting for their vector ([`DurableWrites::embed_deferred`]): (memory,
     /// record id, text), embedded by [`DurableWrites::embed_deferred`] as soon as it
     /// wakes. Bounded: past [`EMBED_SOON_MAX`] a record waits for the backfill scan.
@@ -2102,6 +2104,10 @@ impl<L: Log + 'static> DurableWrites<L> {
     /// Current SEMANTIC / EPISODIC / PROCEDURAL rows with text to embed and no vector.
     async fn unembedded(&self) -> AdbResult<Vec<(adb_store::StoredRow, String)>> {
         let Some(store) = &self.store else { return Ok(Vec::new()) };
+        // Unembedded for the model in force (the setting may have just changed).
+        if let Some(e) = &self.embedder {
+            store.vectors().follow(&e.model(), e.dimension());
+        }
         let now = CommitTs::from_datetime(time::now());
         let filter = format!(
             "{} AND memory IN ('semantic', 'episodic', 'procedural') AND tombstone = false AND superseded_by IS NULL",
@@ -2114,6 +2120,27 @@ impl<L: Log + 'static> DurableWrites<L> {
             .filter(|r| r.is_current(now) && !vectors.contains(&r.id))
             .filter_map(|r| crate::reads::embed_text(r.data.memory.into(), &r.data.value).map(|t| (r, t)))
             .collect())
+    }
+
+    /// Point the partition's vectors at the embedding setting's model; `true` when that
+    /// changed them (the backfill then has every record to embed again, at once: the
+    /// texts queued for the old model are dropped).
+    pub fn follow_embedding(&self) -> bool {
+        let (Some(store), Some(e)) = (&self.store, &self.embedder) else { return false };
+        store.vectors().follow(&e.model(), e.dimension());
+        // A switch made anywhere (a LIKE read, a status call) counts.
+        let n = store.vectors().switches();
+        if self.vector_switches.swap(n, std::sync::atomic::Ordering::Relaxed) == n {
+            return false;
+        }
+        self.backfill_queue.lock().unwrap().clear();
+        *self.deferred_at.lock().unwrap() = None;
+        true
+    }
+
+    /// Whether vector files are being loaded (rows look unembedded until they are).
+    pub fn vectors_loading(&self) -> bool {
+        self.store.as_ref().is_some_and(|s| s.vectors().loading() > 0)
     }
 
     /// How many records still wait for a vector (W9.10: re-embedding progress).
@@ -2182,14 +2209,21 @@ impl<L: Log + 'static> DurableWrites<L> {
             return Ok(0);
         }
         let map = store.vectors();
+        // The setting may change at any time: the vectors carry the model they were
+        // made with, and the map follows the model in force.
+        let (model, dim) = (embedder.model(), embedder.dimension());
+        map.follow(&model, dim);
         let items: Vec<(String, String)> = todo.iter().map(|(m, id, t)| (adb_store::row_id(*m, id), t.clone())).collect();
         let uri = match embedder.embed_to_file(map.location(), &items).await {
             Some(r) => r.map_err(AdbError::EmbeddingError)?,
             None => {
                 let vectors = adb_embed::embed_in_calls(embedder, items.iter().map(|(_, t)| t.clone()).collect()).await.map_err(AdbError::EmbeddingError)?;
+                if vectors.first().is_some_and(|v| v.len() != dim) || embedder.model() != model {
+                    return Err(AdbError::EmbeddingError("the embedding setting changed during the batch; embedding it again".into()));
+                }
                 let entries: Vec<adb_store::vectors::Entry> = items.into_iter().zip(vectors).map(|((id, _), v)| (id, adb_embed::to_f16(&v))).collect();
-                let uri = adb_store::vectors::write(map.location(), embedder.model(), embedder.dimension(), &entries).await.map_err(AdbError::EmbeddingError)?;
-                map.insert(&uri, embedder.model(), entries);
+                let uri = adb_store::vectors::write(map.location(), &model, dim, &entries).await.map_err(AdbError::EmbeddingError)?;
+                map.insert(&uri, &model, entries);
                 uri
             }
         };
@@ -2359,7 +2393,7 @@ impl<L: Log + 'static> DurableWrites<L> {
         steps.push(("aliases", t_step.elapsed()));
         tracing::info!(steps = ?steps, "write path opened");
         let store = Some(store);
-        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), embed_soon: Default::default(), embed_wake: Default::default(), deferred_at: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
+        Ok((Self { log: seq.shared_log(), seq: Mutex::new(seq), seq_holder: Default::default(), epoch_pending: Default::default(), store, applier, subs: Arc::new(subs), branches: Arc::new(branches), platform: None, live: std::sync::Mutex::new(live), embedder: None, forgotten_since: Default::default(), compactor: Mutex::new(()), usage: Mutex::new(None), platform_last: Default::default(), archive_floor: std::sync::atomic::AtomicU64::new(1), purged_at: Default::default(), compacting: Default::default(), archive_marked: Default::default(), archive_record: Default::default(), shipped: Default::default(), epoch: Default::default(), spaces: Default::default(), platform_queue: Default::default(), platform_tickets: Default::default(), platform_applied: Arc::new(tokio::sync::watch::Sender::new(0)), platform_reshape: Default::default(), key_offsets: Default::default(), backfill_queue: Default::default(), vector_switches: Default::default(), embed_soon: Default::default(), embed_wake: Default::default(), deferred_at: Default::default(), poisoned: Default::default(), moved: Default::default(), last_off: Default::default(), last_ts: Default::default(), forgotten: Default::default(), pins: Default::default(), retain_max: retain_max(), sub_idle: sub_idle(), timers: std::sync::Mutex::new(timers), aliases: std::sync::Mutex::new(aliases), engine: None, engine_subs: None, engine_tickets: Default::default(), engine_submitted: Default::default(), engine_committed: Arc::new(tokio::sync::watch::Sender::new(0)) }, stats))
     }
 
     /// Drop what the hot cache holds past its window, TTL or validity (W10).

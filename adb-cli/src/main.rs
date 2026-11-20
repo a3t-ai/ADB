@@ -60,12 +60,13 @@ enum Commands {
         #[arg(long, default_value_t = 3001)]
         flight_port: u16,
     },
-    /// Run a compute node: no database, only work the database nodes hand it. Today
-    /// `embed` (`POST /embeddings`, the OpenAI wire format, from the local model).
-    /// It announces itself to the database nodes in `ADB_COMPUTE_JOIN`
-    /// (comma-separated `http://<host>:3000`), as `ADB_ADVERTISE`
-    /// (`http://<HOSTNAME>:<port>` by default); database nodes with
-    /// `ADB_EMBED=compute` then send it their texts and run no model themselves.
+    /// Run a compute node: no database, only work the database nodes hand it: `embed`
+    /// (`POST /embeddings`, the OpenAI wire format) and `vectors` (embed a batch and
+    /// write it as a vector file to object storage). It announces itself to the
+    /// database nodes in `ADB_COMPUTE_JOIN` (comma-separated `http://<host>:3000`), as
+    /// `ADB_ADVERTISE` (`http://<HOSTNAME>:<port>` by default), and runs the embedding
+    /// setting they answer with (`local`, `openai` or `custom`). With the setting's
+    /// `run_on: compute`, database nodes send it their texts and run no model.
     ServeCompute {
         #[arg(long, default_value = "0.0.0.0")]
         host: IpAddr,
@@ -305,24 +306,11 @@ mod log_tests {
 /// `/v1/embeddings`, announced to the database nodes.
 async fn serve_compute(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     use axum::routing::{get, post};
-    // A compute node embeds with its own model, never through other compute nodes.
+    // A compute node embeds in its own process, never through other compute nodes.
     std::env::remove_var("ADB_COMPUTE_URL");
-    if std::env::var("ADB_EMBED").is_ok_and(|v| v.eq_ignore_ascii_case("compute")) {
-        std::env::remove_var("ADB_EMBED");
-    }
-    // `ADB_COMPUTE_EMBED`: the embedding settings as JSON (`adb_embed::EmbedConfig`),
-    // e.g. an OpenAI endpoint; the key comes from the variable it names. Else the
-    // local model.
-    let embedder = match std::env::var("ADB_COMPUTE_EMBED").ok().filter(|v| !v.trim().is_empty()) {
-        Some(json) => {
-            let cfg: adb_embed::EmbedConfig = serde_json::from_str(&json).map_err(|e| format!("ADB_COMPUTE_EMBED: {e}"))?;
-            let e = Arc::new(adb_embed::Embedder::from_config(&cfg)?);
-            e.verify().await.map_err(|err| format!("ADB_COMPUTE_EMBED: {err}"))?;
-            tracing::info!(provider = ?cfg.provider, model = %cfg.model, dimension = cfg.dimension, "compute node embeds through an endpoint");
-            e
-        }
-        None => adb_embed::Embedder::from_env().ok_or("serve-compute needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?,
-    };
+    // It starts on the default setting (the local model, when its files are here) and
+    // runs whatever setting the database nodes answer its announcements with.
+    let embedder = adb_embed::Embedder::process().ok_or("serve-compute with ADB_EMBED=off: nothing to run")?;
     spawn_announcer(Arc::clone(&embedder), port);
     async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, headers: axum::http::HeaderMap, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
         // A database node's deferred vectors: behind every request someone waits on.
@@ -350,7 +338,10 @@ async fn serve_compute(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error
     /// object storage with this node's `AWS_*` credentials); answers {uri}. The
     /// database node only names the file in its log.
     async fn vectors(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, axum::Json(req): axum::Json<VectorsRequest>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
-        let fail = |code, err: String| (code, axum::Json(serde_json::json!({ "error": err })));
+        let fail = |code: axum::http::StatusCode, err: String| {
+            tracing::warn!(status = code.as_u16(), error = %err, "vector file request failed");
+            (code, axum::Json(serde_json::json!({ "error": err })))
+        };
         if req.model != e.model() || req.dimension != e.dimension() {
             return fail(axum::http::StatusCode::CONFLICT, format!("this compute node runs {} ({}), not {} ({})", e.model(), e.dimension(), req.model, req.dimension));
         }
@@ -360,8 +351,12 @@ async fn serve_compute(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error
             Ok(v) => v,
             Err(err) => return fail(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err),
         };
+        // The setting may have changed while it embedded: the file says what made it.
+        if e.model() != req.model || vectors.first().is_some_and(|v| v.len() != req.dimension) {
+            return fail(axum::http::StatusCode::CONFLICT, "the embedding setting changed during the request".into());
+        }
         let entries: Vec<adb_store::vectors::Entry> = req.items.into_iter().zip(vectors).map(|((id, _), v)| (id, adb_embed::to_f16(&v))).collect();
-        match adb_store::vectors::write(&req.location, e.model(), e.dimension(), &entries).await {
+        match adb_store::vectors::write(&req.location, &req.model, req.dimension, &entries).await {
             Ok(uri) => (axum::http::StatusCode::OK, axum::Json(serde_json::json!({ "uri": uri, "vectors": entries.len() }))),
             Err(err) => fail(axum::http::StatusCode::BAD_GATEWAY, err),
         }
@@ -403,12 +398,13 @@ fn spawn_announcer(embedder: Arc<adb_embed::Embedder>, port: u16) {
         let mut tick = tokio::time::interval(adb_embed::compute::ANNOUNCE_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut down: std::collections::BTreeSet<String> = Default::default();
+        let mut failed_setting: Option<adb_embed::EmbedConfig> = None;
         loop {
             tick.tick().await;
             let a = adb_embed::compute::Announce {
                 url: me.clone(),
                 functions: vec!["embed".into(), "vectors".into()],
-                model: embedder.model().to_string(),
+                model: embedder.model(),
                 dimension: embedder.dimension(),
                 workers: adb_embed::workers(),
                 in_flight: adb_embed::local_in_flight(),
@@ -418,13 +414,37 @@ fn spawn_announcer(embedder: Arc<adb_embed::Embedder>, port: u16) {
                 if let Some(t) = &token {
                     req = req.bearer_auth(t);
                 }
-                async move { (db.clone(), req.send().await.map_err(|e| e.to_string()).and_then(|r| r.error_for_status().map(|_| ()).map_err(|e| e.to_string()))) }
+                async move {
+                    let r = match req.send().await.and_then(|r| r.error_for_status()) {
+                        // Older database nodes answer 204 without a body.
+                        Ok(r) => Ok(r.json::<serde_json::Value>().await.ok().and_then(|v| serde_json::from_value::<adb_embed::EmbedConfig>(v.get("settings")?.clone()).ok())),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    (db.clone(), r)
+                }
             });
+            let mut setting: Option<adb_embed::EmbedConfig> = None;
             for (db, r) in futures::future::join_all(calls).await {
                 match r {
-                    Ok(()) if down.remove(&db) => tracing::info!(db = %db, "database node hears this compute node again"),
+                    Ok(s) => {
+                        if down.remove(&db) {
+                            tracing::info!(db = %db, "database node hears this compute node again");
+                        }
+                        setting = setting.or(s);
+                    }
                     Err(e) if down.insert(db.clone()) => tracing::warn!(db = %db, error = %e, "announcing to a database node failed; retrying"),
-                    _ => {}
+                    Err(_) => {}
+                }
+            }
+            // The cluster's embedding setting, run in this process.
+            if let Some(cfg) = setting.map(|c| c.on_node()) {
+                if cfg != embedder.config() {
+                    if let Err(e) = embedder.reconfigure(&cfg).await {
+                        if failed_setting.as_ref() != Some(&cfg) {
+                            tracing::error!(error = %e, provider = ?cfg.provider, model = %cfg.model, "the cluster's embedding setting can't run on this compute node");
+                            failed_setting = Some(cfg);
+                        }
+                    }
                 }
             }
         }

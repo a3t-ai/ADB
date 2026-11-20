@@ -55,6 +55,9 @@ use crate::Executor;
 /// The catalog's platform table.
 pub const CATALOG: &str = "adb_namespaces";
 
+/// How often a cluster node checks the cluster's embedding setting (applied in place).
+const EMBEDDING_FOLLOW: Duration = Duration::from_secs(10);
+
 /// A partition, here or on its owner.
 #[derive(Clone)]
 pub enum Handle {
@@ -371,6 +374,18 @@ impl crate::spaces::Spaces for RouterSpaces {
 impl PartitionedEngine {
     /// One node holding every partition of `map` (the system partition now, the
     /// memory partitions on first use), and its catalog.
+    /// Apply the cluster's embedding setting (the system partition's) to this
+    /// process's embedder, when it differs.
+    pub async fn follow_embedding(&self) -> Result<(), String> {
+        let Some(e) = adb_embed::Embedder::process() else { return Ok(()) };
+        let v = self.system_handle().await?.op("embedding", json!({})).await?;
+        let cfg: adb_embed::EmbedConfig = serde_json::from_value(v.get("settings").cloned().unwrap_or_default()).map_err(|err| format!("embedding settings: {err}"))?;
+        if cfg != e.config() {
+            e.reconfigure(&cfg).await?;
+        }
+        Ok(())
+    }
+
     pub async fn open(dir: impl Into<PathBuf>, map: PartitionMap) -> Result<Arc<Self>, String> {
         if map.partitions == 0 {
             return Err("the partition map has no partitions yet".into());
@@ -392,6 +407,23 @@ impl PartitionedEngine {
         if node.owns(node.sys()) {
             Box::pin(node.handle(node.sys())).await?;
         }
+        // The cluster's embedding setting, followed without a restart.
+        let follower = Arc::downgrade(&node);
+        tokio::spawn(async move {
+            let mut failed: Option<String> = None;
+            loop {
+                tokio::time::sleep(EMBEDDING_FOLLOW).await;
+                let Some(node) = follower.upgrade() else { return };
+                match node.follow_embedding().await {
+                    Ok(()) => failed = None,
+                    Err(e) if failed.as_deref() != Some(e.as_str()) => {
+                        tracing::warn!(error = %e, "the cluster's embedding setting isn't applied on this node yet");
+                        failed = Some(e);
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
         // Step 7: partitions given to this node are taken over at once, not at their
         // first request — until then the replica's memory is the only copy of their
         // writes not yet on object storage.
@@ -2216,18 +2248,12 @@ impl Engine for Arc<PartitionedEngine> {
         self.system_handle().await?.op("embedding", json!({})).await
     }
 
-    /// Checked and saved by the system partition (which restarts ADB to apply them),
-    /// and saved for every other partition on this node, so all embed with one model.
-    /// Changed on the node owning the system partition.
+    /// Checked, applied and saved by the system partition (from any node); this node
+    /// applies it at once, the others within [`EMBEDDING_FOLLOW`]
+    /// ([`PartitionedEngine::follow_embedding`]). No restart.
     async fn set_embedding(&self, settings: Value) -> Result<Value, String> {
-        let s = self.system_local().ok_or("embedding settings are changed on the node owning the system partition")?;
-        let c: adb_embed::EmbedConfig = serde_json::from_value(settings.clone()).map_err(|e| format!("embedding settings: {e}"))?;
-        let r = s.set_embedding(settings).await?;
-        if let Ok(dirs) = std::fs::read_dir(self.dir.join("parts")) {
-            for d in dirs.flatten().filter(|d| d.path().is_dir()) {
-                c.save(&d.path())?;
-            }
-        }
+        let r = self.system_handle().await?.op("set_embedding", json!({ "settings": settings })).await?;
+        self.follow_embedding().await?;
         Ok(r)
     }
 

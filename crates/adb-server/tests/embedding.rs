@@ -1,6 +1,6 @@
-//! W9.10: embedding settings. A provider is checked with a sample embedding,
-//! saved in the data directory and applied at the next start: another model or
-//! dimension clears the vectors and the backfill embeds every record again.
+//! Embedding settings (W9.10; applied in place 20 Nov 2026). A provider is checked
+//! with a sample embedding, applied at once without a restart and saved in the data
+//! directory: another model or dimension makes every record's vector again.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,7 +63,7 @@ async fn wait_embedded(engine: &LocalEngine) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_endpoint_provider_is_checked_saved_and_applied_at_restart() {
+async fn a_provider_is_checked_applied_in_place_and_kept_across_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (url, seen) = mock_endpoint().await;
     {
@@ -79,43 +79,52 @@ async fn an_endpoint_provider_is_checked_saved_and_applied_at_restart() {
         let (base, server) = serve(Arc::clone(&engine)).await;
         let http = reqwest::Client::new();
         let get = || async { http.get(format!("{base}/admin/embedding")).send().await.unwrap().json::<Value>().await.unwrap() };
+        let put = |v: Value| {
+            let (http, base) = (http.clone(), base.clone());
+            async move { http.put(format!("{base}/admin/embedding")).json(&v).send().await.unwrap().json::<Value>().await.unwrap() }
+        };
         assert_eq!(get().await["data"]["source"], "default");
 
-        // Wrong dimension: refused, nothing saved.
-        let bad = json!({ "provider": "openai", "model": "mock-a", "dimension": 8, "url": url });
-        let r: Value = http.put(format!("{base}/admin/embedding")).json(&bad).send().await.unwrap().json().await.unwrap();
+        // `openai` needs the key's variable; a wrong dimension is refused; nothing saved.
+        let r = put(json!({ "provider": "openai", "model": "text-embedding-3-small", "dimension": 384 })).await;
+        assert!(r["error"].as_str().unwrap().contains("api_key_env"), "{r}");
+        let r = put(json!({ "provider": "custom", "model": "mock-a", "dimension": 8, "url": url })).await;
         assert_eq!(r["success"], false, "{r}");
         assert!(r["error"].as_str().unwrap().contains("4 dimensions"), "{r}");
         assert_eq!(get().await["data"]["source"], "default");
 
-        let good = json!({ "provider": "openai", "model": "mock-a", "dimension": 4, "url": url });
-        let r: Value = http.put(format!("{base}/admin/embedding")).json(&good).send().await.unwrap().json().await.unwrap();
+        // Applied in place: no restart, every record gets mock-a's vector.
+        let r = put(json!({ "provider": "custom", "model": "mock-a", "dimension": 4, "url": url })).await;
         assert_eq!(r["success"], true, "{r}");
-        assert_eq!(r["data"]["restart"], true);
-        assert_eq!(r["data"]["reembed"], true);
-        tokio::time::timeout(Duration::from_secs(3), adb_executor::restart_requested()).await.expect("restart requested");
-        // What `adb serve` does then: stop serving and close the engine.
+        assert_eq!((r["data"]["restart"].clone(), r["data"]["reembed"].clone()), (json!(false), json!(true)));
+        let e = wait_embedded(&engine).await;
+        assert_eq!(e["source"], "settings");
+        assert_eq!((e["active"]["provider"].clone(), e["active"]["model"].clone()), (json!("custom"), json!("mock-a")));
+        let vars = std::collections::HashMap::from([("q".to_string(), json!("when does it renew?"))]);
+        let r = engine.query("RECALL FROM SEMANTIC LIKE $q LIMIT 1", Some(&vars)).await.unwrap();
+        assert_eq!(r["data"]["records"][0]["id"], "acme", "{r}");
+
+        // Another model of the same size, in place: every record embedded again.
+        let r = put(json!({ "provider": "custom", "model": "mock-bb", "dimension": 4, "url": url })).await;
+        assert_eq!(r["data"]["reembed"], true, "{r}");
+        let e = wait_embedded(&engine).await;
+        assert_eq!(e["active"]["model"], "mock-bb");
+        let r = engine.query("RECALL FROM SEMANTIC LIKE $q LIMIT 1", Some(&vars)).await.unwrap();
+        assert_eq!(r["data"]["records"][0]["id"], "acme", "{r}");
         server.abort();
         let _ = server.await;
     }
+    // Three records, the setting's sample check and the LIKE's text.
+    let before = seen.lock().unwrap().get("mock-bb").copied();
+    assert_eq!(before, Some(5), "{:?}", seen.lock().unwrap());
 
-    // The restart: 4-dimension vectors from the endpoint for every record.
+    // After a restart: the saved setting, the vectors read from their files (nothing
+    // embedded again).
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     let e = wait_embedded(&engine).await;
-    assert_eq!(e["source"], "settings");
-    assert_eq!(e["active"], json!({ "model": "mock-a", "dimension": 4 }));
-    let vars = std::collections::HashMap::from([("q".to_string(), json!("when does it renew?"))]);
+    assert_eq!((e["source"].clone(), e["active"]["model"].clone()), (json!("settings"), json!("mock-bb")));
+    let vars = std::collections::HashMap::from([("q".to_string(), json!("the pod is out of memory"))]);
     let r = engine.query("RECALL FROM SEMANTIC LIKE $q LIMIT 1", Some(&vars)).await.unwrap();
-    assert_eq!(r["data"]["records"][0]["id"], "acme", "{r}");
-
-    // Another model of the same size: vectors cleared at open, embedded again.
-    adb_embed::EmbedConfig { model: "mock-bb".into(), ..serde_json::from_value(e["settings"].clone()).unwrap() }.save(dir.path()).unwrap();
-    drop(engine);
-    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
-    let e = wait_embedded(&engine).await;
-    assert_eq!(e["active"]["model"], "mock-bb");
-    // mock-a's vectors were cleared: all three records went to mock-bb (plus the
-    // sample a PUT would embed; none here, the file was edited directly).
-    let seen = seen.lock().unwrap().clone();
-    assert_eq!(seen.get("mock-bb").copied(), Some(3), "{seen:?}");
+    assert_eq!(r["data"]["records"][0]["id"], "oom", "{r}");
+    assert_eq!(seen.lock().unwrap().get("mock-bb").copied(), Some(6), "only the LIKE text is embedded");
 }

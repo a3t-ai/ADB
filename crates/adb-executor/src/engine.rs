@@ -316,33 +316,6 @@ pub async fn restart_requested() {
     RESTART.notified().await
 }
 
-/// The embedder for `settings` (none saved: the environment's local model), and
-/// the table's dimension and model name for it.
-fn embedder_for(settings: Option<&adb_embed::EmbedConfig>) -> (Option<Arc<adb_embed::Embedder>>, i32, Option<String>) {
-    // Without settings: the shared embedder's model names the partition's vectors (its
-    // vector files are checked against it, and merged under it).
-    let Some(c) = settings else {
-        let e = adb_embed::Embedder::shared();
-        let model = e.as_ref().map(|e| e.model().to_string());
-        let dim = e.as_ref().map_or(adb_store::DEFAULT_EMBEDDING_DIM, |e| e.dimension() as i32);
-        return (e, dim, model);
-    };
-    let embedder = if adb_embed::Embedder::disabled() {
-        None
-    } else {
-        match adb_embed::Embedder::from_config(c) {
-            Ok(e) => {
-                tracing::info!(provider = ?c.provider, model = %c.model, dimension = c.dimension, "embeddings from ADB's settings");
-                Some(Arc::new(e))
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "embedding settings unusable; running without vectors");
-                None
-            }
-        }
-    };
-    (embedder, c.dimension as i32, Some(c.model.clone()))
-}
 
 /// The engine: the partition log, its Lance table (the only copy of every memory
 /// type, W7), platform tables, subscriptions and watches.
@@ -638,8 +611,18 @@ pub fn object_storage() -> Option<String> {
 }
 
 pub(crate) async fn open_store(dir: &std::path::Path, partition: PartitionId) -> Result<(Arc<PartitionStore>, Option<Arc<adb_embed::Embedder>>), String> {
-    let settings = adb_embed::EmbedConfig::load(dir)?;
-    let (embedder, embedding_dim, embedding_model) = embedder_for(settings.as_ref());
+    // The process's embedder, shared by every partition; a setting saved here (the
+    // system partition's, or a node's own) is applied to it.
+    let embedder = adb_embed::Embedder::process();
+    if let (Some(e), Some(s)) = (&embedder, adb_embed::EmbedConfig::load(dir)?) {
+        if let Err(err) = e.reconfigure(&s).await {
+            tracing::error!(error = %err, provider = ?s.provider, model = %s.model, "the saved embedding setting can't run; keeping the one in force");
+        }
+    }
+    let (embedding_dim, embedding_model) = match &embedder {
+        Some(e) => (e.dimension() as i32, Some(e.model())),
+        None => (adb_store::DEFAULT_EMBEDDING_DIM, None),
+    };
     // The replica set's other nodes may embed on this node's model (C-17b).
     adb_embed::peers::serve_with(embedder.clone());
     let cold = object_storage();
@@ -665,6 +648,8 @@ const EXPIRE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// rests once nothing is left (new rows are embedded on write).
 const BACKFILL_BATCH: usize = 256;
 const BACKFILL_IDLE_TICKS: u32 = 60;
+/// Ticks before the backfill tries again after a failure.
+const BACKFILL_RETRY_TICKS: u32 = 5;
 
 /// Aborts a task when dropped (a timer's companion task stops with it).
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -805,6 +790,10 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 Ok(n) => tracing::debug!(expired = n, "TTL expiry committed"),
                 Err(e) => tracing::warn!(error = %e, "TTL expiry failed; retrying next tick"),
             }
+            // The embedding setting changed the model: every record's vector again, now.
+            if w.follow_embedding() {
+                backfill_rest = 0;
+            }
             if backfill_rest > 0 {
                 backfill_rest -= 1;
                 continue;
@@ -816,11 +805,14 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 continue;
             }
             match w.embed_backfill(BACKFILL_BATCH).await {
-                Ok(0) => backfill_rest = BACKFILL_IDLE_TICKS,
+                // Vector files still loading: look again in a second, not a minute.
+                Ok(0) => backfill_rest = if w.vectors_loading() { 1 } else { BACKFILL_IDLE_TICKS },
                 Ok(n) => tracing::info!(embedded = n, "embedding backfill"),
+                // A compute node that hasn't taken a new setting yet, an endpoint's rate
+                // limit: seconds, not a minute.
                 Err(e) => {
-                    tracing::warn!(error = %e, "embedding backfill failed; retrying in a minute");
-                    backfill_rest = BACKFILL_IDLE_TICKS;
+                    tracing::warn!(error = %e, "embedding backfill failed; retrying in a few seconds");
+                    backfill_rest = BACKFILL_RETRY_TICKS;
                 }
             }
         }
@@ -1416,27 +1408,24 @@ impl Engine for LocalEngine {
         Ok(json!({
             "source": if saved.is_some() { "settings" } else { "default" },
             "settings": saved.unwrap_or_default(),
-            "active": self.embedder.as_ref().map(|e| json!({ "model": e.model(), "dimension": e.dimension() })),
+            "active": self.embedder.as_ref().map(|e| e.config()),
             "pending": pending,
         }))
     }
 
+    /// Check, apply in place (no restart: every partition shares the process's
+    /// embedder) and save. A model or dimension change makes the vectors again in the
+    /// background (`reembed`).
     async fn set_embedding(&self, settings: Value) -> Result<Value, String> {
         if self.temp.is_some() {
             return Err("embedding settings need a data directory (start ADB with --data-dir)".into());
         }
         let c: adb_embed::EmbedConfig = serde_json::from_value(settings).map_err(|e| format!("embedding settings: {e}"))?;
-        let e = Arc::new(adb_embed::Embedder::from_config(&c)?);
-        e.verify().await?;
-        let clears = self.embedder.as_ref().is_none_or(|a| a.model() != c.model || a.dimension() != c.dimension);
+        c.check()?;
+        let e = self.embedder.as_ref().ok_or("embeddings are off on this node (ADB_EMBED=off)")?;
+        let reembed = e.reconfigure(&c).await?;
         c.save(&self.dir)?;
-        tracing::info!(provider = ?c.provider, model = %c.model, dimension = c.dimension, "embedding settings saved; restarting to apply them");
-        // After this response has gone out.
-        tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            request_restart();
-        });
-        Ok(json!({ "saved": c, "restart": true, "reembed": clears }))
+        Ok(json!({ "saved": c, "restart": false, "reembed": reembed }))
     }
 
     async fn cache(&self) -> Result<Value, String> {

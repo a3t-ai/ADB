@@ -8,9 +8,11 @@
 //! [`REST`]. `ADB_COMPUTE_URL` (comma-separated) names compute nodes up front as
 //! well; they never expire.
 //!
-//! The database nodes then load no model: with `ADB_EMBED=compute`, a database node
-//! embeds only through compute nodes. With none up, a write still commits (vectors
-//! follow later in vector files), and a `LIKE` read is refused until one is up.
+//! The embedding setting's `run_on: compute` (`crate::EmbedConfig`) makes database
+//! nodes embed only through compute nodes; each compute node learns the setting from
+//! the database nodes' answer to its announcement and runs that provider itself. With
+//! none up, a write still commits (vectors follow later in vector files), and a `LIKE`
+//! read is refused until one is up.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -87,12 +89,6 @@ pub fn static_urls() -> Vec<String> {
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
         .collect()
-}
-
-/// Whether this database node embeds through compute nodes (`ADB_EMBED=compute`, or
-/// `ADB_COMPUTE_URL` set).
-pub fn enabled() -> bool {
-    std::env::var("ADB_EMBED").is_ok_and(|v| v.eq_ignore_ascii_case("compute")) || !static_urls().is_empty()
 }
 
 /// A compute node announced itself.
@@ -269,8 +265,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        std::env::set_var("ADB_EMBED", "compute");
-        let e = Arc::new(crate::Embedder::compute_from_env().expect("ADB_EMBED=compute"));
+        let e = Arc::new(crate::Embedder::from_config(&crate::EmbedConfig { run_on: crate::RunOn::Compute, ..Default::default() }).unwrap());
         assert!(e.on_compute());
         let none = e.embed(vec!["a".into()]).await.unwrap_err();
         assert!(none.contains("no compute node is up"), "{none}");

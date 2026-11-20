@@ -79,20 +79,20 @@ pub fn routes(node: Arc<PartitionedEngine>) -> Router {
         .route("/internal/query", post(query))
         .route("/internal/partition/:p", post(partition))
         .route("/internal/replicate/:p", post(replicate))
-        .route("/internal/compute", post(compute_announce).get(compute_status))
         .layer(axum::extract::DefaultBodyLimit::max(INTERNAL_BODY_MAX))
         .layer(axum::middleware::from_fn(adb_cluster::identity::guard))
         .with_state(node)
 }
 
-/// A compute node announcing itself (`adb serve-compute`, every 2 s).
-async fn compute_announce(Json(a): Json<adb_embed::compute::Announce>) -> axum::http::StatusCode {
+/// A compute node's announcement (`adb serve-compute`, every 2 s); the answer carries
+/// the embedding setting in force here, which the compute node then runs.
+pub(crate) async fn compute_announce(Json(a): Json<adb_embed::compute::Announce>) -> Json<serde_json::Value> {
     adb_embed::compute::heard(a);
-    axum::http::StatusCode::NO_CONTENT
+    Json(serde_json::json!({ "settings": adb_embed::Embedder::process().map(|e| e.config()) }))
 }
 
 /// The compute nodes this node sends work to.
-async fn compute_status() -> Json<Vec<adb_embed::compute::Status>> {
+pub(crate) async fn compute_status() -> Json<Vec<adb_embed::compute::Status>> {
     Json(adb_embed::compute::status())
 }
 

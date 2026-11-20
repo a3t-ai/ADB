@@ -116,6 +116,8 @@ fn routes(engine: Arc<dyn Engine>) -> Router {
         .route("/query", post(query))
         .route("/stats", get(stats))
         .route("/admin/embedding", get(embedding).put(set_embedding))
+        // Compute nodes announce themselves to a single node as to a cluster's.
+        .route("/internal/compute", post(internal::compute_announce).get(internal::compute_status))
         .route("/admin/cache", get(cache).put(set_cache))
         .route("/admin/compact", axum::routing::post(compact))
         .route("/mcp", post(mcp_post).get(mcp_get))

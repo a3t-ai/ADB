@@ -1,11 +1,19 @@
-//! ADB's text embeddings (MVP W4, `.ai/W4_RECALL.md`; providers W9.10).
+//! ADB's text embeddings (MVP W4, `.ai/W4_RECALL.md`; providers W9.10; one live
+//! setting 20 Nov 2026).
 //!
-//! One model per deployment. By default **BAAI/bge-small-en-v1.5**, 384 dimensions,
-//! run on ONNX Runtime on the CPU; or (W9.10) any OpenAI-compatible `/embeddings`
-//! endpoint, chosen in ADB's settings ([`EmbedConfig`], `<data dir>/embedding.json`).
-//! ADB embeds the `content` of SEMANTIC / EPISODIC / PROCEDURAL records before
-//! logging them (the vector travels in the log as f16, ARCHITECTURE §9.1) and the
-//! text of `LIKE $q` queries.
+//! One embedding setting per deployment ([`EmbedConfig`]), changed at runtime with
+//! `PUT /admin/embedding` and applied without a restart ([`Embedder::reconfigure`]):
+//!
+//! - `local` (default): **BAAI/bge-small-en-v1.5**, 384 dimensions, on ONNX Runtime
+//!   on the CPU; no network. What local dev and CE run with no setting at all.
+//! - `openai`: OpenAI's `/v1/embeddings`; the setting names the model, the dimension
+//!   (asked of the API) and the environment variable holding the key.
+//! - `custom`: any OpenAI-compatible `/embeddings` endpoint at the setting's `url`
+//!   (Azure, Ollama, vLLM, TEI, an in-house service).
+//!
+//! and `run_on`: `node` (in this process) or `compute` (on compute nodes, [`compute`],
+//! which run the same provider and write the vector files). ADB never stores an API
+//! key: the setting names the variable, filled from a Kubernetes Secret.
 //!
 //! The local model is a directory with `model.onnx`, `tokenizer.json`, `config.json`,
 //! `special_tokens_map.json` and `tokenizer_config.json` (Hugging Face
@@ -35,32 +43,35 @@ pub const MODEL: &str = "bge-small-en-v1.5";
 /// Tokens embedded per text; longer `content` is truncated (bge's limit).
 const MAX_TOKENS: usize = 512;
 
-/// Where the embeddings come from (W9.10): ADB's settings, kept in the data
-/// directory as `embedding.json`. Changing the model or the dimension clears the
-/// table's vectors at the next start, and the backfill embeds everything again.
+/// The embedding setting (W9.10; `local` / `openai` / `custom` and `run_on`, 20 Nov
+/// 2026). Kept as `embedding.json` by the system partition (a cluster) or the data
+/// directory (one node). Changing the model or the dimension makes every vector
+/// again, in the background.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbedConfig {
     pub provider: Provider,
-    /// The model's name: recorded with the table, so a change is noticed.
+    /// The model's name (also the name vector files are kept under).
     pub model: String,
-    /// The vectors' length (the table's `embedding` column).
+    /// The vectors' length.
     pub dimension: usize,
-    /// `openai`: the API base, e.g. `https://api.openai.com/v1` (ADB posts to
-    /// `<url>/embeddings`).
+    /// `custom`: the API base, e.g. `http://ollama:11434/v1` (ADB posts to
+    /// `<url>/embeddings`). `openai`: optional, default [`OPENAI_URL`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// `openai`: the environment variable holding the API key (from a Kubernetes
-    /// Secret). ADB never stores the key.
+    /// `openai` (required) / `custom` (optional): the environment variable holding the
+    /// API key, from a Kubernetes Secret. ADB never stores the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// `local`: the model directory (default `ADB_EMBED_MODEL_DIR`, then the image's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_dir: Option<String>,
-    /// `openai`: ask the endpoint for `dimension`-long vectors (OpenAI's
-    /// `text-embedding-3-*` shorten theirs on request). Off for endpoints that don't
-    /// take the `dimensions` field.
+    /// `custom`: ask the endpoint for `dimension`-long vectors (its `dimensions`
+    /// field). `openai` always asks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub request_dimension: bool,
+    /// Where the embedding runs: this process, or compute nodes.
+    #[serde(default, skip_serializing_if = "RunOn::is_node")]
+    pub run_on: RunOn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,16 +79,37 @@ pub struct EmbedConfig {
 pub enum Provider {
     /// The model on ADB's CPU (ONNX Runtime).
     Local,
-    /// An OpenAI-compatible `/embeddings` endpoint (OpenAI, Azure, Ollama, vLLM, TEI…).
+    /// OpenAI's API.
     Openai,
+    /// Any OpenAI-compatible `/embeddings` endpoint.
+    Custom,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOn {
+    /// In this process (database node, CE, local dev).
+    #[default]
+    Node,
+    /// On compute nodes (`adb serve-compute`), which write the vector files.
+    Compute,
+}
+
+impl RunOn {
+    fn is_node(&self) -> bool {
+        *self == RunOn::Node
+    }
+}
+
+/// OpenAI's API base.
+pub const OPENAI_URL: &str = "https://api.openai.com/v1";
 
 /// The settings file in a data directory.
 pub const SETTINGS_FILE: &str = "embedding.json";
 
 impl Default for EmbedConfig {
     fn default() -> Self {
-        Self { provider: Provider::Local, model: MODEL.into(), dimension: DIM, url: None, api_key_env: None, model_dir: None, request_dimension: false }
+        Self { provider: Provider::Local, model: MODEL.into(), dimension: DIM, url: None, api_key_env: None, model_dir: None, request_dimension: false, run_on: RunOn::Node }
     }
 }
 
@@ -108,7 +140,8 @@ impl EmbedConfig {
         Ok(())
     }
 
-    /// Settings that can't work, before anything is tried.
+    /// Settings that can't work, before anything is tried. The key's variable is
+    /// checked where the embedding runs ([`Embedder::from_config`]).
     pub fn check(&self) -> Result<(), String> {
         if self.model.trim().is_empty() {
             return Err("model: required".into());
@@ -116,27 +149,50 @@ impl EmbedConfig {
         if !(1..=8192).contains(&self.dimension) {
             return Err(format!("dimension {}: expected 1-8192", self.dimension));
         }
-        if self.provider == Provider::Openai {
-            let url = self.url.as_deref().unwrap_or("");
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err("url: an http(s) API base is required for the openai provider".into());
+        let http = |u: &str| u.starts_with("http://") || u.starts_with("https://");
+        match self.provider {
+            Provider::Local => {}
+            Provider::Openai => {
+                if self.url.as_deref().is_some_and(|u| !http(u)) {
+                    return Err("url: an http(s) API base".into());
+                }
+                if self.api_key_env.as_deref().is_none_or(|v| v.trim().is_empty()) {
+                    return Err("api_key_env: the variable holding the OpenAI key is required".into());
+                }
             }
-            if let Some(var) = &self.api_key_env {
-                if std::env::var(var).map_or(true, |v| v.is_empty()) {
-                    return Err(format!("api_key_env: {var} is not set in ADB's environment (add it from a Secret)"));
+            Provider::Custom => {
+                if !self.url.as_deref().is_some_and(http) {
+                    return Err("url: an http(s) API base is required for the custom provider".into());
                 }
             }
         }
         Ok(())
     }
+
+    /// The setting a compute node runs: the same provider, in its own process.
+    pub fn on_node(&self) -> Self {
+        Self { run_on: RunOn::Node, ..self.clone() }
+    }
+
+    /// The endpoint, its key's variable, and whether to ask for the dimension.
+    fn endpoint(&self) -> Option<(String, Option<&str>, bool)> {
+        match self.provider {
+            Provider::Local => None,
+            Provider::Openai => Some((self.url.clone().unwrap_or_else(|| OPENAI_URL.into()), self.api_key_env.as_deref(), true)),
+            Provider::Custom => Some((self.url.clone().unwrap_or_default(), self.api_key_env.as_deref(), self.request_dimension)),
+        }
+    }
 }
 
 enum Backend {
-    Local(LocalModel),
+    Local(Arc<LocalModel>),
     /// Compute nodes ([`compute`]): `adb serve-compute` processes on other machines,
-    /// the least busy first; the database nodes then run no model.
+    /// the least busy first; this node then runs no model.
     Compute { client: reqwest::Client },
     Http { client: reqwest::Client, url: String, key: Option<String>, dimensions: Option<usize> },
+    /// The setting can't run here (no local model files): embedding fails until the
+    /// setting changes (logged once).
+    Unavailable(String),
 }
 
 /// Texts and where their vectors go (and when the job was queued).
@@ -261,113 +317,170 @@ fn run(model: &mut TextEmbedding, jobs: Vec<Job>) {
     }
 }
 
-/// The embedding model, loaded once. A local model runs on its own thread, batching
+/// The local model's files in `dir`, loaded once per process and directory (a
+/// setting switched back to `local` doesn't load them again).
+fn local_model(dir: &Path) -> Result<Arc<LocalModel>, String> {
+    static LOADED: std::sync::Mutex<Vec<(PathBuf, Arc<LocalModel>)>> = std::sync::Mutex::new(Vec::new());
+    let mut loaded = LOADED.lock().unwrap();
+    if let Some((_, m)) = loaded.iter().find(|(d, _)| d == dir) {
+        return Ok(Arc::clone(m));
+    }
+    if !dir.join("model.onnx").exists() {
+        return Err(format!("no embedding model in {} (set ADB_EMBED_MODEL_DIR)", dir.display()));
+    }
+    let threads = threads();
+    let t = std::time::Instant::now();
+    let read = |f: &str| std::fs::read(dir.join(f)).map_err(|e| format!("embedding model: {}: {e}", dir.join(f).display()));
+    let mut models = Vec::new();
+    for _ in 0..workers() {
+        let tokenizer = TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+        // bge models embed the [CLS] token (fastembed's default for this model).
+        let model = UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer).with_pooling(Pooling::Cls);
+        let options = InitOptionsUserDefined::new().with_max_length(MAX_TOKENS).with_intra_threads(threads.max(1));
+        models.push(TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| format!("embedding model: {e}"))?);
+    }
+    let m = Arc::new(LocalModel::start(models)?);
+    tracing::info!(model = MODEL, dir = %dir.display(), threads, workers = workers(), took = ?t.elapsed(), "embedding model loaded");
+    loaded.push((dir.to_path_buf(), Arc::clone(&m)));
+    Ok(m)
+}
+
+/// What an [`Embedder`] runs now.
+struct Active {
+    cfg: EmbedConfig,
+    backend: Backend,
+}
+
+impl Active {
+    fn build(cfg: &EmbedConfig) -> Result<Self, String> {
+        cfg.check()?;
+        let backend = match (cfg.run_on, cfg.endpoint()) {
+            (RunOn::Compute, _) => Backend::Compute {
+                client: reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(500)).timeout(std::time::Duration::from_secs(30)).build().map_err(|e| e.to_string())?,
+            },
+            (RunOn::Node, None) => {
+                let dir = cfg.model_dir.clone().or_else(|| std::env::var("ADB_EMBED_MODEL_DIR").ok()).unwrap_or_else(|| DEFAULT_MODEL_DIR.into());
+                match local_model(Path::new(&dir)) {
+                    Ok(m) => Backend::Local(m),
+                    Err(e) => Backend::Unavailable(e),
+                }
+            }
+            (RunOn::Node, Some((url, key_env, ask))) => {
+                let key = match key_env {
+                    Some(v) => Some(std::env::var(v).ok().filter(|k| !k.is_empty()).ok_or_else(|| format!("api_key_env: {v} is not set in ADB's environment (add it from a Secret)"))?),
+                    None => None,
+                };
+                let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|e| format!("embedding endpoint: {e}"))?;
+                Backend::Http { client, url: url.trim_end_matches('/').to_string(), key, dimensions: ask.then_some(cfg.dimension) }
+            }
+        };
+        Ok(Self { cfg: cfg.clone(), backend })
+    }
+}
+
+/// The embeddings of this process: one per process ([`Embedder::process`]), shared by
+/// every partition, reconfigured in place when the setting changes
+/// ([`Embedder::reconfigure`]). A local model runs on its own threads, batching
 /// concurrent requests; call [`Embedder::embed`].
 pub struct Embedder {
-    backend: Backend,
-    model: String,
-    dim: usize,
+    active: std::sync::RwLock<Arc<Active>>,
 }
 
 impl Embedder {
-    /// Load the local model files in `dir`, running inference on `threads` CPU threads.
-    pub fn load(dir: &Path, threads: usize) -> Result<Self, String> {
-        let read = |f: &str| std::fs::read(dir.join(f)).map_err(|e| format!("embedding model: {}: {e}", dir.join(f).display()));
-        let mut models = Vec::new();
-        for _ in 0..workers() {
-            let tokenizer = TokenizerFiles {
-                tokenizer_file: read("tokenizer.json")?,
-                config_file: read("config.json")?,
-                special_tokens_map_file: read("special_tokens_map.json")?,
-                tokenizer_config_file: read("tokenizer_config.json")?,
-            };
-            // bge models embed the [CLS] token (fastembed's default for this model).
-            let model = UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer).with_pooling(Pooling::Cls);
-            let options = InitOptionsUserDefined::new().with_max_length(MAX_TOKENS).with_intra_threads(threads.max(1));
-            models.push(TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| format!("embedding model: {e}"))?);
-        }
-        Ok(Self { backend: Backend::Local(LocalModel::start(models)?), model: MODEL.into(), dim: DIM })
-    }
-
-    /// The embedder `cfg` describes (W9.10). A local model is loaded now; an
+    /// An embedder for `cfg`. A local model is loaded now (once per process); an
     /// endpoint isn't called until the first embedding ([`Embedder::verify`] does).
     pub fn from_config(cfg: &EmbedConfig) -> Result<Self, String> {
-        cfg.check()?;
-        match cfg.provider {
-            Provider::Local => {
-                if let Some(mut pool) = Self::compute_from_env() {
-                    pool.model = cfg.model.clone();
-                    pool.dim = cfg.dimension;
-                    return Ok(pool);
+        let a = Active::build(cfg)?;
+        if let Backend::Unavailable(e) = &a.backend {
+            return Err(e.clone());
+        }
+        Ok(Self { active: std::sync::RwLock::new(Arc::new(a)) })
+    }
+
+    /// The process's embedder (default setting until [`Self::reconfigure`]): `None`
+    /// only with `ADB_EMBED=off`. Without the local model files it exists but fails to
+    /// embed (logged) until a setting that can run here is applied.
+    pub fn process() -> Option<Arc<Self>> {
+        static PROCESS: std::sync::OnceLock<Option<Arc<Embedder>>> = std::sync::OnceLock::new();
+        PROCESS
+            .get_or_init(|| {
+                if Self::disabled() {
+                    tracing::info!("embeddings off (ADB_EMBED=off)");
+                    return None;
                 }
-                let dir = cfg
-                    .model_dir
-                    .clone()
-                    .or_else(|| std::env::var("ADB_EMBED_MODEL_DIR").ok())
-                    .unwrap_or_else(|| DEFAULT_MODEL_DIR.into());
-                let mut e = Self::load(Path::new(&dir), threads())?;
-                e.model = cfg.model.clone();
-                e.dim = cfg.dimension;
-                Ok(e)
-            }
-            Provider::Openai => {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .map_err(|e| format!("embedding endpoint: {e}"))?;
-                let url = cfg.url.clone().unwrap_or_default().trim_end_matches('/').to_string();
-                let key = cfg.api_key_env.as_ref().and_then(|v| std::env::var(v).ok());
-                let dimensions = cfg.request_dimension.then_some(cfg.dimension);
-                Ok(Self { backend: Backend::Http { client, url, key, dimensions }, model: cfg.model.clone(), dim: cfg.dimension })
+                let a = Active::build(&EmbedConfig::default()).expect("the default setting is valid");
+                if let Backend::Unavailable(e) = &a.backend {
+                    tracing::warn!(error = %e, "no local embedding model: records get no vectors and LIKE ranks by words until an embedding setting that can run is applied");
+                }
+                Some(Arc::new(Self { active: std::sync::RwLock::new(Arc::new(a)) }))
+            })
+            .clone()
+    }
+
+    fn active(&self) -> Arc<Active> {
+        Arc::clone(&self.active.read().unwrap())
+    }
+
+    /// Apply `cfg` in place (every holder of this embedder sees it). An endpoint is
+    /// tried with one sample first; a setting that fails leaves the old one. Returns
+    /// whether the model or dimension changed (the vectors are then made again).
+    pub async fn reconfigure(&self, cfg: &EmbedConfig) -> Result<bool, String> {
+        if self.active().cfg == *cfg {
+            return Ok(false);
+        }
+        let next = Arc::new(Active::build(cfg)?);
+        if let Backend::Unavailable(e) = &next.backend {
+            return Err(e.clone());
+        }
+        if !matches!(next.backend, Backend::Compute { .. }) {
+            let v = Self::embed_with(&next, vec!["ADB embedding check".into()], false).await?;
+            if v.first().map(Vec::len) != Some(cfg.dimension) {
+                return Err(format!("the model returns {} dimensions; the setting says {}", v.first().map_or(0, Vec::len), cfg.dimension));
             }
         }
+        let prev = std::mem::replace(&mut *self.active.write().unwrap(), next);
+        let changed = prev.cfg.model != cfg.model || prev.cfg.dimension != cfg.dimension;
+        tracing::info!(provider = ?cfg.provider, model = %cfg.model, dimension = cfg.dimension, run_on = ?cfg.run_on, reembed = changed, "embedding setting applied");
+        Ok(changed)
+    }
+
+    /// The setting in force.
+    pub fn config(&self) -> EmbedConfig {
+        self.active().cfg.clone()
     }
 
     /// Embed a sample and check the vector's length is the configured dimension.
     pub async fn verify(self: &Arc<Self>) -> Result<(), String> {
-        let v = self.embed_here(vec!["ADB embedding check".into()]).await?;
+        let a = self.active();
+        let v = Self::embed_with(&a, vec!["ADB embedding check".into()], false).await?;
         match v.first().map(Vec::len) {
-            Some(n) if n == self.dim => Ok(()),
-            Some(n) => Err(format!("the model returns {n} dimensions; the settings say {}", self.dim)),
+            Some(n) if n == a.cfg.dimension => Ok(()),
+            Some(n) => Err(format!("the model returns {n} dimensions; the settings say {}", a.cfg.dimension)),
             None => Err("the model returned no vector".into()),
         }
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
+    pub fn model(&self) -> String {
+        self.active().cfg.model.clone()
     }
 
     pub fn dimension(&self) -> usize {
-        self.dim
-    }
-
-    /// The process's embedder from the environment, loaded once ([`Embedder::from_env`]).
-    pub fn shared() -> Option<Arc<Self>> {
-        static SHARED: std::sync::OnceLock<Option<Arc<Embedder>>> = std::sync::OnceLock::new();
-        SHARED.get_or_init(Self::from_env).clone()
-    }
-
-    /// Embeddings from compute nodes ([`compute`]) when `ADB_EMBED=compute` or
-    /// `ADB_COMPUTE_URL` is set: the same model and dimension as the local one, run
-    /// elsewhere.
-    pub fn compute_from_env() -> Option<Self> {
-        if !compute::enabled() {
-            return None;
-        }
-        let client = reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(500)).timeout(std::time::Duration::from_secs(30)).build().ok()?;
-        // The compute nodes' model (`ADB_COMPUTE_MODEL` = "name:dimension"; default
-        // ADB's own): only compute nodes announcing it are used.
-        let (model, dim) = match std::env::var("ADB_COMPUTE_MODEL").ok().and_then(|v| v.rsplit_once(':').and_then(|(m, d)| Some((m.trim().to_string(), d.trim().parse::<usize>().ok()?)))) {
-            Some(md) => md,
-            None => (MODEL.to_string(), DIM),
-        };
-        tracing::info!(named = ?compute::static_urls(), %model, dim, "embeddings from compute nodes; no model on this node");
-        Some(Self { backend: Backend::Compute { client }, model, dim })
+        self.active().cfg.dimension
     }
 
     /// Whether this embedder runs on compute nodes.
     pub fn on_compute(&self) -> bool {
-        matches!(self.backend, Backend::Compute { .. })
+        matches!(self.active().backend, Backend::Compute { .. })
+    }
+
+    /// Whether it embeds through an endpoint (OpenAI, custom).
+    pub fn on_endpoint(&self) -> bool {
+        matches!(self.active().backend, Backend::Http { .. })
     }
 
     /// Whether `ADB_EMBED=off` turns embedding off.
@@ -375,52 +488,24 @@ impl Embedder {
         std::env::var("ADB_EMBED").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
     }
 
-    /// The embedder this process should use without settings: `None` when
-    /// `ADB_EMBED=off`, or when the model directory is missing (logged; ADB then
-    /// runs without vectors).
-    pub fn from_env() -> Option<Arc<Self>> {
-        if Self::disabled() {
-            tracing::info!("embeddings off (ADB_EMBED=off)");
-            return None;
-        }
-        if let Some(pool) = Self::compute_from_env() {
-            return Some(Arc::new(pool));
-        }
-        let dir: PathBuf = std::env::var("ADB_EMBED_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(DEFAULT_MODEL_DIR));
-        if !dir.join("model.onnx").exists() {
-            tracing::warn!(dir = %dir.display(), "no embedding model: records get no vectors and LIKE finds nothing (set ADB_EMBED_MODEL_DIR)");
-            return None;
-        }
-        let threads = threads();
-        let t = std::time::Instant::now();
-        match Self::load(&dir, threads) {
-            Ok(e) => {
-                tracing::info!(model = MODEL, dir = %dir.display(), threads, workers = workers(), took = ?t.elapsed(), "embedding model loaded");
-                Some(Arc::new(e))
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "embedding model failed to load; running without vectors");
-                None
-            }
-        }
-    }
-
     /// Embed `texts` on this node's own model (never a peer's); an endpoint's as
     /// [`Embedder::embed`].
     pub async fn embed_here(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_here_as(texts, false).await
+        Self::embed_with(&self.active(), texts, false).await
     }
 
     /// [`Self::embed_here`] in the background lane: after every foreground request.
     pub async fn embed_here_background(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_here_as(texts, true).await
+        Self::embed_with(&self.active(), texts, true).await
     }
 
-    async fn embed_here_as(&self, texts: Vec<String>, background: bool) -> Result<Vec<Vec<f32>>, String> {
-        match &self.backend {
-            Backend::Local(model) => {
+    async fn embed_with(a: &Active, texts: Vec<String>, background: bool) -> Result<Vec<Vec<f32>>, String> {
+        let (model, dim) = (a.cfg.model.as_str(), a.cfg.dimension);
+        match &a.backend {
+            Backend::Unavailable(e) => Err(e.clone()),
+            Backend::Local(m) => {
                 peers::LOCAL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let r = match model.submit(texts, background) {
+                let r = match m.submit(texts, background) {
                     Ok(wait) => wait.await.map_err(|_| "embedding thread stopped".to_string()).and_then(|r| r),
                     Err(e) => Err(e),
                 };
@@ -434,10 +519,10 @@ impl Embedder {
                     let mut tried: Vec<String> = Vec::new();
                     let mut last = String::from("no compute node is up");
                     loop {
-                        let Some(lease) = compute::pick(&self.model, self.dim, &tried) else {
+                        let Some(lease) = compute::pick(model, dim, &tried) else {
                             return Err(format!("compute nodes: {last}"));
                         };
-                        match http_embed(client, &lease.url, None, &self.model, None, chunk, background).await {
+                        match http_embed(client, &lease.url, None, model, None, chunk, background).await {
                             Ok(v) => {
                                 lease.done();
                                 out.extend(v);
@@ -458,7 +543,7 @@ impl Embedder {
                 let t = std::time::Instant::now();
                 let mut out = Vec::with_capacity(texts.len());
                 for chunk in texts.chunks(ENDPOINT_BATCH) {
-                    out.extend(http_embed(client, url, key.as_deref(), &self.model, *dimensions, chunk, false).await?);
+                    out.extend(http_embed(client, url, key.as_deref(), model, *dimensions, chunk, false).await?);
                 }
                 adb_core::steps::add("endpoint.embed round trip", t.elapsed());
                 Ok(out)
@@ -471,13 +556,15 @@ impl Embedder {
     /// vectors don't come back. `None`: this embedder doesn't use compute nodes (the
     /// caller embeds and writes the file itself).
     pub async fn embed_to_file(&self, location: &str, items: &[(String, String)]) -> Option<Result<String, String>> {
-        let Backend::Compute { client } = &self.backend else { return None };
+        let a = self.active();
+        let Backend::Compute { client } = &a.backend else { return None };
+        let (model, dim) = (a.cfg.model.as_str(), a.cfg.dimension);
         let t = std::time::Instant::now();
-        let body = serde_json::json!({ "location": location, "model": self.model, "dimension": self.dim, "items": items });
+        let body = serde_json::json!({ "location": location, "model": model, "dimension": dim, "items": items });
         let mut tried: Vec<String> = Vec::new();
         let mut last = String::from("no compute node is up");
         let r = loop {
-            let Some(lease) = compute::pick(&self.model, self.dim, &tried) else {
+            let Some(lease) = compute::pick(model, dim, &tried) else {
                 break Err(format!("compute nodes: {last}"));
             };
             let sent = client.post(format!("{}/vectors", lease.url.trim_end_matches('/'))).header(PRIORITY_HEADER, "background").json(&body).send().await;
@@ -508,44 +595,43 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let Backend::Local(model) = &self.backend else { return Err("embed_blocking: not a local model".into()) };
+        let a = self.active();
+        let Backend::Local(model) = &a.backend else { return Err("embed_blocking: not a local model".into()) };
         model.submit(texts.to_vec(), false)?.blocking_recv().map_err(|_| "embedding thread stopped".to_string())?
     }
 
     /// Embed `texts`: unit-length vectors of the configured dimension.
     pub async fn embed(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        let out = self.embed_raw(texts, false).await?;
-        self.check_dim(out)
+        self.embed_raw(texts, false).await
     }
 
     /// [`Self::embed`] for vectors nobody is waiting on (deferred embeddings, the
     /// backfill): the background lane, after every foreground request.
     pub async fn embed_background(self: &Arc<Self>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        let out = self.embed_raw(texts, true).await?;
-        self.check_dim(out)
-    }
-
-    fn check_dim(&self, out: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String> {
-        if let Some(v) = out.iter().find(|v| v.len() != self.dim) {
-            return Err(format!("embedding: the model returned {} dimensions, not {}", v.len(), self.dim));
-        }
-        Ok(out)
+        self.embed_raw(texts, true).await
     }
 
     async fn embed_raw(self: &Arc<Self>, texts: Vec<String>, background: bool) -> Result<Vec<Vec<f32>>, String> {
-        if let (Backend::Local(_), false) = (&self.backend, background) {
+        let a = self.active();
+        let out = if let (Backend::Local(_), false) = (&a.backend, background) {
             // A less busy node of the replica set embeds them, when there is one.
             let t = std::time::Instant::now();
             if let Some(v) = peers::try_peer(self, &texts).await {
                 adb_core::steps::add("embed.on a peer (round trip)", t.elapsed());
-                return Ok(v);
+                v
+            } else {
+                let t = std::time::Instant::now();
+                let r = Self::embed_with(&a, texts, false).await;
+                adb_core::steps::add("embed.here (queue + model)", t.elapsed());
+                r?
             }
-            let t = std::time::Instant::now();
-            let r = self.embed_here_as(texts, false).await;
-            adb_core::steps::add("embed.here (queue + model)", t.elapsed());
-            return r;
+        } else {
+            Self::embed_with(&a, texts, background).await?
+        };
+        if let Some(v) = out.iter().find(|v| v.len() != a.cfg.dimension) {
+            return Err(format!("embedding: the model returned {} dimensions, not {}", v.len(), a.cfg.dimension));
         }
-        self.embed_here_as(texts, background).await
+        Ok(out)
     }
 }
 
@@ -650,7 +736,7 @@ pub const MODEL_CALL: usize = 32;
 /// a foreground request waits little behind any of them on a worker.
 pub async fn embed_in_calls(embedder: &Arc<Embedder>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
     // An endpoint takes the batch in one request (it runs no worker of ours).
-    if matches!(embedder.backend, Backend::Http { .. }) {
+    if embedder.on_endpoint() {
         return embedder.embed_background(texts).await;
     }
     let calls = texts.chunks(MODEL_CALL).map(|c| embedder.embed_background(c.to_vec()));
@@ -668,8 +754,8 @@ mod tests {
     /// Needs the model: `ADB_EMBED_MODEL_DIR` (tests/fetch-model.sh puts it in
     /// $BUILD_DIR/models/bge-small-en-v1.5). Skipped without it.
     fn model() -> Option<Embedder> {
-        let dir = PathBuf::from(std::env::var("ADB_EMBED_MODEL_DIR").ok()?);
-        Some(Embedder::load(&dir, 2).expect("model loads"))
+        let dir = std::env::var("ADB_EMBED_MODEL_DIR").ok()?;
+        Some(Embedder::from_config(&EmbedConfig { model_dir: Some(dir), ..Default::default() }).expect("model loads"))
     }
 
     #[test]
@@ -717,13 +803,14 @@ mod tests {
 
         std::env::set_var("ADB_TEST_EMBED_KEY", "sk-test");
         let cfg = EmbedConfig {
-            provider: Provider::Openai,
+            provider: Provider::Custom,
             model: "test-model".into(),
             dimension: 4,
             url: Some(format!("http://{addr}/v1/")),
             api_key_env: Some("ADB_TEST_EMBED_KEY".into()),
             model_dir: None,
             request_dimension: true,
+            run_on: RunOn::Node,
         };
         let e = Arc::new(Embedder::from_config(&cfg).unwrap());
         e.verify().await.unwrap();
@@ -734,18 +821,49 @@ mod tests {
 
         let wrong = Arc::new(Embedder::from_config(&EmbedConfig { dimension: 8, request_dimension: false, ..cfg.clone() }).unwrap());
         assert!(wrong.verify().await.unwrap_err().contains("4 dimensions"));
-        let missing = EmbedConfig { api_key_env: Some("ADB_TEST_NO_SUCH_KEY".into()), ..cfg };
+        let missing = EmbedConfig { api_key_env: Some("ADB_TEST_NO_SUCH_KEY".into()), ..cfg.clone() };
         assert!(Embedder::from_config(&missing).err().unwrap().contains("not set"));
+
+        // Changed in place: a setting that can't work leaves the one in force; one
+        // that works replaces it for every holder, and says when vectors must be made again.
+        assert!(e.reconfigure(&EmbedConfig { dimension: 8, request_dimension: false, ..cfg.clone() }).await.unwrap_err().contains("4 dimensions"));
+        assert_eq!(e.config(), cfg);
+        assert!(!e.reconfigure(&cfg).await.unwrap(), "the same setting changes nothing");
+        let renamed = EmbedConfig { model: "test-model-2".into(), ..cfg.clone() };
+        assert!(e.reconfigure(&renamed).await.unwrap());
+        assert_eq!((e.model(), e.dimension()), ("test-model-2".to_string(), 4));
+        assert_eq!(e.embed(vec!["x".into()]).await.unwrap().len(), 1);
     }
 
     #[test]
     fn settings_round_trip() {
         let dir = tempfile_dir();
         assert_eq!(EmbedConfig::load(&dir).unwrap(), None);
-        let c = EmbedConfig { provider: Provider::Openai, model: "m".into(), dimension: 1536, url: Some("https://x/v1".into()), api_key_env: None, model_dir: None, request_dimension: true };
+        let c = EmbedConfig { provider: Provider::Custom, model: "m".into(), dimension: 1536, url: Some("https://x/v1".into()), api_key_env: None, model_dir: None, request_dimension: true, run_on: RunOn::Compute };
         c.save(&dir).unwrap();
         assert_eq!(EmbedConfig::load(&dir).unwrap(), Some(c));
         std::fs::remove_dir_all(&dir).unwrap();
+        // The default is the local model, in this process, and needs no fields.
+        let d: EmbedConfig = serde_json::from_str(r#"{"provider":"local","model":"bge-small-en-v1.5","dimension":384}"#).unwrap();
+        assert_eq!(d, EmbedConfig::default());
+        assert_eq!(serde_json::to_value(&d).unwrap(), serde_json::json!({"provider":"local","model":"bge-small-en-v1.5","dimension":384}));
+    }
+
+    /// Each provider's required fields; `openai` has OpenAI's URL and always asks for
+    /// the dimension, `custom` asks only when told to.
+    #[test]
+    fn providers_check_their_fields() {
+        let openai = EmbedConfig { provider: Provider::Openai, model: "text-embedding-3-small".into(), dimension: 384, ..Default::default() };
+        assert!(openai.check().unwrap_err().contains("api_key_env"));
+        let openai = EmbedConfig { api_key_env: Some("OPENAI_API_KEY".into()), ..openai };
+        openai.check().unwrap();
+        assert_eq!(openai.endpoint(), Some((OPENAI_URL.to_string(), Some("OPENAI_API_KEY"), true)));
+        let custom = EmbedConfig { provider: Provider::Custom, model: "nomic-embed-text".into(), dimension: 768, ..Default::default() };
+        assert!(custom.check().unwrap_err().contains("url"));
+        let custom = EmbedConfig { url: Some("http://ollama:11434/v1".into()), ..custom };
+        custom.check().unwrap();
+        assert_eq!(custom.endpoint(), Some(("http://ollama:11434/v1".to_string(), None, false)));
+        assert_eq!(EmbedConfig { run_on: RunOn::Compute, ..custom.clone() }.on_node(), custom);
     }
 
     fn tempfile_dir() -> PathBuf {

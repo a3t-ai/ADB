@@ -89,3 +89,29 @@ background. Settings: `<data dir>/embedding.json` (`adb_embed::EmbedConfig`), re
 start; `GET/PUT /admin/embedding` (PUT embeds a sample, checks the size, saves and
 restarts ADB). The model's name is kept in `_meta` (`embedding_model`); at open a
 different one clears the vectors (a different size rewrites the table, as T6).
+
+## 20 Nov 2026: one live setting, three providers
+
+User: the embedding generator stays in ADB (local dev needs no setup); `openai` and
+`custom` are options; the choice is a **setting**, not environment variables; API keys
+stay out of ADB (`api_key_env` names a variable filled from a Secret).
+
+`EmbedConfig`: `provider` = `local` (default, bge-small-en-v1.5 384, in-process) |
+`openai` (`url` defaults to `https://api.openai.com/v1`, `api_key_env` required, the
+dimension is always asked for) | `custom` (any OpenAI-compatible `url`, key optional,
+`request_dimension` opt-in); `run_on` = `node` (default) | `compute` (compute nodes run
+the same provider and write the vector files).
+
+- `PUT /admin/embedding` checks the setting with a sample, applies it **in place** (one
+  embedder per process, `Embedder::reconfigure`; no restart) and saves it. On a
+  cluster the system partition keeps it (`set_embedding` op, from any node); every
+  node follows it within 10 s (`PartitionedEngine::follow_embedding`); a partition
+  opened later copies it as before.
+- Compute nodes start on the default and run whatever setting the database nodes
+  answer their announcement with (`POST /internal/compute` returns `{settings}`).
+- A model or dimension change: each partition's vector map switches model
+  (`VectorMap::follow`, its files reloaded) and the backfill embeds every record again
+  at once (`DurableWrites::follow_embedding`). Vector files carry their model, so a
+  switch back to an earlier model finds its files.
+- Removed: `ADB_EMBED=compute`, `ADB_COMPUTE_EMBED`, `ADB_COMPUTE_MODEL`.
+  `ADB_EMBED=off` and `ADB_EMBED_MODEL_DIR` remain.

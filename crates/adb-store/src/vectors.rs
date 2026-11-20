@@ -136,19 +136,57 @@ async fn read(uri: &str) -> Result<Option<Vec<u8>>, String> {
 /// A partition's vectors, by row id, as its vector files hold them.
 pub struct VectorMap {
     location: String,
-    /// The model whose vectors rank; files of another model are skipped.
-    model: Option<String>,
-    dim: usize,
+    /// The model whose vectors rank, and their length; files of another model are
+    /// skipped. Changed with the embedding setting ([`Self::follow`]).
+    model: RwLock<(Option<String>, usize)>,
     vectors: RwLock<HashMap<String, Arc<[f16]>>>,
     /// Files loaded, by name.
     files: Mutex<BTreeSet<String>>,
     /// Files being loaded now.
     loading: AtomicUsize,
+    /// How many times the model changed ([`Self::follow`]).
+    switches: AtomicUsize,
 }
 
 impl VectorMap {
     pub fn new(location: String, model: Option<String>, dim: usize) -> Self {
-        Self { location, model, dim, vectors: Default::default(), files: Default::default(), loading: AtomicUsize::new(0) }
+        Self { location, model: RwLock::new((model, dim)), vectors: Default::default(), files: Default::default(), loading: AtomicUsize::new(0), switches: AtomicUsize::new(0) }
+    }
+
+    /// How many times the model changed: whoever acts on a change compares it.
+    pub fn switches(&self) -> usize {
+        self.switches.load(Ordering::Relaxed)
+    }
+
+    /// The model (and length) whose vectors this map holds.
+    pub fn model(&self) -> (Option<String>, usize) {
+        self.model.read().unwrap().clone()
+    }
+
+    /// The embedding setting now names `model` with `dim`-long vectors: when that's
+    /// another model, the map drops what it holds and loads that model's files again,
+    /// in the background (the backfill embeds what has none). Returns whether it switched.
+    pub fn follow(self: &Arc<Self>, model: &str, dim: usize) -> bool {
+        {
+            let mut m = self.model.write().unwrap();
+            if m.0.as_deref() == Some(model) && m.1 == dim {
+                return false;
+            }
+            *m = (Some(model.to_string()), dim);
+        }
+        self.vectors.write().unwrap().clear();
+        self.files.lock().unwrap().clear();
+        self.switches.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(location = %self.location, model, dim, "embedding model changed: vector files loaded again");
+        let me = Arc::clone(self);
+        me.loading.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) = me.load_all().await {
+                tracing::warn!(error = %e, "vector files not loaded after the model changed");
+            }
+            me.loading.fetch_sub(1, Ordering::Relaxed);
+        });
+        true
     }
 
     pub fn location(&self) -> &str {
@@ -186,7 +224,8 @@ impl VectorMap {
     }
 
     fn accept(&self, uri: &str, model: &str, dim: usize, entries: Vec<Entry>) {
-        if self.model.as_deref().is_some_and(|m| m != model) || dim != self.dim {
+        let (want, want_dim) = self.model();
+        if want.as_deref().is_some_and(|m| m != model) || dim != want_dim {
             tracing::info!(%uri, model, dim, "vector file of another model or dimension: skipped (the backfill embeds again)");
             return;
         }
@@ -199,7 +238,8 @@ impl VectorMap {
     /// Vectors this node made and wrote itself (no read back).
     pub fn insert(&self, uri: &str, model: &str, entries: Vec<Entry>) {
         let name = split(uri).1.to_string();
-        self.accept(uri, model, self.dim, entries);
+        let dim = entries.first().map_or(self.model().1, |(_, v)| v.len());
+        self.accept(uri, model, dim, entries);
         self.files.lock().unwrap().insert(name);
     }
 
@@ -276,14 +316,14 @@ impl VectorMap {
     /// it replaces (the owner's housekeeping). A file another writer adds meanwhile
     /// stays. Returns how many files were merged.
     pub async fn merge(&self) -> Result<usize, String> {
-        let Some(model) = self.model.clone() else { return Ok(0) };
+        let (Some(model), dim) = self.model() else { return Ok(0) };
         let merged: Vec<String> = self.files.lock().unwrap().iter().cloned().collect();
         if merged.len() < MERGE_AT {
             return Ok(0);
         }
         let entries: Vec<Entry> = self.vectors.read().unwrap().iter().map(|(k, v)| (k.clone(), v.to_vec())).collect();
         let _t = adb_core::steps::timer("vectors.merge");
-        let uri = write(&self.location, &model, self.dim, &entries).await?;
+        let uri = write(&self.location, &model, dim, &entries).await?;
         self.files.lock().unwrap().insert(split(&uri).1.to_string());
         let (store, base) = crate::ostore::located(&self.location).await.map_err(|e| e.to_string())?;
         for n in &merged {
@@ -342,9 +382,18 @@ mod tests {
         // A file named in an old log record and merged away is skipped.
         map.load(&uris[3]).await.unwrap();
 
-        let fresh = VectorMap::new(loc, Some("bge".into()), 4);
+        let fresh = Arc::new(VectorMap::new(loc.clone(), Some("bge".into()), 4));
         assert_eq!(fresh.load_all().await.unwrap(), 1);
         assert_eq!(fresh.len(), MERGE_AT);
         assert_eq!(fresh.get("semantic:k0").unwrap()[0].to_f32(), 100.0);
+
+        // Another model: its files rank; this one's wait for a switch back.
+        write(&loc, "other", 4, &[("semantic:z".into(), v(9.0, 4))]).await.unwrap();
+        assert!(fresh.follow("other", 4));
+        while fresh.loading() > 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!((fresh.len(), fresh.contains("semantic:z")), (1, true));
+        assert!(!fresh.follow("other", 4), "the same model again changes nothing");
     }
 }

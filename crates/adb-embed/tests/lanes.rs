@@ -12,7 +12,7 @@ async fn a_foreground_request_passes_the_background_backlog() {
         return;
     };
     std::env::set_var("ADB_EMBED_WORKERS", "1");
-    let e = Arc::new(adb_embed::Embedder::load(std::path::Path::new(&dir), 1).unwrap());
+    let e = Arc::new(adb_embed::Embedder::from_config(&adb_embed::EmbedConfig { model_dir: Some(dir), ..Default::default() }).unwrap());
     let texts = |n: usize, tag: &str| (0..n).map(|i| format!("{tag} background text number {i} about invoices and renewals")).collect::<Vec<_>>();
     // A backlog of 30 background calls of 32 texts each on one worker.
     let t0 = Instant::now();

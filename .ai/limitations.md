@@ -117,7 +117,7 @@ delivered to subscribers; multi-hop, inbound / both, `MIN_WEIGHT`, `TYPE IN` / `
 | W4-L3 | **Word matching is English-only and has no synonyms**: Snowball English stemming and a short stop list (W9.11); BM25 statistics computed over the candidates per query. | Words only back up meaning (weight 0.2). | **Later**: per-language analyzers with the inverted index. |
 | W4-L4 | **The evaluation set is small and synthetic** (93 facts, 42 queries, English); the weights were set on it. | Real agent memory may rank differently. | **Later**: grow it from real (anonymised) A3T queries. |
 | W4-L6 | **`MIN_CONFIDENCE` is cosine similarity**, which for bge-small sits around 0.5–0.65 even for unrelated text; useful thresholds are ~0.7+. | A low threshold filters little. | **Later**: calibrate per model. |
-| W9-L4 | **Embedding settings apply by restarting ADB**, and a new model or size clears every vector at once: `LIKE` is partial until the backfill re-embeds (64 records a second; progress in `GET /admin/embedding`). | A few seconds down, then degraded `LIKE` for a large store. | **Note** (user chose clear-and-re-embed, 28 Oct). |
+| W9-L4 | A new embedding model or size re-embeds every record: `LIKE` ranks only the records already re-embedded until the backfill finishes (progress in `GET /admin/embedding`). Since 20 Nov the setting applies in place, without a restart. | Degraded `LIKE` for a large store while re-embedding. | **Note** (user chose clear-and-re-embed, 28 Oct; in place 20 Nov). |
 
 ## Performance and the hot cache (deferred)
 

@@ -321,6 +321,10 @@ impl LanceReads {
     /// explicit `ORDER BY` reorders the selected records.
     async fn similar(&self, memory: MemoryType, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
         let query = modifiers.like_query.as_ref().ok_or_else(|| AdbError::QueryError("LIKE $q: the variable has no value (pass it in `variables`)".into()))?;
+        // The vectors that rank are the embedding setting's model's (it may have changed).
+        if let Some(e) = &self.embedder {
+            self.store.vectors().follow(&e.model(), e.dimension());
+        }
         let (query_text, query_vec) = match query {
             serde_json::Value::String(t) => {
                 let embedded = match &self.embedder {
