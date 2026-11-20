@@ -1,53 +1,104 @@
-# ADB: the database for AI agent memory
+# ADB: one database for everything an AI agent remembers
 
-ADB gives AI agents a long-term memory they can query: what happened, what is true,
-how to do things, and what they are working on now. Agents talk to it in **AQL**, a
-small query language that says what the agent wants. They can also use it through
-**MCP** without writing any code. It runs as one binary on a laptop, or as a
-cluster on object storage.
+**An agent is only as good as its memory. Today that memory is stitched together
+from half a dozen databases. ADB replaces them with one, and a query language agents can
+actually speak.**
 
 [![Licence: ELv2](https://img.shields.io/badge/licence-Elastic%202.0-blue)](LICENSE)
 [![AQL playground](https://img.shields.io/badge/AQL-playground-6f42c1)](https://a3t-ai.github.io/AQL)
 
+## The problem: agent memory is not one kind of data
+
+In a single turn, an agent asks its memory several very different questions:
+
+| The agent asks | What it needs | What teams use today |
+|---|---|---|
+| *Have we seen something like this before?* | Similarity over text | A vector database |
+| *What do we know about Acme?* | Exact facts and fields | Postgres or a document store |
+| *What fixed it last time?* | Relations between memories | A graph database |
+| *What happened in the last hour?* | Events in time order | An event log or time-series store |
+| *What am I working on right now?* | Fast, short-lived state | Redis |
+| *Tell me when something changes.* | Subscriptions | A message queue |
+
+No single database answers all of these, so every team builds the same thing: a
+stack of systems and the glue between them. That costs them in four ways:
+
+- **Slow turns.** One agent step becomes several network round trips in several
+  query languages, and the agent waits for each one.
+- **Memory that disagrees with itself.** There is no shared transaction. A fact
+  updated in Postgres is still stale in the vector index, and the graph still points
+  at a record that was deleted.
+- **Forgetting that doesn't work.** Delete a memory in one store and it comes back
+  from another. That's a real problem when a user asks to be forgotten.
+- **Every agent is a custom project.** Isolating agents and tenants, permissions,
+  backups and audit each have to be built once per store, by every team.
+
+## The solution: ADB, a multi-model memory database
+
+ADB is a database built only for agent memory. Vectors, facts, graph links, events,
+working state and subscriptions live in **one engine**. They share one ordered log,
+one set of namespaces, one permission model and one query language. Each kind of
+memory is a built-in **memory type** with the indexes it needs:
+
+| The agent asks | In ADB |
+|---|---|
+| *Have we seen something like this before?* | `RECALL FROM EPISODIC LIKE "pods running out of memory"` |
+| *What do we know about Acme?* | `RECALL FROM SEMANTIC WHERE account = "acme"` |
+| *What fixed it last time?* | `RECALL FROM EPISODIC WHERE key = "inc-2041" FOLLOW LINKS TYPE "fixed"` |
+| *What happened, most severe first?* | `RECALL FROM EPISODIC WHERE service = "payments" ORDER BY severity DESC` |
+| *What am I working on right now?* | `RECALL FROM WORKING WINDOW LAST 30m` |
+| *Tell me when something changes.* | `SUBSCRIBE RECALL FROM SEMANTIC WHERE account = "acme"` |
+
+Because it is one engine, the four problems go away:
+
+- **One request, one round trip.** A single statement can find memories by meaning
+  and then walk the graph from them. That's work that used to take three systems.
+- **Memory stays consistent.** Every change goes through one ordered log, so every
+  index is built from the same history. Vectors follow a moment later, in the
+  background.
+- **Forget means forget.** `FORGET` removes a memory from similarity search, field
+  filters, graph walks and subscriptions in the same instant, on every node. It's
+  kept as a tombstone with an audit trail until an explicit purge.
+- **Isolation built in.** Each agent or tenant gets a namespace, with its own
+  tokens. `BRANCH`, `FORK` and `MERGE` let an agent try changes on a copy and merge
+  them back.
+
+## AQL: say what the agent wants, not how to find it
+
+AQL has thirteen verbs that work the same on every memory type. There are no tables,
+indexes or joins to choose: `RECALL`, `STORE`, `UPDATE`, `FORGET`, `LINK`, `UNLINK`,
+`BRANCH`, `FORK`, `MERGE`, `PIPELINE`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`. A
+statement reads like the agent's intent. ADB picks the vector, field, key, recency
+or graph index. That also makes AQL easy for an LLM to write correctly.
+
+*"How did we fix incidents like this one?"* Without ADB:
+
+```python
+hits  = vector_db.query(embed("pods running out of memory"), top_k=5, filter={"ns": "ops"})
+rows  = postgres.execute("SELECT * FROM incidents WHERE id = ANY(%s)", [h.id for h in hits])
+fixes = graph.run("MATCH (i:Incident)<-[:FIXED]-(p:Procedure) WHERE i.id IN $ids RETURN p",
+                  ids=[r.id for r in rows])
+```
+
+With ADB, one statement:
+
+```sql
+RECALL FROM EPISODIC LIKE "pods running out of memory" NAMESPACE "ops" LIMIT 5 FOLLOW LINKS TYPE "fixed" DEPTH 1
+```
+
+It finds the similar incidents and returns the procedures that fixed them.
+
+**And it fits the way agents work:**
+- **Built-in MCP server.** Claude Code, Claude Desktop and any other MCP client get
+  memory tools with no code.
+- **AQL over HTTP and Arrow Flight** for applications and data tools.
+- **Embeddings your way.** Use the local model, OpenAI or your own endpoint, and
+  switch at runtime. Vectors are made in the background, so writes never wait.
+- **A web console** in the binary.
+- **Scales from a laptop to a cluster.** One binary runs a single node on a
+  laptop, or a cluster that keeps its data on S3 and scales by adding nodes.
+
 ![The ADB Console: an AQL query and its result](docs/images/console-query.png)
-
-## Why ADB
-
-An agent forgets everything outside its context window. To give it a memory, teams
-usually stitch several systems together:
-- a vector database for similarity search;
-- Postgres for facts;
-- Redis for the current task;
-- a queue for events;
-- sometimes a graph store.
-
-Then they write the glue between them. Every agent ends up with its own version of
-"memory". Nothing stays consistent across those systems. A deleted fact can still
-come back from one of them, and nobody can say what an agent knew at a given moment.
-
-ADB is one database built for this job:
-
-- **Memory types built in.** `WORKING` is the current task, `EPISODIC` is what
-  happened, `SEMANTIC` is facts, `PROCEDURAL` is how to do things, and `TOOLS` is
-  what an agent can use. Each type has the behaviour it needs, and they share one
-  query language.
-- **One query for meaning, filters and relations.** Similarity search (`LIKE`),
-  field filters, ordering, aggregates and graph links (`LINK`, `FOLLOW LINKS`) work
-  together in one AQL statement. There's no second system to keep in sync.
-- **Forget means forget.** `FORGET` records a tombstone that every later read
-  respects, on every node. Nothing is physically deleted until an explicit purge, so
-  there is an audit trail of what was removed and when.
-- **Live memory.** `SUBSCRIBE` keeps a query's result current and streams topic
-  messages over server-sent events. Agents react to changes instead of polling.
-- **Safe experiments.** Namespaces keep one agent's or tenant's memory apart.
-  `BRANCH`, `FORK` and `MERGE` let an agent try changes on a copy and merge them back.
-- **Works with any agent.** ADB has a built-in MCP server for Claude Code, Claude
-  Desktop and other MCP clients, AQL over HTTP, and Arrow Flight for bulk data.
-- **Embeddings your way.** Use the built-in local model, OpenAI, or any
-  OpenAI-compatible endpoint, and switch at runtime. Vectors are made in the
-  background, optionally on separate compute nodes, so writes never wait for a model.
-- **Small to large.** A single node keeps data in a local directory. A cluster keeps
-  data on S3, so nodes need only small disks, and you add nodes to scale.
 
 ## Quick start
 
