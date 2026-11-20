@@ -56,6 +56,11 @@ pub struct EmbedConfig {
     /// `local`: the model directory (default `ADB_EMBED_MODEL_DIR`, then the image's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_dir: Option<String>,
+    /// `openai`: ask the endpoint for `dimension`-long vectors (OpenAI's
+    /// `text-embedding-3-*` shorten theirs on request). Off for endpoints that don't
+    /// take the `dimensions` field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub request_dimension: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +77,7 @@ pub const SETTINGS_FILE: &str = "embedding.json";
 
 impl Default for EmbedConfig {
     fn default() -> Self {
-        Self { provider: Provider::Local, model: MODEL.into(), dimension: DIM, url: None, api_key_env: None, model_dir: None }
+        Self { provider: Provider::Local, model: MODEL.into(), dimension: DIM, url: None, api_key_env: None, model_dir: None, request_dimension: false }
     }
 }
 
@@ -131,7 +136,7 @@ enum Backend {
     /// Compute nodes ([`compute`]): `adb serve-compute` processes on other machines,
     /// the least busy first; the database nodes then run no model.
     Compute { client: reqwest::Client },
-    Http { client: reqwest::Client, url: String, key: Option<String> },
+    Http { client: reqwest::Client, url: String, key: Option<String>, dimensions: Option<usize> },
 }
 
 /// Texts and where their vectors go (and when the job was queued).
@@ -312,7 +317,8 @@ impl Embedder {
                     .map_err(|e| format!("embedding endpoint: {e}"))?;
                 let url = cfg.url.clone().unwrap_or_default().trim_end_matches('/').to_string();
                 let key = cfg.api_key_env.as_ref().and_then(|v| std::env::var(v).ok());
-                Ok(Self { backend: Backend::Http { client, url, key }, model: cfg.model.clone(), dim: cfg.dimension })
+                let dimensions = cfg.request_dimension.then_some(cfg.dimension);
+                Ok(Self { backend: Backend::Http { client, url, key, dimensions }, model: cfg.model.clone(), dim: cfg.dimension })
             }
         }
     }
@@ -349,8 +355,14 @@ impl Embedder {
             return None;
         }
         let client = reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(500)).timeout(std::time::Duration::from_secs(30)).build().ok()?;
-        tracing::info!(named = ?compute::static_urls(), model = MODEL, "embeddings from compute nodes; no model on this node");
-        Some(Self { backend: Backend::Compute { client }, model: MODEL.into(), dim: DIM })
+        // The compute nodes' model (`ADB_COMPUTE_MODEL` = "name:dimension"; default
+        // ADB's own): only compute nodes announcing it are used.
+        let (model, dim) = match std::env::var("ADB_COMPUTE_MODEL").ok().and_then(|v| v.rsplit_once(':').and_then(|(m, d)| Some((m.trim().to_string(), d.trim().parse::<usize>().ok()?)))) {
+            Some(md) => md,
+            None => (MODEL.to_string(), DIM),
+        };
+        tracing::info!(named = ?compute::static_urls(), %model, dim, "embeddings from compute nodes; no model on this node");
+        Some(Self { backend: Backend::Compute { client }, model, dim })
     }
 
     /// Whether this embedder runs on compute nodes.
@@ -425,7 +437,7 @@ impl Embedder {
                         let Some(lease) = compute::pick(&self.model, self.dim, &tried) else {
                             return Err(format!("compute nodes: {last}"));
                         };
-                        match http_embed(client, &lease.url, None, &self.model, chunk, background).await {
+                        match http_embed(client, &lease.url, None, &self.model, None, chunk, background).await {
                             Ok(v) => {
                                 lease.done();
                                 out.extend(v);
@@ -442,11 +454,13 @@ impl Embedder {
                 adb_core::steps::add(if background { "compute.embed round trip (background)" } else { "compute.embed round trip" }, t.elapsed());
                 Ok(out)
             }
-            Backend::Http { client, url, key } => {
+            Backend::Http { client, url, key, dimensions } => {
+                let t = std::time::Instant::now();
                 let mut out = Vec::with_capacity(texts.len());
-                for chunk in texts.chunks(HTTP_BATCH) {
-                    out.extend(http_embed(client, url, key.as_deref(), &self.model, chunk, false).await?);
+                for chunk in texts.chunks(ENDPOINT_BATCH) {
+                    out.extend(http_embed(client, url, key.as_deref(), &self.model, *dimensions, chunk, false).await?);
                 }
+                adb_core::steps::add("endpoint.embed round trip", t.elapsed());
                 Ok(out)
             }
         }
@@ -535,15 +549,18 @@ impl Embedder {
     }
 }
 
-/// Texts per request to an endpoint.
+/// Texts per request to a compute node.
 const HTTP_BATCH: usize = 64;
+/// Texts per request to an embedding endpoint (OpenAI takes up to 2048): one request
+/// per batch counts once against a requests-per-minute limit.
+const ENDPOINT_BATCH: usize = 512;
 
 /// `POST <url>/embeddings` (the OpenAI wire format), vectors in input order.
 /// The header `adb serve-compute` reads: `background` queues the request behind every
 /// foreground one.
 pub const PRIORITY_HEADER: &str = "x-adb-embed-priority";
 
-async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, model: &str, texts: &[String], background: bool) -> Result<Vec<Vec<f32>>, String> {
+async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, model: &str, dimensions: Option<usize>, texts: &[String], background: bool) -> Result<Vec<Vec<f32>>, String> {
     #[derive(Deserialize)]
     struct Item {
         #[serde(default)]
@@ -554,7 +571,11 @@ async fn http_embed(client: &reqwest::Client, url: &str, key: Option<&str>, mode
     struct Resp {
         data: Vec<Item>,
     }
-    let mut req = client.post(format!("{url}/embeddings")).json(&serde_json::json!({ "model": model, "input": texts }));
+    let mut body = serde_json::json!({ "model": model, "input": texts });
+    if let Some(d) = dimensions {
+        body["dimensions"] = d.into();
+    }
+    let mut req = client.post(format!("{url}/embeddings")).json(&body);
     if background {
         req = req.header(PRIORITY_HEADER, "background");
     }
@@ -628,6 +649,10 @@ pub const MODEL_CALL: usize = 32;
 /// Embed `texts` in the background, [`MODEL_CALL`] at a time, the calls in parallel:
 /// a foreground request waits little behind any of them on a worker.
 pub async fn embed_in_calls(embedder: &Arc<Embedder>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+    // An endpoint takes the batch in one request (it runs no worker of ours).
+    if matches!(embedder.backend, Backend::Http { .. }) {
+        return embedder.embed_background(texts).await;
+    }
     let calls = texts.chunks(MODEL_CALL).map(|c| embedder.embed_background(c.to_vec()));
     let mut out = Vec::with_capacity(texts.len());
     for r in futures::future::join_all(calls).await {
@@ -665,14 +690,21 @@ mod tests {
     }
 
     /// An OpenAI-compatible endpoint: vectors come back in input order, unit length,
-    /// with the key as a bearer token; a wrong dimension is caught by `verify`.
+    /// with the key as a bearer token and the `dimensions` asked for; a wrong dimension
+    /// is caught by `verify`.
     #[tokio::test(flavor = "multi_thread")]
     async fn openai_compatible_endpoint() {
         use axum::{routing::post, Json, Router};
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let app = Router::new().route(
             "/v1/embeddings",
             post(|headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| async move {
                 assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-test");
+                // Asked for the configured length (`request_dimension`), or not at all.
+                assert!(body.get("dimensions").is_none_or(|d| *d == 4), "{body}");
+                if body.get("dimensions").is_some() {
+                    ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let n = body["input"].as_array().unwrap().len();
                 // Reversed order, as the API allows: `index` says where each goes.
                 let data: Vec<_> = (0..n).rev().map(|i| serde_json::json!({ "index": i, "embedding": [i as f32 + 1.0, 0.0, 0.0, 0.0] })).collect();
@@ -691,14 +723,16 @@ mod tests {
             url: Some(format!("http://{addr}/v1/")),
             api_key_env: Some("ADB_TEST_EMBED_KEY".into()),
             model_dir: None,
+            request_dimension: true,
         };
         let e = Arc::new(Embedder::from_config(&cfg).unwrap());
         e.verify().await.unwrap();
         let v = e.embed(vec!["a".into(), "b".into(), "c".into()]).await.unwrap();
         assert_eq!(v.iter().map(|x| x[0]).collect::<Vec<_>>(), vec![1.0, 1.0, 1.0], "unit length");
         assert_eq!(v.len(), 3);
+        assert!(ASKED.load(std::sync::atomic::Ordering::SeqCst), "the dimension was asked for");
 
-        let wrong = Arc::new(Embedder::from_config(&EmbedConfig { dimension: 8, ..cfg.clone() }).unwrap());
+        let wrong = Arc::new(Embedder::from_config(&EmbedConfig { dimension: 8, request_dimension: false, ..cfg.clone() }).unwrap());
         assert!(wrong.verify().await.unwrap_err().contains("4 dimensions"));
         let missing = EmbedConfig { api_key_env: Some("ADB_TEST_NO_SUCH_KEY".into()), ..cfg };
         assert!(Embedder::from_config(&missing).err().unwrap().contains("not set"));
@@ -708,7 +742,7 @@ mod tests {
     fn settings_round_trip() {
         let dir = tempfile_dir();
         assert_eq!(EmbedConfig::load(&dir).unwrap(), None);
-        let c = EmbedConfig { provider: Provider::Openai, model: "m".into(), dimension: 1536, url: Some("https://x/v1".into()), api_key_env: None, model_dir: None };
+        let c = EmbedConfig { provider: Provider::Openai, model: "m".into(), dimension: 1536, url: Some("https://x/v1".into()), api_key_env: None, model_dir: None, request_dimension: true };
         c.save(&dir).unwrap();
         assert_eq!(EmbedConfig::load(&dir).unwrap(), Some(c));
         std::fs::remove_dir_all(&dir).unwrap();

@@ -310,7 +310,19 @@ async fn serve_compute(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error
     if std::env::var("ADB_EMBED").is_ok_and(|v| v.eq_ignore_ascii_case("compute")) {
         std::env::remove_var("ADB_EMBED");
     }
-    let embedder = adb_embed::Embedder::from_env().ok_or("serve-compute needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?;
+    // `ADB_COMPUTE_EMBED`: the embedding settings as JSON (`adb_embed::EmbedConfig`),
+    // e.g. an OpenAI endpoint; the key comes from the variable it names. Else the
+    // local model.
+    let embedder = match std::env::var("ADB_COMPUTE_EMBED").ok().filter(|v| !v.trim().is_empty()) {
+        Some(json) => {
+            let cfg: adb_embed::EmbedConfig = serde_json::from_str(&json).map_err(|e| format!("ADB_COMPUTE_EMBED: {e}"))?;
+            let e = Arc::new(adb_embed::Embedder::from_config(&cfg)?);
+            e.verify().await.map_err(|err| format!("ADB_COMPUTE_EMBED: {err}"))?;
+            tracing::info!(provider = ?cfg.provider, model = %cfg.model, dimension = cfg.dimension, "compute node embeds through an endpoint");
+            e
+        }
+        None => adb_embed::Embedder::from_env().ok_or("serve-compute needs the model (ADB_EMBED_MODEL_DIR) and ADB_EMBED not off")?,
+    };
     spawn_announcer(Arc::clone(&embedder), port);
     async fn embed(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, headers: axum::http::HeaderMap, axum::Json(req): axum::Json<serde_json::Value>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
         // A database node's deferred vectors: behind every request someone waits on.

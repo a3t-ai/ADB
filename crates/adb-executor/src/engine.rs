@@ -319,7 +319,14 @@ pub async fn restart_requested() {
 /// The embedder for `settings` (none saved: the environment's local model), and
 /// the table's dimension and model name for it.
 fn embedder_for(settings: Option<&adb_embed::EmbedConfig>) -> (Option<Arc<adb_embed::Embedder>>, i32, Option<String>) {
-    let Some(c) = settings else { return (adb_embed::Embedder::shared(), adb_store::DEFAULT_EMBEDDING_DIM, None) };
+    // Without settings: the shared embedder's model names the partition's vectors (its
+    // vector files are checked against it, and merged under it).
+    let Some(c) = settings else {
+        let e = adb_embed::Embedder::shared();
+        let model = e.as_ref().map(|e| e.model().to_string());
+        let dim = e.as_ref().map_or(adb_store::DEFAULT_EMBEDDING_DIM, |e| e.dimension() as i32);
+        return (e, dim, model);
+    };
     let embedder = if adb_embed::Embedder::disabled() {
         None
     } else {
