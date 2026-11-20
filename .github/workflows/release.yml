@@ -14,6 +14,11 @@ on:
       tag:
         description: "Tag to build (an existing v* tag)"
         required: true
+      platforms:
+        description: "What to build: all, linux (binaries + image) or macos"
+        type: choice
+        options: [all, linux, macos]
+        default: all
 
 permissions:
   contents: write
@@ -35,6 +40,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
             platform: linux/arm64
+    if: github.event_name == 'push' || inputs.platforms != 'macos'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
@@ -76,7 +82,8 @@ jobs:
           path: adb-*.tar.gz*
 
   macos:
-    runs-on: macos-14
+    if: github.event_name == 'push' || inputs.platforms != 'linux'
+    runs-on: macos-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -103,6 +110,7 @@ jobs:
 
   image:
     needs: linux
+    if: needs.linux.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: docker/setup-buildx-action@v3
@@ -118,7 +126,8 @@ jobs:
 
   release:
     needs: [linux, macos, image]
-    if: always() && needs.linux.result == 'success'
+    # Publishes whatever was built; a rerun for one platform adds its files.
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-24.04
     steps:
       - id: v
@@ -132,6 +141,7 @@ jobs:
           tag_name: ${{ env.TAG }}
           name: ADB ${{ env.TAG }} (pre-release, not for production)
           prerelease: true
+          overwrite_files: true
           files: dist/*
           body: |
             **Pre-release, not for production.** APIs and the on-disk format may still change between versions.
