@@ -97,9 +97,10 @@ proptest = "1.4"
 # Internal crates
 adb-core = { path = "crates/adb-core" }
 adb-engine = { path = "crates/adb-engine" }
-# FlowR's engine rules (stage H): the sibling A3T checkout (github.com/a3t-ai/A3T), engine
-# modules only (no FlowR types). deploy.sh builds with both repos side by side.
-flowr-storage = { path = "../A3T/shared/flowr-storage", default-features = false }
+# FlowR's engine rules (stage H), from the A3T repo at a fixed commit, engine modules
+# only (no FlowR types). To build against a local A3T checkout (../A3T), add its patch
+# to .cargo/config.toml (see .cargo/config.toml.example).
+flowr-storage = { git = "https://github.com/a3t-ai/A3T.git", rev = "1fd5965f0ed9c72e1d596fbadfaebba3c492a935", default-features = false }
 # AQL parser comes from the AQL repo (one grammar for AQL and ADB). For local
 # development against a sibling checkout, see .cargo/config.toml.example.
 aql-parser = { git = "https://github.com/a3t-ai/AQL.git", branch = "main" }
