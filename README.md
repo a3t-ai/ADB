@@ -19,9 +19,10 @@ In a single turn, an agent asks its memory several very different questions:
 | *What happened in the last hour?* | Events in time order | An event log or time-series store |
 | *What am I working on right now?* | Fast, short-lived state | Redis |
 | *Tell me when something changes.* | Subscriptions | A message queue |
+| *Can I try this without breaking what users see?* | A safe copy of memory | Copy the database, or hope |
 
 No single database answers all of these, so every team builds the same thing: a
-stack of systems and the glue between them. That costs them in four ways:
+stack of systems and the glue between them. That costs them in six ways:
 
 - **Slow turns.** One agent step becomes several network round trips in several
   query languages, and the agent waits for each one.
@@ -30,8 +31,12 @@ stack of systems and the glue between them. That costs them in four ways:
   at a record that was deleted.
 - **Forgetting that doesn't work.** Delete a memory in one store and it comes back
   from another. That's a real problem when a user asks to be forgotten.
-- **Every agent is a custom project.** Isolating agents and tenants, permissions,
-  backups and audit each have to be built once per store, by every team.
+- **No safe way to experiment.** A new prompt, a new plan or a bulk import writes
+  straight into the memory every user depends on. Undoing a bad import means
+  restoring a backup.
+- **Isolation by convention.** Agents and tenants are kept apart by a `tenant_id`
+  column in every store, so one missed filter leaks memory across customers.
+  Permissions, backups and audit have to be built once per store, by every team.
 
 ## The solution: ADB, a multi-model memory database
 
@@ -48,8 +53,9 @@ memory is a built-in **memory type** with the indexes it needs:
 | *What happened, most severe first?* | `RECALL FROM EPISODIC WHERE service = "payments" ORDER BY severity DESC` |
 | *What am I working on right now?* | `RECALL FROM WORKING WINDOW LAST 30m` |
 | *Tell me when something changes.* | `SUBSCRIBE RECALL FROM SEMANTIC WHERE account = "acme"` |
+| *Can I try this without breaking what users see?* | `BRANCH FROM "support-agent" INTO "support-agent-try"` |
 
-Because it is one engine, the four problems go away:
+Because it is one engine, the six problems go away:
 
 - **One request, one round trip.** A single statement can find memories by meaning
   and then walk the graph from them. That's work that used to take three systems.
@@ -59,9 +65,12 @@ Because it is one engine, the four problems go away:
 - **Forget means forget.** `FORGET` removes a memory from similarity search, field
   filters, graph walks and subscriptions in the same instant, on every node. It's
   kept as a tombstone with an audit trail until an explicit purge.
-- **Isolation built in.** Each agent or tenant gets a namespace, with its own
-  tokens. `BRANCH`, `FORK` and `MERGE` let an agent try changes on a copy and merge
-  them back.
+- **Branch and merge memory like code.** Try a change on a branch that copies
+  nothing, then merge it or drop it. You can also branch from any point in the past.
+  See [below](#branch-merge-and-isolate-memory-like-code).
+- **Isolation built in.** Every memory lives in a namespace, and a token can be
+  limited to the namespaces it may read or write. The database enforces the walls
+  between agents and tenants; it's no longer a filter every query must remember.
 
 ## AQL: say what the agent wants, not how to find it
 
@@ -99,6 +108,48 @@ It finds the similar incidents and returns the procedures that fixed them.
   laptop, or a cluster that keeps its data on S3 and scales by adding nodes.
 
 ![The ADB Console: an AQL query and its result](docs/images/console-query.png)
+
+## Branch, merge and isolate memory, like code
+
+Agents learn by trying. A new prompt, a new plan or a bulk import shouldn't write
+straight into the memory every user depends on. ADB treats memory the way git treats
+code:
+
+```sql
+-- try a change without touching what users see
+BRANCH FROM "support-agent" INTO "support-agent-try"
+UPDATE INTO SEMANTIC WHERE key = "tone" (content = "Answer casually") NAMESPACE "support-agent-try"
+
+-- keep it: merge back. A record changed on both sides is a conflict, unless you say who wins
+MERGE FROM "support-agent-try" INTO "support-agent" PREFER SOURCE
+
+-- or throw it away
+FORGET FROM ALL NAMESPACE "support-agent-try"
+
+-- go back to before a bad import
+BRANCH FROM "support-agent" INTO "support-agent-clean" AS OF "2026-11-20T09:00:00Z"
+
+-- a full, independent copy, for an evaluation run
+FORK FROM "support-agent" INTO "support-agent-eval"
+```
+
+- **Branches copy nothing.** A branch reads its base as it was at the branch point,
+  plus its own changes. Its changes stay in the branch, and later changes to the
+  base don't leak in. So a branch per experiment, per session or per evaluation is
+  cheap.
+- **Merges are explicit.** If the same record changed on both sides, `MERGE` stops
+  and lists the conflicts, unless `PREFER SOURCE` or `PREFER TARGET` says which side
+  wins. Merging the base into a branch brings the branch up to date.
+- **Time travel.** `AS OF` branches from any moment in the past, for example from
+  just before a bad import.
+- **Forgetting still reaches everything.** A `FORGET` in the base also removes the
+  memory from its branches, so deleted data doesn't survive inside an old
+  experiment. A `FORK` is a separate copy with its own life.
+- **Isolation.** Namespaces are the unit of separation. You decide what a namespace
+  is: one per agent, user, tenant or session. A scoped token can be limited to the
+  namespaces it may read or write (for example `acme-*`). Every statement it sends
+  must name a namespace it covers, and it can't reach admin endpoints or other
+  tenants' memory.
 
 ## Quick start
 
