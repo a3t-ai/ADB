@@ -342,12 +342,12 @@ impl LanceReads {
         // A branch namespace ranks its records and its base's at the branch point.
         if let Some(ns) = self.branch_of(modifiers) {
             let rows = self.branch_rows(memory, &ns, modifiers.in_scope.as_deref(), now).await?;
-            return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
+            return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), self.store.vectors(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
         }
         // B7: a space with layers ranks its merged rows.
         if let Some((ns, layers)) = self.layers_for(memory, modifiers) {
             let rows = self.layer_rows(memory, &ns, &layers, modifiers.in_scope.as_deref(), now).await?;
-            return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
+            return Ok(crate::query::rank_rows(rows.into_iter().map(Arc::new).collect(), self.store.vectors(), modifiers, query_text.as_deref(), query_vec.as_deref(), now));
         }
         crate::query::similar(&self.store, memory, modifiers, query_text.as_deref(), query_vec.as_deref(), now).await
     }

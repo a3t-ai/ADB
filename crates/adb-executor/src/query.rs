@@ -1440,7 +1440,7 @@ async fn similar_from(
     let hot = store.hot().filter(|h| source == Source::Cache && h.tracks(m));
     let (mut rows, cached): (Vec<Arc<StoredRow>>, bool) = match hot {
         Some(h) => {
-            let Some(hit) = h.rows(m, in_scope).filter(|hit| hit.floor.is_none() && h.vectors()) else { return Ok(Answer::Insufficient) };
+            let Some(hit) = h.rows(m, in_scope).filter(|hit| hit.floor.is_none()) else { return Ok(Answer::Insufficient) };
             (hit.rows.into_iter().map(|c| c.row).filter(|r| r.is_current(now)).collect(), true)
         }
         None => {
@@ -1457,14 +1457,14 @@ async fn similar_from(
     if let Some(ns) = &modifiers.namespace {
         rows.retain(|r| r.data.namespace.as_ref() == Some(ns));
     }
-    let out = rank_rows(rows, modifiers, text, vector, now);
+    let out = rank_rows(rows, store.vectors(), modifiers, text, vector, now);
     Ok(if cached { Answer::Cache(out) } else { Answer::Lance(out) })
 }
 
 /// `LIKE`'s ranking of candidate `rows` (already filtered by scope and namespace):
 /// `WINDOW`, rank against the text / vector, `MIN_CONFIDENCE`, `LIMIT`, then
 /// `ORDER BY` and `RETURN`. B7: a space with layers ranks its merged rows here.
-pub fn rank_rows(mut rows: Vec<Arc<StoredRow>>, modifiers: &Modifiers, text: Option<&str>, vector: Option<&[f32]>, now: CommitTs) -> Vec<MemoryRecord> {
+pub fn rank_rows(mut rows: Vec<Arc<StoredRow>>, vectors: &adb_store::vectors::VectorMap, modifiers: &Modifiers, text: Option<&str>, vector: Option<&[f32]>, now: CommitTs) -> Vec<MemoryRecord> {
     // One order whatever the source (ranking breaks ties by position).
     rows.sort_by(|a, b| (a.commit_ts, &a.id).cmp(&(b.commit_ts, &b.id)));
     if let Some(w) = &modifiers.window {
@@ -1481,7 +1481,9 @@ pub fn rank_rows(mut rows: Vec<Arc<StoredRow>>, modifiers: &Modifiers, text: Opt
             keep.contains(&(i - 1))
         });
     }
-    let vectors: Vec<Option<Vec<f32>>> = rows.iter().map(|r| r.data.embedding.as_ref().map(|e| e.iter().map(|x| x.to_f32()).collect())).collect();
+    // A row's vector comes from the vector files (`adb_store::vectors`); none yet: it
+    // ranks on its words.
+    let vectors: Vec<Option<Vec<f32>>> = rows.iter().map(|r| vectors.get(&r.id).map(|e| e.iter().map(|x| x.to_f32()).collect())).collect();
     let texts: Vec<Option<String>> = rows.iter().map(|r| crate::reads::embed_text(r.data.memory.into(), &r.data.value)).collect();
     let candidates: Vec<crate::rank::Candidate> =
         rows.iter().enumerate().map(|(i, r)| crate::rank::Candidate { embedding: vectors[i].as_deref(), text: texts[i].as_deref(), at: r.commit_ts }).collect();

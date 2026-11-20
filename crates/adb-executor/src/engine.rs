@@ -690,7 +690,7 @@ fn spawn_shipper<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrite
     })
 }
 
-/// Vectors for records stored without waiting for them (`writes::defer_embedding`):
+/// Vectors for records stored without waiting for them (the vector queue):
 /// woken as each is queued, embedding what is queued in batches until none is left.
 /// A weak reference, like the timer's.
 fn spawn_deferred_embedder<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites<L>>) -> tokio::task::JoinHandle<()> {
@@ -729,7 +729,7 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
     tokio::spawn(async move {
         // S3 option B: the WAL segment shipper lives as long as this timer.
         let _shipper = AbortOnDrop(shipper);
-        // Deferred vectors (`writes::defer_embedding`): as long as this timer too.
+        // Deferred vectors (the vector queue): as long as this timer too.
         let _embedder = AbortOnDrop(embedder);
         // The first tick after one interval, not at once: a just-opened engine is
         // often closed again right away (tests, `adb import`).
@@ -752,6 +752,10 @@ fn spawn_expiry<L: adb_log::Log + 'static>(writes: std::sync::Weak<DurableWrites
                 use chrono::Timelike;
                 now.hour() == h && now.minute() == m && last_nightly != Some(now.date_naive())
             });
+            // The owner merges a partition's many small vector files into one.
+            if ticks % 30 == 0 {
+                w.merge_vector_files();
+            }
             if night || (ticks % check == 0 && w.compaction_due().await) {
                 if night {
                     last_nightly = Some(now.date_naive());
@@ -1038,7 +1042,7 @@ impl LocalEngine {
     }
 
     /// Wait until every record written so far has its vector (writes don't wait for
-    /// them, `writes::defer_embedding`): for a `LIKE` read that must rank them all.
+    /// them, the vector queue): for a `LIKE` read that must rank them all.
     pub async fn vectors_caught_up(&self, within: std::time::Duration) -> Result<(), String> {
         let Some(w) = &self.durable else { return Ok(()) };
         let deadline = std::time::Instant::now() + within;

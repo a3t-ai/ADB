@@ -313,10 +313,10 @@ pub enum Effect {
     /// delete the rows whose `column` (an ISO time, compared as text) is before
     /// `before`.
     TablePurge { table: String, column: String, before: String },
-    /// Set the embedding of row `id` (its current version) in place, without a new
-    /// version (MVP W4): the backfill of rows stored before there was a model, and
-    /// an in-place `Patch` of EPISODIC `content`. The vector travels in the log (§9.1).
-    Embed { memory: Memory, id: RecordId, embedding: Vec<f16> },
+    /// New vectors are in the vector file at `uri` (20 Nov 2026, `adb_store::vectors`):
+    /// every node that applies this loads the file. The vectors themselves don't travel
+    /// in the log, and no row of the table changes.
+    Vectors { uri: String },
     /// FlowR's engine (stage H, `.ai/H_ENGINE_STORE.md`): the durable changes one
     /// operation made in engine space `space` (`flowr_storage::engine_core::Change`
     /// as JSON, applied in order by `adb-engine`; opaque here).

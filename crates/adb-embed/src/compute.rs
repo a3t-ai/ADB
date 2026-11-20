@@ -10,7 +10,7 @@
 //!
 //! The database nodes then load no model: with `ADB_EMBED=compute`, a database node
 //! embeds only through compute nodes. With none up, a write still commits (vectors
-//! follow later, `ADB_EMBED_DEFER`), and a `LIKE` read is refused until one is up.
+//! follow later in vector files), and a `LIKE` read is refused until one is up.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

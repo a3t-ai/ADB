@@ -1,6 +1,5 @@
-//! `ADB_EMBED_DEFER=episodic`: STORE EPISODIC doesn't wait for its vector; the vectors
+//! STORE EPISODIC doesn't wait for its vector; the vectors
 //! follow from the deferred embedder, and LIKE then ranks the episodes by meaning.
-//! Its own test binary: the setting is read once per process.
 //! Needs the model (`ADB_EMBED_MODEL_DIR`); skipped without it.
 
 use std::collections::HashMap;
@@ -40,7 +39,7 @@ const FACTS: &[(&str, &str)] = &[
     ("vpn-reset", "To reset the VPN, restart the client and sign in again"),
 ];
 
-/// With `ADB_EMBED_DEFER=episodic` STORE EPISODIC doesn't wait for its vector:
+/// STORE EPISODIC doesn't wait for its vector:
 /// the vectors follow from the deferred embedder, and LIKE then ranks the episodes by
 /// meaning as it ranks facts.
 #[tokio::test]
@@ -48,7 +47,6 @@ async fn episodes_get_their_vectors_after_the_store() {
     if !have_model() {
         return;
     }
-    std::env::set_var("ADB_EMBED_DEFER", "episodic");
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
     for (k, c) in FACTS {

@@ -96,6 +96,7 @@ dependencies = [
  "adb-core",
  "axum 0.7.9",
  "fastembed",
+ "futures",
  "half",
  "reqwest 0.12.28",
  "serde",

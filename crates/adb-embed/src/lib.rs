@@ -452,6 +452,42 @@ impl Embedder {
         }
     }
 
+    /// Have a compute node embed `items` (row id, text) and write the vectors as one
+    /// vector file in `location` (`adb_store::vectors`); returns the file's URI. The
+    /// vectors don't come back. `None`: this embedder doesn't use compute nodes (the
+    /// caller embeds and writes the file itself).
+    pub async fn embed_to_file(&self, location: &str, items: &[(String, String)]) -> Option<Result<String, String>> {
+        let Backend::Compute { client } = &self.backend else { return None };
+        let t = std::time::Instant::now();
+        let body = serde_json::json!({ "location": location, "model": self.model, "dimension": self.dim, "items": items });
+        let mut tried: Vec<String> = Vec::new();
+        let mut last = String::from("no compute node is up");
+        let r = loop {
+            let Some(lease) = compute::pick(&self.model, self.dim, &tried) else {
+                break Err(format!("compute nodes: {last}"));
+            };
+            let sent = client.post(format!("{}/vectors", lease.url.trim_end_matches('/'))).header(PRIORITY_HEADER, "background").json(&body).send().await;
+            let answer = match sent {
+                Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.map_err(|e| e.to_string()),
+                Ok(r) => Err(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())),
+                Err(e) => Err(e.to_string()),
+            };
+            match answer.and_then(|a| a.get("uri").and_then(|u| u.as_str()).map(String::from).ok_or_else(|| "no uri in the answer".to_string())) {
+                Ok(uri) => {
+                    lease.done();
+                    break Ok(uri);
+                }
+                Err(e) => {
+                    tracing::debug!(url = %lease.url, error = %e, "compute node failed a vector file; trying another");
+                    tried.push(lease.url.clone());
+                    last = e;
+                }
+            }
+        };
+        adb_core::steps::add("compute.vectors file round trip", t.elapsed());
+        Some(r)
+    }
+
     /// Embed `texts` with the local model, waiting on this thread (unit-length vectors).
     /// Not from async code: use [`Embedder::embed`].
     pub fn embed_blocking(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
@@ -584,6 +620,20 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (na * nb)
     }
+}
+
+/// Texts per model call when a batch is embedded in the background ([`embed_in_calls`]).
+pub const MODEL_CALL: usize = 32;
+
+/// Embed `texts` in the background, [`MODEL_CALL`] at a time, the calls in parallel:
+/// a foreground request waits little behind any of them on a worker.
+pub async fn embed_in_calls(embedder: &Arc<Embedder>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+    let calls = texts.chunks(MODEL_CALL).map(|c| embedder.embed_background(c.to_vec()));
+    let mut out = Vec::with_capacity(texts.len());
+    for r in futures::future::join_all(calls).await {
+        out.extend(r?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ pub mod rows;
 pub mod schema;
 pub mod store;
 pub mod table;
+pub mod vectors;
 
 pub use datafusion::logical_expr::Expr;
 pub use field_index::{FieldIndex, Lookup};

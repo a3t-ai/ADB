@@ -179,6 +179,8 @@ pub struct PartitionStore {
     archive_state: std::sync::Mutex<tier::ArchiveState>,
     /// When this store opened: the archive age before the first archive.
     opened_at: std::time::Instant,
+    /// The partition's vectors, from its vector files (`crate::vectors`).
+    vectors: Arc<crate::vectors::VectorMap>,
 }
 
 /// The open table: base dataset, MemWAL writer, SSTable cache, and the put ledger.
@@ -955,7 +957,14 @@ impl PartitionStore {
             archiving: tokio::sync::Mutex::new(()),
             archive_state: std::sync::Mutex::new(tier::load_archive_state(dir)),
             opened_at: std::time::Instant::now(),
+            vectors: Arc::new(crate::vectors::VectorMap::new(
+                crate::vectors::location(cfg.cold.as_deref(), &cfg.root, partition),
+                cfg.embedding_model.clone(),
+                cfg.embedding_dim as usize,
+            )),
         };
+        let files = store.vectors.load_all().await.map_err(StoreError::Decode)?;
+        tracing::debug!(partition = partition.0, files, vectors = store.vectors.len(), "vector files loaded");
         let meta = store.get(META_ID).await?.ok_or_else(|| StoreError::Decode("no _meta row".into()))?;
         let applied = meta.data.value.get("applied_offset").and_then(|v| v.as_u64()).unwrap_or(0);
         store.applied.store(applied, std::sync::atomic::Ordering::SeqCst);
@@ -1660,6 +1669,11 @@ impl PartitionStore {
 
     /// Apply one committed log record as a single MemWAL put. Records at or below
     /// the applied offset are skipped. Returns whether it was applied.
+    /// The partition's vectors (`crate::vectors`).
+    pub fn vectors(&self) -> &Arc<crate::vectors::VectorMap> {
+        &self.vectors
+    }
+
     pub async fn apply(&self, record: &LogRecord) -> StoreResult<bool> {
         Ok(self.apply_many(std::slice::from_ref(record)).await? > 0)
     }
@@ -1672,6 +1686,17 @@ impl PartitionStore {
         let records: Vec<&LogRecord> = records.iter().filter(|r| r.offset > applied_before).collect();
         let Some(last) = records.last().copied() else { return Ok(0) };
         adb_core::steps::value("store.apply records per batch", records.len() as u64);
+        // New vector files load while the rows are put; the apply returns once both are
+        // done, so whoever acts on the applied record (a LIKE watch) sees the vectors.
+        let mut loads = Vec::new();
+        for e in records.iter().flat_map(|r| &r.effects) {
+            match e {
+                Effect::Vectors { uri } => loads.push(self.vectors.load_soon(uri.clone())),
+                // New text: the old vector no longer describes it (a new file follows).
+                Effect::Patch { memory, id, fields, .. } if fields.contains_key("content") => self.vectors.remove(&row_id(*memory, &id.0)),
+                _ => {}
+            }
+        }
         let mut at = std::time::Instant::now();
         let g = self.state.read().await;
         adb_core::steps::lap("store.apply.1 state read-lock wait", &mut at);
@@ -1759,6 +1784,9 @@ impl PartitionStore {
             inner.writer.force_freeze_active().await.map_err(lance)?;
             adb_core::steps::lap("store.apply.7 seal memtable", &mut at);
         }
+        for l in loads {
+            let _ = l.await;
+        }
         Ok(records.len())
     }
 
@@ -1792,7 +1820,7 @@ impl PartitionStore {
                         adb_core::merge_fields(&mut cur.data.value, fields);
                         if let Some(c) = fields.get("content") {
                             cur.data.text = c.as_str().map(String::from);
-                            // The vector described the old text; an `Embed` may follow.
+                            // Vectors live in the vector files now (`apply_many`).
                             cur.data.embedding = None;
                         }
                         cur.version += 1;
@@ -1814,14 +1842,8 @@ impl PartitionStore {
                     }
                     out.insert(log.id.clone(), log);
                 }
-                Effect::Embed { memory, id, embedding } => {
-                    if let Some(mut cur) = Self::row(inner, pre, &out, &row_id(*memory, &id.0)).await? {
-                        // Not a change to the record: `log_offset` stays its version's, or a
-                        // merge would see main as moved when only its vector arrived (DB-19).
-                        cur.data.embedding = Some(embedding.clone());
-                        out.insert(cur.id.clone(), cur);
-                    }
-                }
+                // The vectors aren't the table's: `apply` hands the file to the vector map.
+                Effect::Vectors { .. } => {}
                 Effect::UpdateSubCursor { sub_id, cursor } => {
                     if let Some(mut sub) = Self::row(inner, pre, &out, &sub_id.0).await? {
                         if let serde_json::Value::Object(v) = &mut sub.data.value {
@@ -1873,7 +1895,7 @@ impl PartitionStore {
                     Effect::Supersede { old, new } => {
                         ids.insert(row_id(new.data.memory, &old.0));
                     }
-                    Effect::Patch { memory, id, .. } | Effect::Embed { memory, id, .. } => {
+                    Effect::Patch { memory, id, .. } => {
                         ids.insert(row_id(*memory, &id.0));
                     }
                     Effect::Forget { memory, lineage_id } | Effect::Expire { memory, lineage_id } => lineages.push(row_id(*memory, &lineage_id.0)),

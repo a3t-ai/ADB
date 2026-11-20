@@ -333,15 +333,45 @@ async fn serve_compute(host: IpAddr, port: u16) -> Result<(), Box<dyn std::error
             Err(err) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({ "error": err }))),
         }
     }
+    /// `POST /vectors` {location, model, dimension, items: [[row id, text]]}: embed the
+    /// texts and write them as one vector file in `location` (`adb_store::vectors`,
+    /// object storage with this node's `AWS_*` credentials); answers {uri}. The
+    /// database node only names the file in its log.
+    async fn vectors(axum::extract::State(e): axum::extract::State<std::sync::Arc<adb_embed::Embedder>>, axum::Json(req): axum::Json<VectorsRequest>) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+        let fail = |code, err: String| (code, axum::Json(serde_json::json!({ "error": err })));
+        if req.model != e.model() || req.dimension != e.dimension() {
+            return fail(axum::http::StatusCode::CONFLICT, format!("this compute node runs {} ({}), not {} ({})", e.model(), e.dimension(), req.model, req.dimension));
+        }
+        let _t = adb_core::steps::timer("compute.vectors file (embed + write)");
+        let texts: Vec<String> = req.items.iter().map(|(_, t)| t.clone()).collect();
+        let vectors = match adb_embed::embed_in_calls(&e, texts).await {
+            Ok(v) => v,
+            Err(err) => return fail(axum::http::StatusCode::INTERNAL_SERVER_ERROR, err),
+        };
+        let entries: Vec<adb_store::vectors::Entry> = req.items.into_iter().zip(vectors).map(|((id, _), v)| (id, adb_embed::to_f16(&v))).collect();
+        match adb_store::vectors::write(&req.location, e.model(), e.dimension(), &entries).await {
+            Ok(uri) => (axum::http::StatusCode::OK, axum::Json(serde_json::json!({ "uri": uri, "vectors": entries.len() }))),
+            Err(err) => fail(axum::http::StatusCode::BAD_GATEWAY, err),
+        }
+    }
     let app = axum::Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/vectors", post(vectors))
         .route("/embeddings", post(embed))
         .route("/v1/embeddings", post(embed))
         .with_state(embedder);
     let addr = std::net::SocketAddr::new(host, port);
-    tracing::info!(%addr, workers = adb_embed::workers(), functions = "embed", "ADB compute node");
+    tracing::info!(%addr, workers = adb_embed::workers(), functions = "embed, vectors", "ADB compute node");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).with_graceful_shutdown(async { shutdown_signal().await; }).await?;
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct VectorsRequest {
+    location: String,
+    model: String,
+    dimension: usize,
+    items: Vec<(String, String)>,
 }
 
 /// A compute node's announcements: to every database node of `ADB_COMPUTE_JOIN`,
@@ -365,7 +395,7 @@ fn spawn_announcer(embedder: Arc<adb_embed::Embedder>, port: u16) {
             tick.tick().await;
             let a = adb_embed::compute::Announce {
                 url: me.clone(),
-                functions: vec!["embed".into()],
+                functions: vec!["embed".into(), "vectors".into()],
                 model: embedder.model().to_string(),
                 dimension: embedder.dimension(),
                 workers: adb_embed::workers(),

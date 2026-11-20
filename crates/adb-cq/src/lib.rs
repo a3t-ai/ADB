@@ -116,7 +116,8 @@ impl WatchSet {
             Effect::Patch { memory, .. } | Effect::Forget { memory, .. } | Effect::Expire { memory, .. } | Effect::Validity { memory, .. } => {
                 self.memory(*memory)
             }
-            Effect::Embed { memory, .. } => self.like && self.memory(*memory),
+            // New vectors can reorder a LIKE watch's result.
+            Effect::Vectors { .. } => self.like,
             _ => false,
         })
     }
