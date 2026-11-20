@@ -230,6 +230,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Serve { http: true, host, port, flight_port } | Commands::ServeHttp { host, port, flight_port } => {
+            #[cfg(feature = "console")]
+            {
+                adb_server::console::describe(adb_server::console::NodeInfo {
+                    mode: "single",
+                    node_id: None,
+                    http_port: port,
+                    flight_port,
+                    control_port: None,
+                    advertise: None,
+                    data_dir: cli.data_dir.as_ref().map(|d| d.display().to_string()),
+                });
+                tracing::info!("ADB Console on http://{}:{port}/ui", if host.is_unspecified() { "localhost".to_string() } else { host.to_string() });
+            }
             // Arrow Flight next to HTTP (stage G): FlowR's native wire.
             let flight = async {
                 match flight_port {

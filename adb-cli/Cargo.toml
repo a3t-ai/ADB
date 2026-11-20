@@ -9,6 +9,10 @@ description = "ADB command-line interface"
 name = "adb"
 path = "src/main.rs"
 
+[features]
+# The standalone ADB: `cargo build --release -p adb-cli --features console`.
+console = ["adb-server/console"]
+
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # The allocator (see `alloc.rs`). Also takes over malloc for C and C++ code in this binary.

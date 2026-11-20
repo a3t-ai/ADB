@@ -2,6 +2,9 @@
 #
 #   docker build -t adb .                                     # AQL parser from GitHub
 #   docker build -t adb --build-context aql=../AQL .          # AQL parser from a local checkout
+#   docker build -t adb --build-arg ADB_FEATURES=console .    # standalone: with the ADB Console (/ui)
+#
+# A3T's images build without the console: its ADB serves no UI.
 #
 # The `aql` stage below is empty unless a build context of that name replaces it.
 FROM scratch AS aql
@@ -18,7 +21,8 @@ COPY . .
 RUN if [ -f /AQL/crates/aql-parser/Cargo.toml ]; then \
       mkdir -p .cargo && printf '[patch."https://github.com/a3t-ai/AQL.git"]\naql-parser = { path = "/AQL/crates/aql-parser" }\n' > .cargo/config.toml; \
     fi
-RUN cargo build --release -p adb-cli
+ARG ADB_FEATURES=""
+RUN cargo build --release -p adb-cli ${ADB_FEATURES:+--features $ADB_FEATURES}
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \

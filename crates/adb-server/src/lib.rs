@@ -19,6 +19,8 @@
 #![recursion_limit = "256"]
 
 pub mod auth;
+#[cfg(feature = "console")]
+pub mod console;
 pub mod flight;
 pub mod forward;
 pub mod internal;
@@ -109,7 +111,7 @@ async fn metrics_json() -> axum::Json<serde_json::Value> {
 }
 
 fn routes(engine: Arc<dyn Engine>) -> Router {
-    Router::new()
+    let r = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_text))
         .route("/admin/stats/metrics", get(metrics_json))
@@ -124,8 +126,10 @@ fn routes(engine: Arc<dyn Engine>) -> Router {
         .route("/mcp/sse", get(mcp_sse))
         .route("/mcp/message", post(mcp_message))
         .route("/subscriptions/:id/events", get(subscription_events))
-        .route("/watches/:id/events", get(watch_events))
-        .with_state(AppState::new(engine))
+        .route("/watches/:id/events", get(watch_events));
+    #[cfg(feature = "console")]
+    let r = r.route("/ui", get(console::page)).route("/admin/console", get(console::info));
+    r.with_state(AppState::new(engine))
 }
 
 /// Bind and serve until the process ends.
@@ -366,8 +370,8 @@ async fn embedding(State(s): State<AppState>) -> (StatusCode, Json<QueryResponse
     respond(s.engine.embedding().await, StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// `PUT /admin/embedding` — `{provider, model, dimension, url?, api_key_env?}`:
-/// checked with a sample embedding, saved, applied by restarting ADB (W9.10).
+/// `PUT /admin/embedding` — `{provider, model, dimension, url?, api_key_env?, run_on?}`:
+/// checked with a sample embedding, applied in place and saved.
 async fn set_embedding(State(s): State<AppState>, Json(body): Json<Value>) -> (StatusCode, Json<QueryResponse>) {
     respond(s.engine.set_embedding(body).await, StatusCode::BAD_REQUEST)
 }

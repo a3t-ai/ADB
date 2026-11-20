@@ -44,6 +44,24 @@ adb query 'RECALL FROM EPISODIC WHERE pod = "payments" LIMIT 5'
 **A3T:** ADB serves the same API as ClawDB's server, so an A3T `clawdb` resource can
 point at ADB unchanged (`url: http://<adb>:3000`, MCP at `/mcp/sse`).
 
+## ADB Console (standalone build)
+
+A small web UI built into the binary: every connection point with ready-to-copy
+snippets (curl, MCP config, pyarrow Flight, CLI), health and uptime, an AQL editor
+with variables and history, the embedding and cache settings, the cluster map
+(nodes, partition owners and replicas, compute nodes) and live latency metrics.
+
+```bash
+cargo build --release -p adb-cli --features console
+adb serve-http --data-dir ./data          # then open http://localhost:3000/ui
+docker build -t adb --build-arg ADB_FEATURES=console .
+```
+
+It is a build feature, off by default: A3T's ADB is built without it and serves no
+UI. `/ui` itself is open (it holds no data and asks for the token); everything it
+shows goes through the token like any other client, including `GET /admin/console`
+(node, auth, storage, endpoints, cluster map).
+
 ## API
 
 | Endpoint | |

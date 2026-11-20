@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADB Console</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #16191d; --muted: #5d6570; --line: #dfe3e8;
+  --accent: #2b62d9; --accent-soft: #e6eefc; --ok: #1b7f4b; --ok-soft: #e3f4ea;
+  --warn: #9a5b00; --warn-soft: #fdf1dc; --bad: #b42318; --bad-soft: #fde8e6;
+  --code: #f0f2f5; --on-accent: #ffffff; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111418; --panel: #191d22; --text: #e6e9ed; --muted: #98a1ac; --line: #2a3038;
+    --accent: #7aa2ff; --accent-soft: #1d2a45; --ok: #4fc485; --ok-soft: #15301f;
+    --warn: #f0b75a; --warn-soft: #3a2b12; --bad: #ff7b6e; --bad-soft: #3d1a17; --code: #20252c; --on-accent: #0d1117;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111418; --panel: #191d22; --text: #e6e9ed; --muted: #98a1ac; --line: #2a3038;
+  --accent: #7aa2ff; --accent-soft: #1d2a45; --ok: #4fc485; --ok-soft: #15301f;
+  --warn: #f0b75a; --warn-soft: #3a2b12; --bad: #ff7b6e; --bad-soft: #3d1a17; --code: #20252c; --on-accent: #0d1117;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { background: var(--panel); border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+header h1 span { color: var(--muted); font-weight: 400; }
+.conn { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
+.conn input { width: 220px; }
+nav { display: flex; gap: 2px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line); overflow-x: auto; }
+nav button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 12px; color: var(--muted); font: inherit; cursor: pointer; white-space: nowrap; }
+nav button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+main { padding: 16px; max-width: 1280px; margin: 0 auto; }
+section[hidden], .card[hidden] { display: none; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); margin-bottom: 16px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.tile .k { color: var(--muted); font-size: 12px; }
+.tile .v { font-size: 18px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .v.path { direction: rtl; text-align: left; font: 600 13px/27px var(--mono); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 16px; min-width: 0; }
+.card h2 { font-size: 14px; margin: 0 0 10px; }
+.card h2 small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.split { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 900px) { .split { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); } }
+input, select, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; }
+textarea { width: 100%; font-family: var(--mono); font-size: 13px; resize: vertical; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+button.b { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button.b:hover { border-color: var(--accent); }
+button.p { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.danger { color: var(--bad); }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--code); color: var(--muted); }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.mn { white-space: nowrap; }
+td.mn code { overflow-wrap: normal; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+code, pre { font-family: var(--mono); font-size: 12.5px; }
+code { background: var(--code); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+pre { background: var(--code); padding: 10px; border-radius: 6px; overflow: auto; margin: 0; max-height: 520px; }
+.muted { color: var(--muted); }
+.err { color: var(--bad); white-space: pre-wrap; }
+.snip { position: relative; margin-top: 8px; }
+.snip button { position: absolute; top: 6px; right: 6px; font-size: 12px; padding: 2px 8px; }
+.snip .t { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap: 3px; }
+.parts div { font: 11px/1 var(--mono); text-align: center; padding: 7px 0; border-radius: 4px; color: #fff; cursor: default; }
+.parts div.none { background: var(--bad); }
+.parts div.norep { outline: 2px solid var(--warn); outline-offset: -2px; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.hist li { cursor: pointer; padding: 4px 0; border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow: auto; }
+.form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ADB Console <span id="ver"></span></h1>
+  <span id="status" class="pill">not connected</span>
+  <div class="conn">
+    <input id="base" aria-label="ADB URL" placeholder="http://localhost:3000">
+    <input id="token" aria-label="Token" type="password" placeholder="Token (ADB_AUTH_TOKEN)" autocomplete="off">
+    <button class="b p" id="connect">Connect</button>
+    <button class="b" id="theme" title="Theme">◐</button>
+  </div>
+</header>
+<nav role="tablist">
+  <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+  <button role="tab" data-tab="query">Query</button>
+  <button role="tab" data-tab="settings">Settings</button>
+  <button role="tab" data-tab="cluster">Cluster</button>
+  <button role="tab" data-tab="metrics">Metrics</button>
+</nav>
+<main>
+  <section id="tab-overview">
+    <div class="grid" id="tiles"></div>
+    <div class="card"><h2>Connection points <small>every way into this node</small></h2><div class="tablewrap"><table id="endpoints"></table></div></div>
+    <div class="card"><h2>Connect from…</h2><div id="snippets"></div></div>
+    <div class="card"><h2>Stats</h2><pre id="stats" class="muted">—</pre></div>
+  </section>
+
+  <section id="tab-query" hidden>
+    <div class="split">
+      <div class="card">
+        <h2>AQL <small>Ctrl/⌘ + Enter runs</small></h2>
+        <textarea id="aql" rows="9" spellcheck="false" placeholder="RECALL FROM SEMANTIC NAMESPACE &quot;docs&quot; LIMIT 10"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="b p" id="run">Run</button>
+          <span id="qinfo" class="muted"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Variables <small>JSON, bound as $name</small></h2>
+        <textarea id="vars" rows="5" spellcheck="false" placeholder='{"ns": "docs"}'></textarea>
+        <h2 style="margin-top:12px">History</h2>
+        <ul class="hist" id="hist"></ul>
+      </div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2 style="margin:0">Result</h2>
+        <div class="row"><button class="b" id="vtable">Table</button><button class="b" id="vjson">JSON</button></div></div>
+      <div id="result" style="margin-top:10px" class="muted">Run a statement to see its result.</div>
+    </div>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>Embedding <small id="embsrc"></small></h2>
+      <div class="form">
+        <label>Provider<select id="e_provider"><option>local</option><option>openai</option><option>custom</option></select></label>
+        <label>Model<input id="e_model"></label>
+        <label>Dimension<input id="e_dimension" type="number" min="1"></label>
+        <label>Runs on<select id="e_run_on"><option value="node">this node</option><option value="compute">compute nodes</option></select></label>
+        <label>Endpoint URL<input id="e_url" placeholder="custom only"></label>
+        <label>API key env var<input id="e_api_key_env" placeholder="e.g. OPENAI_API_KEY"></label>
+        <label>Model dir<input id="e_model_dir" placeholder="local only, optional"></label>
+        <label>Send dimension<select id="e_request_dimension"><option value="false">no</option><option value="true">yes</option></select></label>
+      </div>
+      <p class="note">The key itself is never stored in ADB: name the environment variable that holds it. A new model or dimension makes the vectors again in the background.</p>
+      <div class="row"><button class="b p" id="esave">Apply</button><span id="emsg"></span></div>
+    </div>
+    <div class="card">
+      <h2>Hot cache <small id="csrc"></small></h2>
+      <textarea id="cache" rows="10" spellcheck="false"></textarea>
+      <p class="note">Edit <code>max_bytes</code> and <code>rules</code> (<code>{memory, scope?, keep}</code>); applied at once.</p>
+      <div class="row"><button class="b p" id="csave">Apply</button><span id="cmsg"></span></div>
+      <h2 style="margin-top:14px">Cache figures</h2><pre id="cstats" class="muted">—</pre>
+    </div>
+    <div class="card">
+      <h2>Maintenance</h2>
+      <div class="row"><button class="b danger" id="compact">Compact now</button><span id="kmsg" class="muted">Rewrites the tables; the maintenance timer normally does this.</span></div>
+    </div>
+  </section>
+
+  <section id="tab-cluster" hidden>
+    <div class="grid" id="ctiles"></div>
+    <div class="card" id="cnodes"><h2>Nodes</h2><div class="tablewrap"><table id="members"></table></div></div>
+    <div class="card" id="cparts"><h2>Partitions <small>colour = owner · amber edge = no replica · red = unassigned</small></h2><div class="parts" id="parts"></div><div class="legend" id="legend"></div></div>
+    <div class="card"><h2>Compute nodes</h2><div class="tablewrap"><table id="compute"></table></div></div>
+  </section>
+
+  <section id="tab-metrics" hidden>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <input id="mfilter" placeholder="Filter metrics" style="flex:1;max-width:360px">
+        <label style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" id="mauto"> refresh every 5 s</label>
+        <button class="b" id="mrefresh">Refresh</button>
+      </div>
+    </div>
+    <div class="card"><h2>Latencies <small>histograms</small></h2><div class="tablewrap"><table id="mhist"></table></div></div>
+    <div class="card"><h2>Counters and gauges</h2><div class="tablewrap"><table id="mcount"></table></div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, s = sessionStorage) { try { return s.getItem(k); } catch { return null; } },
+  set(k, v, s = sessionStorage) { try { s.setItem(k, v); } catch {} },
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (n) => (typeof n !== "number" ? esc(n) : Number.isInteger(n) ? n.toLocaleString() : n.toPrecision(3));
+const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${s % 60}s`; };
+
+// ---- connection
+$("base").value = store.get("adb.base") || location.origin;
+$("token").value = store.get("adb.token") || "";
+const base = () => $("base").value.replace(/\/+$/, "");
+async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json" };
+  const t = $("token").value.trim();
+  if (t) headers.Authorization = "Bearer " + t;
+  const r = await fetch(base() + path, { ...opts, headers });
+  const text = await r.text();
+  let body; try { body = JSON.parse(text); } catch { body = text; }
+  if (!r.ok) { const e = new Error((body && body.error) || (typeof body === "string" ? body : "") || `HTTP ${r.status}`); e.status = r.status; e.body = body; throw e; }
+  return body;
+}
+function status(cls, text) { const s = $("status"); s.className = "pill " + cls; s.textContent = text; }
+
+let info = null;
+async function connect() {
+  store.set("adb.base", $("base").value); store.set("adb.token", $("token").value);
+  status("", "connecting…");
+  try {
+    const h = await api("/health");
+    $("ver").textContent = "v" + h.version;
+  } catch (e) { status("bad", "unreachable"); $("tiles").innerHTML = tile("Health", "unreachable", e.message); return; }
+  try {
+    info = await api("/admin/console");
+    status("ok", "connected");
+  } catch (e) {
+    info = null;
+    status(e.status === 401 || e.status === 403 ? "warn" : "bad", e.status === 401 || e.status === 403 ? "token needed" : "error");
+    $("tiles").innerHTML = tile("Health", "ok") + tile("Console", e.status === 401 || e.status === 403 ? "token needed" : "error", e.message);
+    return;
+  }
+  overview(); loadStats();
+  const active = document.querySelector('nav [aria-selected="true"]').dataset.tab;
+  if (active !== "overview") show(active);
+}
+$("connect").onclick = connect;
+$("token").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+
+// ---- theme
+const savedTheme = store.get("adb.theme", localStorage);
+if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+$("theme").onclick = () => {
+  const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  store.set("adb.theme", document.documentElement.dataset.theme, localStorage);
+};
+
+// ---- tabs
+const loaders = { overview: () => { if (info) { overview(); loadStats(); } }, query: renderHistory, settings: loadSettings, cluster: loadCluster, metrics: loadMetrics };
+function show(tab) {
+  document.querySelectorAll("nav button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+  document.querySelectorAll("main > section").forEach((s) => (s.hidden = s.id !== "tab-" + tab));
+  store.set("adb.tab", tab);
+  loaders[tab] && loaders[tab]();
+}
+document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => show(b.dataset.tab)));
+
+// ---- overview
+const tile = (k, v, sub, cls = "") => `<div class="tile"><div class="k">${esc(k)}</div><div class="v ${cls}" title="${esc(v)}">${esc(v)}</div>${sub ? `<div class="k">${esc(sub)}</div>` : ""}</div>`;
+function hostOf() { try { return new URL(base()).hostname; } catch { return location.hostname; } }
+function overview() {
+  const n = info.node, a = info.auth;
+  const authText = a.memory_token ? "token" : a.scoped_tokens ? "scoped tokens" : "open";
+  $("tiles").innerHTML =
+    tile("Health", "ok") +
+    tile("Mode", n.mode + (n.node_id != null ? " · node " + n.node_id : "")) +
+    tile("Uptime", dur(info.uptime_s), new Date(info.started_at * 1000).toLocaleString()) +
+    tile("Auth", authText, a.engine_token ? "engine token set" : "") +
+    tile("Data dir", info.storage.data_dir || "temporary", info.storage.data_dir ? "" : "lost on restart", info.storage.data_dir ? "path" : "") +
+    tile("Object storage", info.storage.object_storage || "none", "", info.storage.object_storage ? "path" : "") +
+    (info.cluster ? tile("Cluster", info.cluster.in_touch ? "in touch" : "no lease", `${info.cluster.members.length} nodes · ${info.cluster.partitions} partitions + system`) : "");
+  const host = hostOf(), http = base();
+  $("endpoints").innerHTML = "<tr><th>Name</th><th>Kind</th><th>Where</th><th>What it is for</th></tr>" + info.endpoints.map((e) => {
+    const where = e.path ? `${e.method ? esc(e.method) + " " : ""}<code>${esc(e.port ? `${host}:${e.port}${e.path}` : e.path)}</code>`
+      : e.port ? `<code>grpc://${esc(host)}:${esc(e.port)}</code>` : `<code>${esc(e.command)}</code>`;
+    return `<tr><td>${esc(e.name)}</td><td><span class="pill">${esc(e.kind)}</span></td><td>${where}</td><td class="muted">${esc(e.use)}</td></tr>`;
+  }).join("");
+  const auth = a.memory_token ? ' -H "Authorization: Bearer $ADB_AUTH_TOKEN"' : "";
+  const flight = info.node.flight_port ? `grpc://${host}:${info.node.flight_port}` : null;
+  const snips = [
+    ["curl", `curl -s ${http}/query${auth} \\\n  -H 'Content-Type: application/json' \\\n  -d '{"query": "RECALL FROM SEMANTIC NAMESPACE \\"docs\\" LIMIT 5"}'`],
+    ["MCP client config (Claude Code, Claude Desktop, other agents)", JSON.stringify({ mcpServers: { adb: { type: "http", url: http + "/mcp", ...(a.memory_token ? { headers: { Authorization: "Bearer ${ADB_AUTH_TOKEN}" } } : {}) } } }, null, 2)],
+  ];
+  if (flight) snips.push(["Python (pyarrow Flight)", `import json, pyarrow.flight as fl\nc = fl.connect("${flight}")\nopts = fl.FlightCallOptions(${a.memory_token ? 'headers=[(b"authorization", b"Bearer " + TOKEN.encode())]' : ""})\n# a table as Arrow\nt = c.do_get(fl.Ticket(json.dumps({"table": "projects", "limit": 100})), opts).read_all()\n# AQL\nr = list(c.do_action(fl.Action("aql", json.dumps({"query": "RECALL FROM SEMANTIC NAMESPACE \\"docs\\" LIMIT 5"}).encode()), opts))`]);
+  snips.push(["CLI", `adb query 'RECALL FROM SEMANTIC NAMESPACE "docs" LIMIT 5'${flight ? `\nadb sql "select count(*) from memory" --flight ${flight}` : ""}`]);
+  $("snippets").innerHTML = snips.map(([t, s], i) => `<div class="snip"><div class="t">${esc(t)}</div><pre id="snip${i}">${esc(s)}</pre><button class="b" data-copy="snip${i}">Copy</button></div>`).join("");
+  document.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => { navigator.clipboard?.writeText($(b.dataset.copy).textContent); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1200); }));
+}
+async function loadStats() {
+  try { const s = await api("/stats"); $("stats").textContent = JSON.stringify(s.data ?? s, null, 2); $("stats").classList.remove("muted"); }
+  catch (e) { $("stats").textContent = e.message; }
+}
+
+// ---- query
+let lastResult = null, view = "table";
+function history() { try { return JSON.parse(store.get("adb.hist", localStorage) || "[]"); } catch { return []; } }
+function renderHistory() {
+  const h = history();
+  $("hist").innerHTML = h.length ? h.map((q, i) => `<li data-i="${i}" title="${esc(q.query)}">${esc(q.query)}</li>`).join("") : '<li class="muted">No statements yet</li>';
+  $("hist").querySelectorAll("li[data-i]").forEach((li) => (li.onclick = () => { const q = h[+li.dataset.i]; $("aql").value = q.query; $("vars").value = q.variables || ""; }));
+}
+async function run() {
+  const query = $("aql").value.trim();
+  if (!query) return;
+  let variables;
+  const vt = $("vars").value.trim();
+  if (vt) { try { variables = JSON.parse(vt); } catch (e) { $("result").innerHTML = `<div class="err">Variables are not valid JSON: ${esc(e.message)}</div>`; return; } }
+  $("qinfo").textContent = "running…";
+  const t0 = performance.now();
+  try {
+    const r = await api("/query", { method: "POST", body: JSON.stringify(variables ? { query, variables } : { query }) });
+    lastResult = r;
+    $("qinfo").textContent = `${Math.round(performance.now() - t0)} ms` + (r.execution_time_ms != null ? ` · server ${r.execution_time_ms} ms` : "");
+  } catch (e) {
+    lastResult = e.body && typeof e.body === "object" ? e.body : { success: false, error: e.message };
+    $("qinfo").textContent = `${Math.round(performance.now() - t0)} ms`;
+  }
+  const h = history().filter((q) => q.query !== query); h.unshift({ query, variables: vt }); store.set("adb.hist", JSON.stringify(h.slice(0, 30)), localStorage);
+  renderHistory(); renderResult();
+}
+function rowsOf(d) {
+  const isRows = (v) => Array.isArray(v) && v.length > 0 && v.every((x) => x && typeof x === "object" && !Array.isArray(x));
+  if (isRows(d)) return d;
+  if (d && typeof d === "object") for (const v of Object.values(d)) { if (isRows(v)) return v; if (v && typeof v === "object") for (const w of Object.values(v)) if (isRows(w)) return w; }
+  return null;
+}
+function cell(v) { if (v == null) return '<span class="muted">—</span>'; if (typeof v === "object") { const s = JSON.stringify(v); return `<code title="${esc(s)}">${esc(s.length > 120 ? s.slice(0, 120) + "…" : s)}</code>`; } return esc(v); }
+function renderResult() {
+  const r = lastResult; if (!r) return;
+  if (r.success === false) { $("result").innerHTML = `<div class="err">${esc(r.code ? `[${r.code}] ` : "")}${esc(r.error)}</div>`; return; }
+  let rows = rowsOf(r.data);
+  if (view === "table" && rows && rows.every((x) => x.data && typeof x.data === "object" && !Array.isArray(x.data))) {
+    rows = rows.map((x) => { const m = x.metadata || {}; return { id: x.id, ...(x.memory_type ? { memory: x.memory_type } : {}), ...x.data, namespace: m.namespace, ...(x.score != null ? { score: x.score } : {}), created_at: m.created_at }; });
+  }
+  if (view === "table" && rows) {
+    const cols = [...new Set(rows.flatMap((x) => Object.keys(x)))];
+    $("result").innerHTML = `<div class="muted" style="margin-bottom:6px">${rows.length} row${rows.length === 1 ? "" : "s"}</div><div class="tablewrap"><table><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>${rows.map((x) => `<tr>${cols.map((c) => `<td>${cell(x[c])}</td>`).join("")}</tr>`).join("")}</table></div>`;
+  } else {
+    $("result").innerHTML = `<pre>${esc(JSON.stringify(r.data, null, 2))}</pre>`;
+  }
+}
+$("run").onclick = run;
+$("aql").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); } });
+$("vtable").onclick = () => { view = "table"; renderResult(); };
+$("vjson").onclick = () => { view = "json"; renderResult(); };
+
+// ---- settings
+const EF = ["provider", "model", "dimension", "run_on", "url", "api_key_env", "model_dir", "request_dimension"];
+async function loadSettings() {
+  try {
+    const e = (await api("/admin/embedding")).data;
+    const c = e.active || e.settings || {};
+    $("embsrc").textContent = `${e.source}${e.pending != null ? ` · ${e.pending} waiting for vectors` : ""}`;
+    for (const k of EF) $("e_" + k).value = c[k] == null ? (k === "run_on" ? "node" : k === "request_dimension" ? "false" : "") : String(c[k]);
+  } catch (e) { $("embsrc").textContent = e.message; }
+  try {
+    const c = (await api("/admin/cache")).data;
+    $("csrc").textContent = c.mode ? `${c.mode} · ${c.source}` : c.source || "";
+    $("cache").value = JSON.stringify(c.settings ?? {}, null, 2);
+    $("cstats").textContent = JSON.stringify(c.stats ?? {}, null, 2); $("cstats").classList.remove("muted");
+  } catch (e) { $("csrc").textContent = e.message; }
+}
+$("esave").onclick = async () => {
+  const body = {};
+  for (const k of EF) { const v = $("e_" + k).value.trim(); if (v === "") continue; body[k] = k === "dimension" ? Number(v) : k === "request_dimension" ? v === "true" : v; }
+  $("emsg").innerHTML = '<span class="muted">checking with a sample embedding…</span>';
+  try { const r = await api("/admin/embedding", { method: "PUT", body: JSON.stringify(body) }); $("emsg").innerHTML = `<span class="pill ok">applied</span> <span class="muted">${r.data && r.data.reembed ? "vectors are being made again" : ""}</span>`; loadSettings(); }
+  catch (e) { $("emsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+};
+$("csave").onclick = async () => {
+  let body; try { body = JSON.parse($("cache").value); } catch (e) { $("cmsg").innerHTML = `<span class="err">Not valid JSON: ${esc(e.message)}</span>`; return; }
+  try { await api("/admin/cache", { method: "PUT", body: JSON.stringify(body) }); $("cmsg").innerHTML = '<span class="pill ok">applied</span>'; loadSettings(); }
+  catch (e) { $("cmsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+};
+$("compact").onclick = async () => {
+  if (!confirm("Compact the tables now? It runs in the foreground and can take a while on a large node.")) return;
+  $("kmsg").textContent = "compacting…";
+  try { const r = await api("/admin/compact", { method: "POST" }); $("kmsg").textContent = JSON.stringify(r.data); }
+  catch (e) { $("kmsg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+};
+
+// ---- cluster
+const hue = (i) => `hsl(${(i * 137.5) % 360} 55% 45%)`;
+async function loadCluster() {
+  try { info = await api("/admin/console"); } catch (e) { $("ctiles").innerHTML = tile("Cluster", "error", e.message); return; }
+  const c = info.cluster;
+  if (!c) {
+    $("ctiles").innerHTML = tile("Mode", "single node", "holds every partition; no cluster map");
+    $("cnodes").hidden = $("cparts").hidden = true;
+  } else {
+    $("cnodes").hidden = $("cparts").hidden = false;
+    $("ctiles").innerHTML = tile("Control plane", c.in_touch ? "in touch" : "no lease") + tile("Nodes", c.members.length) + tile("Partitions", c.partitions, "memory, plus the system partition") +
+      tile("Unassigned", c.unassigned.length) + tile("No replica", c.unreplicated.length) + tile("Map version", c.map_version);
+    const ids = c.members.map((m) => m.id), color = (id) => hue(ids.indexOf(id));
+    $("members").innerHTML = "<tr><th>Node</th><th>Data plane</th><th>Flight</th><th class='num'>Owns</th><th class='num'>Replicas</th></tr>" + c.members.map((m) =>
+      `<tr><td><i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${color(m.id)}"></i> ${esc(m.id)}${info.node.node_id === m.id ? ' <span class="pill">this node</span>' : ""}</td><td><code>${esc(m.addr)}</code></td><td>${m.flight ? `<code>${esc(m.flight)}</code>` : "—"}</td><td class="num">${m.owns}</td><td class="num">${m.replicas}</td></tr>`).join("");
+    const byP = new Map(c.assignments.map((a) => [a.partition, a]));
+    const cells = [];
+    for (let p = 0; p <= c.partitions; p++) {
+      const a = byP.get(p);
+      if (!a) { if (c.unassigned.includes(p)) cells.push(`<div class="none" title="p${p}: unassigned">${p}</div>`); continue; }
+      cells.push(`<div class="${a.replica == null ? "norep" : ""}" style="background:${color(a.owner)}" title="p${p}: owner ${a.owner}, replica ${a.replica ?? "none"}, epoch ${a.epoch}">${p}</div>`);
+    }
+    $("parts").innerHTML = cells.join("");
+    $("legend").innerHTML = c.members.map((m) => `<span><i style="background:${color(m.id)}"></i>node ${esc(m.id)}</span>`).join("");
+  }
+  try {
+    const cn = await api("/internal/compute");
+    $("compute").innerHTML = cn.length ? "<tr><th>URL</th><th>Role</th><th>Model</th><th class='num'>Workers</th><th class='num'>Load</th><th class='num'>In flight</th><th class='num'>Served</th></tr>" +
+      cn.map((n) => `<tr><td><code>${esc(n.url)}</code></td><td>${esc(n.role)}</td><td>${esc(n.model ?? "—")}</td><td class="num">${fmt(n.workers ?? "—")}</td><td class="num">${fmt(n.load ?? "—")}</td><td class="num">${fmt(n.in_flight)}</td><td class="num">${fmt(n.served)}</td></tr>`).join("")
+      : '<tr><td class="muted">No compute nodes; embedding runs on the database nodes.</td></tr>';
+  } catch (e) { $("compute").innerHTML = `<tr><td class="err">${esc(e.message)}</td></tr>`; }
+}
+
+// ---- metrics
+let metrics = null, timer = null;
+async function loadMetrics() {
+  try { metrics = await api("/admin/stats/metrics"); renderMetrics(); }
+  catch (e) { $("mhist").innerHTML = `<tr><td class="err">${esc(e.message)}</td></tr>`; }
+}
+function renderMetrics() {
+  if (!metrics) return;
+  const f = $("mfilter").value.toLowerCase();
+  const hist = [], count = [];
+  for (const [name, series] of Object.entries(metrics)) for (const s of series) {
+    const labels = Object.entries(s.labels || {}).map(([k, v]) => `${k}=${v}`).join(" ");
+    if (f && !(name + " " + labels).toLowerCase().includes(f)) continue;
+    (typeof s.value === "object" ? hist : count).push({ name, labels, v: s.value });
+  }
+  hist.sort((a, b) => b.v.count - a.v.count);
+  const short = (n) => n.replace(/^adb_/, "").replace(/_seconds$/, "");
+  const t = (h, x) => (/_seconds$/.test(h.name) ? fmt(x * 1000) : fmt(x));
+  $("mhist").innerHTML = "<tr><th>Metric</th><th>Labels</th><th class='num'>Count</th><th class='num'>p50</th><th class='num'>p90</th><th class='num'>p99</th><th class='num'>Mean</th></tr>" +
+    hist.map((h) => `<tr><td class="mn"><code>${esc(short(h.name))}</code>${/_seconds$/.test(h.name) ? ' <span class="muted">ms</span>' : ""}</td><td class="muted">${esc(h.labels)}</td><td class="num">${fmt(h.v.count)}</td><td class="num">${t(h, h.v.p50)}</td><td class="num">${t(h, h.v.p90)}</td><td class="num">${t(h, h.v.p99)}</td><td class="num">${t(h, h.v.mean)}</td></tr>`).join("");
+  $("mcount").innerHTML = "<tr><th>Metric</th><th>Labels</th><th class='num'>Value</th></tr>" +
+    count.map((c) => `<tr><td class="mn"><code>${esc(c.name.replace(/^adb_/, ""))}</code></td><td class="muted">${esc(c.labels)}</td><td class="num">${fmt(c.v)}</td></tr>`).join("");
+}
+$("mfilter").oninput = renderMetrics;
+$("mrefresh").onclick = loadMetrics;
+$("mauto").onchange = (e) => { clearInterval(timer); if (e.target.checked) timer = setInterval(loadMetrics, 5000); };
+
+// ---- start
+renderHistory();
+const startTab = store.get("adb.tab");
+connect().then(() => { if (startTab && startTab !== "overview") show(startTab); });
+</script>
+</body>
+</html>

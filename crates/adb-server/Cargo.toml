@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "ADB HTTP server: ClawDB-compatible REST API and MCP (streamable HTTP + SSE)"
 
+[features]
+# ADB Console (`/ui`, `/admin/console`): the standalone build only. A3T builds leave
+# it off, so its ADB serves no UI at all.
+console = []
+
 [dependencies]
 adb-executor = { path = "../adb-executor" }
 adb-embed = { path = "../adb-embed" }

@@ -70,7 +70,8 @@ pub fn authorized(value: Option<&str>, token: &str) -> bool {
 /// HTTP middleware: `/health` stays open (probes); everything else needs the token.
 pub async fn require_token(token: Option<Arc<str>>, scopes: Arc<Vec<Arc<crate::scope::Scope>>>, mut req: Request, next: Next) -> Response {
     // `/metrics` too when ADB_METRICS_OPEN is set (a scraper inside the cluster, OB-1).
-    if req.uri().path() == "/health" || (req.uri().path() == "/metrics" && metrics_open()) {
+    // The console page (standalone build only) holds no data; it asks for the token.
+    if req.uri().path() == "/health" || (req.uri().path() == "/metrics" && metrics_open()) || (cfg!(feature = "console") && req.uri().path() == "/ui") {
         return next.run(req).await;
     }
     let value = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());

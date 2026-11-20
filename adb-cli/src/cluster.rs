@@ -180,6 +180,21 @@ pub async fn run(dir: &Path, config: ClusterConfig, host: IpAddr, port: u16, fli
     let placement = Arc::new(ClientPlacement { me: config.id, client: client.clone(), map: shared });
     let peers = Arc::new(adb_server::internal::HttpPeers::new(token.clone()));
     let node = PartitionedEngine::open_cluster(dir, placement as Arc<dyn Placement>, peers as _).await?;
+    #[cfg(feature = "console")]
+    {
+        adb_server::console::describe(adb_server::console::NodeInfo {
+            mode: "cluster",
+            node_id: Some(config.id),
+            http_port: port,
+            flight_port,
+            control_port: config.voters.contains_key(&config.id).then_some(config.control_port),
+            advertise: Some(config.advertise.clone()),
+            data_dir: Some(dir.display().to_string()),
+        });
+        let c = client.clone();
+        adb_server::console::cluster_map(Arc::new(move || (c.map(), c.in_touch())));
+        tracing::info!(node = config.id, "ADB Console on {}/ui", config.advertise);
+    }
     let in_touch = client.clone();
     let app = Router::new()
         .route("/ready", get(move || {
