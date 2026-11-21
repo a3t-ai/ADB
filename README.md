@@ -171,7 +171,7 @@ docker run -d --name adb -p 3000:3000 -p 3001:3001 -v adb-data:/data ghcr.io/a3t
 ```
 
 Or download a binary from [Releases](https://github.com/a3t-ai/ADB/releases). There
-are builds for Linux x86_64 and arm64 (glibc 2.35+: Ubuntu 22.04+, Debian 12+) and
+are builds for Linux x86_64 and arm64 (glibc 2.39+: Ubuntu 24.04+, Debian 13+) and
 macOS on Apple silicon:
 
 ```bash

@@ -2,7 +2,7 @@
 # push the Docker image to ghcr.io/a3t-ai/adb, and publish the binaries as a GitHub
 # release. Every build has the console; the image also has the local embedding model.
 #
-# Linux binaries come out of the Dockerfile's builder stage (Ubuntu 22.04, glibc 2.35),
+# Linux binaries come out of the Dockerfile's builder stage (Ubuntu 24.04, glibc 2.39),
 # so the image and the downloadable binary are the same file.
 name: release
 
@@ -155,8 +155,8 @@ jobs:
             ### Binaries
             | Platform | File |
             |---|---|
-            | Linux x86_64 (glibc 2.35+: Ubuntu 22.04+, Debian 12+) | `adb-${{ env.TAG }}-linux-x86_64.tar.gz` |
-            | Linux arm64 (glibc 2.35+) | `adb-${{ env.TAG }}-linux-arm64.tar.gz` |
+            | Linux x86_64 (glibc 2.39+: Ubuntu 24.04+, Debian 13+) | `adb-${{ env.TAG }}-linux-x86_64.tar.gz` |
+            | Linux arm64 (glibc 2.39+) | `adb-${{ env.TAG }}-linux-arm64.tar.gz` |
             | macOS (Apple silicon) | `adb-${{ env.TAG }}-macos-arm64.tar.gz` |
 
             ```bash

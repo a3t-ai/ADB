@@ -5,19 +5,23 @@
 #   docker build -t adb --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=perf .
 #                                                               # the published image: console + local model
 #
-# The binary is built on Ubuntu 22.04, so the same file runs on any Linux with glibc
-# 2.35 or newer (Ubuntu 22.04+, Debian 12+). The release workflow copies it out of
-# the builder stage. A3T's images build without the console: its ADB serves no UI.
+# The binary is built on Ubuntu 24.04, so the same file runs on any Linux with glibc
+# 2.39 or newer (Ubuntu 24.04+, Debian 13+). That floor comes from ONNX Runtime's
+# prebuilt library (the local embedding model), which needs glibc 2.38 and GCC 14's
+# libstdc++. The release workflow copies the binary out of the builder stage. A3T's images build without the console: its ADB serves no UI.
 #
 # The `aql` stage below is empty unless a build context of that name replaces it.
 FROM scratch AS aql
 
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 ARG DEBIAN_FRONTEND=noninteractive
+# GCC 14 as cc/c++: ONNX Runtime's prebuilt library is built with it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl build-essential cmake pkg-config libssl-dev unzip \
-    && rm -rf /var/lib/apt/lists/*
-# Ubuntu 22.04's protoc is too old for Lance: take a release build.
+      ca-certificates curl build-essential gcc-14 g++-14 cmake pkg-config libssl-dev unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/gcc-14 /usr/local/bin/cc && ln -sf /usr/bin/gcc-14 /usr/local/bin/gcc \
+    && ln -sf /usr/bin/g++-14 /usr/local/bin/c++ && ln -sf /usr/bin/g++-14 /usr/local/bin/g++
+# A current protoc release (independent of the distribution's).
 ARG PROTOC_VERSION=29.3
 RUN arch=$(uname -m | sed 's/aarch64/aarch_64/') \
     && curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${arch}.zip" \
@@ -43,7 +47,7 @@ RUN cargo build --profile "$ADB_PROFILE" -p adb-cli ${ADB_FEATURES:+--features $
 ARG ADB_MODEL=""
 RUN mkdir -p /models && if [ -n "$ADB_MODEL" ]; then bash tests/fetch-model.sh /models/bge-small-en-v1.5; fi
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /data adb \
