@@ -2,7 +2,7 @@
 #
 #   docker build -t adb .                                       # plain: no console, no model
 #   docker build -t adb --build-context aql=../AQL .            # AQL parser from a local checkout
-#   docker build -t adb --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=perf .
+#   docker build -t adb --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=dist .
 #                                                               # the published image: console + local model
 #
 # The binary is built on Ubuntu 24.04, so the same file runs on any Linux with glibc
@@ -37,8 +37,8 @@ RUN if [ -f /AQL/crates/aql-parser/Cargo.toml ]; then \
       mkdir -p .cargo && printf '[patch."https://github.com/a3t-ai/AQL.git"]\naql-parser = { path = "/AQL/crates/aql-parser" }\n' > .cargo/config.toml; \
     fi
 ARG ADB_FEATURES=""
-# ADB_PROFILE=perf: release optimisation without LTO, the build the published
-# benchmarks ran on (and a fraction of fat LTO's build time and memory).
+# ADB_PROFILE=dist (published builds): the perf profile, the build the published
+# benchmarks ran on, without symbols; a fraction of fat LTO's build time and memory.
 ARG ADB_PROFILE=release
 ENV CARGO_INCREMENTAL=0
 RUN cargo build --profile "$ADB_PROFILE" -p adb-cli ${ADB_FEATURES:+--features $ADB_FEATURES} \

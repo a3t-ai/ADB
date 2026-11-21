@@ -61,7 +61,7 @@ jobs:
         run: |
           v="${TAG#v}"
           docker buildx build --platform ${{ matrix.platform }} \
-            --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=perf \
+            --build-arg ADB_FEATURES=console --build-arg ADB_MODEL=1 --build-arg ADB_PROFILE=dist \
             --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
             --label org.opencontainers.image.description="ADB: one database for everything an AI agent remembers (pre-release, not for production)" \
             --label org.opencontainers.image.licenses=Elastic-2.0 \
@@ -95,10 +95,10 @@ jobs:
       - name: Build
         env:
           CARGO_INCREMENTAL: "0"
-        run: cargo build --profile perf -p adb-cli --features console
+        run: cargo build --profile dist -p adb-cli --features console
       - name: Package the binary
         run: |
-          mkdir -p dist/adb && cp target/perf/adb dist/adb/adb
+          mkdir -p dist/adb && cp target/dist/adb dist/adb/adb
           cp LICENSE NOTICE README.md dist/adb/
           f="adb-$TAG-macos-arm64.tar.gz"
           tar -C dist -czf "$f" adb && shasum -a 256 "$f" > "$f.sha256"

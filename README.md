@@ -10,7 +10,7 @@ actually speak.**
 [![AQL playground](https://img.shields.io/badge/AQL-playground-6f42c1)](https://a3t-ai.github.io/AQL)
 
 > [!WARNING]
-> **Not for production.** ADB is a pre-release (v0.1.0). AQL, the APIs and the
+> **Not for production.** ADB is a pre-release (v0.1.1). AQL, the APIs and the
 > on-disk format can still change, and data written by one version may not be
 > readable by the next. Use it to build and try things, not to hold data you can't
 > recreate.
@@ -167,7 +167,7 @@ With Docker (Linux x86_64 and arm64, or Docker Desktop on a Mac). The image has 
 console and the embedding model built in:
 
 ```bash
-docker run -d --name adb -p 3000:3000 -p 3001:3001 -v adb-data:/data ghcr.io/a3t-ai/adb:0.1.0
+docker run -d --name adb -p 3000:3000 -p 3001:3001 -v adb-data:/data ghcr.io/a3t-ai/adb:0.1.1
 ```
 
 Or download a binary from [Releases](https://github.com/a3t-ai/ADB/releases). There
@@ -175,8 +175,8 @@ are builds for Linux x86_64 and arm64 (glibc 2.39+: Ubuntu 24.04+, Debian 13+) a
 macOS on Apple silicon:
 
 ```bash
-curl -fsSL -O https://github.com/a3t-ai/ADB/releases/download/v0.1.0/adb-v0.1.0-linux-x86_64.tar.gz
-tar -xzf adb-v0.1.0-linux-x86_64.tar.gz
+curl -fsSL -O https://github.com/a3t-ai/ADB/releases/download/v0.1.1/adb-v0.1.1-linux-x86_64.tar.gz
+tar -xzf adb-v0.1.1-linux-x86_64.tar.gz
 ./adb/adb serve-http --data-dir ./adb-data
 ```
 

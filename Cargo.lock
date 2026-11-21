@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-cluster",
  "adb-core",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "adb-cluster"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.7.9",
  "futures",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "adb-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "adb-cq"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "adb-log",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "adb-embed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "axum 0.7.9",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "adb-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "adb-log",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "adb-executor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-cluster",
  "adb-core",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "adb-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "adb-log",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "adb-log"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "async-trait",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "adb-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "adb-executor",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "adb-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "arrow-array",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "adb-sequencer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "adb-log",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "adb-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-cluster",
  "adb-core",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "adb-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "arrow-array",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "aql-planner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adb-core",
  "aql-parser",

@@ -22,7 +22,7 @@ members = [
 exclude = ["third_party/lance"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Elastic-2.0"
 authors = ["A3T"]
@@ -126,6 +126,13 @@ codegen-units = 16
 # Rebuilds recompile only what changed (minutes, not the release profile's ~40 with
 # fat LTO). Use for every benchmark / test iteration: `cargo build --profile perf`.
 incremental = true
+
+[profile.dist]
+# Published binaries and the public image: the perf build, without symbols (about a
+# quarter smaller). A3T's images keep perf, so their crash backtraces have names.
+inherits = "perf"
+incremental = false
+strip = "symbols"
 
 [profile.prof]
 # Profiling (perf / flamegraphs): the perf profile with line tables and symbols. Build
