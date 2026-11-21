@@ -118,8 +118,8 @@ impl Planner {
             return Err(PlanError::InvalidMemoryType("IN SCOPE doesn't apply to WORKING (a session's own state)".to_string()));
         }
         let mut modifiers = convert_modifiers(&stmt.modifiers)?;
-        let predicate = convert_predicate(&stmt.predicate, stmt.memory_type, stmt.modifiers.confidence)?;
-        // `LIKE "text"` (not a procedure match): the text is the query.
+        let predicate = convert_predicate(&stmt.predicate)?;
+        // `LIKE "text"`: the text is the query.
         if let (CorePredicate::Like { .. }, Predicate::Like { text: Some(t), .. }) = (&predicate, &stmt.predicate) {
             modifiers.like_query = Some(serde_json::Value::String(t.clone()));
         }
@@ -144,7 +144,6 @@ impl Planner {
             (MemoryType::Tools, CorePredicate::Where { .. } | CorePredicate::All) if !history && modifiers.aggregate.is_none() => {
                 StepPlan::load(predicate, modifiers)
             }
-            (_, CorePredicate::Pattern { .. }) => StepPlan::lookup(memory, predicate, modifiers),
             _ => StepPlan::recall(memory, predicate, modifiers),
         }))
     }
@@ -260,18 +259,12 @@ fn convert_memory_type(mt: MemoryType) -> PlanResult<CoreMemoryType> {
     }
 }
 
-/// A RECALL's predicate. `LIKE "text"` on PROCEDURAL is the token-overlap match
-/// (what PATTERN was), its CONFIDENCE the threshold; any other LIKE is similarity.
-fn convert_predicate(pred: &Predicate, memory: MemoryType, confidence: Option<f32>) -> PlanResult<CorePredicate> {
+/// A RECALL's predicate. `LIKE` is similarity on every memory type (PROCEDURAL too:
+/// its vectors come from `content`, or `pattern` and `steps`); `CONFIDENCE` is the
+/// least similarity kept.
+fn convert_predicate(pred: &Predicate) -> PlanResult<CorePredicate> {
     match pred {
         Predicate::Where { conditions } => Ok(CorePredicate::Where { conditions: convert_conditions(conditions)? }),
-        Predicate::Like { variable, text: Some(text) } if memory == MemoryType::Procedural => {
-            Ok(CorePredicate::Pattern { pattern_var: variable.clone(), threshold: confidence, text: Some(text.clone()) })
-        }
-        // `LIKE $p` on PROCEDURAL: the procedures matching the text `$p` holds.
-        Predicate::Like { variable, text: None } if memory == MemoryType::Procedural => {
-            Ok(CorePredicate::Pattern { pattern_var: variable.clone(), threshold: confidence, text: None })
-        }
         Predicate::Like { variable, .. } => Ok(CorePredicate::Like { embedding_var: variable.clone() }),
 
         Predicate::All => Ok(CorePredicate::All),
@@ -465,7 +458,8 @@ mod tests {
         assert!(matches!(s.predicate, CorePredicate::Key { ref field, .. } if field == "key"));
         assert_eq!(single(r#"RECALL FROM SEMANTIC WHERE key = "a" AND n > 1"#).operation, Operation::Recall);
         let s = single(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.6"#);
-        assert!(matches!(s.predicate, CorePredicate::Pattern { threshold: Some(t), .. } if (t - 0.6).abs() < 1e-6));
+        assert!(matches!(s.predicate, CorePredicate::Like { .. }));
+        assert!(matches!(s.modifiers.min_confidence, Some(t) if (t - 0.6).abs() < 1e-6));
         assert!(matches!(single("RECALL FROM SEMANTIC LIKE $q").predicate, CorePredicate::Like { .. }));
         assert_eq!(single(r#"RECALL FROM EPISODIC WHERE pod = "p" LIMIT 5"#).operation, Operation::Recall);
     }

@@ -1,7 +1,7 @@
 //! Predicates, conditions, and modifiers for AQL queries
 //!
 //! This module defines the query building blocks:
-//! - Predicates: WHERE, KEY, LIKE, PATTERN, ALL
+//! - Predicates: WHERE, KEY, LIKE, ALL
 //! - Conditions: field = value, field > value, etc.
 //! - Modifiers: LIMIT, ORDER BY, RETURN, TIMEOUT, etc.
 //! - Window: LAST N, LAST duration, TOP N BY field, SINCE condition
@@ -22,14 +22,6 @@ pub enum Predicate {
     Key { field: String, value: Value },
     /// LIKE $embedding (similarity search)
     Like { embedding_var: String },
-    /// PATTERN $var THRESHOLD 0.7, or PATTERN "text": `text` is the literal, or the
-    /// variable's bound value once the executor binds it (W9).
-    Pattern {
-        pattern_var: String,
-        threshold: Option<f32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-    },
     /// ALL (match everything)
     All,
 }
@@ -57,15 +49,6 @@ impl Predicate {
         }
     }
 
-    /// Create a PATTERN predicate
-    pub fn pattern(pattern_var: impl Into<String>, threshold: Option<f32>) -> Self {
-        Self::Pattern {
-            pattern_var: pattern_var.into(),
-            threshold,
-            text: None,
-        }
-    }
-
     /// Create an ALL predicate
     pub fn all() -> Self {
         Self::All
@@ -74,11 +57,6 @@ impl Predicate {
     /// Check if this predicate requires embedding
     pub fn requires_embedding(&self) -> bool {
         matches!(self, Self::Like { .. })
-    }
-
-    /// Check if this predicate requires pattern matching
-    pub fn requires_pattern_match(&self) -> bool {
-        matches!(self, Self::Pattern { .. })
     }
 }
 
@@ -854,7 +832,6 @@ mod tests {
         };
 
         assert!(!pred.requires_embedding());
-        assert!(!pred.requires_pattern_match());
     }
 
     #[test]

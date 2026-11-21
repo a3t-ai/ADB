@@ -49,7 +49,7 @@ const READS: &[&str] = &[
     r#"RECALL FROM SEMANTIC WHERE id = "person:ada" FOLLOW LINKS DEPTH 3"#,
     r#"RECALL FROM SEMANTIC WHERE id = "org:acme" FOLLOW LINKS"#,
     r#"RECALL FROM SEMANTIC WHERE id = "person:ada" WITH LINKS"#,
-    r#"RECALL FROM PROCEDURAL LIKE "restart the service" CONFIDENCE 0.2"#,
+    r#"RECALL FROM PROCEDURAL LIKE "restart the service""#,
     r#"RECALL FROM PROCEDURAL WHERE pattern_id = "p3""#,
     r#"RECALL FROM TOOLS WHERE category = "c1" LIMIT 3"#,
 ];

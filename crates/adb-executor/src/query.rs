@@ -1,7 +1,7 @@
 //! The query engine (MVP W7, `W7_QUERY_ENGINE.md`): AQL reads as one DataFusion
 //! scan of an LSM snapshot (current view, memory type, scope, namespace and a
 //! superset of the payload filter pushed down; vectors only when asked for), then
-//! AQL semantics once, for every memory type: exact WHERE / KEY / PATTERN, WINDOW,
+//! AQL semantics once, for every memory type: exact WHERE / KEY, WINDOW,
 //! ORDER BY, LIMIT, RETURN, aggregates, links in batches.
 
 use std::borrow::Borrow;
@@ -422,19 +422,8 @@ fn json_text(v: &serde_json::Value) -> String {
     }
 }
 
-/// Token-overlap similarity of two texts (PROCEDURAL `PATTERN`).
-pub fn jaccard(a: &str, b: &str) -> f32 {
-    let ta: HashSet<&str> = a.split_whitespace().collect();
-    let tb: HashSet<&str> = b.split_whitespace().collect();
-    if ta.is_empty() && tb.is_empty() {
-        return 1.0;
-    }
-    let union = ta.union(&tb).count();
-    if union == 0 { 0.0 } else { ta.intersection(&tb).count() as f32 / union as f32 }
-}
-
-/// Whether `r` (of `memory`) matches `predicate` exactly. `LIKE` and `PATTERN` are
-/// ranked elsewhere and match nothing here.
+/// Whether `r` (of `memory`) matches `predicate` exactly. `LIKE` is ranked elsewhere
+/// and matches nothing here.
 pub fn matches(memory: MemoryType, r: &MemoryRecord, predicate: &Predicate) -> bool {
     match predicate {
         Predicate::All => true,
@@ -447,7 +436,9 @@ pub fn matches(memory: MemoryType, r: &MemoryRecord, predicate: &Predicate) -> b
         Predicate::Key { field, value } => {
             let want = value_text(value);
             match (memory, field.as_str()) {
-                (MemoryType::Procedural, "pattern_id" | "id") | (MemoryType::Tools, "tool_id" | "id") => r.id == want,
+                // `key` and `id` arrive as the row id (`reads::scope_ids`), for every
+                // memory type: compare the record's id, not its payload `key`.
+                (MemoryType::Procedural, "pattern_id" | "id" | "key") | (MemoryType::Tools, "tool_id" | "id" | "key") => r.id == want,
                 (MemoryType::Procedural, _) => r.data.get(field).map(json_text) == Some(want),
                 (MemoryType::Tools, "name" | "category") => {
                     matches!(value, Value::String(_)) && r.data.get(field).and_then(|v| v.as_str()) == Some(want.as_str())
@@ -457,7 +448,7 @@ pub fn matches(memory: MemoryType, r: &MemoryRecord, predicate: &Predicate) -> b
                 _ => r.data.get(field).map(json_text) == Some(want),
             }
         }
-        Predicate::Like { .. } | Predicate::Pattern { .. } => false,
+        Predicate::Like { .. } => false,
     }
 }
 
@@ -813,10 +804,9 @@ async fn candidates(
 /// What a `RECALL` / `LOOKUP` keeps while it scans: the records its predicate and
 /// `SCOPE` take, and with `LIMIT k` the first k in its order (`ORDER BY`, then the
 /// default order: a total order, so the same k as sorting everything). A read with a
-/// window, aggregate, grouping, links or a PATTERN needs every match.
+/// window, aggregate, grouping or links needs every match.
 fn read_keeper(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> Keeper<Arc<MemoryRecord>> {
-    let needs_all = matches!(predicate, Predicate::Pattern { .. })
-        || modifiers.window.is_some()
+    let needs_all = modifiers.window.is_some()
         || modifiers.aggregate.is_some()
         || modifiers.group_by.is_some()
         || modifiers.having.is_some()
@@ -993,8 +983,7 @@ async fn indexed(store: &PartitionStore, memory: MemoryType, predicate: &Predica
 }
 
 /// `RECALL` / `LOOKUP` (not `LIKE`): candidates → exact predicate → visibility →
-/// order → `LIMIT` → `RETURN`. `PATTERN` (PROCEDURAL) ranks by token overlap, its
-/// score in `metadata.confidence`.
+/// order → `LIMIT` → `RETURN`.
 pub async fn read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Vec<MemoryRecord>> {
     if let Some(records) = newest_episodes(store, memory, predicate, modifiers, now).await? {
         return Ok(records);
@@ -1043,16 +1032,6 @@ async fn newest_episodes(store: &PartitionStore, memory: MemoryType, predicate: 
 
 async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs, source: Source) -> AdbResult<Answer<Vec<MemoryRecord>>> {
     let c = candidates(store, memory, predicate, modifiers, now, source, Keep::Read).await?;
-    if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
-        if memory != MemoryType::Procedural {
-            return Ok(Answer::of(&c, Vec::new()));
-        }
-        if c.floor.is_some() {
-            return Ok(Answer::Insufficient);
-        }
-        let out = pattern_match(&c.records, pattern_var, *threshold, text.as_deref(), modifiers.limit);
-        return Ok(Answer::of(&c, out));
-    }
     let mut records: Vec<Arc<MemoryRecord>> = c.records.iter().filter(|r| matches(memory, r, predicate)).cloned().collect();
     if let Some(v) = &modifiers.scope {
         records.retain(|r| &r.metadata.scope == v);
@@ -1097,12 +1076,12 @@ async fn read_from(store: &PartitionStore, memory: MemoryType, predicate: &Predi
 /// `RECALL … AGGREGATE` folded while it scans (PF-39): the matches go into running
 /// totals, so an aggregate over every row holds none of them (it was refused by the
 /// read budget at 1.3M rows). `None` when the read needs its records first: a
-/// window, links, PATTERN, or `ORDER BY` / `LIMIT` before an aggregate without
+/// window, links, or `ORDER BY` / `LIMIT` before an aggregate without
 /// `GROUP BY` (those pick the records the aggregate sees) — the caller reads them.
 pub async fn aggregate_read(store: &PartitionStore, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<serde_json::Value>> {
     let Some(funcs) = modifiers.aggregate.as_deref() else { return Ok(None) };
     let grouped = modifiers.group_by.is_some();
-    if matches!(predicate, Predicate::Pattern { .. } | Predicate::Like { .. })
+    if matches!(predicate, Predicate::Like { .. })
         || modifiers.window.is_some()
         || modifiers.follow_links.is_some()
         || modifiers.with_links.is_some()
@@ -1198,8 +1177,8 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     if matches!(memory, MemoryType::Working) {
         return Err(AdbError::UnsupportedOperation("AS OF and WITH HISTORY aren't valid on WORKING: it's session state, without versions".into()));
     }
-    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() || matches!(predicate, Predicate::Pattern { .. }) {
-        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS, WITH LINKS and PATTERN don't read history (AS OF, WITH HISTORY)".into()));
+    if modifiers.follow_links.is_some() || modifiers.with_links.is_some() {
+        return Err(AdbError::UnsupportedOperation("FOLLOW LINKS and WITH LINKS don't read history (AS OF, WITH HISTORY)".into()));
     }
     let tx = modifiers.as_of.as_ref().map(|t| instant(t, "AS OF", now)).transpose()?.unwrap_or(now);
     let (in_scope, namespace) = (modifiers.in_scope.as_deref(), modifiers.namespace.as_deref());
@@ -1239,34 +1218,6 @@ pub async fn history(store: &PartitionStore, memory: MemoryType, predicate: &Pre
     Ok(records)
 }
 
-/// `PATTERN` (PROCEDURAL): the records whose `pattern` overlaps the query by at
-/// least `threshold` (default 0.7), best first, at most `limit`; the overlap score is
-/// the match's confidence, as LIKE's similarity is (F-L2).
-fn pattern_match(records: &[Arc<MemoryRecord>], pattern_var: &str, threshold: Option<f32>, text: Option<&str>, limit: Option<usize>) -> Vec<MemoryRecord> {
-    // The literal or bound value; an unbound `$name` matches its name (as before).
-    let query = text.unwrap_or(pattern_var.trim_start_matches('$'));
-    let threshold = threshold.unwrap_or(0.7);
-    let mut scored: Vec<(f32, &Arc<MemoryRecord>)> = records
-        .iter()
-        .filter_map(|r| {
-            let s = jaccard(query, r.data["pattern"].as_str().unwrap_or(""));
-            (s >= threshold).then_some((s, r))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal).then_with(|| a.1.id.cmp(&b.1.id)));
-    if let Some(n) = limit {
-        scored.truncate(n);
-    }
-    scored
-        .into_iter()
-        .map(|(s, r)| {
-            let mut r = (**r).clone();
-            r.metadata.confidence = Some(s);
-            r
-        })
-        .collect()
-}
-
 /// `RECALL` on a branch namespace: the branch's view (its rows, then its base's as of
 /// the point), then the predicate and modifiers as on main.
 pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers) -> AdbResult<Vec<MemoryRecord>> {
@@ -1277,18 +1228,6 @@ pub fn branch_read(rows: Vec<StoredRow>, memory: MemoryType, predicate: &Predica
         return Err(AdbError::UnsupportedOperation("FOLLOW LINKS and WITH LINKS are not read on a branch yet".into()));
     }
     let in_scope = modifiers.in_scope.as_deref();
-    // PATTERN ranks the branch's view as main ranks its records.
-    if let Predicate::Pattern { pattern_var, threshold, text } = predicate {
-        if memory != MemoryType::Procedural {
-            return Ok(Vec::new());
-        }
-        let records: Vec<Arc<MemoryRecord>> = rows.iter().filter(|r| in_scope.is_none_or(|s| r.data.scope == s)).map(|r| Arc::new(record(r))).collect();
-        let mut out = pattern_match(&records, pattern_var, *threshold, text.as_deref(), modifiers.limit);
-        if let Some(f) = &modifiers.return_fields {
-            project(&mut out, f);
-        }
-        return Ok(out);
-    }
     let mut records: Vec<MemoryRecord> = rows
         .iter()
         .filter(|r| in_scope.is_none_or(|s| r.data.scope == s))

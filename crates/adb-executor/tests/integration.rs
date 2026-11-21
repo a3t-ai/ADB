@@ -904,21 +904,22 @@ async fn pipeline_timeout_is_a_hard_budget_when_enforced() {
     assert_eq!(steps.len(), 3);
 }
 
-/// S7 (W9): `LIKE "text"` and `LIKE $p` with `$p` bound on PROCEDURAL both match
-/// procedures by their pattern text; the score is `metadata.confidence`.
+/// Issue #1: `WHERE key = …` finds a procedure by its key, in a namespace (the exact
+/// lookup) and without one, as it does a fact.
 #[tokio::test]
-async fn pattern_takes_a_literal_or_a_bound_variable() {
+async fn procedures_are_found_by_key() {
     let adb = Mem::new().await;
-    adb.execute(r#"STORE INTO PROCEDURAL (key = "oom", pattern = "pod OOMKilled restart loop")"#).await.unwrap();
-    adb.execute(r#"STORE INTO PROCEDURAL (key = "disk", pattern = "node disk pressure eviction")"#).await.unwrap();
+    adb.execute(r#"STORE INTO PROCEDURAL (key = "oom-fix", content = "Raise the memory limit") NAMESPACE "ops""#).await.unwrap();
+    adb.execute(r#"STORE INTO PROCEDURAL (key = "cert-renew", pattern = "TLS certificate expired", steps = "renew") NAMESPACE "ops""#).await.unwrap();
+    adb.execute(r#"STORE INTO SEMANTIC (key = "fact-1", content = "a fact") NAMESPACE "ops""#).await.unwrap();
     let ids = |r: QueryResult| r.get_records().unwrap().iter().map(|r| r.id.clone()).collect::<Vec<_>>();
-
-    let r = adb.execute(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.5"#).await.unwrap();
-    // The overlap is the match's confidence (F-L2): 3 of 4 words.
-    assert_eq!(r.get_records().unwrap()[0].metadata.confidence, Some(0.75));
-    assert_eq!(ids(r), vec!["oom"]);
-
-    let vars = std::collections::HashMap::from([("p".to_string(), json!("node disk pressure"))]);
-    let r = adb.0.executor().execute_with_vars("RECALL FROM PROCEDURAL LIKE $p CONFIDENCE 0.5", &vars).await.unwrap();
-    assert_eq!(ids(r), vec!["disk"]);
+    for (memory, key) in [("PROCEDURAL", "oom-fix"), ("PROCEDURAL", "cert-renew"), ("SEMANTIC", "fact-1")] {
+        let want = vec![format!("ops|~{key}")];
+        let r = adb.execute(&format!(r#"RECALL FROM {memory} WHERE key = "{key}" NAMESPACE "ops""#)).await.unwrap();
+        assert_eq!(ids(r), want, "{memory} {key} in its namespace");
+        let r = adb.execute(&format!(r#"RECALL FROM {memory} WHERE key = "{key}""#)).await.unwrap();
+        assert_eq!(ids(r), want, "{memory} {key} without NAMESPACE");
+    }
+    let r = adb.execute(r#"RECALL FROM PROCEDURAL WHERE key = "nope" NAMESPACE "ops""#).await.unwrap();
+    assert!(ids(r).is_empty());
 }

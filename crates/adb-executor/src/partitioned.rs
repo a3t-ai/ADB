@@ -1830,7 +1830,7 @@ impl Routed {
 
 /// Merge per-target answers as one engine would order and cut them.
 fn merge(memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, lists: Vec<Vec<MemoryRecord>>) -> Vec<MemoryRecord> {
-    let mut all: Vec<MemoryRecord> = if matches!(predicate, Predicate::Like { .. } | Predicate::Pattern { .. }) && modifiers.order_by.is_none() {
+    let mut all: Vec<MemoryRecord> = if matches!(predicate, Predicate::Like { .. }) && modifiers.order_by.is_none() {
         // Similarity: each list is ranked by its partition; fuse the ranks (RRF, k = 60),
         // ties to the higher similarity.
         let mut scored: Vec<(f64, f32, MemoryRecord)> = Vec::new();

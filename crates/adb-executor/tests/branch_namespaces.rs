@@ -183,7 +183,7 @@ async fn like_reads_a_branch() {
     assert!(!base.contains("black coffee"), "the base doesn't see it: {base}");
     let p = |ns: &'static str| {
         let e = &e;
-        async move { vals(e, &format!(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" CONFIDENCE 0.4 NAMESPACE "{ns}""#), "pattern").await }
+        async move { vals(e, &format!(r#"RECALL FROM PROCEDURAL LIKE "pod OOMKilled restart" NAMESPACE "{ns}""#), "pattern").await }
     };
     assert_eq!(p("crm-try").await, ["pod OOMKilled loop", "pod OOMKilled restart"], "the branch's and the inherited one");
     assert_eq!(p("crm").await, ["pod OOMKilled restart"], "the base: its own only");

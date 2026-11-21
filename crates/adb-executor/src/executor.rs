@@ -269,17 +269,6 @@ impl Executor {
                 bound_step.modifiers.like_query = Some(v.to_json());
             }
         }
-        // `PATTERN $p` (W9): matched against `$p`'s value, not its name.
-        if let Predicate::Pattern { pattern_var, threshold, text: None } = &step.predicate {
-            let name = pattern_var.trim_start_matches('$');
-            if let Some(v) = bindings.get(name).or_else(|| bindings.get(pattern_var)) {
-                let text = match v.to_json() {
-                    serde_json::Value::String(s) => s,
-                    other => other.to_string(),
-                };
-                bound_step.predicate = Predicate::Pattern { pattern_var: pattern_var.clone(), threshold: *threshold, text: Some(text) };
-            }
-        }
         // `AS OF $t`: the bound value is the time.
         for t in bound_step.modifiers.as_of.iter_mut() {
             if let adb_core::TimePoint::Variable { name } = t {

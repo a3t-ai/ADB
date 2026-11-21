@@ -294,14 +294,14 @@ impl LanceReads {
     }
 
     /// B7: a read in a namespace with layers. `None`: no layer applies, or the
-    /// statement reads what layers don't serve yet (history, links, PATTERN): the
+    /// statement reads what layers don't serve yet (history, links, LIKE): the
     /// space's own records.
     async fn layered(&self, memory: MemoryType, predicate: &Predicate, modifiers: &Modifiers, now: CommitTs) -> AdbResult<Option<Vec<MemoryRecord>>> {
         let Some((ns, layers)) = self.layers_for(memory, modifiers) else { return Ok(None) };
         if crate::query::is_history(modifiers)
             || modifiers.follow_links.is_some()
             || modifiers.with_links.is_some()
-            || matches!(predicate, Predicate::Pattern { .. } | Predicate::Like { .. })
+            || matches!(predicate, Predicate::Like { .. })
         {
             return Ok(None);
         }

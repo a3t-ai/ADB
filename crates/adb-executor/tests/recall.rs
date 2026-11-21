@@ -109,3 +109,43 @@ async fn like_without_a_value_or_on_working_is_an_error() {
     let vars: HashMap<String, Value> = [("q".to_string(), json!("x"))].into();
     assert!(engine.query("RECALL FROM WORKING LIKE $q", Some(&vars)).await.is_err());
 }
+
+/// Issue #1: `LIKE` on PROCEDURAL ranks by meaning as on the other memory types,
+/// over a procedure's `content`, or its `pattern` and `steps`; `CONFIDENCE` is the
+/// least similarity kept; a bound `$q` works as a literal does.
+#[tokio::test]
+async fn like_on_procedural_ranks_by_meaning() {
+    if !have_model() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = LocalEngine::durable(dir.path()).await.unwrap();
+    for aql in [
+        r#"STORE INTO PROCEDURAL (key = "oom", pattern = "pod OOMKilled restart loop") NAMESPACE "ops""#,
+        r#"STORE INTO PROCEDURAL (key = "disk", pattern = "node disk pressure eviction") NAMESPACE "ops""#,
+        r#"STORE INTO PROCEDURAL (key = "cert", content = "Renew the TLS certificate and reload the ingress") NAMESPACE "ops""#,
+        r#"STORE INTO PROCEDURAL (key = "slow", pattern = "slow queries", steps = "add the missing index\nanalyze the table") NAMESPACE "ops""#,
+    ] {
+        q(&engine, aql).await;
+    }
+    engine.vectors_caught_up(std::time::Duration::from_secs(60)).await.unwrap();
+
+    for (question, want) in [
+        // Stored with `content` only: it had no `pattern` the old word match could use.
+        ("certificate expired", "cert"),
+        ("pods keep running out of memory", "oom"),
+        // Found by its `steps`.
+        ("missing index", "slow"),
+    ] {
+        let r = like(&engine, r#"RECALL FROM PROCEDURAL LIKE $q NAMESPACE "ops" LIMIT 2"#, question).await;
+        assert_eq!(keys(&r).first().map(String::as_str), Some(want), "{question}: {:?}", keys(&r));
+        let conf = r["data"]["records"][0]["metadata"]["confidence"].as_f64().unwrap();
+        assert!(conf > 0.5 && conf <= 1.0, "{question}: confidence {conf}");
+    }
+    let r = q(&engine, r#"RECALL FROM PROCEDURAL LIKE "certificate expired" NAMESPACE "ops" LIMIT 1"#).await;
+    assert_eq!(keys(&r), ["cert"], "a literal as a bound variable");
+    let all = like(&engine, r#"RECALL FROM PROCEDURAL LIKE $q NAMESPACE "ops" LIMIT 10"#, "certificate expired").await;
+    let strict = like(&engine, r#"RECALL FROM PROCEDURAL LIKE $q NAMESPACE "ops" CONFIDENCE 0.7 LIMIT 10"#, "certificate expired").await;
+    assert_eq!(keys(&all).len(), 4);
+    assert_eq!(keys(&strict), ["cert"], "CONFIDENCE cuts the unrelated ones");
+}
