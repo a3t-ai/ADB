@@ -246,6 +246,13 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// The system partition's services (platform tables, the engine store, the
+    /// gateway) are missing only because it is still opening (a cluster node that
+    /// owns it, or no owner known yet), not because this engine has no data dir.
+    fn system_opening(&self) -> bool {
+        false
+    }
+
     /// Step 4b: the Flight endpoint of the node owning the system partition (platform
     /// tables, the engine store), when that isn't this node; the transports send those
     /// calls there. `None`: this node serves them.

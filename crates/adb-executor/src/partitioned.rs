@@ -2030,6 +2030,12 @@ impl Engine for Arc<PartitionedEngine> {
         Some(Box::pin(self.query_in(aql, variables, reach)).await)
     }
 
+    /// Every node of a cluster is durable: no system engine here (while no other node
+    /// serves it) means it is still opening.
+    fn system_opening(&self) -> bool {
+        self.system_local().is_none()
+    }
+
     fn system_flight(&self) -> Option<String> {
         let sys = self.sys();
         if self.owns(sys) {

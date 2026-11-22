@@ -24,7 +24,8 @@
 //! opens nothing else (H8).
 //!
 //! Errors are gRPC statuses: `invalid_argument` for a bad request or write,
-//! `not_found` for a missing table, `failed_precondition` without `--data-dir`.
+//! `not_found` for a missing table, `failed_precondition` without `--data-dir`,
+//! `unavailable` (`adb-code` `not_ready`) while the system partition is still opening.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -198,7 +199,7 @@ impl AdbFlight {
         let space = str_field(b, "space")?;
         self.engine
             .flowr_engine(space)
-            .ok_or_else(|| Status::failed_precondition("FlowR's engine store needs a durable ADB (start it with --data-dir)"))
+            .ok_or_else(|| self.no_system("FlowR's engine store needs a durable ADB (start it with --data-dir)"))
     }
 
     /// One engine store op, in the gateway's envelope (stage H).
@@ -227,7 +228,17 @@ impl AdbFlight {
     fn platform(&self) -> Result<Arc<adb_platform::PlatformStore>, Status> {
         self.engine
             .platform()
-            .ok_or_else(|| Status::failed_precondition("platform tables need a durable engine (start ADB with --data-dir)"))
+            .ok_or_else(|| self.no_system("platform tables need a durable engine (start ADB with --data-dir)"))
+    }
+
+    /// Why a system-partition service is missing: still opening (`unavailable`,
+    /// `adb-code` `not_ready`; callers retry), or no data dir (`failed_precondition`).
+    fn no_system(&self, no_data_dir: &str) -> Status {
+        if self.engine.system_opening() {
+            with_code(Status::unavailable("not_ready: the system partition is still opening (rebuilding platform tables); retry in a few minutes"))
+        } else {
+            with_code(Status::failed_precondition(no_data_dir))
+        }
     }
 
     async fn write_many(&self, effects: Vec<Effect>) -> Result<u64, Status> {
@@ -299,7 +310,7 @@ impl AdbFlight {
             // DB-5: platform-table changes after `from` (long poll up to `wait_ms`):
             // `{from?, tables?, max?, wait_ms?}` → `{changes, reset, next, tip}`.
             "table_changes" => {
-                let gateway = self.engine.gateway().ok_or_else(|| Status::failed_precondition("the table feed needs a durable engine (start ADB with --data-dir)"))?;
+                let gateway = self.engine.gateway().ok_or_else(|| self.no_system("the table feed needs a durable engine (start ADB with --data-dir)"))?;
                 let q = adb_gateway::tables::TableQuery {
                     from: b.get("from").and_then(|v| v.as_u64()),
                     tables: string_list(b.get("tables")),

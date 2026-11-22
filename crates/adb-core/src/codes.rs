@@ -45,6 +45,7 @@ pub const CODES: &[&str] = &[
     "table_not_found",
     "column_not_found",
     "durable_required",
+    "not_ready",
     "forbidden",
     "unauthorized",
     "unsupported",
@@ -118,6 +119,8 @@ pub fn code_of(message: &str) -> &'static str {
         "column_not_found"
     } else if has("column name ") || has("add columns to ") || has("purge ") && has("name the time") {
         "invalid_value"
+    } else if has("not_ready:") {
+        "not_ready"
     } else if has("needs a durable engine") || has("need a durable engine") || has("need a data directory") || has("no durable log") || has("no table to compact") {
         "durable_required"
     } else if has("requires a WHERE") || has("WHERE predicate") {
@@ -186,6 +189,7 @@ mod tests {
         ("tags need a durable engine (start ADB with --data-dir)", "durable_required"),
         ("embedding settings need a data directory (start ADB with --data-dir)", "durable_required"),
         ("no table to compact", "durable_required"),
+        ("not_ready: the system partition is still opening (rebuilding platform tables); retry in a few minutes", "not_ready"),
         ("Parse error: expected verb at position 0", "parse_error"),
         ("Invalid syntax: unexpected token", "parse_error"),
         ("Invalid memory type 'EPISODIC' for verb 'MERGE'. Allowed: [\"SEMANTIC\"]", "invalid_memory_type"),

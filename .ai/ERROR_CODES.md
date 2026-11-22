@@ -41,6 +41,7 @@ Where the code appears:
 | `layer_invalid` | A layer that is nested, itself, of a wrong memory type, a bad space, or a pin without a tag | Fix the layer |
 | `sealed_key` | A write that would shadow a sealed layer's key | Don't; change the layer |
 | `durable_required` | The feature needs `--data-dir` | Start ADB with a data dir |
+| `not_ready` | The system partition (platform tables, engine store, table feed) is still opening on its node, e.g. after a takeover; gRPC `UNAVAILABLE` | Retry later |
 | `forbidden` | The token doesn't open this operation (pool or engine token) | Use the right token |
 | `unauthorized` | No or bad token | Send `Authorization: Bearer` |
 | `unsupported` | Not supported (yet), or an unknown action | — |
